@@ -1,6 +1,7 @@
 //! Hardened Git CLI implementation of the typed core port.
 
-use std::ffi::OsString;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufReader, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -90,8 +91,38 @@ pub const HARDENED_GIT_GLOBAL_ARGS: &[&str] = &[
 ];
 
 /// Environment overrides required for non-interactive Git operations.
-pub const HARDENED_GIT_ENV: &[(&str, &str)] =
-    &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")];
+pub const HARDENED_GIT_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GCM_INTERACTIVE", "Never"),
+    ("LC_ALL", "C"),
+];
+
+/// Ambient Git settings whose semantics must match the invoking user's Git discovery/configuration.
+const PRESERVED_GIT_ENV: &[&str] = &[
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_ATTR_NOSYSTEM",
+];
+
+/// Ambient overrides that could silently redirect Forge to a different repository or executable.
+const REJECTED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_EXEC_PATH",
+];
 
 impl GitCli {
     /// Creates a Git CLI with the default bounded timeout and status capacity.
@@ -120,7 +151,7 @@ impl GitCli {
         self.with_status_spool_limit_bytes(limit)
     }
 
-    fn command_spec(&self, operation: GitOperation) -> CommandSpec {
+    fn command_spec(&self, operation: GitOperation) -> io::Result<CommandSpec> {
         let mut spec = CommandSpec::new(
             operation.command_id(),
             Intent::Check,
@@ -143,10 +174,8 @@ impl GitCli {
         // ecosystem offline flags were requested when Git has no such flag for these operations.
         spec.network = NetworkIntent::Unknown;
         spec.confidence = Confidence::High;
-        for (key, value) in HARDENED_GIT_ENV {
-            spec.env.insert(OsString::from(key), OsString::from(value));
-        }
-        spec
+        spec.env = hardened_git_environment(std::env::vars_os())?;
+        Ok(spec)
     }
 
     fn run(&self, start: &Path, operation: GitOperation) -> io::Result<Vec<u8>> {
@@ -160,12 +189,14 @@ impl GitCli {
             ));
         }
         let runner = SynchronousProcessRunner::new(start)?;
-        let observation = runner.run(&self.command_spec(operation)).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to execute git {}: {error}", operation.name()),
-            )
-        })?;
+        let observation = runner
+            .run(&self.command_spec(operation)?)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to execute git {}: {error}", operation.name()),
+                )
+            })?;
         checked_stdout(operation.name(), observation)
     }
 
@@ -184,7 +215,10 @@ impl GitCli {
             ));
         }
         SynchronousProcessRunner::new(root)?
-            .run_spooled_stdout(&self.command_spec(operation), self.status_spool_limit_bytes)
+            .run_spooled_stdout(
+                &self.command_spec(operation)?,
+                self.status_spool_limit_bytes,
+            )
             .map_err(|error| {
                 io::Error::new(
                     error.kind(),
@@ -221,6 +255,64 @@ impl GitCli {
         )
         .map_err(map_path_list_read_error)
     }
+}
+
+fn hardened_git_environment<I>(ambient: I) -> io::Result<BTreeMap<OsString, OsString>>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut environment = BTreeMap::new();
+    for (key, value) in ambient {
+        if let Some(rejected) = REJECTED_GIT_ENV
+            .iter()
+            .find(|candidate| git_environment_key_eq(&key, candidate))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "ambient Git environment variable `{rejected}` would override Forge's resolved repository or Git executable; unset it and use `forge -C <path>`"
+                ),
+            ));
+        }
+        if PRESERVED_GIT_ENV
+            .iter()
+            .any(|candidate| git_environment_key_eq(&key, candidate))
+            || indexed_git_config_key(&key, "GIT_CONFIG_KEY_")
+            || indexed_git_config_key(&key, "GIT_CONFIG_VALUE_")
+        {
+            environment.insert(key, value);
+        }
+    }
+    for (key, value) in HARDENED_GIT_ENV {
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
+    Ok(environment)
+}
+
+#[cfg(windows)]
+fn git_environment_key_eq(key: &OsStr, expected: &str) -> bool {
+    key.to_string_lossy().eq_ignore_ascii_case(expected)
+}
+
+#[cfg(not(windows))]
+fn git_environment_key_eq(key: &OsStr, expected: &str) -> bool {
+    key == OsStr::new(expected)
+}
+
+fn indexed_git_config_key(key: &OsStr, prefix: &str) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    let suffix = if cfg!(windows) {
+        key.get(..prefix.len())
+            .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+            .map(|_| &key[prefix.len()..])
+    } else {
+        key.strip_prefix(prefix)
+    };
+    suffix.is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 impl GitPort for GitCli {
@@ -497,6 +589,7 @@ fn path_buf_from_git_bytes(bytes: Vec<u8>) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::io;
     use std::path::Path;
     use std::time::Duration;
@@ -507,7 +600,8 @@ mod tests {
     use super::{
         GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, OBJECT_FORMAT_ARGS,
         STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS, checked_stdout,
-        parse_absolute_git_path, parse_object_format,
+        hardened_git_environment, indexed_git_config_key, parse_absolute_git_path,
+        parse_object_format,
     };
 
     #[test]
@@ -531,6 +625,117 @@ mod tests {
             ["ls-files", "--others", "--exclude-standard", "-z", "--"]
         );
         assert!(HARDENED_GIT_ENV.contains(&("GIT_TERMINAL_PROMPT", "0")));
+        assert!(HARDENED_GIT_ENV.contains(&("GIT_OPTIONAL_LOCKS", "0")));
+        assert!(HARDENED_GIT_ENV.contains(&("GCM_INTERACTIVE", "Never")));
+        assert!(HARDENED_GIT_ENV.contains(&("LC_ALL", "C")));
+    }
+
+    #[test]
+    fn git_environment_preserves_discovery_and_config_without_unrelated_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let environment = hardened_git_environment([
+            (
+                OsString::from("GIT_CEILING_DIRECTORIES"),
+                OsString::from("/workspace"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                OsString::from("/config/git/config"),
+            ),
+            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+            (
+                OsString::from("GIT_CONFIG_KEY_0"),
+                OsString::from("safe.directory"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_VALUE_0"),
+                OsString::from("/workspace"),
+            ),
+            (
+                OsString::from("FORGE_SECRET_TEST_VALUE"),
+                OsString::from("must-not-leak"),
+            ),
+        ])?;
+
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CEILING_DIRECTORIES")),
+            Some(&OsString::from("/workspace"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&OsString::from("/config/git/config"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_KEY_0")),
+            Some(&OsString::from("safe.directory"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_VALUE_0")),
+            Some(&OsString::from("/workspace"))
+        );
+        assert!(!environment.contains_key(OsStr::new("FORGE_SECRET_TEST_VALUE")));
+        Ok(())
+    }
+
+    #[test]
+    fn git_environment_overrides_interactive_and_locale_controls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let environment = hardened_git_environment([
+            (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("1")),
+            (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("1")),
+            (OsString::from("GCM_INTERACTIVE"), OsString::from("Always")),
+            (OsString::from("LC_ALL"), OsString::from("fr_FR.UTF-8")),
+        ])?;
+
+        for (key, expected) in HARDENED_GIT_ENV {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&OsString::from(expected))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn git_environment_rejects_repository_redirection_without_echoing_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_EXEC_PATH"] {
+            let result = hardened_git_environment([(
+                OsString::from(key),
+                OsString::from("sensitive-value-must-not-leak"),
+            )]);
+            let error = result
+                .err()
+                .ok_or("repository redirection was not rejected")?;
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(key));
+            assert!(!error.to_string().contains("sensitive-value-must-not-leak"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_git_config_names_require_a_decimal_index() {
+        assert!(indexed_git_config_key(
+            OsStr::new("GIT_CONFIG_KEY_0"),
+            "GIT_CONFIG_KEY_"
+        ));
+        assert!(indexed_git_config_key(
+            OsStr::new("GIT_CONFIG_VALUE_123"),
+            "GIT_CONFIG_VALUE_"
+        ));
+        for invalid in [
+            "GIT_CONFIG_KEY_",
+            "GIT_CONFIG_KEY_-1",
+            "GIT_CONFIG_KEY_NAME",
+            "XGIT_CONFIG_KEY_0",
+        ] {
+            assert!(!indexed_git_config_key(
+                OsStr::new(invalid),
+                "GIT_CONFIG_KEY_"
+            ));
+        }
     }
 
     #[test]
