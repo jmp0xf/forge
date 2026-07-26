@@ -9,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use forge_core::ports::ProcessPort as _;
+use forge_core::ports::{ExecSpec, ProcessPort as _};
 use forge_core::{CommandSource, CommandSpec, Intent, RepoRelativePath};
 use forge_runtime::interrupt::InterruptToken;
 use forge_runtime::process::SynchronousProcessRunner;
@@ -135,7 +135,7 @@ fn sigint_runner_helper() -> Result<(), Box<dyn Error>> {
         heartbeat_worker_pid.into_os_string(),
     );
 
-    let observation = runner.run(&command)?;
+    let observation = runner.run(&ExecSpec::from_project_command(&command))?;
     if !observation.interrupted || observation.timed_out {
         return Err(io::Error::other(format!(
             "runner reported interrupted={} timed_out={}",

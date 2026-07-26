@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use forge_core::domain::CommandSpec;
-use forge_core::ports::{ProcessObservation, ProcessPort};
+use forge_core::ports::{
+    DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, ProcessError, ProcessErrorKind,
+    ProcessObservation, ProcessPort, StdinPolicy,
+};
 
 /// Default maximum number of bytes retained in memory for each output stream.
-pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
+pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = DEFAULT_CAPTURE_LIMIT_BYTES;
 
 /// Default maximum number of stdout bytes retained in an anonymous temporary file.
 ///
@@ -25,25 +27,6 @@ pub const DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const INHERITED_ENVIRONMENT: &[&str] = &[
-    "PATH",
-    "HOME",
-    "XDG_CONFIG_HOME",
-    "USERPROFILE",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "GOMODCACHE",
-    "GOPATH",
-    "GOROOT",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
-    "SYSTEMROOT",
-    "WINDIR",
-    "PATHEXT",
-    "LOCALAPPDATA",
-    "APPDATA",
-];
 const RESTRICTED_ENVIRONMENT: &[&str] = &[
     "PAGER",
     "GIT_PAGER",
@@ -70,25 +53,33 @@ const RESTRICTED_ENVIRONMENT: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct SynchronousProcessRunner {
     repository_root: PathBuf,
-    output_limit_bytes: usize,
     termination_grace: Duration,
     cancellation: Arc<AtomicBool>,
 }
 
 impl SynchronousProcessRunner {
     /// Binds a runner to `repository_root` after resolving symlinks.
-    pub fn new(repository_root: impl AsRef<Path>) -> io::Result<Self> {
-        let repository_root = repository_root.as_ref().canonicalize()?;
+    pub fn new(repository_root: impl AsRef<Path>) -> Result<Self, ProcessError> {
+        let repository_root = repository_root.as_ref().canonicalize().map_err(|error| {
+            ProcessError::new(
+                ProcessErrorKind::InvalidRepositoryRoot,
+                "resolve process runner repository root",
+                error,
+            )
+        })?;
         if !repository_root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "process runner repository root is not a directory",
+            return Err(ProcessError::new(
+                ProcessErrorKind::InvalidRepositoryRoot,
+                "validate process runner repository root",
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "process runner repository root is not a directory",
+                ),
             ));
         }
 
         Ok(Self {
             repository_root,
-            output_limit_bytes: DEFAULT_OUTPUT_LIMIT_BYTES,
             termination_grace: TERMINATION_GRACE,
             cancellation: Arc::new(AtomicBool::new(false)),
         })
@@ -101,16 +92,6 @@ impl SynchronousProcessRunner {
     #[must_use]
     pub fn with_cancellation_flag(mut self, cancellation: Arc<AtomicBool>) -> Self {
         self.cancellation = cancellation;
-        self
-    }
-
-    /// Replaces the per-stream output retention limit.
-    ///
-    /// A zero limit still drains both streams and records their total byte counts, but retains no
-    /// output bytes.
-    #[must_use]
-    pub fn with_output_limit_bytes(mut self, limit: usize) -> Self {
-        self.output_limit_bytes = limit;
         self
     }
 
@@ -128,11 +109,21 @@ impl SynchronousProcessRunner {
     /// is removed by the operating system after its last handle closes.
     pub(crate) fn run_spooled_stdout(
         &self,
-        spec: &CommandSpec,
-        spool_limit_bytes: usize,
-    ) -> io::Result<SpooledProcessObservation> {
-        let spool = private_anonymous_tempfile()?;
-        let execution = self.execute(spec, spool, spool_limit_bytes, DEFAULT_OUTPUT_LIMIT_BYTES)?;
+        spec: &ExecSpec,
+    ) -> Result<SpooledProcessObservation, ProcessError> {
+        let spool = private_anonymous_tempfile().map_err(|error| {
+            ProcessError::new(
+                ProcessErrorKind::Output,
+                "create private stdout spool",
+                error,
+            )
+        })?;
+        let execution = self.execute(
+            spec,
+            spool,
+            spec.stdout.retention_limit(),
+            spec.stderr.retention_limit(),
+        )?;
         let (observation, stdout_file) = execution.into_spooled_observation();
         Ok(SpooledProcessObservation {
             observation,
@@ -140,18 +131,36 @@ impl SynchronousProcessRunner {
         })
     }
 
-    fn resolve_cwd(&self, relative: &Path) -> io::Result<PathBuf> {
-        let resolved = self.repository_root.join(relative).canonicalize()?;
+    fn resolve_cwd(&self, relative: &Path) -> Result<PathBuf, ProcessError> {
+        let resolved = self
+            .repository_root
+            .join(relative)
+            .canonicalize()
+            .map_err(|error| {
+                ProcessError::new(
+                    ProcessErrorKind::InvalidWorkingDirectory,
+                    "resolve command working directory",
+                    error,
+                )
+            })?;
         if !resolved.starts_with(&self.repository_root) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "command working directory resolves outside the repository",
+            return Err(ProcessError::new(
+                ProcessErrorKind::InvalidWorkingDirectory,
+                "confine command working directory",
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command working directory resolves outside the repository",
+                ),
             ));
         }
         if !resolved.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "command working directory is not a directory",
+            return Err(ProcessError::new(
+                ProcessErrorKind::InvalidWorkingDirectory,
+                "validate command working directory",
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command working directory is not a directory",
+                ),
             ));
         }
         Ok(resolved)
@@ -159,17 +168,30 @@ impl SynchronousProcessRunner {
 
     fn execute<W>(
         &self,
-        spec: &CommandSpec,
+        spec: &ExecSpec,
         stdout_sink: W,
         stdout_limit_bytes: usize,
         stderr_limit_bytes: usize,
-    ) -> io::Result<ExecutionObservation<W>>
+    ) -> Result<ExecutionObservation<W>, ProcessError>
     where
         W: Write + Send + 'static,
     {
         let cwd = self.resolve_cwd(spec.cwd.as_path())?;
-        let environment = sanitized_environment(std::env::vars_os(), &spec.env)?;
-        reject_implicit_shell_program(&spec.program)?;
+        let environment =
+            sanitized_environment(std::env::vars_os(), &spec.env).map_err(|error| {
+                ProcessError::new(
+                    ProcessErrorKind::InvalidEnvironment,
+                    "build command environment",
+                    error,
+                )
+            })?;
+        reject_implicit_shell_program(&spec.program).map_err(|error| {
+            ProcessError::new(
+                ProcessErrorKind::UnsupportedProgram,
+                "validate command program",
+                error,
+            )
+        })?;
         if self.cancellation.load(Ordering::Acquire) {
             return Ok(ExecutionObservation::interrupted_before_spawn(stdout_sink));
         }
@@ -180,18 +202,35 @@ impl SynchronousProcessRunner {
             .current_dir(cwd)
             .env_clear()
             .envs(environment)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        match spec.stdin {
+            StdinPolicy::Closed => {
+                command.stdin(Stdio::null());
+            }
+            StdinPolicy::Inherit => {
+                command.stdin(Stdio::inherit());
+            }
+        }
 
-        let prepared_tree = platform::PreparedTree::prepare(&mut command)?;
+        let prepared_tree = platform::PreparedTree::prepare(&mut command).map_err(|error| {
+            ProcessError::new(
+                ProcessErrorKind::ProcessTree,
+                "prepare child process tree",
+                error,
+            )
+        })?;
         let started_at = Instant::now();
-        let mut child = command.spawn()?;
+        let mut child = command.spawn().map_err(map_spawn_error)?;
         let mut tree = match prepared_tree.attach(&child) {
             Ok(tree) => tree,
             Err(error) => {
                 reap_direct_child(&mut child);
-                return Err(error);
+                return Err(ProcessError::new(
+                    ProcessErrorKind::ProcessTree,
+                    "attach child process tree",
+                    error,
+                ));
             }
         };
 
@@ -199,14 +238,22 @@ impl SynchronousProcessRunner {
             Some(stdout) => stdout,
             None => {
                 abort_child(&mut child, &tree);
-                return Err(io::Error::other("child stdout pipe was not created"));
+                return Err(ProcessError::new(
+                    ProcessErrorKind::Output,
+                    "open child stdout pipe",
+                    io::Error::other("child stdout pipe was not created"),
+                ));
             }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
                 abort_child(&mut child, &tree);
-                return Err(io::Error::other("child stderr pipe was not created"));
+                return Err(ProcessError::new(
+                    ProcessErrorKind::Output,
+                    "open child stderr pipe",
+                    io::Error::other("child stderr pipe was not created"),
+                ));
             }
         };
 
@@ -219,7 +266,11 @@ impl SynchronousProcessRunner {
             Ok(reader) => reader,
             Err(error) => {
                 abort_child(&mut child, &tree);
-                return Err(error);
+                return Err(ProcessError::new(
+                    ProcessErrorKind::Output,
+                    "start child stdout drain",
+                    error,
+                ));
             }
         };
         let stderr_reader = match spawn_reader(
@@ -232,7 +283,11 @@ impl SynchronousProcessRunner {
             Err(error) => {
                 abort_child(&mut child, &tree);
                 let _ = join_reader(stdout_reader);
-                return Err(error);
+                return Err(ProcessError::new(
+                    ProcessErrorKind::Output,
+                    "start child stderr drain",
+                    error,
+                ));
             }
         };
 
@@ -245,11 +300,21 @@ impl SynchronousProcessRunner {
         );
         let stdout_result = join_reader(stdout_reader);
         let stderr_result = join_reader(stderr_reader);
-        let (status, timed_out, interrupted) = wait_result?;
-        let mut stdout = stdout_result?;
-        let mut stderr = stderr_result?;
-        reject_sink_error("stdout", &mut stdout)?;
-        reject_sink_error("stderr", &mut stderr)?;
+        let (status, timed_out, interrupted) = wait_result.map_err(|error| {
+            ProcessError::new(ProcessErrorKind::Wait, "wait for child process tree", error)
+        })?;
+        let mut stdout = stdout_result.map_err(|error| {
+            ProcessError::new(ProcessErrorKind::Output, "drain child stdout", error)
+        })?;
+        let mut stderr = stderr_result.map_err(|error| {
+            ProcessError::new(ProcessErrorKind::Output, "drain child stderr", error)
+        })?;
+        reject_sink_error("stdout", &mut stdout).map_err(|error| {
+            ProcessError::new(ProcessErrorKind::Output, "retain child stdout", error)
+        })?;
+        reject_sink_error("stderr", &mut stderr).map_err(|error| {
+            ProcessError::new(ProcessErrorKind::Output, "retain child stderr", error)
+        })?;
 
         Ok(ExecutionObservation {
             exit_code: status.code(),
@@ -304,15 +369,24 @@ fn is_windows_batch_program(program: &OsStr) -> bool {
 }
 
 impl ProcessPort for SynchronousProcessRunner {
-    fn run(&self, spec: &CommandSpec) -> io::Result<ProcessObservation> {
+    fn run(&self, spec: &ExecSpec) -> Result<ProcessObservation, ProcessError> {
         self.execute(
             spec,
-            Vec::with_capacity(self.output_limit_bytes.min(8 * 1024)),
-            self.output_limit_bytes,
-            self.output_limit_bytes,
+            Vec::with_capacity(spec.stdout.retention_limit().min(8 * 1024)),
+            spec.stdout.retention_limit(),
+            spec.stderr.retention_limit(),
         )
         .map(ExecutionObservation::into_process_observation)
     }
+}
+
+fn map_spawn_error(error: io::Error) -> ProcessError {
+    let kind = match error.kind() {
+        io::ErrorKind::NotFound => ProcessErrorKind::ExecutableUnavailable,
+        io::ErrorKind::PermissionDenied => ProcessErrorKind::PermissionDenied,
+        _ => ProcessErrorKind::Spawn,
+    };
+    ProcessError::new(kind, "spawn child process", error)
 }
 
 /// Process metadata plus stdout held outside the heap in an anonymous temporary file.
@@ -626,20 +700,30 @@ fn reject_sink_error<W>(stream: &str, output: &mut DrainedOutput<W>) -> io::Resu
 
 fn sanitized_environment<I>(
     inherited: I,
-    explicit: &BTreeMap<OsString, OsString>,
+    policy: &EnvPolicy,
 ) -> io::Result<BTreeMap<OsString, OsString>>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
     let mut environment = BTreeMap::new();
     for (key, value) in inherited {
-        if is_inherited_environment_key(&key) {
+        if policy
+            .inherit
+            .iter()
+            .any(|candidate| environment_policy_key_eq(&key, candidate))
+        {
             validate_environment_entry(&key, &value)?;
+            if is_restricted_environment_key(&key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command environment policy inherits a restricted pager, prompt, or trace setting",
+                ));
+            }
             environment.insert(key, value);
         }
     }
 
-    for (key, value) in explicit {
+    for (key, value) in &policy.overrides {
         validate_environment_entry(key, value)?;
         if is_restricted_environment_key(key) && !is_safe_disabled_control(key, value) {
             return Err(io::Error::new(
@@ -652,10 +736,15 @@ where
     Ok(environment)
 }
 
-fn is_inherited_environment_key(key: &OsStr) -> bool {
-    INHERITED_ENVIRONMENT
-        .iter()
-        .any(|candidate| environment_key_eq(key, candidate))
+#[cfg(windows)]
+fn environment_policy_key_eq(key: &OsStr, candidate: &OsStr) -> bool {
+    key.to_string_lossy()
+        .eq_ignore_ascii_case(&candidate.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn environment_policy_key_eq(key: &OsStr, candidate: &OsStr) -> bool {
+    key == candidate
 }
 
 fn is_restricted_environment_key(key: &OsStr) -> bool {
@@ -1337,7 +1426,9 @@ mod tests {
 
     use forge_core::RepoRelativePath;
     use forge_core::domain::{CommandSource, CommandSpec, Intent};
-    use forge_core::ports::ProcessPort as _;
+    use forge_core::ports::{
+        EnvPolicy, ExecSpec, OutputPolicy, ProcessErrorKind, ProcessPort as _,
+    };
     use tempfile::tempdir;
 
     use super::{
@@ -1350,18 +1441,20 @@ mod tests {
     const PROCESS_TREE_FIXTURE_OUTPUT_BYTES: &str = "FORGE_PROCESS_FIXTURE_OUTPUT_BYTES";
     const PROCESS_TREE_FIXTURE_TEST: &str = "process::tests::process_tree_fixture_helper";
 
-    fn spec(program: impl AsRef<OsStr>, args: &[&str]) -> CommandSpec {
-        CommandSpec::new(
-            "runtime.process.test",
-            Intent::Test,
-            program,
-            RepoRelativePath::root(),
-            CommandSource::LanguageDefault {
-                provider: "test".into(),
-                rule: "runtime-process".into(),
-            },
+    fn spec(program: impl AsRef<OsStr>, args: &[&str]) -> ExecSpec {
+        ExecSpec::from_project_command(
+            &CommandSpec::new(
+                "runtime.process.test",
+                Intent::Test,
+                program,
+                RepoRelativePath::root(),
+                CommandSource::LanguageDefault {
+                    provider: "test".into(),
+                    rule: "runtime-process".into(),
+                },
+            )
+            .with_args(args),
         )
-        .with_args(args)
     }
 
     #[test]
@@ -1436,17 +1529,17 @@ mod tests {
         Err(io::Error::other("unknown process-tree fixture mode").into())
     }
 
-    fn output_fixture_command(bytes: usize) -> Result<CommandSpec, Box<dyn Error>> {
+    fn output_fixture_command(bytes: usize) -> Result<ExecSpec, Box<dyn Error>> {
         let executable = std::env::current_exe()?;
         let mut command = spec(
             executable,
             &["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"],
         );
-        command.env.insert(
+        command.env.overrides.insert(
             OsString::from(PROCESS_TREE_FIXTURE_MODE),
             OsString::from("output"),
         );
-        command.env.insert(
+        command.env.overrides.insert(
             OsString::from(PROCESS_TREE_FIXTURE_OUTPUT_BYTES),
             OsString::from(bytes.to_string()),
         );
@@ -1460,8 +1553,11 @@ mod tests {
         let root = tempdir()?;
         let runner = SynchronousProcessRunner::new(root.path())?;
         let payload_bytes = DEFAULT_OUTPUT_LIMIT_BYTES + 64 * 1024;
-        let mut spooled =
-            runner.run_spooled_stdout(&output_fixture_command(payload_bytes)?, 2 * 1024 * 1024)?;
+        let mut command = output_fixture_command(payload_bytes)?;
+        command.stdout = OutputPolicy::CaptureBounded {
+            max_bytes: 2 * 1024 * 1024,
+        };
+        let mut spooled = runner.run_spooled_stdout(&command)?;
 
         assert_eq!(spooled.observation.exit_code, Some(0));
         assert!(!spooled.observation.timed_out);
@@ -1502,8 +1598,11 @@ mod tests {
         let root = tempdir()?;
         let runner = SynchronousProcessRunner::new(root.path())?;
         let payload_bytes = DEFAULT_OUTPUT_LIMIT_BYTES + 64 * 1024;
-        let spooled =
-            runner.run_spooled_stdout(&output_fixture_command(payload_bytes)?, SPOOL_LIMIT)?;
+        let mut command = output_fixture_command(payload_bytes)?;
+        command.stdout = OutputPolicy::CaptureBounded {
+            max_bytes: SPOOL_LIMIT,
+        };
+        let spooled = runner.run_spooled_stdout(&command)?;
 
         assert_eq!(spooled.observation.exit_code, Some(0));
         assert!(spooled.observation.stdout_truncated);
@@ -1573,6 +1672,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_failures_have_stable_typed_categories() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+
+        let missing = runner
+            .run(&spec("forge-test-program-that-does-not-exist", &[]))
+            .err()
+            .ok_or("missing executable unexpectedly started")?;
+        assert_eq!(missing.kind(), ProcessErrorKind::ExecutableUnavailable);
+        assert_eq!(missing.io_kind(), io::ErrorKind::NotFound);
+
+        let mut invalid_environment = spec("forge-test-program-that-is-not-reached", &[]);
+        invalid_environment.env.overrides.insert(
+            OsString::from("INVALID=NAME"),
+            OsString::from("must-not-be-read"),
+        );
+        let invalid_environment = runner
+            .run(&invalid_environment)
+            .err()
+            .ok_or("invalid environment unexpectedly reached process creation")?;
+        assert_eq!(
+            invalid_environment.kind(),
+            ProcessErrorKind::InvalidEnvironment
+        );
+
+        let mut missing_cwd = spec("forge-test-program-that-is-not-reached", &[]);
+        missing_cwd.cwd = RepoRelativePath::new("missing-directory")?;
+        let missing_cwd = runner
+            .run(&missing_cwd)
+            .err()
+            .ok_or("missing working directory unexpectedly reached process creation")?;
+        assert_eq!(
+            missing_cwd.kind(),
+            ProcessErrorKind::InvalidWorkingDirectory
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_before_spawn_remains_an_observation() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let runner =
+            SynchronousProcessRunner::new(root.path())?.with_cancellation_flag(cancellation);
+
+        let observation = runner.run(&spec("forge-test-program-that-is-not-reached", &[]))?;
+
+        assert!(observation.interrupted);
+        assert!(!observation.timed_out);
+        assert_eq!(observation.exit_code, None);
+        assert_eq!(observation.duration, Duration::ZERO);
+        Ok(())
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_batch_program_is_rejected_before_path_resolution() -> Result<(), Box<dyn Error>> {
@@ -1583,7 +1737,7 @@ mod tests {
             .err()
             .ok_or("Windows batch program unexpectedly reached process creation")?;
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), ProcessErrorKind::UnsupportedProgram);
         assert!(error.to_string().contains("implicit cmd.exe"));
         Ok(())
     }
@@ -1598,11 +1752,11 @@ mod tests {
             executable,
             &["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"],
         );
-        command.env.insert(
+        command.env.overrides.insert(
             OsString::from(PROCESS_TREE_FIXTURE_MODE),
             OsString::from("parent"),
         );
-        command.env.insert(
+        command.env.overrides.insert(
             OsString::from(PROCESS_TREE_FIXTURE_HEARTBEAT),
             heartbeat.as_os_str().to_os_string(),
         );
@@ -1633,11 +1787,11 @@ mod tests {
             executable,
             &["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"],
         );
-        command.env.insert(
+        command.env.overrides.insert(
             OsString::from(PROCESS_TREE_FIXTURE_MODE),
             OsString::from("orphan-parent"),
         );
-        command.env.insert(
+        command.env.overrides.insert(
             OsString::from(PROCESS_TREE_FIXTURE_HEARTBEAT),
             heartbeat.as_os_str().to_os_string(),
         );
@@ -1739,7 +1893,7 @@ mod tests {
             .run(&command)
             .err()
             .ok_or_else(|| io::Error::other("symlink escape unexpectedly executed the command"))?;
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), ProcessErrorKind::InvalidWorkingDirectory);
         Ok(())
     }
 
@@ -1768,7 +1922,8 @@ mod tests {
         explicit.insert(OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0"));
         explicit.insert(OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0"));
         explicit.insert(OsString::from("GCM_INTERACTIVE"), OsString::from("Never"));
-        let environment = sanitized_environment(inherited, &explicit)?;
+        let policy = EnvPolicy::minimal_with_overrides(explicit);
+        let environment = sanitized_environment(inherited, &policy)?;
 
         assert_eq!(
             environment.get(OsStr::new("PATH")),
@@ -1811,7 +1966,8 @@ mod tests {
         ] {
             let mut restricted = BTreeMap::new();
             restricted.insert(OsString::from(key), OsString::from(value));
-            assert!(sanitized_environment([], &restricted).is_err());
+            let policy = EnvPolicy::minimal_with_overrides(restricted);
+            assert!(sanitized_environment([], &policy).is_err());
         }
         Ok(())
     }
@@ -1821,10 +1977,13 @@ mod tests {
     fn restricted_environment_keys_are_case_insensitive_on_windows() -> Result<(), Box<dyn Error>> {
         let mut explicit = BTreeMap::new();
         explicit.insert(OsString::from("git_terminal_prompt"), OsString::from("0"));
-        assert!(sanitized_environment([], &explicit).is_ok());
+        let mut policy = EnvPolicy::minimal_with_overrides(explicit);
+        assert!(sanitized_environment([], &policy).is_ok());
 
-        explicit.insert(OsString::from("git_terminal_prompt"), OsString::from("1"));
-        assert!(sanitized_environment([], &explicit).is_err());
+        policy
+            .overrides
+            .insert(OsString::from("git_terminal_prompt"), OsString::from("1"));
+        assert!(sanitized_environment([], &policy).is_err());
         Ok(())
     }
 
@@ -1849,7 +2008,7 @@ mod tests {
     #[test]
     fn huge_output_is_drained_but_retained_within_each_limit() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
-        let runner = SynchronousProcessRunner::new(root.path())?.with_output_limit_bytes(4 * 1024);
+        let runner = SynchronousProcessRunner::new(root.path())?;
         let script = concat!(
             "i=0; ",
             "while [ \"$i\" -lt 20000 ]; do ",
@@ -1857,7 +2016,14 @@ mod tests {
             "i=$((i + 1)); ",
             "done"
         );
-        let observation = runner.run(&spec("/bin/sh", &["-c", script]))?;
+        let mut command = spec("/bin/sh", &["-c", script]);
+        command.stdout = OutputPolicy::CaptureBounded {
+            max_bytes: 4 * 1024,
+        };
+        command.stderr = OutputPolicy::CaptureBounded {
+            max_bytes: 4 * 1024,
+        };
+        let observation = runner.run(&command)?;
 
         assert_eq!(observation.stdout.len(), 4 * 1024);
         assert_eq!(observation.stdout_total_bytes, 660_000);

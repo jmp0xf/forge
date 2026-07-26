@@ -11,7 +11,10 @@ use std::time::Duration;
 use forge_core::domain::{
     CommandSource, CommandSpec, Confidence, Intent, Mutability, NetworkIntent,
 };
-use forge_core::ports::{GitPort, ProcessObservation, ProcessPort as _};
+use forge_core::ports::{
+    ExecSpec, GitPort, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation,
+    ProcessPort as _,
+};
 use forge_core::{
     GitError, GitErrorKind, GitFileSet, GitObjectFormat, GitPathListReadError,
     PorcelainV2ReadError, PorcelainV2Status, RepoRelativePath, parse_git_path_list_reader,
@@ -199,6 +202,16 @@ impl GitCli {
         Ok(spec)
     }
 
+    fn exec_spec(&self, operation: GitOperation) -> Result<ExecSpec, GitError> {
+        let mut spec = ExecSpec::from_project_command(&self.command_spec(operation)?);
+        if operation.uses_spool() {
+            spec.stdout = OutputPolicy::CaptureBounded {
+                max_bytes: self.status_spool_limit_bytes,
+            };
+        }
+        Ok(spec)
+    }
+
     fn run(&self, start: &Path, operation: GitOperation) -> Result<Vec<u8>, GitError> {
         if operation.uses_spool() {
             return Err(GitError::new(
@@ -212,10 +225,10 @@ impl GitCli {
         }
         self.fail_if_cancelled(operation)?;
         let runner = SynchronousProcessRunner::new(start)
-            .map_err(|error| map_io_error(operation, "prepare repository process root", error))?
+            .map_err(|error| map_execution_error(operation, error))?
             .with_cancellation_flag(Arc::clone(&self.cancellation));
         let observation = runner
-            .run(&self.command_spec(operation)?)
+            .run(&self.exec_spec(operation)?)
             .map_err(|error| map_execution_error(operation, error))?;
         checked_stdout(operation, observation)
     }
@@ -237,12 +250,9 @@ impl GitCli {
         }
         self.fail_if_cancelled(operation)?;
         SynchronousProcessRunner::new(root)
-            .map_err(|error| map_io_error(operation, "prepare repository process root", error))?
+            .map_err(|error| map_execution_error(operation, error))?
             .with_cancellation_flag(Arc::clone(&self.cancellation))
-            .run_spooled_stdout(
-                &self.command_spec(operation)?,
-                self.status_spool_limit_bytes,
-            )
+            .run_spooled_stdout(&self.exec_spec(operation)?)
             .map_err(|error| map_execution_error(operation, error))
     }
 
@@ -584,11 +594,10 @@ fn map_io_error(operation: GitOperation, action: &str, error: io::Error) -> GitE
     )
 }
 
-fn map_execution_error(operation: GitOperation, error: io::Error) -> GitError {
-    let kind = if error.kind() == io::ErrorKind::NotFound {
-        GitErrorKind::ExecutableUnavailable
-    } else {
-        GitErrorKind::Io
+fn map_execution_error(operation: GitOperation, error: ProcessError) -> GitError {
+    let kind = match error.kind() {
+        ProcessErrorKind::ExecutableUnavailable => GitErrorKind::ExecutableUnavailable,
+        _ => GitErrorKind::Io,
     };
     GitError::new(kind, operation.name(), error.to_string())
 }
@@ -700,7 +709,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use forge_core::ports::{GitPort as _, ProcessObservation};
+    use forge_core::ports::{
+        GitPort as _, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation, StdinPolicy,
+    };
     use forge_core::{GitErrorKind, GitObjectFormat};
 
     use super::{
@@ -709,6 +720,45 @@ mod tests {
         classify_command_failure, hardened_git_environment, indexed_git_config_key,
         parse_absolute_git_path, parse_object_format,
     };
+
+    #[test]
+    fn git_execution_uses_the_shared_bounded_noninteractive_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let git = GitCli::new().with_status_spool_limit_bytes(1234);
+        let status = git.exec_spec(GitOperation::Status)?;
+        let root = git.exec_spec(GitOperation::RepositoryRoot)?;
+
+        assert_eq!(status.stdin, StdinPolicy::Closed);
+        assert_eq!(
+            status.stdout,
+            OutputPolicy::CaptureBounded { max_bytes: 1234 }
+        );
+        assert_eq!(
+            root.stdout,
+            OutputPolicy::CaptureBounded {
+                max_bytes: forge_core::ports::DEFAULT_CAPTURE_LIMIT_BYTES
+            }
+        );
+        assert_eq!(
+            status.env.overrides.get(OsStr::new("GIT_TERMINAL_PROMPT")),
+            Some(&OsString::from("0"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_maps_typed_missing_executable_without_parsing_text() {
+        let process_error = ProcessError::new(
+            ProcessErrorKind::ExecutableUnavailable,
+            "spawn child process",
+            io::Error::new(io::ErrorKind::NotFound, "localized diagnostic"),
+        );
+
+        assert_eq!(
+            super::map_execution_error(GitOperation::Status, process_error).kind(),
+            GitErrorKind::ExecutableUnavailable
+        );
+    }
 
     #[test]
     fn hardened_status_is_argv_only_and_non_interactive() {
