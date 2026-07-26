@@ -1,32 +1,69 @@
 //! Read-only P1-P9 assembly of the generic v0 project model.
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use forge_core::ports::{FileSystemPort, GitPort, Hasher};
+use forge_core::ports::{FileSystemPort, GitPort, Hasher, ProcessPort};
 use forge_core::{
-    CommandSource, CommandSpec, Confidence, EffectivePolicy, GitError, Intent,
-    InvalidCommandResolution, Inventory, InventoryError, InventoryKind, InventoryOptions,
-    ProjectModel, ProjectModelError, ProjectModelInputs, Provenance, RelativePathError,
-    RepoRelativePath,
+    Assumption, CommandSource, CommandSpec, Confidence, Diagnostic, EffectivePolicy, GitError,
+    GitFileSet, Intent, InvalidCommandResolution, Inventory, InventoryError, InventoryKind,
+    InventoryOptions, ProjectModel, ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance,
+    RelativePathError, RepoRelativePath, Severity,
 };
 
 use crate::assets::{AssetDiscoveryError, StandardAssetDiscovery, discover_standard_assets};
 use crate::config::{ConfigError, ForgeConfig, load_default_forge_config, load_forge_config_at};
+use crate::go::{
+    GoProvider, GoProviderContext, GoProviderError, GoProviderIssue, GoProviderIssueKind,
+};
 use crate::repository::{RepositoryDetection, RepositoryDetectionError, detect_repository};
 use crate::resolution::{
     CommandLayer, CommandLayerKind, CommandPlanCandidate, CommandResolutionLayers,
-    resolve_command_intents,
+    compose_ordered_language_plans, resolve_command_intents,
 };
 use crate::runner::{RunnerDiscovery, RunnerDiscoveryCompleteness, RunnerKind, discover_runner};
+use crate::rust::{
+    CargoMetadataCompletion, CargoMetadataOutcome, RustDetectionContext, RustDetectionError,
+    RustProvider,
+};
+
+const DEFAULT_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Read-only generic detection controls. Provider-specific controls are added in M3.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDetectionOptions {
     pub inventory: InventoryOptions,
     pub config_path: Option<RepoRelativePath>,
+    pub metadata_timeout: Duration,
+}
+
+impl Default for ModelDetectionOptions {
+    fn default() -> Self {
+        Self {
+            inventory: InventoryOptions::default(),
+            config_path: None,
+            metadata_timeout: DEFAULT_METADATA_TIMEOUT,
+        }
+    }
+}
+
+/// Whether all model-detection stages completed without a bounded degradation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDetectionCompletion {
+    Complete,
+    Partial,
+    TimedOut,
+    Interrupted,
+}
+
+/// A finalized model retained independently from its typed completion state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDetectionOutcome {
+    pub model: ProjectModel,
+    pub completion: ModelDetectionCompletion,
 }
 
 /// A typed failure from one generic project-model assembly stage.
@@ -37,6 +74,8 @@ pub enum ModelDetectionError {
     Inventory(InventoryError),
     Assets(AssetDiscoveryError),
     Config(ConfigError),
+    RustProvider(RustDetectionError),
+    GoProvider(GoProviderError),
     InvalidInventoryPath {
         path: PathBuf,
         source: RelativePathError,
@@ -53,6 +92,8 @@ impl fmt::Display for ModelDetectionError {
             Self::Inventory(error) => error.fmt(formatter),
             Self::Assets(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
+            Self::RustProvider(error) => write!(formatter, "Rust provider failed: {error}"),
+            Self::GoProvider(error) => write!(formatter, "Go provider failed: {error}"),
             Self::InvalidInventoryPath { path, source } => write!(
                 formatter,
                 "inventory runner path {path:?} is not repository-relative: {source}"
@@ -71,6 +112,8 @@ impl Error for ModelDetectionError {
             Self::Inventory(error) => Some(error),
             Self::Assets(error) => Some(error),
             Self::Config(error) => Some(error),
+            Self::RustProvider(error) => Some(error),
+            Self::GoProvider(error) => Some(error),
             Self::InvalidInventoryPath { source, .. } => Some(source),
             Self::CommandResolution(error) => Some(error),
             Self::InvalidModel(error) => Some(error),
@@ -79,18 +122,14 @@ impl Error for ModelDetectionError {
 }
 
 /// Detects a finalized generic project model without executing project-owned commands.
-pub fn detect_project_model<G, F, H>(
+pub fn detect_project_model(
     start: &Path,
-    git: &G,
-    filesystem: &F,
-    hasher: &H,
+    git: &dyn GitPort,
+    filesystem: &dyn FileSystemPort,
+    process: &dyn ProcessPort,
+    hasher: &dyn Hasher,
     options: &ModelDetectionOptions,
-) -> Result<ProjectModel, ModelDetectionError>
-where
-    G: GitPort + ?Sized,
-    F: FileSystemPort + ?Sized,
-    H: Hasher + ?Sized,
-{
+) -> Result<ModelDetectionOutcome, ModelDetectionError> {
     let repository = detect_repository(start, git, filesystem, hasher)
         .map_err(ModelDetectionError::Repository)?;
     let file_set = git
@@ -99,6 +138,15 @@ where
     let inventory = filesystem
         .inventory(&repository.facts.root, Some(&file_set), options.inventory)
         .map_err(ModelDetectionError::Inventory)?;
+    let language = detect_language_providers(
+        &repository,
+        &inventory,
+        &file_set,
+        filesystem,
+        process,
+        hasher,
+        options.metadata_timeout,
+    )?;
     let standard_assets =
         discover_standard_assets(&inventory).map_err(ModelDetectionError::Assets)?;
     let (config, config_path) = load_config(
@@ -120,6 +168,7 @@ where
         config.as_ref(),
         &config_path,
         runners,
+        language,
     )
 }
 
@@ -211,6 +260,240 @@ fn runner_kind_for_path(path: &Path) -> Option<RunnerKind> {
     }
 }
 
+#[derive(Debug)]
+struct LanguageDetection {
+    units: Vec<ProjectUnit>,
+    plans: Vec<CommandPlanCandidate>,
+    provenance: Vec<Provenance>,
+    confidence: Confidence,
+    complete: bool,
+    timed_out: bool,
+    interrupted: bool,
+    diagnostics: Vec<Diagnostic>,
+    assumptions: Vec<Assumption>,
+}
+
+fn detect_language_providers(
+    repository: &RepositoryDetection,
+    inventory: &Inventory,
+    file_set: &GitFileSet,
+    filesystem: &dyn FileSystemPort,
+    process: &dyn ProcessPort,
+    hasher: &dyn Hasher,
+    metadata_timeout: Duration,
+) -> Result<LanguageDetection, ModelDetectionError> {
+    let rust_relevant = has_manifest(inventory, "Cargo.toml");
+    let go_relevant = has_manifest(inventory, "go.mod") || has_manifest(inventory, "go.work");
+    let mut units = Vec::new();
+    let mut plan_fragments = Vec::new();
+    let mut provenance = vec![Provenance {
+        rule_id: String::from("units.provider-order.v1"),
+        source_path: None,
+        source_range: None,
+        detail: String::from(
+            "relevant built-in providers were evaluated in stable Rust then Go order",
+        ),
+    }];
+    let mut complete = inventory.skipped.is_empty();
+    let mut timed_out = false;
+    let mut interrupted = false;
+    let mut diagnostics = Vec::new();
+    let mut assumptions = Vec::new();
+
+    if rust_relevant {
+        let result = RustProvider
+            .detect_project(&RustDetectionContext {
+                repository_root: &repository.facts.root,
+                inventory,
+                filesystem,
+                process,
+                hasher,
+                metadata_timeout,
+            })
+            .map_err(ModelDetectionError::RustProvider)?;
+        for completion in &result.metadata_completions {
+            interrupted |= completion.interrupted;
+            timed_out |= completion.timed_out;
+            if completion.outcome != CargoMetadataOutcome::Succeeded {
+                let (diagnostic, assumption) = rust_incomplete_evidence(completion);
+                diagnostics.push(diagnostic);
+                assumptions.push(assumption);
+                complete = false;
+            }
+        }
+        complete &= result.confidence == Confidence::High;
+        units.extend(result.units);
+        plan_fragments.extend(result.command_plan_fragments);
+        provenance.extend(result.provenance);
+    }
+
+    if go_relevant {
+        let changed_paths = repository.changed_paths();
+        let result = GoProvider
+            .analyze(GoProviderContext {
+                repository_root: &repository.facts.root,
+                inventory,
+                git_files: file_set,
+                changed_files: changed_paths.as_deref(),
+                file_system: filesystem,
+                process,
+                hasher,
+                metadata_timeout,
+            })
+            .map_err(ModelDetectionError::GoProvider)?;
+        for issue in &result.issues {
+            interrupted |= issue.kind == GoProviderIssueKind::MetadataInterrupted;
+            timed_out |= issue.kind == GoProviderIssueKind::MetadataTimedOut;
+            let (diagnostic, assumption) = go_incomplete_evidence(issue);
+            diagnostics.push(diagnostic);
+            assumptions.push(assumption);
+        }
+        complete &= result.complete;
+        units.extend(result.units);
+        plan_fragments.extend(result.plans);
+        provenance.extend(result.provenance);
+    }
+
+    units.sort_by(|left, right| {
+        left.root
+            .cmp(&right.root)
+            .then_with(|| left.manifest.cmp(&right.manifest))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    provenance.sort();
+    provenance.dedup();
+    Ok(LanguageDetection {
+        units,
+        plans: compose_ordered_language_plans(plan_fragments),
+        provenance,
+        confidence: if complete {
+            Confidence::Medium
+        } else {
+            Confidence::Unknown
+        },
+        complete,
+        timed_out,
+        interrupted,
+        diagnostics,
+        assumptions,
+    })
+}
+
+fn has_manifest(inventory: &Inventory, name: &str) -> bool {
+    inventory
+        .entries
+        .iter()
+        .any(|entry| entry.path.file_name() == Some(OsStr::new(name)))
+}
+
+fn rust_incomplete_evidence(completion: &CargoMetadataCompletion) -> (Diagnostic, Assumption) {
+    let reason = rust_outcome_reason(&completion.outcome);
+    let location = completion.manifest.as_path().display().to_string();
+    let provenance = Provenance {
+        rule_id: String::from("rust.provider-incomplete.v1"),
+        source_path: Some(completion.manifest.as_path().into()),
+        source_range: None,
+        detail: reason.to_owned(),
+    };
+    (
+        Diagnostic::new(
+            "FGE2210",
+            Severity::Warning,
+            "Rust metadata detection was incomplete",
+            location,
+            reason,
+            "repair the declared Rust toolchain or manifest, then rerun Forge detection",
+        ),
+        Assumption::new(
+            format!("Rust unit and command scope remain uncertain because {reason}"),
+            vec![provenance],
+            Confidence::Unknown,
+        ),
+    )
+}
+
+fn rust_outcome_reason(outcome: &CargoMetadataOutcome) -> &'static str {
+    match outcome {
+        CargoMetadataOutcome::Succeeded => "Cargo metadata completed successfully",
+        CargoMetadataOutcome::ManifestNotRegular { .. } => {
+            "the inventoried Cargo manifest was not a regular file"
+        }
+        CargoMetadataOutcome::ManifestProbeFailed { .. } => {
+            "the Cargo manifest could not be inspected safely"
+        }
+        CargoMetadataOutcome::ProcessFailed { .. } => "the Cargo metadata process could not start",
+        CargoMetadataOutcome::ExitFailure => "Cargo metadata exited unsuccessfully",
+        CargoMetadataOutcome::TimedOut => "Cargo metadata exceeded its configured timeout",
+        CargoMetadataOutcome::Interrupted => "Cargo metadata was interrupted",
+        CargoMetadataOutcome::OutputTruncated => "Cargo metadata exceeded its bounded output",
+        CargoMetadataOutcome::InvalidOutput(_) => {
+            "Cargo metadata output failed structural or repository-boundary validation"
+        }
+    }
+}
+
+fn go_incomplete_evidence(issue: &GoProviderIssue) -> (Diagnostic, Assumption) {
+    let reason = go_issue_reason(issue.kind);
+    let location = issue.path.as_ref().map_or_else(
+        || String::from("Go provider"),
+        |path| path.as_path().display().to_string(),
+    );
+    let provenance = Provenance {
+        rule_id: String::from("go.provider-incomplete.v1"),
+        source_path: issue.path.as_ref().map(|path| path.as_path().into()),
+        source_range: None,
+        detail: reason.to_owned(),
+    };
+    (
+        Diagnostic::new(
+            "FGE2211",
+            Severity::Warning,
+            "Go project detection was incomplete",
+            location,
+            reason,
+            "repair the Go workspace or toolchain evidence, then rerun Forge detection",
+        ),
+        Assumption::new(
+            format!("Go unit, impact, or command scope remains uncertain because {reason}"),
+            vec![provenance],
+            Confidence::Unknown,
+        ),
+    )
+}
+
+fn go_issue_reason(kind: GoProviderIssueKind) -> &'static str {
+    match kind {
+        GoProviderIssueKind::InvalidRepositoryRoot => "the repository root was invalid",
+        GoProviderIssueKind::InventoryIncomplete => "the repository inventory was incomplete",
+        GoProviderIssueKind::InvalidInventoryPath => "an inventoried Go path was invalid",
+        GoProviderIssueKind::InvalidManifestKind => "a Go manifest was not a regular file",
+        GoProviderIssueKind::ManifestProbeFailed => "a Go manifest could not be inspected safely",
+        GoProviderIssueKind::InvalidUsePath => "a go.work use path was invalid",
+        GoProviderIssueKind::UseTargetNotDirectory => "a go.work use target was not a directory",
+        GoProviderIssueKind::UseManifestNotRegular => {
+            "a go.work module manifest was not a regular file"
+        }
+        GoProviderIssueKind::MetadataUnavailable => "Go workspace metadata could not start",
+        GoProviderIssueKind::MetadataTimedOut => "Go workspace metadata timed out",
+        GoProviderIssueKind::MetadataInterrupted => "Go workspace metadata was interrupted",
+        GoProviderIssueKind::MetadataOutputLimit => {
+            "Go workspace metadata exceeded its output bound"
+        }
+        GoProviderIssueKind::MetadataCommandFailed => "Go workspace metadata exited unsuccessfully",
+        GoProviderIssueKind::MetadataInvalid => "Go workspace metadata was invalid",
+        GoProviderIssueKind::DuplicateWorkspaceMembership => {
+            "a Go module belonged to multiple workspaces"
+        }
+        GoProviderIssueKind::OverlappingWorkspace => "Go workspace roots overlapped",
+        GoProviderIssueKind::ChangedScopeUnavailable => "the changed Go path set was unavailable",
+        GoProviderIssueKind::ChangedPathUnknown => "a changed path could not be mapped safely",
+        GoProviderIssueKind::GeneratedStatusUnknown => {
+            "generated Go source status could not be proven"
+        }
+        GoProviderIssueKind::ImpactScopeBroadened => "Go change impact required a broader scope",
+    }
+}
+
 fn assemble_project_model(
     repository: RepositoryDetection,
     inventory: Inventory,
@@ -218,14 +501,24 @@ fn assemble_project_model(
     config: Option<&ForgeConfig>,
     config_path: &RepoRelativePath,
     runners: RunnerScan,
-) -> Result<ProjectModel, ModelDetectionError> {
+    language: LanguageDetection,
+) -> Result<ModelDetectionOutcome, ModelDetectionError> {
     let timeout = config
         .and_then(|config| config.policy.default_timeout_seconds)
         .unwrap_or(300);
+    let generic_partial = repository.confidence == Confidence::Unknown
+        || !inventory.skipped.is_empty()
+        || !runners.complete
+        || standard_assets.assets.confidence == Confidence::Unknown
+        || standard_assets.adapters.confidence == Confidence::Unknown;
+    let completion = model_detection_completion(
+        language.interrupted,
+        language.timed_out,
+        generic_partial || !language.complete,
+    );
     let explicit_config = explicit_config_layer(config, config_path, timeout);
     let existing_project = existing_project_layer(runners, timeout);
-    let (language_default, unit_provenance, unit_confidence) =
-        language_default_layer(&inventory, &standard_assets);
+    let language_default = language_default_layer(&language);
     let commands = resolve_command_intents(&CommandResolutionLayers {
         explicit_config,
         existing_project,
@@ -238,15 +531,37 @@ fn assemble_project_model(
         repository: repository.facts,
         repository_provenance: repository.provenance,
         repository_confidence: repository.confidence,
-        unit_inventory_provenance: unit_provenance,
-        unit_inventory_confidence: unit_confidence,
+        unit_inventory_provenance: language.provenance,
+        unit_inventory_confidence: language.confidence,
         assets: standard_assets.assets,
         adapters: standard_assets.adapters,
         policy,
     });
+    model.units = language.units;
     model.commands = commands;
     model.diagnostics = repository.diagnostics;
-    model.finalize().map_err(ModelDetectionError::InvalidModel)
+    model.diagnostics.extend(language.diagnostics);
+    model.assumptions = language.assumptions;
+    let model = model
+        .finalize()
+        .map_err(ModelDetectionError::InvalidModel)?;
+    Ok(ModelDetectionOutcome { model, completion })
+}
+
+fn model_detection_completion(
+    interrupted: bool,
+    timed_out: bool,
+    partial: bool,
+) -> ModelDetectionCompletion {
+    if interrupted {
+        ModelDetectionCompletion::Interrupted
+    } else if timed_out {
+        ModelDetectionCompletion::TimedOut
+    } else if partial {
+        ModelDetectionCompletion::Partial
+    } else {
+        ModelDetectionCompletion::Complete
+    }
 }
 
 fn explicit_config_layer(
@@ -334,48 +649,19 @@ fn existing_project_layer(runners: RunnerScan, timeout_seconds: u64) -> CommandL
     }
 }
 
-fn language_default_layer(
-    inventory: &Inventory,
-    standard_assets: &StandardAssetDiscovery,
-) -> (CommandLayer, Vec<Provenance>, Confidence) {
-    let supported_manifest = standard_assets
-        .assets
-        .entries
-        .iter()
-        .any(|asset| asset.kind.starts_with("manifest."));
-    let complete = inventory.skipped.is_empty() && !supported_manifest;
-    let provenance = vec![Provenance {
-        rule_id: String::from("units.generic-detection.v1"),
-        source_path: None,
-        source_range: None,
-        detail: if supported_manifest {
-            String::from("supported manifests were inventoried; provider resolution belongs to M3")
-        } else if inventory.skipped.is_empty() {
-            String::from("no supported language manifest was present in the complete inventory")
-        } else {
-            String::from("partial inventory cannot prove the supported unit set is empty")
-        },
-    }];
-    if complete {
-        (
-            CommandLayer::complete(
-                CommandLayerKind::LanguageDefault,
-                Vec::new(),
-                provenance.clone(),
-                Confidence::Medium,
-            ),
-            provenance,
-            Confidence::Medium,
+fn language_default_layer(language: &LanguageDetection) -> CommandLayer {
+    if language.complete {
+        CommandLayer::complete(
+            CommandLayerKind::LanguageDefault,
+            language.plans.clone(),
+            language.provenance.clone(),
+            language.confidence,
         )
     } else {
-        (
-            CommandLayer::unknown(
-                CommandLayerKind::LanguageDefault,
-                Vec::new(),
-                provenance.clone(),
-            ),
-            provenance,
-            Confidence::Unknown,
+        CommandLayer::unknown(
+            CommandLayerKind::LanguageDefault,
+            language.plans.clone(),
+            language.provenance.clone(),
         )
     }
 }
@@ -429,10 +715,20 @@ fn intent_name(intent: Intent) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::ffi::OsString;
+    use std::io;
     use std::path::{Path, PathBuf};
 
     use forge_core::inventory::DEFAULT_MAX_TEXT_FILE_BYTES;
-    use forge_core::{CommandResolution, Confidence, InventoryEntry, RepoFacts, RepoId, WorkState};
+    use forge_core::ports::{ExecSpec, ProcessError, ProcessErrorKind, ProcessObservation};
+    use forge_core::{
+        BoundedText, BranchHead, BranchOid, BranchStatus, CommandResolution, Confidence, Digest,
+        GitFileSet, GitObjectFormat, InventoryEntry, PathKind, PorcelainV2Status, RepoFacts,
+        RepoId, WorkState,
+    };
+    use serde_json::json;
 
     use super::*;
 
@@ -459,6 +755,218 @@ mod tests {
             confidence: Confidence::High,
             diagnostics: Vec::new(),
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ModelGit {
+        file_set: GitFileSet,
+        status: PorcelainV2Status,
+    }
+
+    impl GitPort for ModelGit {
+        fn repository_root(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            Ok(PathBuf::from("/repo"))
+        }
+
+        fn git_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            Ok(PathBuf::from("/repo/.git"))
+        }
+
+        fn git_common_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            Ok(PathBuf::from("/repo/.git"))
+        }
+
+        fn status(&self, _root: &Path) -> Result<PorcelainV2Status, GitError> {
+            Ok(self.status.clone())
+        }
+
+        fn file_set(&self, _root: &Path) -> Result<GitFileSet, GitError> {
+            Ok(self.file_set.clone())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ModelFileSystem {
+        inventory: Inventory,
+        kinds: BTreeMap<RepoRelativePath, PathKind>,
+    }
+
+    impl ModelFileSystem {
+        fn new(inventory: Inventory) -> Self {
+            let kinds = inventory
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    RepoRelativePath::new(&entry.path).ok().map(|path| {
+                        let kind = match entry.kind {
+                            InventoryKind::Directory => PathKind::Directory,
+                            InventoryKind::File => PathKind::File,
+                            InventoryKind::Symlink => PathKind::Symlink,
+                            InventoryKind::Other => PathKind::Other,
+                        };
+                        (path, kind)
+                    })
+                })
+                .collect();
+            Self { inventory, kinds }
+        }
+    }
+
+    impl FileSystemPort for ModelFileSystem {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "raw reads are outside this model fake",
+            ))
+        }
+
+        fn inventory(
+            &self,
+            _root: &Path,
+            _file_set: Option<&GitFileSet>,
+            _options: InventoryOptions,
+        ) -> Result<Inventory, InventoryError> {
+            Ok(self.inventory.clone())
+        }
+
+        fn read_bounded_text(
+            &self,
+            _root: &Path,
+            _path: &RepoRelativePath,
+            _max_text_file_bytes: u64,
+        ) -> Result<BoundedText, InventoryError> {
+            Ok(BoundedText {
+                bytes: Vec::new(),
+                truncated: false,
+                binary: false,
+            })
+        }
+
+        fn path_kind(&self, _root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
+            Ok(self.kinds.get(path).copied().unwrap_or(PathKind::Missing))
+        }
+
+        fn write_atomic(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "model detection must not write",
+            ))
+        }
+
+        fn exists(&self, _path: &Path) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ModelProcess {
+        responses: RefCell<VecDeque<ProcessObservation>>,
+        calls: RefCell<Vec<ExecSpec>>,
+    }
+
+    impl ModelProcess {
+        fn with_responses(responses: Vec<ProcessObservation>) -> Self {
+            Self {
+                responses: RefCell::new(responses.into()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProcessPort for ModelProcess {
+        fn run(&self, spec: &ExecSpec) -> Result<ProcessObservation, ProcessError> {
+            self.calls.borrow_mut().push(spec.clone());
+            self.responses.borrow_mut().pop_front().ok_or_else(|| {
+                ProcessError::new(
+                    ProcessErrorKind::Spawn,
+                    "model fixture process response",
+                    io::Error::other("unexpected provider process execution"),
+                )
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ModelHasher;
+
+    impl Hasher for ModelHasher {
+        fn digest(&self, chunks: &[&[u8]]) -> Digest {
+            let mut state = 0xcbf2_9ce4_8422_2325_u64;
+            for chunk in chunks {
+                for byte in *chunk {
+                    state ^= u64::from(*byte);
+                    state = state.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            Digest::new(format!("model:{state:016x}"))
+        }
+    }
+
+    fn model_inventory(entries: &[(&str, InventoryKind)]) -> Inventory {
+        Inventory {
+            entries: entries
+                .iter()
+                .map(|(path, kind)| InventoryEntry {
+                    path: PathBuf::from(path),
+                    kind: *kind,
+                    size_bytes: usize::from(*kind == InventoryKind::File) as u64,
+                })
+                .collect(),
+            skipped: Vec::new(),
+        }
+    }
+
+    fn model_git(inventory: &Inventory) -> Result<ModelGit, RelativePathError> {
+        let tracked = inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == InventoryKind::File)
+            .map(|entry| RepoRelativePath::new(&entry.path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ModelGit {
+            file_set: GitFileSet::new(tracked, Vec::new()),
+            status: PorcelainV2Status {
+                object_format: GitObjectFormat::Sha1,
+                branch: BranchStatus {
+                    oid: Some(BranchOid::Unborn),
+                    head: Some(BranchHead::Detached),
+                    ..BranchStatus::default()
+                },
+                entries: Vec::new(),
+            },
+        })
+    }
+
+    fn observation(stdout: Vec<u8>) -> ProcessObservation {
+        ProcessObservation {
+            exit_code: Some(0),
+            signal: None,
+            stdout_total_bytes: stdout.len() as u64,
+            stderr_total_bytes: 0,
+            stdout,
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: Duration::from_millis(1),
+            timed_out: false,
+            interrupted: false,
+        }
+    }
+
+    fn rust_metadata() -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&json!({
+            "packages": [{
+                "name": "rust-root",
+                "id": "path+file:///repo#rust-root@0.1.0",
+                "manifest_path": "/repo/Cargo.toml",
+                "dependencies": []
+            }],
+            "workspace_members": ["path+file:///repo#rust-root@0.1.0"],
+            "workspace_default_members": ["path+file:///repo#rust-root@0.1.0"],
+            "resolve": null,
+            "workspace_root": "/repo",
+            "format_version": 1
+        }))
     }
 
     fn file(path: &str, contents: &[u8]) -> (InventoryEntry, RunnerDiscovery) {
@@ -490,6 +998,30 @@ mod tests {
     ) -> Result<ProjectModel, ModelDetectionError> {
         let standard_assets =
             discover_standard_assets(&inventory).map_err(ModelDetectionError::Assets)?;
+        let relevant_manifest = has_manifest(&inventory, "Cargo.toml")
+            || has_manifest(&inventory, "go.mod")
+            || has_manifest(&inventory, "go.work");
+        let complete_language = inventory.skipped.is_empty() && !relevant_manifest;
+        let language = LanguageDetection {
+            units: Vec::new(),
+            plans: Vec::new(),
+            provenance: vec![Provenance {
+                rule_id: String::from("test.language"),
+                source_path: None,
+                source_range: None,
+                detail: String::from("test language detection fixture"),
+            }],
+            confidence: if complete_language {
+                Confidence::Medium
+            } else {
+                Confidence::Unknown
+            },
+            complete: complete_language,
+            timed_out: false,
+            interrupted: false,
+            diagnostics: Vec::new(),
+            assumptions: Vec::new(),
+        };
         assemble_project_model(
             repository(),
             inventory,
@@ -506,7 +1038,9 @@ mod tests {
                 failures: Vec::new(),
                 complete,
             },
+            language,
         )
+        .map(|outcome| outcome.model)
     }
 
     #[test]
@@ -566,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_manifest_is_explicitly_unknown_until_provider_milestone()
+    fn incomplete_provider_result_keeps_language_commands_unknown()
     -> Result<(), Box<dyn std::error::Error>> {
         let inventory = Inventory {
             entries: vec![InventoryEntry {
@@ -638,12 +1172,208 @@ args = ["test", "--workspace"]
     }
 
     #[test]
+    fn mixed_repository_runs_rust_then_go_and_composes_one_language_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[
+            ("Cargo.toml", InventoryKind::File),
+            ("go.work", InventoryKind::File),
+            ("gomod", InventoryKind::Directory),
+            ("gomod/go.mod", InventoryKind::File),
+            ("gomod/main.go", InventoryKind::File),
+        ]);
+        let git = model_git(&inventory)?;
+        let filesystem = ModelFileSystem::new(inventory);
+        let process = ModelProcess::with_responses(vec![
+            observation(rust_metadata()?),
+            observation(serde_json::to_vec(&json!({
+                "Use": [{"DiskPath": "./gomod"}]
+            }))?),
+        ]);
+
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(outcome.completion, ModelDetectionCompletion::Complete);
+        let calls = process.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].program, OsString::from("cargo"));
+        assert_eq!(calls[1].program, OsString::from("go"));
+        assert!(
+            outcome
+                .model
+                .units
+                .iter()
+                .any(|unit| unit.language.as_str() == "rust")
+        );
+        assert!(
+            outcome
+                .model
+                .units
+                .iter()
+                .any(|unit| unit.language.as_str() == "go")
+        );
+        let check = &outcome.model.commands[&Intent::Check];
+        assert_eq!(check.resolution(), CommandResolution::Resolved);
+        assert!(check.commands().len() >= 3);
+        assert_eq!(check.commands()[0].program, "cargo");
+        assert!(
+            check
+                .commands()
+                .iter()
+                .skip(1)
+                .any(|command| command.program == "go" || command.program == "gofmt")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_failure_keeps_static_model_and_redacted_uncertainty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("Cargo.toml", InventoryKind::File)]);
+        let git = model_git(&inventory)?;
+        let filesystem = ModelFileSystem::new(inventory);
+        let mut failure = observation(Vec::new());
+        failure.exit_code = Some(1);
+        failure.stderr = b"SECRET_RAW_TOOL_OUTPUT".to_vec();
+        failure.stderr_total_bytes = failure.stderr.len() as u64;
+        let process = ModelProcess::with_responses(vec![failure]);
+
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(outcome.completion, ModelDetectionCompletion::Partial);
+        assert_eq!(outcome.model.units.len(), 1);
+        assert_eq!(outcome.model.units[0].confidence, Confidence::Low);
+        assert_eq!(
+            outcome.model.commands[&Intent::Check].resolution(),
+            CommandResolution::Unknown
+        );
+        assert!(!outcome.model.diagnostics.is_empty());
+        assert!(!outcome.model.assumptions.is_empty());
+        assert!(outcome.model.diagnostics.iter().all(|diagnostic| {
+            !diagnostic.what.contains("SECRET_RAW_TOOL_OUTPUT")
+                && !diagnostic.why.contains("SECRET_RAW_TOOL_OUTPUT")
+                && !diagnostic.next.contains("SECRET_RAW_TOOL_OUTPUT")
+        }));
+        assert!(outcome.model.assumptions.iter().all(|assumption| {
+            !assumption.statement.contains("SECRET_RAW_TOOL_OUTPUT")
+                && assumption
+                    .provenance
+                    .iter()
+                    .all(|item| !item.detail.contains("SECRET_RAW_TOOL_OUTPUT"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_retains_static_units_and_typed_completion() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let inventory = model_inventory(&[("Cargo.toml", InventoryKind::File)]);
+        let git = model_git(&inventory)?;
+        let filesystem = ModelFileSystem::new(inventory);
+        let mut timeout = observation(Vec::new());
+        timeout.exit_code = None;
+        timeout.timed_out = true;
+        let process = ModelProcess::with_responses(vec![timeout]);
+
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(outcome.completion, ModelDetectionCompletion::TimedOut);
+        assert_eq!(outcome.model.units.len(), 1);
+        assert!(!outcome.model.diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn interruption_has_priority_over_timeout_without_losing_model()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("Cargo.toml", InventoryKind::File)]);
+        let git = model_git(&inventory)?;
+        let filesystem = ModelFileSystem::new(inventory);
+        let mut interrupted = observation(Vec::new());
+        interrupted.exit_code = None;
+        interrupted.timed_out = true;
+        interrupted.interrupted = true;
+        let process = ModelProcess::with_responses(vec![interrupted]);
+
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(outcome.completion, ModelDetectionCompletion::Interrupted);
+        assert_eq!(outcome.model.units.len(), 1);
+        assert_eq!(
+            outcome.model.commands[&Intent::Test].resolution(),
+            CommandResolution::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_without_language_manifests_runs_no_tool_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
+        let git = model_git(&inventory)?;
+        let filesystem = ModelFileSystem::new(inventory);
+        let process = ModelProcess::default();
+
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(outcome.completion, ModelDetectionCompletion::Complete);
+        assert!(process.calls.borrow().is_empty());
+        assert!(outcome.model.units.is_empty());
+        assert!(
+            outcome
+                .model
+                .commands
+                .values()
+                .all(|commands| commands.resolution() == CommandResolution::Absent)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn generic_default_text_bound_matches_inventory_bootstrap_bound() {
         assert_eq!(
             ModelDetectionOptions::default()
                 .inventory
                 .max_text_file_bytes,
             DEFAULT_MAX_TEXT_FILE_BYTES
+        );
+        assert_eq!(
+            ModelDetectionOptions::default().metadata_timeout,
+            Duration::from_secs(60)
         );
     }
 }
