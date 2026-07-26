@@ -2,7 +2,7 @@
 
 Forge is a repository-native, executor-neutral engineering runtime layer for humans and coding agents.
 It discovers the repository's own build and verification interface, produces minimal host adapters,
-computes the next verifiable action, and records scope-bound local evidence. It does **not** own project
+computes the next verifiable action, and is designed to record scope-bound local evidence. It does **not** own project
 build logic, call an LLM, run an agent loop, or replace independent CI and approval.
 
 This repository contains:
@@ -15,13 +15,18 @@ This repository contains:
 
 ## Status
 
-M0 and M1 are implemented. The executable protocol surface is backed by typed identifiers, structured diagnostics,
-stable exit codes, checked-in JSON Schemas, and shell completions. Runtime boundaries now include typed Git porcelain
-and Git-authoritative inventory, native repository paths, isolated private state, atomic repository-confined writes,
-BLAKE3 hashing, and synchronous bounded subprocess execution with timeout, cancellation, and process-tree cleanup.
+M0 through M5 are implemented. Forge now provides typed contracts and diagnostics, hardened Git/filesystem/process
+boundaries, Rust and Go project-model detection, deterministic command resolution, minimal managed-block `init`, host
+adapter drift/sync, `doctor`, and the read-only `next` reducer with effective-policy, risk, and bounded context output.
 
-M2 project-model and generic detection work is next. `init`, `doctor`, `next`, adapters, explain, and evidence still
-fail explicitly rather than pretending placeholder behavior is complete.
+M6 Receipt/Evidence foundations are in progress. The accepted design does not yet define a trustworthy comparison
+base for committed repositories and the published Receipt v1 shape cannot represent every invalidation dimension
+required by the accepted ADRs. Until those contracts are resolved, committed-repository navigation remains explicitly
+`unknown` and evidence commands fail closed instead of claiming that local observations are sufficient. Explicit
+runner/CI generation also remains disabled because its generated-file contracts are not frozen.
+
+See the [v0 implementation status](docs/v0-implementation-status.md) for the exact implemented boundary and the
+decisions required before the public Evidence surface can be enabled.
 
 ## Bootstrap commands
 
@@ -54,9 +59,10 @@ The stable interface of projects analyzed by Forge remains their own commands (`
 
 ## Current implementation boundary
 
-M1 is complete. Continue with M2 in the design proposal: repository facts, strict optional configuration, static
-runner discovery, deterministic command resolution, the complete `ProjectModel`, and read-only `forge explain`.
-Higher-level write, navigation, and evidence commands remain explicit failures until their prerequisite milestones
-are real.
+The implemented command surface is `init`, `doctor`, `next`, `adapters`, `explain`, `schema`, `version`, and
+`completions`. `init --with-runner`, `init --with-ci`, and every `evidence` subcommand report explicit unsupported
+boundaries rather than generating or validating contracts that the accepted design has not fixed. `improve` and
+`evolve` are intentionally not v0 commands; controlled improvement candidates and bounded self-hosting remain later
+version work.
 
 Do not add a feature that changes an accepted decision without an ADR that supersedes the relevant record.
