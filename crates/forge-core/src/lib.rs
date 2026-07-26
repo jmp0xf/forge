@@ -13,8 +13,11 @@ pub mod path;
 pub mod ports;
 
 pub use domain::{
-    CommandSource, CommandSpec, Confidence, CoverageDimension, Intent, Mutability, NetworkIntent,
-    ProjectModel, ProjectUnit, SuccessPredicate,
+    AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, Assumption, CommandResolution,
+    CommandSource, CommandSpec, CommitId, Confidence, CoverageDimension, EffectivePolicy, Intent,
+    InvalidCommandResolution, InvalidTextRange, Mutability, NetworkIntent, ProjectKind,
+    ProjectModel, ProjectUnit, Provenance, RepoFacts, ResolvedCommandSet, SuccessPredicate,
+    TextRange, ToolchainInfo, UnitEdge, UpstreamState, WorkState,
 };
 pub use error::{AppError, ExitCode};
 pub use forge_schema::Digest;
