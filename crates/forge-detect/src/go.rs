@@ -1190,7 +1190,9 @@ fn go_module_commands(
             )
             .with_args(std::iter::once(subcommand).chain(args.iter().copied()));
             command.env = command_environment(scope, Some(repository_root));
-            command.mutability = Mutability::ReadOnly;
+            // Test executes project code, while vet traverses project-controlled build inputs.
+            // Keep both behind the external-side-effect authorization boundary.
+            command.mutability = Mutability::ExternalSideEffect;
             command.network = NetworkIntent::Inherit;
             command.enforcement = if advisory {
                 CommandEnforcement::Advisory
@@ -1467,8 +1469,8 @@ mod tests {
     };
     use forge_core::{
         BoundedText, Confidence, Digest, GitFileSet, Intent, Inventory, InventoryEntry,
-        InventoryError, InventoryKind, InventoryOptions, InventorySkip, PathKind, ProjectKind,
-        RepoRelativePath,
+        InventoryError, InventoryKind, InventoryOptions, InventorySkip, Mutability, PathKind,
+        ProjectKind, RepoRelativePath,
     };
 
     use super::{
@@ -1752,15 +1754,35 @@ mod tests {
             format_check.commands()[0].args,
             ["-l", "generated.go", "main.go"].map(OsString::from)
         );
+        assert_eq!(format_check.commands()[0].mutability, Mutability::ReadOnly);
         let format = plan(&result, Intent::Format)?;
         assert_eq!(format.commands()[0].args, ["-w", "main.go"]);
+        assert_eq!(
+            format.commands()[0].mutability,
+            Mutability::WorkingTreeWrite
+        );
         let fix = plan(&result, Intent::Fix)?;
         assert_eq!(fix.commands()[0].args, ["-w", "main.go"]);
+        assert_eq!(fix.commands()[0].mutability, Mutability::WorkingTreeWrite);
+
+        let test = plan(&result, Intent::Test)?;
+        assert_eq!(test.commands().len(), 1);
+        assert_eq!(test.commands()[0].args, ["test", "-json", "./..."]);
+        assert_eq!(
+            test.commands()[0].mutability,
+            Mutability::ExternalSideEffect
+        );
 
         let check = plan(&result, Intent::Check)?;
         assert_eq!(check.commands().len(), 3);
         assert_eq!(check.commands()[1].args, ["test", "-json", "./..."]);
         assert_eq!(check.commands()[2].args, ["vet", "-json", "./..."]);
+        assert_eq!(check.commands()[0].mutability, Mutability::ReadOnly);
+        assert!(
+            check.commands()[1..]
+                .iter()
+                .all(|command| command.mutability == Mutability::ExternalSideEffect)
+        );
         assert_eq!(
             check.commands()[2].enforcement,
             forge_core::domain::CommandEnforcement::Advisory
@@ -1768,6 +1790,17 @@ mod tests {
         assert_eq!(
             check.commands()[1].env.get(OsStr::new("GOWORK")),
             Some(&OsString::from("off"))
+        );
+
+        let verify = plan(&result, Intent::Verify)?;
+        assert_eq!(verify.commands().len(), 3);
+        assert_eq!(verify.commands()[1].args, ["test", "-json", "./..."]);
+        assert_eq!(verify.commands()[2].args, ["vet", "-json", "./..."]);
+        assert_eq!(verify.commands()[0].mutability, Mutability::ReadOnly);
+        assert!(
+            verify.commands()[1..]
+                .iter()
+                .all(|command| command.mutability == Mutability::ExternalSideEffect)
         );
         assert!(
             result
@@ -1846,6 +1879,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].cwd, RepoRelativePath::root());
         assert_eq!(calls[0].args, ["work", "edit", "-json", "go.work"]);
+        assert_eq!(calls[0].mutability, Mutability::ReadOnly);
         for (key, value) in [
             ("GOWORK", "off"),
             ("GOENV", "off"),

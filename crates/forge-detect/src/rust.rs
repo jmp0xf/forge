@@ -1057,8 +1057,9 @@ fn rust_command(intent: Intent, phase: RustCommandPhase, scope: &RustCommandScop
     command.mutability = match phase {
         RustCommandPhase::FormatCheck => Mutability::ReadOnly,
         RustCommandPhase::Format => Mutability::WorkingTreeWrite,
-        RustCommandPhase::Check => Mutability::Unknown,
-        RustCommandPhase::Test => Mutability::ExternalSideEffect,
+        // `cargo check` can execute project build scripts and proc macros; tests execute project
+        // code directly. Both therefore require the external-side-effect authorization boundary.
+        RustCommandPhase::Check | RustCommandPhase::Test => Mutability::ExternalSideEffect,
     };
     command.network = NetworkIntent::Inherit;
     command.confidence = scope.confidence;
@@ -1407,7 +1408,10 @@ mod tests {
         assert_eq!(check.commands()[0].args, ["fmt", "--all", "--", "--check"]);
         assert_eq!(check.commands()[1].args, ["check", "--all-targets"]);
         assert_eq!(check.commands()[0].mutability, Mutability::ReadOnly);
-        assert_eq!(check.commands()[1].mutability, Mutability::Unknown);
+        assert_eq!(
+            check.commands()[1].mutability,
+            Mutability::ExternalSideEffect
+        );
         assert_eq!(
             check.commands()[0].coverage,
             BTreeSet::from([CoverageDimension::Format])
@@ -1431,9 +1435,11 @@ mod tests {
             .iter()
             .find(|plan| plan.intent() == Intent::Test)
             .ok_or("missing test plan")?;
-        assert_eq!(
-            test.commands()[2].mutability,
-            Mutability::ExternalSideEffect
+        assert_eq!(test.commands()[0].mutability, Mutability::ReadOnly);
+        assert!(
+            test.commands()[1..]
+                .iter()
+                .all(|command| command.mutability == Mutability::ExternalSideEffect)
         );
         assert_eq!(test.coverage_confidence(), Confidence::Medium);
         Ok(())
