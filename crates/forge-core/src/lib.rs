@@ -15,4 +15,5 @@ pub use domain::{
     ProjectModel, ProjectUnit, SuccessPredicate,
 };
 pub use error::{AppError, ExitCode};
+pub use forge_schema::Digest;
 pub use path::{RelativePathError, RepoRelativePath};

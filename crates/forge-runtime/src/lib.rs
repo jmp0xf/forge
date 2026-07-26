@@ -3,10 +3,15 @@
 //! M1 implements typed Git porcelain calls, atomic files, state locking, bounded output,
 //! timeout handling, and cross-platform process-tree termination here.
 
-#![forbid(unsafe_code)]
+// Windows Job Objects require a small, isolated FFI module. Keep unsafe denied everywhere
+// else; the platform module must opt in locally and document each invariant.
+#![deny(unsafe_code)]
 
+pub mod clock;
 pub mod fs;
 pub mod git;
+pub mod hash;
+pub mod inventory;
 pub mod process;
 pub mod state;
 

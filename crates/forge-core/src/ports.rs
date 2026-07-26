@@ -1,19 +1,25 @@
 //! Side-effect ports implemented by `forge-runtime`.
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::domain::CommandSpec;
+use forge_schema::Digest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessObservation {
     pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_total_bytes: u64,
+    pub stderr_total_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub duration: Duration,
     pub timed_out: bool,
+    pub interrupted: bool,
 }
 
 pub trait ProcessPort {
@@ -43,5 +49,5 @@ pub trait Clock {
 }
 
 pub trait Hasher {
-    fn digest(&self, chunks: &[&[u8]]) -> OsString;
+    fn digest(&self, chunks: &[&[u8]]) -> Digest;
 }
