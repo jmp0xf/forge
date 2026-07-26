@@ -1,5 +1,6 @@
 //! Read-only assembly of Git facts required by every later detector stage.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -22,9 +23,45 @@ const NATIVE_PATH_ENCODING: &[u8] = b"windows-wide";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryDetection {
     pub facts: RepoFacts,
+    /// The same bounded porcelain snapshot used to derive `facts`.
+    ///
+    /// Providers consume this retained snapshot rather than racing a second status call. `None`
+    /// means status was unavailable and changed-path scope is unknown.
+    pub status: Option<PorcelainV2Status>,
     pub provenance: Vec<Provenance>,
     pub confidence: Confidence,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+impl RepositoryDetection {
+    /// Returns the stable changed path set from the retained status snapshot.
+    ///
+    /// Rename/copy records retain both paths so conservative impact analysis cannot forget the
+    /// source location. Ignored entries are deliberately excluded.
+    #[must_use]
+    pub fn changed_paths(&self) -> Option<Vec<RepoRelativePath>> {
+        let status = self.status.as_ref()?;
+        let mut paths = BTreeSet::new();
+        for entry in &status.entries {
+            match entry {
+                StatusEntry::Ordinary(entry) => {
+                    paths.insert(entry.path.clone());
+                }
+                StatusEntry::RenamedOrCopied(entry) => {
+                    paths.insert(entry.path.clone());
+                    paths.insert(entry.original_path.clone());
+                }
+                StatusEntry::Unmerged(entry) => {
+                    paths.insert(entry.path.clone());
+                }
+                StatusEntry::Untracked(path) => {
+                    paths.insert(path.clone());
+                }
+                StatusEntry::Ignored(_) => {}
+            }
+        }
+        Some(paths.into_iter().collect())
+    }
 }
 
 /// A Git failure that prevents even a conservative `RepoFacts` value from being formed.
@@ -138,21 +175,22 @@ where
         }
     };
 
-    let (head, branch, upstream, work_state, status_confidence) = if let Some(status) = status {
-        provenance.push(git_provenance(
-            "git.porcelain-v2-status",
-            "head, branch, upstream, and worktree entries parsed from porcelain v2",
-        ));
-        facts_from_status(&root, &git_dir, status, filesystem, &mut diagnostics)
-    } else {
-        (
-            None,
-            None,
-            None,
-            status_failure_state.unwrap_or(WorkState::Unknown),
-            Confidence::Unknown,
-        )
-    };
+    let (head, branch, upstream, work_state, status_confidence) =
+        if let Some(status) = status.as_ref() {
+            provenance.push(git_provenance(
+                "git.porcelain-v2-status",
+                "head, branch, upstream, and worktree entries parsed from porcelain v2",
+            ));
+            facts_from_status(&root, &git_dir, status, filesystem, &mut diagnostics)
+        } else {
+            (
+                None,
+                None,
+                None,
+                status_failure_state.unwrap_or(WorkState::Unknown),
+                Confidence::Unknown,
+            )
+        };
 
     provenance.sort();
     provenance.dedup();
@@ -175,6 +213,7 @@ where
             upstream,
             work_state,
         },
+        status,
         provenance,
         confidence: status_confidence,
         diagnostics,
@@ -228,7 +267,7 @@ fn required_git_step<T>(
 fn facts_from_status<F>(
     root: &Path,
     git_dir: &Path,
-    status: PorcelainV2Status,
+    status: &PorcelainV2Status,
     filesystem: &F,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (
@@ -294,7 +333,7 @@ where
             "inspect and repair the in-progress Git operation before running project commands",
         ));
     }
-    let work_state = classify_work_state(&status, operation_state);
+    let work_state = classify_work_state(status, operation_state);
     let confidence = branch_confidence.min(operation_confidence);
     (head, branch, upstream, work_state, confidence)
 }
@@ -602,6 +641,27 @@ mod tests {
 
         assert_eq!(first, repeated);
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn detection_retains_one_status_snapshot_for_stable_changed_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let status = committed_status(b"? new.go\0! ignored.go\0")?;
+        let git = MockGit::with_status(Ok(status.clone()));
+
+        let detection = detect_repository(
+            Path::new("/repo"),
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )?;
+
+        assert_eq!(detection.status, Some(status));
+        assert_eq!(
+            detection.changed_paths(),
+            Some(vec![RepoRelativePath::new("new.go")?])
+        );
+        Ok(())
     }
 
     #[test]

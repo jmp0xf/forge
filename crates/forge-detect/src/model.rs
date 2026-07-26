@@ -449,6 +449,7 @@ mod tests {
                 upstream: None,
                 work_state: WorkState::Unborn,
             },
+            status: None,
             provenance: vec![Provenance {
                 rule_id: String::from("test.repository"),
                 source_path: None,
