@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod branding;
+pub mod context;
 pub mod domain;
 pub mod error;
 pub mod git;
