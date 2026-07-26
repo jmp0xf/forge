@@ -17,7 +17,7 @@ use crate::assets::{AssetDiscoveryError, StandardAssetDiscovery, discover_standa
 use crate::config::{ConfigError, ForgeConfig, load_default_forge_config, load_forge_config_at};
 use crate::repository::{RepositoryDetection, RepositoryDetectionError, detect_repository};
 use crate::resolution::{
-    CommandCandidate, CommandLayer, CommandLayerKind, CommandResolutionLayers,
+    CommandLayer, CommandLayerKind, CommandPlanCandidate, CommandResolutionLayers,
     resolve_command_intents,
 };
 use crate::runner::{RunnerDiscovery, RunnerDiscoveryCompleteness, RunnerKind, discover_runner};
@@ -267,7 +267,7 @@ fn explicit_config_layer(
             .with_args(&configured.args);
             command.timeout = Duration::from_secs(timeout_seconds);
             command.confidence = Confidence::High;
-            candidates.push(CommandCandidate::new(
+            candidates.push(CommandPlanCandidate::single(
                 command,
                 vec![config_provenance(
                     config_path,
@@ -305,7 +305,7 @@ fn existing_project_layer(runners: RunnerScan, timeout_seconds: u64) -> CommandL
         for candidate in discovery.candidates() {
             let mut command = candidate.command.clone();
             command.timeout = Duration::from_secs(timeout_seconds);
-            candidates.push(CommandCandidate::new(
+            candidates.push(CommandPlanCandidate::single(
                 command,
                 candidate.provenance.clone(),
                 Confidence::Unknown,

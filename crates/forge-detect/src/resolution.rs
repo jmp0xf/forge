@@ -1,6 +1,8 @@
 //! Deterministic command-intent resolution across explicit, project, and language layers.
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 
 use forge_core::{
     CommandSpec, Confidence, Intent, InvalidCommandResolution, Provenance, ResolvedCommandSet,
@@ -31,17 +33,66 @@ pub enum CommandLayerCompleteness {
     Unknown,
 }
 
-/// One command candidate and the evidence used to construct it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandCandidate {
-    pub command: CommandSpec,
-    pub provenance: Vec<Provenance>,
-    pub coverage_confidence: Confidence,
+/// An invalid ordered command plan candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidCommandPlanCandidate {
+    Empty,
+    MixedIntent { expected: Intent, actual: Intent },
 }
 
-impl CommandCandidate {
-    #[must_use]
+impl fmt::Display for InvalidCommandPlanCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("a command plan candidate must not be empty"),
+            Self::MixedIntent { expected, actual } => write!(
+                formatter,
+                "a command plan candidate cannot mix {expected:?} and {actual:?} intents"
+            ),
+        }
+    }
+}
+
+impl Error for InvalidCommandPlanCandidate {}
+
+/// One non-empty ordered command-plan candidate and its construction evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPlanCandidate {
+    intent: Intent,
+    commands: Vec<CommandSpec>,
+    provenance: Vec<Provenance>,
+    coverage_confidence: Confidence,
+}
+
+impl CommandPlanCandidate {
+    /// Creates a non-empty plan whose commands all implement the same intent.
     pub fn new(
+        commands: Vec<CommandSpec>,
+        mut provenance: Vec<Provenance>,
+        coverage_confidence: Confidence,
+    ) -> Result<Self, InvalidCommandPlanCandidate> {
+        let Some(first) = commands.first() else {
+            return Err(InvalidCommandPlanCandidate::Empty);
+        };
+        let intent = first.intent;
+        if let Some(command) = commands.iter().find(|command| command.intent != intent) {
+            return Err(InvalidCommandPlanCandidate::MixedIntent {
+                expected: intent,
+                actual: command.intent,
+            });
+        }
+        provenance.sort();
+        provenance.dedup();
+        Ok(Self {
+            intent,
+            commands,
+            provenance,
+            coverage_confidence,
+        })
+    }
+
+    /// Creates the plan shape used by explicit config and project-runner targets.
+    #[must_use]
+    pub fn single(
         command: CommandSpec,
         mut provenance: Vec<Provenance>,
         coverage_confidence: Confidence,
@@ -49,11 +100,68 @@ impl CommandCandidate {
         provenance.sort();
         provenance.dedup();
         Self {
-            command,
+            intent: command.intent,
+            commands: vec![command],
             provenance,
             coverage_confidence,
         }
     }
+
+    #[must_use]
+    pub const fn intent(&self) -> Intent {
+        self.intent
+    }
+
+    #[must_use]
+    pub fn commands(&self) -> &[CommandSpec] {
+        &self.commands
+    }
+
+    #[must_use]
+    pub fn provenance(&self) -> &[Provenance] {
+        &self.provenance
+    }
+
+    #[must_use]
+    pub const fn coverage_confidence(&self) -> Confidence {
+        self.coverage_confidence
+    }
+}
+
+/// Composes additive provider fragments into one stable plan per intent.
+///
+/// Callers must pass fragments in stable provider order. Fragment order is preserved within each
+/// intent, so Rust and Go commands that jointly cover an intent become one plan rather than false
+/// equal-priority alternatives.
+#[must_use]
+pub fn compose_ordered_language_plans(
+    fragments: Vec<CommandPlanCandidate>,
+) -> Vec<CommandPlanCandidate> {
+    let mut composed = BTreeMap::<Intent, (Vec<CommandSpec>, Vec<Provenance>, Confidence)>::new();
+    for fragment in fragments {
+        let entry = composed
+            .entry(fragment.intent)
+            .or_insert_with(|| (Vec::new(), Vec::new(), Confidence::High));
+        entry.0.extend(fragment.commands);
+        entry.1.extend(fragment.provenance);
+        entry.2 = entry.2.min(fragment.coverage_confidence);
+    }
+
+    composed
+        .into_iter()
+        .map(
+            |(intent, (commands, mut provenance, coverage_confidence))| {
+                provenance.sort();
+                provenance.dedup();
+                CommandPlanCandidate {
+                    intent,
+                    commands,
+                    provenance,
+                    coverage_confidence,
+                }
+            },
+        )
+        .collect()
 }
 
 /// Candidates discovered at one priority, including an explicit completeness claim.
@@ -61,7 +169,7 @@ impl CommandCandidate {
 pub struct CommandLayer {
     kind: CommandLayerKind,
     completeness: CommandLayerCompleteness,
-    candidates: Vec<CommandCandidate>,
+    candidates: Vec<CommandPlanCandidate>,
     provenance: Vec<Provenance>,
     confidence: Confidence,
 }
@@ -70,7 +178,7 @@ impl CommandLayer {
     #[must_use]
     pub fn complete(
         kind: CommandLayerKind,
-        candidates: Vec<CommandCandidate>,
+        candidates: Vec<CommandPlanCandidate>,
         provenance: Vec<Provenance>,
         confidence: Confidence,
     ) -> Self {
@@ -86,7 +194,7 @@ impl CommandLayer {
     #[must_use]
     pub fn unknown(
         kind: CommandLayerKind,
-        candidates: Vec<CommandCandidate>,
+        candidates: Vec<CommandPlanCandidate>,
         provenance: Vec<Provenance>,
     ) -> Self {
         Self::new(
@@ -101,11 +209,11 @@ impl CommandLayer {
     fn new(
         kind: CommandLayerKind,
         completeness: CommandLayerCompleteness,
-        mut candidates: Vec<CommandCandidate>,
+        mut candidates: Vec<CommandPlanCandidate>,
         mut provenance: Vec<Provenance>,
         confidence: Confidence,
     ) -> Self {
-        candidates.sort_by(|left, right| left.command.cmp(&right.command));
+        candidates.sort_by(|left, right| left.commands.cmp(&right.commands));
         provenance.push(layer_provenance(kind, completeness));
         provenance.sort();
         provenance.dedup();
@@ -129,7 +237,7 @@ impl CommandLayer {
     }
 
     #[must_use]
-    pub fn candidates(&self) -> &[CommandCandidate] {
+    pub fn candidates(&self) -> &[CommandPlanCandidate] {
         &self.candidates
     }
 
@@ -191,27 +299,34 @@ fn resolve_intent(
                 retained.extend(candidates_for_intent(lower, intent));
                 provenance.extend(lower.provenance.iter().cloned());
             }
-            let (commands, candidate_provenance, _) = merge_identical_candidates(retained);
+            let (plans, candidate_provenance, _) = merge_identical_plans(retained);
             provenance.extend(candidate_provenance);
-            return Ok(ResolvedCommandSet::unknown(commands, provenance));
+            return Ok(ResolvedCommandSet::unknown(
+                flatten_plans(plans),
+                provenance,
+            ));
         }
 
-        let (commands, candidate_provenance, coverage_confidence) =
-            merge_identical_candidates(candidates);
-        if commands.len() == 1 {
+        let (plans, candidate_provenance, coverage_confidence) = merge_identical_plans(candidates);
+        if let [commands] = plans.as_slice() {
             inspected_provenance.extend(candidate_provenance);
-            let resolution_confidence = layer.confidence.min(commands[0].confidence);
+            let command_confidence = commands
+                .iter()
+                .fold(Confidence::High, |confidence, command| {
+                    confidence.min(command.confidence)
+                });
+            let resolution_confidence = layer.confidence.min(command_confidence);
             return ResolvedCommandSet::resolved(
-                commands,
+                commands.clone(),
                 inspected_provenance,
                 resolution_confidence,
                 coverage_confidence,
             );
         }
-        if commands.len() > 1 {
+        if plans.len() > 1 {
             inspected_provenance.extend(candidate_provenance);
             return Ok(ResolvedCommandSet::ambiguous(
-                commands,
+                flatten_plans(plans),
                 inspected_provenance,
                 layer.confidence,
             ));
@@ -226,41 +341,45 @@ fn resolve_intent(
     ))
 }
 
-fn candidates_for_intent(layer: &CommandLayer, intent: Intent) -> Vec<CommandCandidate> {
+fn candidates_for_intent(layer: &CommandLayer, intent: Intent) -> Vec<CommandPlanCandidate> {
     layer
         .candidates
         .iter()
-        .filter(|candidate| candidate.command.intent == intent)
+        .filter(|candidate| candidate.intent() == intent)
         .cloned()
         .collect()
 }
 
-fn merge_identical_candidates(
-    candidates: Vec<CommandCandidate>,
-) -> (Vec<CommandSpec>, Vec<Provenance>, Confidence) {
-    let mut unique = BTreeMap::<CommandSpec, (Vec<Provenance>, Confidence)>::new();
+fn merge_identical_plans(
+    candidates: Vec<CommandPlanCandidate>,
+) -> (Vec<Vec<CommandSpec>>, Vec<Provenance>, Confidence) {
+    let mut unique = BTreeMap::<Vec<CommandSpec>, (Vec<Provenance>, Confidence)>::new();
     for candidate in candidates {
         let entry = unique
-            .entry(candidate.command)
+            .entry(candidate.commands)
             .or_insert_with(|| (Vec::new(), Confidence::High));
         entry.0.extend(candidate.provenance);
         entry.1 = entry.1.min(candidate.coverage_confidence);
     }
 
-    let mut commands = Vec::with_capacity(unique.len());
+    let mut plans = Vec::with_capacity(unique.len());
     let mut provenance = Vec::new();
     let mut coverage_confidence = Confidence::High;
-    for (command, (candidate_provenance, candidate_coverage)) in unique {
-        commands.push(command);
+    for (plan, (candidate_provenance, candidate_coverage)) in unique {
+        plans.push(plan);
         provenance.extend(candidate_provenance);
         coverage_confidence = coverage_confidence.min(candidate_coverage);
     }
     provenance.sort();
     provenance.dedup();
-    if commands.is_empty() {
+    if plans.is_empty() {
         coverage_confidence = Confidence::Unknown;
     }
-    (commands, provenance, coverage_confidence)
+    (plans, provenance, coverage_confidence)
+}
+
+fn flatten_plans(plans: Vec<Vec<CommandSpec>>) -> Vec<CommandSpec> {
+    plans.into_iter().flatten().collect()
 }
 
 fn layer_provenance(kind: CommandLayerKind, completeness: CommandLayerCompleteness) -> Provenance {
@@ -284,8 +403,8 @@ mod tests {
     };
 
     use super::{
-        CommandCandidate, CommandLayer, CommandLayerKind, CommandResolutionLayers,
-        resolve_command_intents,
+        CommandLayer, CommandLayerKind, CommandPlanCandidate, CommandResolutionLayers,
+        InvalidCommandPlanCandidate, compose_ordered_language_plans, resolve_command_intents,
     };
 
     fn command(id: &str, intent: Intent, program: &str, confidence: Confidence) -> CommandSpec {
@@ -314,7 +433,7 @@ mod tests {
 
     fn complete(
         kind: CommandLayerKind,
-        candidates: Vec<CommandCandidate>,
+        candidates: Vec<CommandPlanCandidate>,
         confidence: Confidence,
     ) -> CommandLayer {
         CommandLayer::complete(
@@ -345,8 +464,45 @@ mod tests {
         }
     }
 
-    fn candidate(command: CommandSpec, rule_id: &str) -> CommandCandidate {
-        CommandCandidate::new(command, vec![provenance(rule_id)], Confidence::Unknown)
+    fn candidate(command: CommandSpec, rule_id: &str) -> CommandPlanCandidate {
+        CommandPlanCandidate::single(command, vec![provenance(rule_id)], Confidence::Unknown)
+    }
+
+    fn plan(
+        commands: Vec<CommandSpec>,
+        rule_id: &str,
+    ) -> Result<CommandPlanCandidate, InvalidCommandPlanCandidate> {
+        CommandPlanCandidate::new(commands, vec![provenance(rule_id)], Confidence::Unknown)
+    }
+
+    #[test]
+    fn empty_plan_is_rejected() {
+        let result = CommandPlanCandidate::new(
+            Vec::new(),
+            vec![provenance("plan/empty")],
+            Confidence::Unknown,
+        );
+
+        assert_eq!(result, Err(InvalidCommandPlanCandidate::Empty));
+    }
+
+    #[test]
+    fn mixed_intent_plan_is_rejected() {
+        let result = plan(
+            vec![
+                command("rust.check", Intent::Check, "cargo", Confidence::High),
+                command("rust.test", Intent::Test, "cargo", Confidence::High),
+            ],
+            "plan/mixed",
+        );
+
+        assert_eq!(
+            result,
+            Err(InvalidCommandPlanCandidate::MixedIntent {
+                expected: Intent::Check,
+                actual: Intent::Test,
+            })
+        );
     }
 
     #[test]
@@ -419,6 +575,31 @@ mod tests {
     }
 
     #[test]
+    fn resolved_plan_preserves_command_order() -> Result<(), Box<dyn std::error::Error>> {
+        let mut layers = empty_layers();
+        layers.language_default = complete(
+            CommandLayerKind::LanguageDefault,
+            vec![plan(
+                vec![
+                    command("rust.format", Intent::Format, "rustfmt", Confidence::High),
+                    command("go.format", Intent::Format, "gofmt", Confidence::Medium),
+                ],
+                "language/format",
+            )?],
+            Confidence::High,
+        );
+
+        let commands = resolve_command_intents(&layers)?;
+        let format = &commands[&Intent::Format];
+
+        assert_eq!(format.resolution(), CommandResolution::Resolved);
+        assert_eq!(format.commands()[0].program, "rustfmt");
+        assert_eq!(format.commands()[1].program, "gofmt");
+        assert_eq!(format.resolution_confidence, Confidence::Medium);
+        Ok(())
+    }
+
+    #[test]
     fn unknown_higher_layer_blocks_fallback_and_retains_nonexecuting_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut layers = empty_layers();
@@ -447,15 +628,23 @@ mod tests {
     }
 
     #[test]
-    fn identical_candidates_merge_instead_of_creating_false_ambiguity()
+    fn identical_ordered_plans_merge_instead_of_creating_false_ambiguity()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut layers = empty_layers();
-        let duplicate = command("runner.test", Intent::Test, "make", Confidence::Medium);
+        let duplicate = vec![
+            command("runner.test.unit", Intent::Test, "unit", Confidence::Medium),
+            command(
+                "runner.test.integration",
+                Intent::Test,
+                "integration",
+                Confidence::Medium,
+            ),
+        ];
         layers.existing_project = complete(
             CommandLayerKind::ExistingProject,
             vec![
-                candidate(duplicate.clone(), "runner/first"),
-                candidate(duplicate, "runner/second"),
+                plan(duplicate.clone(), "runner/first")?,
+                plan(duplicate, "runner/second")?,
             ],
             Confidence::Medium,
         );
@@ -464,7 +653,9 @@ mod tests {
         let test = &commands[&Intent::Test];
 
         assert_eq!(test.resolution(), CommandResolution::Resolved);
-        assert_eq!(test.commands().len(), 1);
+        assert_eq!(test.commands().len(), 2);
+        assert_eq!(test.commands()[0].program, "unit");
+        assert_eq!(test.commands()[1].program, "integration");
         assert!(
             test.provenance
                 .iter()
@@ -475,6 +666,64 @@ mod tests {
                 .iter()
                 .any(|item| item.rule_id == "runner/second")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn different_ordered_plans_are_ambiguous() -> Result<(), Box<dyn std::error::Error>> {
+        let mut layers = empty_layers();
+        let first = command("test.first", Intent::Test, "first", Confidence::High);
+        let second = command("test.second", Intent::Test, "second", Confidence::High);
+        layers.language_default = complete(
+            CommandLayerKind::LanguageDefault,
+            vec![
+                plan(vec![first.clone(), second.clone()], "plan/forward")?,
+                plan(vec![second, first], "plan/reverse")?,
+            ],
+            Confidence::High,
+        );
+
+        let commands = resolve_command_intents(&layers)?;
+        let test = &commands[&Intent::Test];
+
+        assert_eq!(test.resolution(), CommandResolution::Ambiguous);
+        assert_eq!(test.commands().len(), 4);
+        assert_eq!(test.executable_commands(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_language_provider_fragments_compose_without_false_ambiguity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fragments = vec![
+            plan(
+                vec![command(
+                    "rust.test",
+                    Intent::Test,
+                    "cargo",
+                    Confidence::High,
+                )],
+                "rust/test",
+            )?,
+            plan(
+                vec![command("go.test", Intent::Test, "go", Confidence::High)],
+                "go/test",
+            )?,
+        ];
+        let mut layers = empty_layers();
+        layers.language_default = complete(
+            CommandLayerKind::LanguageDefault,
+            compose_ordered_language_plans(fragments),
+            Confidence::High,
+        );
+
+        let commands = resolve_command_intents(&layers)?;
+        let test = &commands[&Intent::Test];
+
+        assert_eq!(test.resolution(), CommandResolution::Resolved);
+        assert_eq!(test.commands().len(), 2);
+        assert_eq!(test.commands()[0].program, "cargo");
+        assert_eq!(test.commands()[1].program, "go");
         Ok(())
     }
 
