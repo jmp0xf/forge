@@ -1,6 +1,5 @@
 //! Read-only assembly of Git facts required by every later detector stage.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -40,27 +39,7 @@ impl RepositoryDetection {
     /// source location. Ignored entries are deliberately excluded.
     #[must_use]
     pub fn changed_paths(&self) -> Option<Vec<RepoRelativePath>> {
-        let status = self.status.as_ref()?;
-        let mut paths = BTreeSet::new();
-        for entry in &status.entries {
-            match entry {
-                StatusEntry::Ordinary(entry) => {
-                    paths.insert(entry.path.clone());
-                }
-                StatusEntry::RenamedOrCopied(entry) => {
-                    paths.insert(entry.path.clone());
-                    paths.insert(entry.original_path.clone());
-                }
-                StatusEntry::Unmerged(entry) => {
-                    paths.insert(entry.path.clone());
-                }
-                StatusEntry::Untracked(path) => {
-                    paths.insert(path.clone());
-                }
-                StatusEntry::Ignored(_) => {}
-            }
-        }
-        Some(paths.into_iter().collect())
+        self.status.as_ref().map(PorcelainV2Status::changed_paths)
     }
 }
 

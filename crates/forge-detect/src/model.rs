@@ -64,6 +64,30 @@ pub enum ModelDetectionCompletion {
 pub struct ModelDetectionOutcome {
     pub model: ProjectModel,
     pub completion: ModelDetectionCompletion,
+    /// Read-only inputs retained for deterministic doctor/risk/navigation evaluation.
+    pub navigation: NavigationSnapshot,
+}
+
+/// Repository observations that are intentionally not part of the public `ProjectModel`.
+///
+/// Keeping exact status, inventory, and parsed policy inputs beside the model lets navigation use
+/// the same bounded detection snapshot without widening the stable model or racing a second scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavigationSnapshot {
+    pub status: Option<forge_core::PorcelainV2Status>,
+    pub inventory: Inventory,
+    pub config: Option<ForgeConfig>,
+    pub config_path: RepoRelativePath,
+}
+
+impl NavigationSnapshot {
+    /// Stable changed paths, or `None` when Git status was unavailable.
+    #[must_use]
+    pub fn changed_paths(&self) -> Option<Vec<RepoRelativePath>> {
+        self.status
+            .as_ref()
+            .map(forge_core::PorcelainV2Status::changed_paths)
+    }
 }
 
 /// A typed failure from one generic project-model assembly stage.
@@ -165,7 +189,7 @@ pub fn detect_project_model(
         repository,
         inventory,
         standard_assets,
-        config.as_ref(),
+        config,
         &config_path,
         runners,
         language,
@@ -498,12 +522,13 @@ fn assemble_project_model(
     repository: RepositoryDetection,
     inventory: Inventory,
     standard_assets: StandardAssetDiscovery,
-    config: Option<&ForgeConfig>,
+    config: Option<ForgeConfig>,
     config_path: &RepoRelativePath,
     runners: RunnerScan,
     language: LanguageDetection,
 ) -> Result<ModelDetectionOutcome, ModelDetectionError> {
     let timeout = config
+        .as_ref()
         .and_then(|config| config.policy.default_timeout_seconds)
         .unwrap_or(300);
     let generic_partial = repository.confidence == Confidence::Unknown
@@ -516,7 +541,7 @@ fn assemble_project_model(
         language.timed_out,
         generic_partial || !language.complete,
     );
-    let explicit_config = explicit_config_layer(config, config_path, timeout);
+    let explicit_config = explicit_config_layer(config.as_ref(), config_path, timeout);
     let existing_project = existing_project_layer(runners, timeout);
     let language_default = language_default_layer(&language);
     let commands = resolve_command_intents(&CommandResolutionLayers {
@@ -525,12 +550,20 @@ fn assemble_project_model(
         language_default,
     })
     .map_err(ModelDetectionError::CommandResolution)?;
-    let policy = unresolved_effective_policy(config, config_path);
+    let policy = unresolved_effective_policy(config.as_ref(), config_path);
+
+    let RepositoryDetection {
+        facts,
+        status,
+        provenance: repository_provenance,
+        confidence: repository_confidence,
+        diagnostics: repository_diagnostics,
+    } = repository;
 
     let mut model = ProjectModel::new(ProjectModelInputs {
-        repository: repository.facts,
-        repository_provenance: repository.provenance,
-        repository_confidence: repository.confidence,
+        repository: facts,
+        repository_provenance,
+        repository_confidence,
         unit_inventory_provenance: language.provenance,
         unit_inventory_confidence: language.confidence,
         assets: standard_assets.assets,
@@ -539,13 +572,22 @@ fn assemble_project_model(
     });
     model.units = language.units;
     model.commands = commands;
-    model.diagnostics = repository.diagnostics;
+    model.diagnostics = repository_diagnostics;
     model.diagnostics.extend(language.diagnostics);
     model.assumptions = language.assumptions;
     let model = model
         .finalize()
         .map_err(ModelDetectionError::InvalidModel)?;
-    Ok(ModelDetectionOutcome { model, completion })
+    Ok(ModelDetectionOutcome {
+        model,
+        completion,
+        navigation: NavigationSnapshot {
+            status,
+            inventory,
+            config,
+            config_path: config_path.clone(),
+        },
+    })
 }
 
 fn model_detection_completion(
@@ -1026,7 +1068,7 @@ mod tests {
             repository(),
             inventory,
             standard_assets,
-            config,
+            config.cloned(),
             &RepoRelativePath::new("forge.toml").map_err(|source| {
                 ModelDetectionError::InvalidInventoryPath {
                     path: PathBuf::from("forge.toml"),
@@ -1182,6 +1224,7 @@ args = ["test", "--workspace"]
             ("gomod/main.go", InventoryKind::File),
         ]);
         let git = model_git(&inventory)?;
+        let expected_inventory = inventory.clone();
         let filesystem = ModelFileSystem::new(inventory);
         let process = ModelProcess::with_responses(vec![
             observation(rust_metadata()?),
@@ -1200,6 +1243,14 @@ args = ["test", "--workspace"]
         )?;
 
         assert_eq!(outcome.completion, ModelDetectionCompletion::Complete);
+        assert_eq!(outcome.navigation.inventory, expected_inventory);
+        assert_eq!(outcome.navigation.status, Some(git.status.clone()));
+        assert_eq!(outcome.navigation.changed_paths(), Some(Vec::new()));
+        assert_eq!(outcome.navigation.config, None);
+        assert_eq!(
+            outcome.navigation.config_path.as_path(),
+            Path::new("forge.toml")
+        );
         let calls = process.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].program, OsString::from("cargo"));

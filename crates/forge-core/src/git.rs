@@ -1,5 +1,6 @@
 //! Typed, side-effect-free Git domain types and porcelain v2 parser.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Cursor, Read as _};
 use std::path::PathBuf;
 
@@ -185,6 +186,36 @@ pub struct PorcelainV2Status {
     pub object_format: GitObjectFormat,
     pub branch: BranchStatus,
     pub entries: Vec<StatusEntry>,
+}
+
+impl PorcelainV2Status {
+    /// Returns every changed repository path in stable order.
+    ///
+    /// Rename and copy records retain both endpoints so downstream impact and risk evaluation
+    /// cannot silently forget the source path. Ignored entries are not worktree changes.
+    #[must_use]
+    pub fn changed_paths(&self) -> Vec<RepoRelativePath> {
+        let mut paths = BTreeSet::new();
+        for entry in &self.entries {
+            match entry {
+                StatusEntry::Ordinary(entry) => {
+                    paths.insert(entry.path.clone());
+                }
+                StatusEntry::RenamedOrCopied(entry) => {
+                    paths.insert(entry.path.clone());
+                    paths.insert(entry.original_path.clone());
+                }
+                StatusEntry::Unmerged(entry) => {
+                    paths.insert(entry.path.clone());
+                }
+                StatusEntry::Untracked(path) => {
+                    paths.insert(path.clone());
+                }
+                StatusEntry::Ignored(_) => {}
+            }
+        }
+        paths.into_iter().collect()
+    }
 }
 
 /// Git's authoritative tracked and untracked repository paths.
@@ -1303,6 +1334,7 @@ mod tests {
         PorcelainV2ParseErrorKind, PorcelainV2ReadError, RenameOrCopy, StatusEntry,
         parse_git_path_list_reader, parse_status_porcelain_v2, parse_status_porcelain_v2_reader,
     };
+    use crate::RepoRelativePath;
 
     const OID_1: &[u8] = b"1111111111111111111111111111111111111111";
     const OID_2: &[u8] = b"2222222222222222222222222222222222222222";
@@ -1345,6 +1377,19 @@ mod tests {
         assert!(matches!(parsed.branch.oid, Some(BranchOid::Commit(_))));
         assert!(matches!(parsed.branch.head, Some(BranchHead::Named(_))));
         assert_eq!(parsed.entries.len(), 5);
+        assert_eq!(
+            parsed.changed_paths(),
+            [
+                "conflict file",
+                "new name",
+                "old\nname",
+                "path with space\nand-byte",
+                "untracked file",
+            ]
+            .into_iter()
+            .map(RepoRelativePath::new)
+            .collect::<Result<Vec<_>, _>>()?
+        );
 
         match parsed.entries.as_slice() {
             [

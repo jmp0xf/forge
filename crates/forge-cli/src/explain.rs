@@ -13,7 +13,8 @@ use forge_core::{
     ProjectModelWireError, RepoRelativePath, project_model_to_wire,
 };
 use forge_detect::model::{
-    ModelDetectionCompletion, ModelDetectionError, ModelDetectionOptions, detect_project_model,
+    ModelDetectionCompletion, ModelDetectionError, ModelDetectionOptions, NavigationSnapshot,
+    detect_project_model,
 };
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::git::GitCli;
@@ -32,6 +33,7 @@ pub(crate) struct DetectedProject {
     pub(crate) model: ProjectModel,
     pub(crate) wire: ProjectModelData,
     pub(crate) completion: ModelDetectionCompletion,
+    pub(crate) navigation: NavigationSnapshot,
 }
 
 /// Detects and projects the model used by both human and JSON explain output.
@@ -87,6 +89,7 @@ pub(crate) fn detect(
         model: outcome.model,
         wire,
         completion: outcome.completion,
+        navigation: outcome.navigation,
     })
 }
 
