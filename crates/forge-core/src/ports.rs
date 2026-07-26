@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::domain::CommandSpec;
-use crate::git::PorcelainV2Status;
+use crate::git::{GitFileSet, PorcelainV2Status};
 use forge_schema::Digest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub trait GitPort {
     fn git_dir(&self, start: &Path) -> io::Result<PathBuf>;
     fn git_common_dir(&self, start: &Path) -> io::Result<PathBuf>;
     fn status(&self, root: &Path) -> io::Result<PorcelainV2Status>;
+    fn file_set(&self, root: &Path) -> io::Result<GitFileSet>;
 }
 
 pub trait StateStore {

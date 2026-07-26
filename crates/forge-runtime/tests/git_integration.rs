@@ -7,6 +7,8 @@ use std::process::{Command, Output};
 use forge_core::ports::GitPort as _;
 use forge_core::{BranchHead, BranchOid, GitObjectFormat, StatusEntry};
 use forge_runtime::git::GitCli;
+use forge_runtime::inventory::{InventoryOptions, build_git_inventory};
+use forge_runtime::state::{AtomicStateStore, GitStateLayout};
 
 #[derive(Debug)]
 struct GitFixture {
@@ -180,7 +182,7 @@ fn add_linked_worktree(fixture: &GitFixture, linked: &Path) -> io::Result<()> {
 }
 
 #[test]
-fn linked_worktree_has_distinct_typed_git_dir_and_shared_common_dir()
+fn linked_worktrees_isolate_mutable_state_and_share_cache_layout()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = GitFixture::committed(GitObjectFormat::Sha1)?;
     let linked = fixture._root.path().join("linked");
@@ -195,10 +197,36 @@ fn linked_worktree_has_distinct_typed_git_dir_and_shared_common_dir()
     let repository_git_dir = git.git_dir(&fixture.repository)?;
     let linked_git_dir = git.git_dir(&linked)?;
     assert_ne!(repository_git_dir, linked_git_dir);
-    assert_eq!(
-        git.git_common_dir(&fixture.repository)?,
-        git.git_common_dir(&linked)?
+    let repository_common_dir = git.git_common_dir(&fixture.repository)?;
+    let linked_common_dir = git.git_common_dir(&linked)?;
+    assert_eq!(repository_common_dir, linked_common_dir);
+
+    let repository_layout = GitStateLayout::new(repository_git_dir, repository_common_dir);
+    let linked_layout = GitStateLayout::new(linked_git_dir, linked_common_dir);
+    assert_ne!(
+        repository_layout.worktree_dir(),
+        linked_layout.worktree_dir()
     );
+    assert_eq!(
+        repository_layout.shared_cache_dir(),
+        linked_layout.shared_cache_dir()
+    );
+
+    let repository_store = AtomicStateStore::new(repository_layout)?;
+    let linked_store = AtomicStateStore::new(linked_layout)?;
+    let state_key = "receipts/current.json";
+    let repository_value = br#"{"worktree":"repository"}"#;
+    let linked_value = br#"{"worktree":"linked"}"#;
+
+    repository_store.store_atomic(state_key, repository_value)?;
+    assert_eq!(linked_store.load(state_key)?, None);
+    linked_store.store_atomic(state_key, linked_value)?;
+    assert_eq!(
+        repository_store.load(state_key)?,
+        Some(repository_value.to_vec())
+    );
+    assert_eq!(linked_store.load(state_key)?, Some(linked_value.to_vec()));
+
     assert!(git.status(&fixture.repository)?.branch.oid.is_some());
     assert!(git.status(&linked)?.branch.oid.is_some());
     Ok(())
@@ -250,6 +278,55 @@ fn unborn_repository_status_is_typed_without_a_commit() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn git_inventory_keeps_tracked_ignored_paths_and_filters_only_untracked_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = GitFixture::committed(GitObjectFormat::Sha1)?;
+    fs::write(
+        fixture.repository.join(".gitignore"),
+        b"tracked.txt\ngit-ignored.txt\n",
+    )?;
+    fs::write(
+        fixture.repository.join(".ignore"),
+        b"tracked.txt\ndot-ignore-ignored.txt\n",
+    )?;
+    fs::write(fixture.repository.join("git-ignored.txt"), b"ignored\n")?;
+    fs::write(
+        fixture.repository.join("dot-ignore-ignored.txt"),
+        b"ignored\n",
+    )?;
+    fs::write(fixture.repository.join("kept-untracked.txt"), b"kept\n")?;
+
+    let git = GitCli::new();
+    let file_set = git.file_set(&fixture.repository)?;
+    assert!(
+        file_set
+            .tracked
+            .iter()
+            .any(|path| path.as_path() == Path::new("tracked.txt"))
+    );
+    assert!(
+        !file_set
+            .untracked
+            .iter()
+            .any(|path| path.as_path() == Path::new("git-ignored.txt"))
+    );
+    assert!(
+        file_set
+            .untracked
+            .iter()
+            .any(|path| path.as_path() == Path::new("dot-ignore-ignored.txt"))
+    );
+
+    let inventory = build_git_inventory(&fixture.repository, &git, InventoryOptions::default())?;
+    let contains = |expected: &Path| inventory.entries.iter().any(|entry| entry.path == expected);
+    assert!(contains(Path::new("tracked.txt")));
+    assert!(contains(Path::new("kept-untracked.txt")));
+    assert!(!contains(Path::new("git-ignored.txt")));
+    assert!(!contains(Path::new("dot-ignore-ignored.txt")));
+    Ok(())
+}
+
+#[test]
 fn non_repository_fails_closed_with_operation_context() -> Result<(), Box<dyn std::error::Error>> {
     // This fixture must live outside the Forge checkout or Git would intentionally discover the
     // checkout's parent repository while walking upward.
@@ -280,7 +357,8 @@ fn status_preserves_a_non_utf8_worktree_path() -> Result<(), Box<dyn std::error:
         )
     })?;
 
-    let status = GitCli::new().status(&fixture.repository).map_err(|error| {
+    let git = GitCli::new();
+    let status = git.status(&fixture.repository).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("failed to read typed status for non-UTF-8 fixture: {error}"),
@@ -295,6 +373,21 @@ fn status_preserves_a_non_utf8_worktree_path() -> Result<(), Box<dyn std::error:
     assert!(
         found,
         "typed status did not preserve the native filename bytes"
+    );
+
+    let file_set = git.file_set(&fixture.repository)?;
+    assert!(
+        file_set
+            .untracked
+            .iter()
+            .any(|path| { path.as_path().as_os_str().as_bytes() == filename.as_bytes() })
+    );
+    let inventory = build_git_inventory(&fixture.repository, &git, InventoryOptions::default())?;
+    assert!(
+        inventory
+            .entries
+            .iter()
+            .any(|entry| { entry.path.as_os_str().as_bytes() == filename.as_bytes() })
     );
     Ok(())
 }

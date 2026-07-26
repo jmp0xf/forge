@@ -1,6 +1,6 @@
 //! Typed, side-effect-free Git domain types and porcelain v2 parser.
 
-use std::io::{self, BufRead, Cursor};
+use std::io::{self, BufRead, Cursor, Read as _};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -185,6 +185,141 @@ pub struct PorcelainV2Status {
     pub object_format: GitObjectFormat,
     pub branch: BranchStatus,
     pub entries: Vec<StatusEntry>,
+}
+
+/// Git's authoritative tracked and untracked repository paths.
+///
+/// Tracked paths come from the index and intentionally remain distinct from untracked paths so
+/// callers can apply supplementary search-tool ignores only to the latter. Both lists are stable,
+/// deduplicated native repository-relative paths.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GitFileSet {
+    pub tracked: Vec<RepoRelativePath>,
+    pub untracked: Vec<RepoRelativePath>,
+}
+
+impl GitFileSet {
+    #[must_use]
+    pub fn new(mut tracked: Vec<RepoRelativePath>, mut untracked: Vec<RepoRelativePath>) -> Self {
+        tracked.sort();
+        tracked.dedup();
+        untracked.sort();
+        untracked.dedup();
+        Self { tracked, untracked }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tracked.len().saturating_add(self.untracked.len())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tracked.is_empty() && self.untracked.is_empty()
+    }
+}
+
+/// A bounded streaming failure while parsing `git ls-files -z` output.
+#[derive(Debug, Error)]
+pub enum GitPathListReadError {
+    #[error("failed to read Git path list at byte {offset}, record {record}: {source}")]
+    Input {
+        offset: usize,
+        record: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Git path list record {record} is not terminated by NUL at byte {offset}")]
+    MissingNulTerminator { offset: usize, record: usize },
+    #[error("Git path list record {record} contains an empty path at byte {offset}")]
+    EmptyPath { offset: usize, record: usize },
+    #[error("Git path list record {record} contains an invalid repository path at byte {offset}")]
+    InvalidPath { offset: usize, record: usize },
+    #[error(
+        "Git path list record {record} exceeds the configured {max_bytes}-byte bound at byte {offset}"
+    )]
+    PathTooLong {
+        offset: usize,
+        record: usize,
+        max_bytes: usize,
+    },
+    #[error("Git path list contains more than the configured {max_paths} paths")]
+    TooManyPaths { max_paths: usize },
+}
+
+/// Incrementally parses NUL-delimited native repository paths from `git ls-files -z`.
+///
+/// At most `max_path_bytes + 1` bytes are buffered for one path, and `max_paths` bounds typed
+/// allocation. Clean empty output is valid; every non-empty record must have a NUL terminator.
+pub fn parse_git_path_list_reader<R>(
+    mut reader: R,
+    max_path_bytes: usize,
+    max_paths: usize,
+) -> Result<Vec<RepoRelativePath>, GitPathListReadError>
+where
+    R: BufRead,
+{
+    let mut paths = Vec::new();
+    let mut record = Vec::with_capacity(max_path_bytes.min(8 * 1024));
+    let mut offset = 0_usize;
+    let mut record_number = 0_usize;
+
+    loop {
+        record.clear();
+        let record_start = offset;
+        let read_bound = u64::try_from(max_path_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let bytes_read = reader
+            .by_ref()
+            .take(read_bound)
+            .read_until(0, &mut record)
+            .map_err(|source| GitPathListReadError::Input {
+                offset: record_start,
+                record: record_number.saturating_add(1),
+                source,
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        record_number = record_number.saturating_add(1);
+        offset = offset.saturating_add(bytes_read);
+        if record.last().copied() != Some(0) {
+            if record.len() > max_path_bytes {
+                return Err(GitPathListReadError::PathTooLong {
+                    offset: record_start.saturating_add(max_path_bytes),
+                    record: record_number,
+                    max_bytes: max_path_bytes,
+                });
+            }
+            return Err(GitPathListReadError::MissingNulTerminator {
+                offset,
+                record: record_number,
+            });
+        }
+        record.pop();
+        if record.is_empty() {
+            return Err(GitPathListReadError::EmptyPath {
+                offset: record_start,
+                record: record_number,
+            });
+        }
+        if paths.len() >= max_paths {
+            return Err(GitPathListReadError::TooManyPaths { max_paths });
+        }
+        let path = native_path_from_git_bytes(&record)
+            .and_then(|path| RepoRelativePath::new(path).ok())
+            .ok_or(GitPathListReadError::InvalidPath {
+                offset: record_start,
+                record: record_number,
+            })?;
+        paths.push(path);
+    }
+
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// Why porcelain v2 input could not be parsed.
@@ -1111,9 +1246,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AheadBehind, BranchHead, BranchOid, GitObjectFormat, PorcelainV2ParseErrorKind,
-        PorcelainV2ReadError, RenameOrCopy, StatusEntry, parse_status_porcelain_v2,
-        parse_status_porcelain_v2_reader,
+        AheadBehind, BranchHead, BranchOid, GitObjectFormat, GitPathListReadError,
+        PorcelainV2ParseErrorKind, PorcelainV2ReadError, RenameOrCopy, StatusEntry,
+        parse_git_path_list_reader, parse_status_porcelain_v2, parse_status_porcelain_v2_reader,
     };
 
     const OID_1: &[u8] = b"1111111111111111111111111111111111111111";
@@ -1329,6 +1464,39 @@ mod tests {
         assert!(matches!(
             parsed.entries.last(),
             Some(StatusEntry::Untracked(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn git_path_list_streams_more_than_one_hundred_thousand_paths_and_enforces_its_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PATH_COUNT: usize = 100_001;
+        let mut input = Vec::with_capacity(1_700_000);
+        for index in 0..PATH_COUNT {
+            input.extend_from_slice(b"path-");
+            input.extend_from_slice(index.to_string().as_bytes());
+            input.push(0);
+        }
+
+        let parsed = parse_git_path_list_reader(
+            BufReader::with_capacity(127, Cursor::new(input.as_slice())),
+            64,
+            PATH_COUNT,
+        )?;
+        assert_eq!(parsed.len(), PATH_COUNT);
+
+        let error = parse_git_path_list_reader(
+            BufReader::with_capacity(127, Cursor::new(input.as_slice())),
+            64,
+            PATH_COUNT - 1,
+        )
+        .err()
+        .ok_or("path-list cap unexpectedly accepted an extra path")?;
+        assert!(matches!(
+            error,
+            GitPathListReadError::TooManyPaths { max_paths }
+                if max_paths == PATH_COUNT - 1
         ));
         Ok(())
     }

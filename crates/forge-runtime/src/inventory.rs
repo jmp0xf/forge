@@ -1,11 +1,15 @@
 //! Read-only repository inventory with standard ignore handling.
 
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
-use forge_core::RepoRelativePath;
-use ignore::WalkBuilder;
+use forge_core::ports::GitPort;
+use forge_core::{GitFileSet, RepoRelativePath};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{Match, WalkBuilder};
 use thiserror::Error;
 
 const GENERATED_DIRECTORIES: &[&str] = &[".git", "target", "vendor", "node_modules"];
@@ -78,20 +82,72 @@ pub enum InventoryError {
     },
     #[error("repository-relative path points through a symlink: {0}")]
     Symlink(PathBuf),
+    #[error("Git-backed repository inventory failed: {0}")]
+    Git(#[source] io::Error),
+    #[error(
+        "repository inventory contains {observed} entries, exceeding the configured {max_entries}-entry bound"
+    )]
+    EntryLimit { max_entries: usize, observed: usize },
 }
 
-/// Walks repository inputs without following symlinks or generated directories.
-pub fn build_inventory(
+/// Builds a Git-backed inventory from the index plus untracked, non-Git-ignored paths.
+///
+/// Git owns tracked, `.gitignore`, info-exclude, and global-exclude semantics. Supplementary
+/// `.ignore` files are applied only to untracked candidates, so a tracked file can never disappear
+/// merely because a later ignore rule matches it. Git lists paths without traversing generated
+/// directories; tracked paths in such directories remain authoritative. No symlink is followed.
+pub fn build_git_inventory<G>(
+    root: &Path,
+    git: &G,
+    options: InventoryOptions,
+) -> Result<Inventory, InventoryError>
+where
+    G: GitPort,
+{
+    validate_root(root)?;
+    let file_set = git.file_set(root).map_err(InventoryError::Git)?;
+    build_inventory_from_git_file_set(root, &file_set, options)
+}
+
+fn build_inventory_from_git_file_set(
+    root: &Path,
+    file_set: &GitFileSet,
+    options: InventoryOptions,
+) -> Result<Inventory, InventoryError> {
+    let mut inventory = Inventory::default();
+    let dot_ignore_matchers = load_dot_ignore_matchers(
+        root,
+        file_set,
+        options.max_text_file_bytes,
+        &mut inventory.skipped,
+    );
+    let mut seen = BTreeSet::new();
+
+    for path in &file_set.tracked {
+        if seen.insert(path.clone()) {
+            inventory_path(root, path, &mut inventory);
+        }
+    }
+    for path in &file_set.untracked {
+        if seen.contains(path) || dot_ignore_match(&dot_ignore_matchers, root, path).is_ignore() {
+            continue;
+        }
+        seen.insert(path.clone());
+        inventory_path(root, path, &mut inventory);
+    }
+
+    finish_inventory(inventory, options)
+}
+
+/// Filesystem-only fallback for callers that have explicitly established a non-Git context.
+///
+/// Unlike [`build_git_inventory`], this walker cannot distinguish tracked files from ignored
+/// untracked files. It must therefore never be used as the inventory source for a Git repository.
+pub fn build_non_git_filesystem_inventory(
     root: &Path,
     options: InventoryOptions,
 ) -> Result<Inventory, InventoryError> {
-    let root_metadata = fs::symlink_metadata(root).map_err(|source| InventoryError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return Err(InventoryError::InvalidRoot(root.to_path_buf()));
-    }
+    validate_root(root)?;
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(true)
@@ -161,17 +217,214 @@ pub fn build_inventory(
         });
     }
 
+    finish_inventory(inventory, options)
+}
+
+fn validate_root(root: &Path) -> Result<(), InventoryError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|source| InventoryError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(InventoryError::InvalidRoot(root.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn finish_inventory(
+    mut inventory: Inventory,
+    options: InventoryOptions,
+) -> Result<Inventory, InventoryError> {
     inventory.entries.sort();
     inventory.skipped.sort();
     if inventory.entries.len() > options.max_entries {
-        let omitted = inventory.entries.len() - options.max_entries;
-        inventory.entries.truncate(options.max_entries);
-        inventory.skipped.push(InventorySkip {
-            path: None,
-            reason: format!("inventory entry limit reached; {omitted} entries omitted"),
+        return Err(InventoryError::EntryLimit {
+            max_entries: options.max_entries,
+            observed: inventory.entries.len(),
         });
     }
     Ok(inventory)
+}
+
+fn inventory_path(root: &Path, relative: &RepoRelativePath, inventory: &mut Inventory) {
+    if let Err(error) = reject_symlink_ancestors(root, relative.as_path()) {
+        inventory.skipped.push(InventorySkip {
+            path: Some(relative.as_path().to_path_buf()),
+            reason: error.to_string(),
+        });
+        return;
+    }
+    let path = root.join(relative.as_path());
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            inventory.skipped.push(InventorySkip {
+                path: Some(relative.as_path().to_path_buf()),
+                reason: error.to_string(),
+            });
+            return;
+        }
+    };
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        InventoryKind::Symlink
+    } else if file_type.is_dir() {
+        InventoryKind::Directory
+    } else if file_type.is_file() {
+        InventoryKind::File
+    } else {
+        InventoryKind::Other
+    };
+    inventory.entries.push(InventoryEntry {
+        path: relative.as_path().to_path_buf(),
+        kind,
+        size_bytes: metadata.len(),
+    });
+}
+
+#[derive(Debug)]
+struct DotIgnoreMatcher {
+    directory: PathBuf,
+    matcher: Gitignore,
+}
+
+fn load_dot_ignore_matchers(
+    root: &Path,
+    file_set: &GitFileSet,
+    max_text_file_bytes: u64,
+    skipped: &mut Vec<InventorySkip>,
+) -> Vec<DotIgnoreMatcher> {
+    let mut ignore_paths: Vec<_> = file_set
+        .tracked
+        .iter()
+        .chain(&file_set.untracked)
+        .filter(|path| path.as_path().file_name() == Some(OsStr::new(".ignore")))
+        .cloned()
+        .collect();
+    ignore_paths.sort_by(|left, right| {
+        left.as_path()
+            .components()
+            .count()
+            .cmp(&right.as_path().components().count())
+            .then_with(|| left.cmp(right))
+    });
+    ignore_paths.dedup();
+
+    let mut matchers = Vec::new();
+    for relative in ignore_paths {
+        if dot_ignore_match(&matchers, root, &relative).is_ignore() {
+            continue;
+        }
+        let text = match read_bounded_text(root, &relative, max_text_file_bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                push_dot_ignore_skip(
+                    skipped,
+                    &relative,
+                    format!("the file is unreadable: {error}"),
+                );
+                continue;
+            }
+        };
+        if text.truncated {
+            push_dot_ignore_skip(
+                skipped,
+                &relative,
+                format!("the file exceeds the {max_text_file_bytes}-byte text bound"),
+            );
+            continue;
+        }
+        if text.binary {
+            push_dot_ignore_skip(
+                skipped,
+                &relative,
+                String::from("the file contains NUL bytes"),
+            );
+            continue;
+        }
+        let contents = match std::str::from_utf8(&text.bytes) {
+            Ok(contents) => contents,
+            Err(_) => {
+                push_dot_ignore_skip(
+                    skipped,
+                    &relative,
+                    String::from("the file is not valid UTF-8"),
+                );
+                continue;
+            }
+        };
+
+        let directory = relative
+            .as_path()
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        let absolute = root.join(relative.as_path());
+        let mut builder = GitignoreBuilder::new(root.join(&directory));
+        let mut invalid_rules = 0_usize;
+        for (index, line) in contents.lines().enumerate() {
+            let line = if index == 0 {
+                line.trim_start_matches('\u{feff}')
+            } else {
+                line
+            };
+            if builder.add_line(Some(absolute.clone()), line).is_err() {
+                invalid_rules = invalid_rules.saturating_add(1);
+            }
+        }
+        let matcher = match builder.build() {
+            Ok(matcher) => matcher,
+            Err(_) => {
+                push_dot_ignore_skip(
+                    skipped,
+                    &relative,
+                    String::from("the bounded rule set could not be compiled"),
+                );
+                continue;
+            }
+        };
+        if invalid_rules > 0 {
+            skipped.push(InventorySkip {
+                path: Some(relative.as_path().to_path_buf()),
+                reason: format!(
+                    "partially applied .ignore rules; {invalid_rules} invalid rule(s) were skipped"
+                ),
+            });
+        }
+        matchers.push(DotIgnoreMatcher { directory, matcher });
+    }
+    matchers
+}
+
+fn push_dot_ignore_skip(
+    skipped: &mut Vec<InventorySkip>,
+    relative: &RepoRelativePath,
+    reason: String,
+) {
+    skipped.push(InventorySkip {
+        path: Some(relative.as_path().to_path_buf()),
+        reason: format!("ignored .ignore rules because {reason}"),
+    });
+}
+
+fn dot_ignore_match<'a>(
+    matchers: &'a [DotIgnoreMatcher],
+    root: &Path,
+    relative: &RepoRelativePath,
+) -> Match<&'a ignore::gitignore::Glob> {
+    let absolute = root.join(relative.as_path());
+    for matcher in matchers.iter().rev() {
+        if !relative.as_path().starts_with(&matcher.directory) {
+            continue;
+        }
+        let matched = matcher
+            .matcher
+            .matched_path_or_any_parents(&absolute, false);
+        if !matched.is_none() {
+            return matched;
+        }
+    }
+    Match::None
 }
 
 fn ignore_error_path(error: &ignore::Error) -> Option<PathBuf> {
@@ -240,6 +493,25 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), Invento
     Ok(())
 }
 
+fn reject_symlink_ancestors(root: &Path, relative: &Path) -> Result<(), InventoryError> {
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|source| InventoryError::Io {
+            path: current.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(InventoryError::Symlink(current));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -247,7 +519,9 @@ mod tests {
     use forge_core::RepoRelativePath;
     use tempfile::tempdir;
 
-    use super::{InventoryKind, InventoryOptions, build_inventory, read_bounded_text};
+    use super::{
+        InventoryKind, InventoryOptions, build_non_git_filesystem_inventory, read_bounded_text,
+    };
 
     #[test]
     fn inventory_respects_gitignore_and_generated_directory_boundaries()
@@ -259,7 +533,8 @@ mod tests {
         fs::create_dir(directory.path().join("target"))?;
         fs::write(directory.path().join("target/generated"), "generated")?;
 
-        let inventory = build_inventory(directory.path(), InventoryOptions::default())?;
+        let inventory =
+            build_non_git_filesystem_inventory(directory.path(), InventoryOptions::default())?;
         let paths: Vec<_> = inventory
             .entries
             .iter()
@@ -297,7 +572,8 @@ mod tests {
         fs::write(outside.path().join("secret"), "do not read")?;
         symlink(outside.path(), directory.path().join("link"))?;
 
-        let inventory = build_inventory(directory.path(), InventoryOptions::default())?;
+        let inventory =
+            build_non_git_filesystem_inventory(directory.path(), InventoryOptions::default())?;
         let link = inventory
             .entries
             .iter()

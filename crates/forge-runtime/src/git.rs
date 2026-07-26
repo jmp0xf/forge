@@ -10,8 +10,8 @@ use forge_core::domain::{
 };
 use forge_core::ports::{GitPort, ProcessObservation, ProcessPort as _};
 use forge_core::{
-    GitObjectFormat, PorcelainV2ReadError, PorcelainV2Status, RepoRelativePath,
-    parse_status_porcelain_v2_reader,
+    GitFileSet, GitObjectFormat, GitPathListReadError, PorcelainV2ReadError, PorcelainV2Status,
+    RepoRelativePath, parse_git_path_list_reader, parse_status_porcelain_v2_reader,
 };
 
 use crate::process::{
@@ -60,6 +60,13 @@ pub const STATUS_PORCELAIN_V2_ARGS: &[&str] = &[
     "--branch",
     "--untracked-files=all",
 ];
+
+/// Enumerate every path represented by the index, including tracked paths ignored later.
+pub const TRACKED_FILES_ARGS: &[&str] = &["ls-files", "--cached", "-z", "--"];
+
+/// Enumerate untracked paths using Git's repository, info, and global exclude semantics.
+pub const UNTRACKED_FILES_ARGS: &[&str] =
+    &["ls-files", "--others", "--exclude-standard", "-z", "--"];
 
 /// Resolve the repository root as an absolute native path.
 pub const REPOSITORY_ROOT_ARGS: &[&str] = &["rev-parse", "--show-toplevel"];
@@ -143,10 +150,13 @@ impl GitCli {
     }
 
     fn run(&self, start: &Path, operation: GitOperation) -> io::Result<Vec<u8>> {
-        if matches!(operation, GitOperation::Status) {
+        if operation.uses_spool() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Git status must use the bounded anonymous spool path",
+                format!(
+                    "Git {} must use the bounded anonymous spool path",
+                    operation.name()
+                ),
             ));
         }
         let runner = SynchronousProcessRunner::new(start)?;
@@ -159,8 +169,20 @@ impl GitCli {
         checked_stdout(operation.name(), observation)
     }
 
-    fn run_spooled_status(&self, root: &Path) -> io::Result<SpooledProcessObservation> {
-        let operation = GitOperation::Status;
+    fn run_spooled(
+        &self,
+        root: &Path,
+        operation: GitOperation,
+    ) -> io::Result<SpooledProcessObservation> {
+        if !operation.uses_spool() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "git {} does not use the bounded spool path",
+                    operation.name()
+                ),
+            ));
+        }
         SynchronousProcessRunner::new(root)?
             .run_spooled_stdout(&self.command_spec(operation), self.status_spool_limit_bytes)
             .map_err(|error| {
@@ -179,6 +201,26 @@ impl GitCli {
     fn object_format(&self, root: &Path) -> io::Result<GitObjectFormat> {
         parse_object_format(self.run(root, GitOperation::ObjectFormat)?)
     }
+
+    fn spooled_paths(
+        &self,
+        root: &Path,
+        operation: GitOperation,
+        max_paths: usize,
+    ) -> io::Result<Vec<RepoRelativePath>> {
+        let mut spooled = self.run_spooled(root, operation)?;
+        check_spooled_observation(
+            operation.name(),
+            &mut spooled,
+            self.status_spool_limit_bytes,
+        )?;
+        parse_git_path_list_reader(
+            BufReader::new(spooled.stdout_file),
+            self.status_record_limit_bytes,
+            max_paths,
+        )
+        .map_err(map_path_list_read_error)
+    }
 }
 
 impl GitPort for GitCli {
@@ -196,22 +238,12 @@ impl GitPort for GitCli {
 
     fn status(&self, root: &Path) -> io::Result<PorcelainV2Status> {
         let object_format = self.object_format(root)?;
-        let mut spooled = self.run_spooled_status(root)?;
-        check_observation(GitOperation::Status.name(), &spooled.observation)?;
-        spooled.stdout_file.flush()?;
-        let spool_length = spooled.stdout_file.metadata()?.len();
-        let spool_limit = u64::try_from(self.status_spool_limit_bytes).unwrap_or(u64::MAX);
-        let expected_length = spooled.observation.stdout_total_bytes.min(spool_limit);
-        if spool_length != expected_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Git status spool length mismatch: retained {spool_length} bytes, expected {expected_length} from {} total bytes",
-                    spooled.observation.stdout_total_bytes
-                ),
-            ));
-        }
-        spooled.stdout_file.seek(SeekFrom::Start(0))?;
+        let mut spooled = self.run_spooled(root, GitOperation::Status)?;
+        check_spooled_observation(
+            GitOperation::Status.name(),
+            &mut spooled,
+            self.status_spool_limit_bytes,
+        )?;
         let status = parse_status_porcelain_v2_reader(
             BufReader::new(spooled.stdout_file),
             object_format,
@@ -227,6 +259,14 @@ impl GitPort for GitCli {
         }
         Ok(status)
     }
+
+    fn file_set(&self, root: &Path) -> io::Result<GitFileSet> {
+        let tracked =
+            self.spooled_paths(root, GitOperation::TrackedFiles, self.status_entry_limit)?;
+        let remaining = self.status_entry_limit.saturating_sub(tracked.len());
+        let untracked = self.spooled_paths(root, GitOperation::UntrackedFiles, remaining)?;
+        Ok(GitFileSet::new(tracked, untracked))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -236,6 +276,8 @@ enum GitOperation {
     GitCommonDir,
     ObjectFormat,
     Status,
+    TrackedFiles,
+    UntrackedFiles,
 }
 
 impl GitOperation {
@@ -246,6 +288,8 @@ impl GitOperation {
             Self::GitCommonDir => "git-common-dir",
             Self::ObjectFormat => "object-format",
             Self::Status => "status",
+            Self::TrackedFiles => "tracked-files",
+            Self::UntrackedFiles => "untracked-files",
         }
     }
 
@@ -256,6 +300,8 @@ impl GitOperation {
             Self::GitCommonDir => "runtime.git.git-common-dir",
             Self::ObjectFormat => "runtime.git.object-format",
             Self::Status => "runtime.git.status",
+            Self::TrackedFiles => "runtime.git.tracked-files",
+            Self::UntrackedFiles => "runtime.git.untracked-files",
         }
     }
 
@@ -266,8 +312,40 @@ impl GitOperation {
             Self::GitCommonDir => GIT_COMMON_DIR_ARGS,
             Self::ObjectFormat => OBJECT_FORMAT_ARGS,
             Self::Status => STATUS_PORCELAIN_V2_ARGS,
+            Self::TrackedFiles => TRACKED_FILES_ARGS,
+            Self::UntrackedFiles => UNTRACKED_FILES_ARGS,
         }
     }
+
+    fn uses_spool(self) -> bool {
+        matches!(
+            self,
+            Self::Status | Self::TrackedFiles | Self::UntrackedFiles
+        )
+    }
+}
+
+fn check_spooled_observation(
+    operation: &str,
+    spooled: &mut SpooledProcessObservation,
+    spool_limit_bytes: usize,
+) -> io::Result<()> {
+    check_observation(operation, &spooled.observation)?;
+    spooled.stdout_file.flush()?;
+    let spool_length = spooled.stdout_file.metadata()?.len();
+    let spool_limit = u64::try_from(spool_limit_bytes).unwrap_or(u64::MAX);
+    let expected_length = spooled.observation.stdout_total_bytes.min(spool_limit);
+    if spool_length != expected_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Git {operation} spool length mismatch: retained {spool_length} bytes, expected {expected_length} from {} total bytes",
+                spooled.observation.stdout_total_bytes
+            ),
+        ));
+    }
+    spooled.stdout_file.seek(SeekFrom::Start(0))?;
+    Ok(())
 }
 
 fn checked_stdout(operation: &str, observation: ProcessObservation) -> io::Result<Vec<u8>> {
@@ -322,6 +400,19 @@ fn map_status_read_error(error: PorcelainV2ReadError) -> io::Error {
         PorcelainV2ReadError::Parse(error) => io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Git returned malformed porcelain v2 status: {error}"),
+        ),
+    }
+}
+
+fn map_path_list_read_error(error: GitPathListReadError) -> io::Error {
+    match error {
+        GitPathListReadError::Input { source, .. } => io::Error::new(
+            source.kind(),
+            format!("failed to read Git path list: {source}"),
+        ),
+        error => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Git returned a malformed path list: {error}"),
         ),
     }
 }
@@ -415,7 +506,8 @@ mod tests {
 
     use super::{
         GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, OBJECT_FORMAT_ARGS,
-        STATUS_PORCELAIN_V2_ARGS, checked_stdout, parse_absolute_git_path, parse_object_format,
+        STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS, checked_stdout,
+        parse_absolute_git_path, parse_object_format,
     };
 
     #[test]
@@ -433,6 +525,11 @@ mod tests {
             OBJECT_FORMAT_ARGS,
             ["rev-parse", "--show-object-format=output"]
         );
+        assert_eq!(TRACKED_FILES_ARGS, ["ls-files", "--cached", "-z", "--"]);
+        assert_eq!(
+            UNTRACKED_FILES_ARGS,
+            ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+        );
         assert!(HARDENED_GIT_ENV.contains(&("GIT_TERMINAL_PROMPT", "0")));
     }
 
@@ -446,6 +543,7 @@ mod tests {
         let git_dir = git.git_dir(&root)?;
         let git_common_dir = git.git_common_dir(&root)?;
         let status = git.status(&root)?;
+        let file_set = git.file_set(&root)?;
 
         assert_eq!(root, expected_root);
         assert!(git_dir.is_absolute());
@@ -454,6 +552,12 @@ mod tests {
         assert!(git_common_dir.is_dir());
         assert!(status.branch.oid.is_some());
         assert!(status.branch.head.is_some());
+        assert!(
+            file_set
+                .tracked
+                .iter()
+                .any(|path| path.as_path() == Path::new("Cargo.toml"))
+        );
         Ok(())
     }
 
