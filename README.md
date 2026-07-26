@@ -15,10 +15,13 @@ This repository contains:
 
 ## Status
 
-M0 is implemented: typed protocol primitives, structured diagnostics and exit codes, the full clap command surface,
-`version --json`, checked-in JSON Schemas, schema drift checks, and shell completions are executable and tested. M1
-runtime work is next. `init`, `doctor`, `next`, adapters, explain, and evidence still fail explicitly rather than
-pretending placeholder behavior is complete.
+M0 and M1 are implemented. The executable protocol surface is backed by typed identifiers, structured diagnostics,
+stable exit codes, checked-in JSON Schemas, and shell completions. Runtime boundaries now include typed Git porcelain
+and Git-authoritative inventory, native repository paths, isolated private state, atomic repository-confined writes,
+BLAKE3 hashing, and synchronous bounded subprocess execution with timeout, cancellation, and process-tree cleanup.
+
+M2 project-model and generic detection work is next. `init`, `doctor`, `next`, adapters, explain, and evidence still
+fail explicitly rather than pretending placeholder behavior is complete.
 
 ## Bootstrap commands
 
@@ -51,8 +54,9 @@ The stable interface of projects analyzed by Forge remains their own commands (`
 
 ## Current implementation boundary
 
-M0 is complete. Continue with M1 in the design proposal: typed Git porcelain-v2 access, atomic private state,
-synchronous bounded subprocess execution, timeout/process-tree termination, hashing, and invariant tests. Higher-level
-commands must remain explicit failures until those runtime boundaries are real.
+M1 is complete. Continue with M2 in the design proposal: repository facts, strict optional configuration, static
+runner discovery, deterministic command resolution, the complete `ProjectModel`, and read-only `forge explain`.
+Higher-level write, navigation, and evidence commands remain explicit failures until their prerequisite milestones
+are real.
 
 Do not add a feature that changes an accepted decision without an ADR that supersedes the relevant record.
