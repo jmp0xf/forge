@@ -202,8 +202,40 @@ where
     let path = RepoRelativePath::new(CONFIG_FILE).map_err(|_| ConfigError::Load {
         reason: ConfigLoadError::InvalidDefaultPath,
     })?;
+    load_optional_forge_config_at(filesystem, repository_root, &path)
+}
+
+/// Loads a caller-selected, repository-relative configuration through the same bounded boundary.
+///
+/// Unlike the zero-configuration default probe, an explicitly selected missing path is an error.
+pub fn load_forge_config_at<F>(
+    filesystem: &F,
+    repository_root: &Path,
+    path: &RepoRelativePath,
+) -> Result<ForgeConfig, ConfigError>
+where
+    F: FileSystemPort + ?Sized,
+{
+    match load_optional_forge_config_at(filesystem, repository_root, path)? {
+        Some(config) => Ok(config),
+        None => Err(ConfigError::Load {
+            reason: ConfigLoadError::ExpectedRegularFile {
+                found: PathKind::Missing,
+            },
+        }),
+    }
+}
+
+fn load_optional_forge_config_at<F>(
+    filesystem: &F,
+    repository_root: &Path,
+    path: &RepoRelativePath,
+) -> Result<Option<ForgeConfig>, ConfigError>
+where
+    F: FileSystemPort + ?Sized,
+{
     let kind = filesystem
-        .path_kind(repository_root, &path)
+        .path_kind(repository_root, path)
         .map_err(|error| ConfigError::Load {
             reason: ConfigLoadError::ProbeFailed { kind: error.kind() },
         })?;
@@ -218,7 +250,7 @@ where
     }
 
     let text = filesystem
-        .read_bounded_text(repository_root, &path, DEFAULT_MAX_CONFIG_FILE_BYTES)
+        .read_bounded_text(repository_root, path, DEFAULT_MAX_CONFIG_FILE_BYTES)
         .map_err(map_config_read_error)?;
     if text.truncated {
         return Err(ConfigError::Load {
@@ -576,7 +608,8 @@ mod tests {
 
     use super::{
         CONFIG_SCHEMA_V1, ConfigError, ConfigLoadError, DEFAULT_MAX_CONFIG_FILE_BYTES, RiskLevel,
-        load_default_forge_config, parse_forge_config, parse_optional_forge_config,
+        load_default_forge_config, load_forge_config_at, parse_forge_config,
+        parse_optional_forge_config,
     };
 
     #[derive(Debug, Clone)]
@@ -589,6 +622,7 @@ mod tests {
     #[derive(Debug)]
     struct MockFileSystem {
         repository_root: PathBuf,
+        expected_path: PathBuf,
         path_kind: Result<PathKind, io::ErrorKind>,
         text: TextOutcome,
         probe_calls: Cell<usize>,
@@ -600,6 +634,7 @@ mod tests {
         fn new(path_kind: Result<PathKind, io::ErrorKind>, text: TextOutcome) -> Self {
             Self {
                 repository_root: PathBuf::from("repository-root"),
+                expected_path: PathBuf::from(CONFIG_FILE),
                 path_kind,
                 text,
                 probe_calls: Cell::new(0),
@@ -619,8 +654,13 @@ mod tests {
             )
         }
 
+        fn with_expected_path(mut self, path: impl Into<PathBuf>) -> Self {
+            self.expected_path = path.into();
+            self
+        }
+
         fn validate_request(&self, root: &Path, path: &RepoRelativePath) -> io::Result<()> {
-            if root != self.repository_root || path.as_path() != Path::new(CONFIG_FILE) {
+            if root != self.repository_root || path.as_path() != self.expected_path {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "configuration loader used an unexpected root or path",
@@ -771,6 +811,45 @@ external = ["owner-review", "protected-ci"]
             filesystem.observed_read_bound.get(),
             Some(DEFAULT_MAX_CONFIG_FILE_BYTES)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_repository_relative_config_uses_the_same_bounded_loader()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selected = RepoRelativePath::new("config/forge.toml")?;
+        let filesystem =
+            MockFileSystem::text(COMPLETE_CONFIG.as_bytes()).with_expected_path(selected.as_path());
+
+        let config = load_forge_config_at(&filesystem, &filesystem.repository_root, &selected)?;
+
+        assert_eq!(config.schema, CONFIG_SCHEMA_V1);
+        assert_eq!(filesystem.probe_calls.get(), 1);
+        assert_eq!(filesystem.read_calls.get(), 1);
+        assert_eq!(
+            filesystem.observed_read_bound.get(),
+            Some(DEFAULT_MAX_CONFIG_FILE_BYTES)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_explicit_config_is_an_error_not_zero_configuration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selected = RepoRelativePath::new("config/missing.toml")?;
+        let filesystem =
+            MockFileSystem::new(Ok(PathKind::Missing), TextOutcome::Io(io::ErrorKind::Other))
+                .with_expected_path(selected.as_path());
+
+        assert_eq!(
+            load_forge_config_at(&filesystem, &filesystem.repository_root, &selected),
+            Err(ConfigError::Load {
+                reason: ConfigLoadError::ExpectedRegularFile {
+                    found: PathKind::Missing,
+                }
+            })
+        );
+        assert_eq!(filesystem.read_calls.get(), 0);
         Ok(())
     }
 
