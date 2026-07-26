@@ -96,6 +96,24 @@ impl AtomicStateStore {
         Ok(Self { layout, writer })
     }
 
+    /// Opens an existing per-worktree state store without changing the
+    /// filesystem.
+    ///
+    /// This validates both resolved Git roots and the private state directory,
+    /// but deliberately does not create the state directory, shared cache, or
+    /// lock file. An absent state directory is reported as `Ok(None)`; an
+    /// existing unsafe path fails closed.
+    pub fn open_existing_read_only(layout: GitStateLayout) -> Result<Option<Self>, StateError> {
+        validate_resolved_directory(layout.git_dir())?;
+        validate_resolved_directory(layout.common_dir())?;
+        if !validate_existing_private_directory(layout.worktree_dir())? {
+            return Ok(None);
+        }
+
+        let writer = RepositoryWriter::new(layout.worktree_dir())?;
+        Ok(Some(Self { layout, writer }))
+    }
+
     #[must_use]
     pub fn layout(&self) -> &GitStateLayout {
         &self.layout
@@ -261,6 +279,26 @@ fn ensure_private_directory(path: &Path) -> Result<(), StateError> {
 
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| StateError::io("verify private state directory", path, source))?;
+    validate_private_directory(path, &metadata)
+}
+
+fn validate_existing_private_directory(path: &Path) -> Result<bool, StateError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(StateError::io(
+                "inspect private state directory",
+                path,
+                source,
+            ));
+        }
+    };
+    validate_private_directory(path, &metadata)?;
+    Ok(true)
+}
+
+fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), StateError> {
     if metadata.file_type().is_symlink() {
         return Err(StateError::PathSafety(FileSystemError::SymlinkComponent {
             path: path.to_path_buf(),
@@ -273,7 +311,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), StateError> {
         });
     }
 
-    validate_private_directory_permissions(path, &metadata)?;
+    validate_private_directory_permissions(path, metadata)?;
     Ok(())
 }
 
@@ -474,10 +512,97 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::io;
+    use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
 
     use super::{AtomicStateStore, GitStateLayout, StateError};
+
+    type FileSystemSnapshot = Vec<(PathBuf, u32, Option<Vec<u8>>)>;
+
+    #[test]
+    fn read_only_open_leaves_absent_state_and_filesystem_unchanged() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        let common_dir = temporary.path().join("common");
+        fs::create_dir(&git_dir)?;
+        fs::create_dir(&common_dir)?;
+        let layout = GitStateLayout::new(&git_dir, &common_dir);
+        let before = filesystem_snapshot(temporary.path())?;
+
+        let result = AtomicStateStore::open_existing_read_only(layout.clone())?;
+
+        assert!(result.is_none());
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        assert!(!layout.worktree_dir().exists());
+        assert!(!layout.shared_cache_dir().exists());
+        assert!(!layout.lock_file().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_open_reads_existing_state_without_writing() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        let common_dir = temporary.path().join("common");
+        fs::create_dir(&git_dir)?;
+        fs::create_dir(&common_dir)?;
+        let layout = GitStateLayout::new(&git_dir, &common_dir);
+        let store = AtomicStateStore::new(layout.clone())?;
+        store.store_atomic("evidence/current.json", br#"{"schema":1}"#)?;
+        let before = filesystem_snapshot(temporary.path())?;
+
+        let read_only = AtomicStateStore::open_existing_read_only(layout.clone())?
+            .ok_or_else(|| io::Error::other("existing state store was not opened"))?;
+
+        assert_eq!(
+            read_only.load("evidence/current.json")?,
+            Some(br#"{"schema":1}"#.to_vec())
+        );
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        assert!(!layout.lock_file().exists());
+        Ok(())
+    }
+
+    fn filesystem_snapshot(root: &Path) -> io::Result<FileSystemSnapshot> {
+        let mut snapshot = Vec::new();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                let contents = if metadata.is_file() {
+                    Some(fs::read(&path)?)
+                } else {
+                    None
+                };
+                snapshot.push((
+                    path.strip_prefix(root)
+                        .map_err(|error| io::Error::other(error.to_string()))?
+                        .to_path_buf(),
+                    permission_mode(&metadata),
+                    contents,
+                ));
+                if metadata.is_dir() {
+                    directories.push(path);
+                }
+            }
+        }
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(snapshot)
+    }
+
+    #[cfg(unix)]
+    fn permission_mode(metadata: &fs::Metadata) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        metadata.permissions().mode() & 0o777
+    }
+
+    #[cfg(not(unix))]
+    fn permission_mode(_metadata: &fs::Metadata) -> u32 {
+        0
+    }
 
     #[test]
     fn worktree_state_is_isolated_while_cache_is_shared() -> Result<(), Box<dyn Error>> {
@@ -518,10 +643,18 @@ mod tests {
         fs::create_dir(&outside)?;
         symlink(&outside, git_dir.join("forge"))?;
 
-        let result = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir));
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
+        let create_result = AtomicStateStore::new(layout.clone());
+        let read_only_result = AtomicStateStore::open_existing_read_only(layout);
 
         assert!(matches!(
-            result,
+            create_result,
+            Err(StateError::PathSafety(
+                crate::fs::FileSystemError::SymlinkComponent { .. }
+            ))
+        ));
+        assert!(matches!(
+            read_only_result,
             Err(StateError::PathSafety(
                 crate::fs::FileSystemError::SymlinkComponent { .. }
             ))
@@ -536,9 +669,16 @@ mod tests {
         fs::create_dir(&git_dir)?;
         fs::write(git_dir.join("forge"), b"conflict")?;
 
-        let result = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir));
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
 
-        assert!(matches!(result, Err(StateError::InvalidLayout { .. })));
+        assert!(matches!(
+            AtomicStateStore::new(layout.clone()),
+            Err(StateError::InvalidLayout { .. })
+        ));
+        assert!(matches!(
+            AtomicStateStore::open_existing_read_only(layout),
+            Err(StateError::InvalidLayout { .. })
+        ));
         Ok(())
     }
 
@@ -554,20 +694,24 @@ mod tests {
         fs::create_dir(&state_dir)?;
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o777))?;
 
-        let result = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir));
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
 
-        match result {
-            Err(StateError::InvalidLayout { reason, .. }) => {
-                assert!(reason.contains("group or other access"));
-            }
-            Err(other) => {
-                return Err(io::Error::other(format!("unexpected error: {other}")).into());
-            }
-            Ok(_) => {
-                return Err(io::Error::other("public state directory was accepted").into());
-            }
-        }
+        assert_insecure_state_error(AtomicStateStore::new(layout.clone()))?;
+        assert_insecure_state_error(AtomicStateStore::open_existing_read_only(layout))?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn assert_insecure_state_error<T>(result: Result<T, StateError>) -> io::Result<()> {
+        match result {
+            Err(StateError::InvalidLayout { reason, .. })
+                if reason.contains("group or other access") =>
+            {
+                Ok(())
+            }
+            Err(other) => Err(io::Error::other(format!("unexpected error: {other}"))),
+            Ok(_) => Err(io::Error::other("public state directory was accepted")),
+        }
     }
 
     #[cfg(unix)]
