@@ -385,6 +385,8 @@ pub struct ProjectUnit {
     pub members: Vec<UnitId>,
     pub dependencies: Vec<UnitEdge>,
     pub toolchain: ToolchainInfo,
+    pub provenance: Vec<Provenance>,
+    pub confidence: Confidence,
 }
 
 /// Ordered commands and resolution evidence for one project-owned intent.
@@ -781,6 +783,7 @@ impl ProjectModel {
         canonicalize_provenance(&mut self.repository_provenance);
         canonicalize_provenance(&mut self.unit_inventory_provenance);
         for unit in &mut self.units {
+            canonicalize_provenance(&mut unit.provenance);
             unit.members.sort();
             unit.members.dedup();
             for dependency in &mut unit.dependencies {
@@ -929,6 +932,7 @@ impl ProjectModel {
             )?;
         }
         for unit in &self.units {
+            validate_provenance(&format!("units.{}.provenance", unit.id), &unit.provenance)?;
             validate_provenance(
                 &format!("units.{}.toolchain.provenance", unit.id),
                 &unit.toolchain.provenance,
@@ -1097,6 +1101,12 @@ mod tests {
                 vec![provenance(format!("unit/{id}/toolchain"))],
                 Confidence::High,
             ),
+            provenance: vec![
+                provenance(format!("unit/{id}/z")),
+                provenance(format!("unit/{id}/a")),
+                provenance(format!("unit/{id}/a")),
+            ],
+            confidence: Confidence::High,
         })
     }
 
@@ -1366,6 +1376,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a", "z"]
         );
+        assert_eq!(
+            once.units[0]
+                .provenance
+                .iter()
+                .map(|source| source.rule_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unit/a/a", "unit/a/z"]
+        );
         assert_eq!(once.diagnostics, diagnostics);
         assert_eq!(
             once.commands[&Intent::Verify]
@@ -1581,6 +1599,17 @@ mod tests {
             empty.finalize(),
             Err(ProjectModelError::EmptyProvenance {
                 location: "commands.Setup.provenance".into(),
+            })
+        );
+
+        let mut unit_empty = valid_model();
+        let mut unit_without_evidence = unit("unit", "unit")?;
+        unit_without_evidence.provenance.clear();
+        unit_empty.units = vec![unit_without_evidence];
+        assert_eq!(
+            unit_empty.finalize(),
+            Err(ProjectModelError::EmptyProvenance {
+                location: "units.unit.provenance".into(),
             })
         );
 

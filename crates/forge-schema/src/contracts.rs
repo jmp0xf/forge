@@ -578,6 +578,8 @@ pub struct UnitDependencyDetailData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectUnitDetailData {
     pub id: UnitId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_evidence: Option<DerivationEvidenceData>,
     pub dependency_edges: Vec<UnitDependencyDetailData>,
     pub toolchain_evidence: DerivationEvidenceData,
 }
@@ -889,9 +891,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        CheckStatusData, CommandResolutionData, CommandSourceData, Envelope,
-        NativeStringEncodingData, ProjectModelData, SchemaIndexData, SchemaKind,
-        SuccessPredicateData, VersionData, schema_json,
+        CheckStatusData, CommandResolutionData, CommandSourceData, ConfidenceData, Envelope,
+        NativeStringEncodingData, ProjectModelData, ProjectUnitDetailData, SchemaIndexData,
+        SchemaKind, SuccessPredicateData, VersionData, schema_json,
     };
 
     #[test]
@@ -1060,15 +1062,60 @@ mod tests {
     #[test]
     fn unknown_companion_enums_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
         let resolution: CommandResolutionData = serde_json::from_str("\"future-resolution\"")?;
+        let confidence: ConfidenceData = serde_json::from_str("\"future-confidence\"")?;
         let encoding: NativeStringEncodingData = serde_json::from_str("\"future-encoding\"")?;
         let source: CommandSourceData =
             serde_json::from_str(r#"{"kind":"future-source","detail":"ignored"}"#)?;
         let success: SuccessPredicateData = serde_json::from_str(r#"{"kind":"future-success"}"#)?;
 
         assert_eq!(resolution, CommandResolutionData::Unknown);
+        assert_eq!(confidence, ConfidenceData::Unknown);
         assert_eq!(encoding, NativeStringEncodingData::Unknown);
         assert_eq!(source, CommandSourceData::Unknown);
         assert_eq!(success, SuccessPredicateData::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn previous_unit_detail_without_derivation_evidence_still_deserializes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let detail: ProjectUnitDetailData = serde_json::from_str(
+            r#"{
+                "id": "unit",
+                "dependency_edges": [],
+                "toolchain_evidence": {
+                    "provenance": [{
+                        "rule_id": "unit/toolchain",
+                        "detail": "legacy toolchain evidence"
+                    }],
+                    "confidence": "high"
+                }
+            }"#,
+        )?;
+
+        assert!(detail.derivation_evidence.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn project_unit_derivation_evidence_is_optional_in_the_v1_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::ProjectModel)?)?;
+        let detail = schema
+            .pointer("/$defs/ProjectUnitDetailData")
+            .ok_or_else(|| std::io::Error::other("ProjectUnitDetailData definition is missing"))?;
+        let required = detail["required"].as_array().ok_or_else(|| {
+            std::io::Error::other("ProjectUnitDetailData.required is not an array")
+        })?;
+        let properties = detail["properties"].as_object().ok_or_else(|| {
+            std::io::Error::other("ProjectUnitDetailData.properties is not an object")
+        })?;
+
+        assert!(properties.contains_key("derivation_evidence"));
+        assert!(required.iter().all(|value| value != "derivation_evidence"));
+        for legacy_field in ["id", "dependency_edges", "toolchain_evidence"] {
+            assert!(required.iter().any(|value| value == legacy_field));
+        }
         Ok(())
     }
 

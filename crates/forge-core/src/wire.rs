@@ -271,6 +271,7 @@ fn project_unit(unit: &crate::domain::ProjectUnit) -> ProjectUnitData {
 fn project_unit_detail(unit: &crate::domain::ProjectUnit) -> ProjectUnitDetailData {
     ProjectUnitDetailData {
         id: unit.id.clone(),
+        derivation_evidence: Some(derivation_evidence(&unit.provenance, unit.confidence)),
         dependency_edges: unit
             .dependencies
             .iter()
@@ -670,6 +671,8 @@ mod tests {
                 vec![provenance(format!("unit/{id}/toolchain"))],
                 Confidence::High,
             ),
+            provenance: vec![provenance(format!("unit/{id}/derivation"))],
+            confidence: Confidence::High,
         })
     }
 
@@ -763,6 +766,8 @@ mod tests {
                 vec![provenance("unit/toolchain")],
                 Confidence::High,
             ),
+            provenance: vec![provenance("unit/derivation")],
+            confidence: Confidence::Medium,
         }];
 
         let mut verify = command("verify", Intent::Verify).with_args(["test", "--workspace"]);
@@ -856,6 +861,12 @@ mod tests {
             .as_ref()
             .and_then(|details| details.first())
             .ok_or_else(|| missing("unit_details[0]"))?;
+        let unit_evidence = unit_detail
+            .derivation_evidence
+            .as_ref()
+            .ok_or_else(|| missing("unit_details[0].derivation_evidence"))?;
+        assert_eq!(unit_evidence.confidence, ConfidenceData::Medium);
+        assert_eq!(unit_evidence.provenance[0].rule_id, "unit/derivation");
         assert_eq!(
             unit_detail.dependency_edges[0].provenance[0].rule_id,
             "unit/dependency"

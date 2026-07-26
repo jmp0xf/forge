@@ -847,6 +847,16 @@
             "$ref": "#/$defs/UnitDependencyDetailData"
           }
         },
+        "derivation_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivationEvidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "$ref": "#/$defs/UnitId"
         },
