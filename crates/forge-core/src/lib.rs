@@ -18,6 +18,7 @@ pub mod path;
 pub mod policy;
 pub mod ports;
 pub mod risk;
+pub(crate) mod scope;
 pub mod wire;
 
 pub use domain::{
