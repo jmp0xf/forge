@@ -11,6 +11,7 @@ pub mod clock;
 pub mod fs;
 pub mod git;
 pub mod hash;
+pub mod interrupt;
 pub mod inventory;
 pub mod process;
 pub mod state;

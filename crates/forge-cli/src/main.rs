@@ -9,23 +9,49 @@ use std::ffi::OsStr;
 use std::io::{self, Write as _};
 use std::process::ExitCode as ProcessExitCode;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use args::{Cli, Command, OutputFormat};
 use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
 use forge_core::branding::CLI_NAME;
 use forge_core::{AppError, ExitCode};
+use forge_runtime::interrupt::{InterruptInstallError, InterruptToken};
 use forge_schema::{
-    DiagnosticData, Envelope, SchemaIndexData, SchemaKind, VersionData, schema_json,
-    unknown_schema_diagnostic,
+    Diagnostic, DiagnosticData, Envelope, SchemaIndexData, SchemaKind, Severity, VersionData,
+    schema_json, unknown_schema_diagnostic,
 };
 use serde::Serialize;
 
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Debug)]
+struct ExecutionContext {
+    interrupt: InterruptToken,
+}
+
+impl ExecutionContext {
+    fn install() -> Result<Self, AppError> {
+        InterruptToken::install()
+            .map(|interrupt| Self { interrupt })
+            .map_err(interrupt_installation_error)
+    }
+
+    /// Every process runner composed by the CLI receives a clone of this flag through
+    /// `SynchronousProcessRunner::with_cancellation_flag`.
+    fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        self.interrupt.cancellation_flag()
+    }
+}
+
 fn main() -> ProcessExitCode {
     let json_requested = raw_args_request_json();
+    let context = match ExecutionContext::install() {
+        Ok(context) => context,
+        Err(error) => return emit_error(&error, json_requested),
+    };
     match Cli::try_parse() {
-        Ok(cli) => match execute(cli) {
+        Ok(cli) => match execute(cli, &context) {
             Ok(()) => ProcessExitCode::from(ExitCode::Ok.as_u8()),
             Err(error) => emit_error(&error, json_requested),
         },
@@ -53,7 +79,11 @@ fn main() -> ProcessExitCode {
     }
 }
 
-fn execute(cli: Cli) -> Result<(), AppError> {
+fn execute(cli: Cli, context: &ExecutionContext) -> Result<(), AppError> {
+    let cancellation = context.cancellation_flag();
+    if cancellation.load(Ordering::Acquire) {
+        return Err(interrupted_error());
+    }
     let json = output_is_json(&cli)?;
     match cli.command {
         None => print_help(),
@@ -80,6 +110,30 @@ fn execute(cli: Cli) -> Result<(), AppError> {
         }
         Some(command) => Err(not_implemented_error(&command)),
     }
+}
+
+fn interrupt_installation_error(error: InterruptInstallError) -> AppError {
+    AppError::internal(
+        "FGE0007",
+        "failed to install the process interrupt handler",
+        "process signal handler",
+        error.to_string(),
+        "retry the command; report a repeatable failure as a Forge implementation defect",
+    )
+}
+
+fn interrupted_error() -> AppError {
+    AppError::new(
+        ExitCode::Interrupted,
+        Diagnostic::new(
+            "FGE0008",
+            Severity::Error,
+            "Forge was interrupted",
+            "process signal handler",
+            "the process received Ctrl-C before command execution began",
+            "rerun the command when ready",
+        ),
+    )
 }
 
 fn output_is_json(cli: &Cli) -> Result<bool, AppError> {
