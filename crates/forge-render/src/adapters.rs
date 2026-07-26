@@ -62,7 +62,7 @@ pub(crate) fn render_agents_body(model: &ProjectModel) -> Result<String, Adapter
     Ok(body)
 }
 
-pub(crate) fn render_claude_pointer() -> &'static str {
+pub(crate) const fn render_claude_pointer() -> &'static str {
     "@AGENTS.md"
 }
 

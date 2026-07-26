@@ -9,10 +9,8 @@ use forge_core::domain::{Assumption, CommandResolution, ProjectModel, ProjectMod
 use forge_core::ports::{Hasher, RepositoryFilePort};
 use forge_core::{Digest, RelativePathError, RepoId, RepoRelativePath};
 
-use crate::adapters::{
-    AGENTS_MAX_BYTES, AGENTS_MAX_LINES, AdapterRenderError, render_agents_body,
-    render_claude_pointer,
-};
+use crate::adapter_registry::{adapter_specs, managed_adapter_spec};
+use crate::adapters::{AGENTS_MAX_BYTES, AGENTS_MAX_LINES, AdapterRenderError};
 use crate::inspection::{
     AdapterInspectionError, AdapterInspectionKind, AdapterInspectionRequest,
     AdapterInspectionState, FileEditReason, inspect_adapter_targets,
@@ -127,7 +125,14 @@ pub struct InitAdapterInspection {
     pub model_digest: Digest,
     pub assumptions: Vec<Assumption>,
     pub targets: Vec<InitAdapterTargetInspection>,
-    pub reused_adapters: Vec<AdapterTarget>,
+    pub reused_adapters: Vec<ReusedAdapter>,
+}
+
+/// A requested host that consumes an already planned canonical adapter path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusedAdapter {
+    pub target: AdapterTarget,
+    pub path: RepoRelativePath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,11 +277,10 @@ where
     let inspection = inspect_init_targets(model, filesystem, hasher, options)?;
     let mut edits = Vec::new();
     let mut skipped = Vec::new();
-    let agents_path = target_path("AGENTS.md")?;
     for adapter in &inspection.reused_adapters {
         skipped.push(SkippedChange {
-            path: agents_path.clone(),
-            reason: SkippedReason::ReusesAgents(*adapter),
+            path: adapter.path.clone(),
+            reason: SkippedReason::ReusesAgents(adapter.target),
             satisfied_managed: None,
         });
     }
@@ -353,29 +357,27 @@ where
     }
     let requested = unique_options(options)?;
     let _ = unique_forced_blocks(options)?;
-    let agents_path = target_path("AGENTS.md")?;
-    let claude_path = target_path("CLAUDE.md")?;
-    let mut desired_targets = vec![(
-        agents_path,
-        DesiredManagedBlock {
-            kind: ManagedBlockKind::ProjectIndex,
-            body: render_agents_body(&model).map_err(map_render_error)?,
-        },
-    )];
-    if requested.contains(&AdapterTarget::Claude)
-        || model.adapters.entries.iter().any(|entry| {
-            entry.host == "claude"
-                && matches!(
-                    entry.confidence,
-                    forge_core::domain::Confidence::Medium | forge_core::domain::Confidence::High
-                )
-        })
-    {
+    let mut desired_targets = Vec::new();
+    let mut reused_adapters = Vec::new();
+    for spec in adapter_specs() {
+        let explicitly_requested = requested.contains(&spec.target);
+        if spec.reports_reuse(explicitly_requested) {
+            reused_adapters.push(ReusedAdapter {
+                target: spec.target,
+                path: target_path(spec.path)?,
+            });
+        }
+        if !spec.selected(&model, explicitly_requested) {
+            continue;
+        }
+        let Some(body) = spec.render_body(&model).map_err(map_render_error)? else {
+            continue;
+        };
         desired_targets.push((
-            claude_path,
+            target_path(spec.path)?,
             DesiredManagedBlock {
-                kind: ManagedBlockKind::ClaudePointer,
-                body: render_claude_pointer().to_owned(),
+                kind: spec.block,
+                body,
             },
         ));
     }
@@ -396,8 +398,8 @@ where
             path,
             block_id: desired.kind.id(),
             desired_body: &desired.body,
-            equivalent_unmanaged: (desired.kind == ManagedBlockKind::ClaudePointer)
-                .then_some(render_claude_pointer()),
+            equivalent_unmanaged: managed_adapter_spec(path, desired.kind)
+                .and_then(|spec| spec.equivalent_unmanaged),
         })
         .collect::<Vec<_>>();
     let model_digest = projection_digest(hasher, &model.repository.id, &desired_targets);
@@ -417,10 +419,6 @@ where
             state: observed.state,
         });
     }
-    let reused_adapters = [AdapterTarget::Cursor, AdapterTarget::Codex]
-        .into_iter()
-        .filter(|adapter| requested.contains(adapter))
-        .collect();
     Ok(InitAdapterInspection {
         repository: model.repository.id,
         model_digest,
@@ -601,6 +599,7 @@ mod tests {
     use forge_core::ports::{Hasher, RepositoryFilePort};
     use forge_core::{Digest, RelativePathError, RepoId, RepoRelativePath};
 
+    use crate::adapter_registry::{AdapterSelection, adapter_specs};
     use crate::inspection::{ADAPTER_FILE_MAX_BYTES, AdapterInspectionKind, FileEditReason};
     use crate::managed_block::ManagedBlockError;
 
@@ -1015,6 +1014,27 @@ mod tests {
                 .count(),
             2
         );
+        for spec in adapter_specs() {
+            if spec.owns_managed_projection() {
+                assert!(plan.edits.iter().any(|edit| {
+                    edit.path.as_path() == Path::new(spec.path) && edit.desired.kind == spec.block
+                }));
+            }
+            if let AdapterSelection::ExplicitReuse { source } = spec.selection {
+                assert!(
+                    plan.skipped.iter().any(|skipped| {
+                        skipped.reason == SkippedReason::ReusesAgents(spec.target)
+                    })
+                );
+                let source_spec = adapter_specs()
+                    .iter()
+                    .find(|candidate| candidate.target == source)
+                    .ok_or_else(|| io::Error::other("reuse source is not registered"))?;
+                assert!(source_spec.owns_managed_projection());
+                assert_eq!(spec.path, source_spec.path);
+                assert_eq!(spec.block, source_spec.block);
+            }
+        }
         Ok(())
     }
 

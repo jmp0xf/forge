@@ -10,9 +10,9 @@ use forge_core::{AppError, Digest, ExitCode, RepoRelativePath};
 use forge_detect::model::ModelDetectionCompletion;
 use forge_render::managed_block::ManagedBlockError;
 use forge_render::{
-    ADAPTER_FILE_MAX_BYTES, AdapterInspectionState, AdapterTarget, ChangePlan, FileEditKind,
-    FileEditReason, InitAdapterInspection, InitPlanOptions, ManagedBlockKind, PlanError,
-    inspect_init_targets, plan_init,
+    ADAPTER_FILE_MAX_BYTES, AdapterInspectionState, AdapterSelection, AdapterTarget, ChangePlan,
+    FileEditKind, FileEditReason, InitAdapterInspection, InitPlanOptions, ManagedBlockKind,
+    PlanError, inspect_init_targets, managed_adapter_spec_for_path, plan_init,
 };
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::hash::Blake3Hasher;
@@ -23,7 +23,7 @@ use forge_schema::{
 
 use crate::adapter_manifest::{
     ADAPTER_BEHAVIOR_VERSION, AdapterManifest, AdapterManifestEntry, AdapterManifestError,
-    load_adapter_manifest, managed_adapter_identity,
+    load_adapter_manifest,
 };
 use crate::args::{AdapterChoice, AdaptersArgs, AdaptersCommand, AdaptersSyncArgs, Cli, InitArgs};
 use crate::{explain, init};
@@ -230,16 +230,20 @@ fn plan_options(
     manifest: Option<&AdapterManifest>,
     force_values: &[String],
 ) -> Result<InitPlanOptions, AppError> {
-    let adapters = manifest
-        .is_some_and(|manifest| {
-            manifest
-                .adapters()
-                .iter()
-                .any(|entry| entry.block_id().as_str() == ManagedBlockKind::ClaudePointer.id())
-        })
-        .then_some(AdapterTarget::Claude)
-        .into_iter()
-        .collect();
+    let mut adapters = BTreeSet::new();
+    if let Some(manifest) = manifest {
+        for entry in manifest.adapters() {
+            let path = manifest_entry_path(entry)?;
+            let Some(spec) = managed_adapter_spec_for_path(&path) else {
+                continue;
+            };
+            if entry.block_id().as_str() == spec.block.id()
+                && matches!(spec.selection, AdapterSelection::ExplicitOrDetected)
+            {
+                adapters.insert(spec.target);
+            }
+        }
+    }
     let mut force_blocks = Vec::with_capacity(force_values.len());
     let mut unique = BTreeSet::new();
     for value in force_values {
@@ -268,7 +272,7 @@ fn plan_options(
         force_blocks.push(block);
     }
     Ok(InitPlanOptions {
-        adapters,
+        adapters: adapters.into_iter().collect(),
         force_blocks,
     })
 }
@@ -300,12 +304,12 @@ fn classify_inspection(
     let mut statuses = Vec::new();
 
     for target in &inspection.targets {
-        let (host, kind) = managed_adapter_identity(&target.path)
+        let spec = managed_adapter_spec_for_path(&target.path)
             .ok_or_else(|| unknown_adapter_error(&target.path))?;
-        if kind != target.desired.kind {
+        if spec.block != target.desired.kind {
             return Err(unknown_adapter_error(&target.path));
         }
-        let block_id = ManagedBlockId::new(kind.id());
+        let block_id = ManagedBlockId::new(spec.block.id());
         let entry = manifest_entry(manifest, &target.path, &block_id)?;
         visited.insert((target.path.clone(), block_id.clone()));
         let (drift, detail) = if behavior_stale {
@@ -376,7 +380,7 @@ fn classify_inspection(
                 },
             }
         };
-        statuses.push(status(host, &target.path, block_id, drift, detail));
+        statuses.push(status(spec.host, &target.path, block_id, drift, detail));
     }
 
     if let Some(manifest) = manifest {
@@ -587,9 +591,9 @@ fn certified_statuses(
         let Some(satisfied) = &skipped.satisfied_managed else {
             continue;
         };
-        let (host, registered_kind) = managed_adapter_identity(&skipped.path)
+        let spec = managed_adapter_spec_for_path(&skipped.path)
             .ok_or_else(|| unknown_adapter_error(&skipped.path))?;
-        if registered_kind != satisfied.kind {
+        if spec.block != satisfied.kind {
             return Err(unknown_adapter_error(&skipped.path));
         }
         let block_id = ManagedBlockId::new(satisfied.kind.id());
@@ -603,7 +607,7 @@ fn certified_statuses(
             ));
         }
         statuses.push(status(
-            host,
+            spec.host,
             &skipped.path,
             block_id,
             AdapterDriftData::NoDrift,
@@ -799,5 +803,102 @@ const fn edit_reason_name(reason: FileEditReason) -> &'static str {
         FileEditReason::MissingManagedBlock => "missing-managed-block",
         FileEditReason::AssetChanged => "asset-changed",
         FileEditReason::UserEdited => "user-edited",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::path::Path;
+
+    use forge_core::{Digest, RepoId, RepoRelativePath};
+    use forge_render::{
+        AdapterInspectionState, AdapterSelection, DesiredManagedBlock, InitAdapterTargetInspection,
+        adapter_specs,
+    };
+    use forge_schema::{AdapterDriftData, ManagedBlockId};
+
+    use super::{
+        ADAPTER_BEHAVIOR_VERSION, AdapterManifest, AdapterManifestEntry, InitAdapterInspection,
+        NativeFileSystem, classify_inspection,
+    };
+
+    #[test]
+    fn drift_classifier_consumes_owned_registry_identities_without_host_matches()
+    -> Result<(), Box<dyn Error>> {
+        let repository = RepoId::new(format!("local:{}", digest('a').as_str()));
+        let source_digest = digest('b');
+        let postimage_digest = digest('c');
+        let mut targets = Vec::new();
+        let mut entries = Vec::new();
+        for spec in adapter_specs()
+            .iter()
+            .filter(|spec| spec.owns_managed_projection())
+        {
+            let path = RepoRelativePath::new(spec.path)?;
+            targets.push(InitAdapterTargetInspection {
+                path: path.clone(),
+                desired: DesiredManagedBlock {
+                    kind: spec.block,
+                    body: String::from("fixture"),
+                },
+                state: AdapterInspectionState::Satisfied {
+                    full_postimage_digest: postimage_digest.clone(),
+                },
+            });
+            entries.push(AdapterManifestEntry::new(
+                spec.host,
+                &path,
+                ManagedBlockId::new(spec.block.id()),
+                postimage_digest.clone(),
+            )?);
+        }
+        let inspection = InitAdapterInspection {
+            repository: repository.clone(),
+            model_digest: source_digest.clone(),
+            assumptions: Vec::new(),
+            targets,
+            reused_adapters: Vec::new(),
+        };
+        let manifest =
+            AdapterManifest::new(repository, source_digest, ADAPTER_BEHAVIOR_VERSION, entries)?;
+
+        let statuses = classify_inspection(
+            &inspection,
+            Some(&manifest),
+            Path::new("/unused"),
+            &NativeFileSystem,
+        )?;
+        let owned_count = adapter_specs()
+            .iter()
+            .filter(|spec| spec.owns_managed_projection())
+            .count();
+        assert_eq!(statuses.len(), owned_count);
+        for spec in adapter_specs() {
+            if spec.owns_managed_projection() {
+                assert!(statuses.iter().any(|status| {
+                    status.host == spec.host
+                        && status.path.display == spec.path
+                        && status.block_id.as_str() == spec.block.id()
+                        && status.drift == AdapterDriftData::NoDrift
+                }));
+            }
+            if let AdapterSelection::ExplicitReuse { source } = spec.selection {
+                let source_spec = adapter_specs()
+                    .iter()
+                    .find(|candidate| candidate.target == source)
+                    .ok_or("reuse source is not registered")?;
+                assert!(statuses.iter().any(|status| {
+                    status.host == source_spec.host
+                        && status.path.display == source_spec.path
+                        && status.block_id.as_str() == source_spec.block.id()
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn digest(seed: char) -> Digest {
+        Digest::new(format!("blake3:{}", seed.to_string().repeat(64)))
     }
 }

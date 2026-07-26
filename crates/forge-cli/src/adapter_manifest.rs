@@ -9,7 +9,8 @@ use std::path::Path;
 use forge_core::RepoRelativePath;
 use forge_core::ports::{Hasher, RepositoryFilePort, StateStore};
 use forge_render::{
-    ADAPTER_FILE_MAX_BYTES, ChangePlan, ManagedBlockKind, SkippedReason, repository_file_digest,
+    ADAPTER_FILE_MAX_BYTES, ChangePlan, SkippedReason, managed_adapter_spec_for_path,
+    repository_file_digest,
 };
 use forge_schema::{Digest, ManagedBlockId, PathEncoding, RepoId, WirePath};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -212,9 +213,9 @@ where
         let satisfied = skipped.satisfied_managed.as_ref().ok_or_else(|| {
             GeneratedManifestError::MissingSatisfiedIdentity(skipped.path.clone())
         })?;
-        let (host, registered_kind) = managed_adapter_identity(&skipped.path)
+        let spec = managed_adapter_spec_for_path(&skipped.path)
             .ok_or_else(|| GeneratedManifestError::UnknownIdentity(skipped.path.clone()))?;
-        if registered_kind != satisfied.kind {
+        if spec.block != satisfied.kind {
             return Err(GeneratedManifestError::IdentityMismatch(
                 skipped.path.clone(),
             ));
@@ -233,7 +234,7 @@ where
         }
         entries.push(
             AdapterManifestEntry::new(
-                host,
+                spec.host,
                 &skipped.path,
                 ManagedBlockId::new(satisfied.kind.id()),
                 satisfied.full_postimage_digest.clone(),
@@ -252,17 +253,6 @@ where
         entries,
     )
     .map_err(GeneratedManifestError::Manifest)
-}
-
-#[must_use]
-pub(crate) fn managed_adapter_identity(
-    path: &RepoRelativePath,
-) -> Option<(&'static str, ManagedBlockKind)> {
-    match path.as_path().to_str()? {
-        "AGENTS.md" => Some(("codex", ManagedBlockKind::ProjectIndex)),
-        "CLAUDE.md" => Some(("claude", ManagedBlockKind::ClaudePointer)),
-        _ => None,
-    }
 }
 
 /// A failure to derive state from the generated files observed by the post-check.
@@ -662,18 +652,72 @@ impl Error for AdapterManifestError {}
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::error::Error;
     use std::io;
+    use std::path::Path;
 
     use forge_core::RepoRelativePath;
-    use forge_core::ports::StateStore;
+    use forge_core::ports::{Hasher, RepositoryFilePort, StateStore};
+    use forge_render::{
+        ChangePlan, RollbackPlan, SatisfiedManagedBlock, SkippedChange, SkippedReason,
+        adapter_specs,
+    };
     use forge_schema::{Digest, ManagedBlockId, RepoId};
     use serde_json::{Value, json};
 
     use super::{
         ADAPTER_MANIFEST_STATE_KEY, AdapterManifest, AdapterManifestEntry, AdapterManifestError,
-        MAX_MANIFEST_BYTES, load_adapter_manifest, store_adapter_manifest,
+        MAX_MANIFEST_BYTES, load_adapter_manifest, manifest_from_converged_plan,
+        store_adapter_manifest,
     };
+
+    #[derive(Debug)]
+    struct FixedHasher(Digest);
+
+    impl Hasher for FixedHasher {
+        fn digest(&self, _chunks: &[&[u8]]) -> Digest {
+            self.0.clone()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ManifestFiles(BTreeMap<std::path::PathBuf, Vec<u8>>);
+
+    impl RepositoryFilePort for ManifestFiles {
+        fn read_confined(
+            &self,
+            _repository_root: &Path,
+            _path: &RepoRelativePath,
+        ) -> io::Result<Option<Vec<u8>>> {
+            Err(io::Error::other("manifest fixture forbids unbounded reads"))
+        }
+
+        fn read_confined_bounded(
+            &self,
+            _repository_root: &Path,
+            path: &RepoRelativePath,
+            max_bytes: usize,
+        ) -> io::Result<Option<Vec<u8>>> {
+            match self.0.get(path.as_path()) {
+                Some(bytes) if bytes.len() > max_bytes => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest fixture exceeds read limit",
+                )),
+                Some(bytes) => Ok(Some(bytes.clone())),
+                None => Ok(None),
+            }
+        }
+
+        fn write_atomic_confined(
+            &self,
+            _repository_root: &Path,
+            _path: &RepoRelativePath,
+            _bytes: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::other("manifest fixture must not write"))
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MemoryStateStore {
@@ -793,6 +837,57 @@ mod tests {
         assert_eq!(loaded, manifest);
         assert_eq!(loaded.adapters()[0].path().display, "A.md");
         assert!(!String::from_utf8_lossy(&second).contains("/Users/"));
+        Ok(())
+    }
+
+    #[test]
+    fn converged_manifest_consumes_every_owned_registry_identity() -> Result<(), Box<dyn Error>> {
+        let postimage_digest = digest('c');
+        let mut files = BTreeMap::new();
+        let mut skipped = Vec::new();
+        for spec in adapter_specs()
+            .iter()
+            .filter(|spec| spec.owns_managed_projection())
+        {
+            let path = RepoRelativePath::new(spec.path)?;
+            files.insert(path.as_path().to_path_buf(), vec![b'x']);
+            skipped.push(SkippedChange {
+                path,
+                reason: SkippedReason::AlreadySatisfied,
+                satisfied_managed: Some(SatisfiedManagedBlock {
+                    kind: spec.block,
+                    full_postimage_digest: postimage_digest.clone(),
+                }),
+            });
+        }
+        let plan = ChangePlan {
+            schema: 1,
+            repository: repository('a'),
+            model_digest: digest('b'),
+            edits: Vec::new(),
+            assumptions: Vec::new(),
+            skipped,
+            rollback: RollbackPlan::default(),
+        };
+
+        let manifest = manifest_from_converged_plan(
+            &plan,
+            Path::new("/repo"),
+            &ManifestFiles(files),
+            &FixedHasher(postimage_digest),
+        )?;
+        let owned = adapter_specs()
+            .iter()
+            .filter(|spec| spec.owns_managed_projection())
+            .collect::<Vec<_>>();
+        assert_eq!(manifest.adapters().len(), owned.len());
+        for spec in owned {
+            assert!(manifest.adapters().iter().any(|entry| {
+                entry.host() == spec.host
+                    && entry.path().display == spec.path
+                    && entry.block_id().as_str() == spec.block.id()
+            }));
+        }
         Ok(())
     }
 
