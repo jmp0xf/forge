@@ -47,7 +47,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DURATION")]
     pub timeout: Option<String>,
 
-    /// Read configuration from an explicit path.
+    /// Read configuration from an explicit repository-relative path.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 

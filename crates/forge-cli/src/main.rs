@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod args;
+mod explain;
 
 use std::env;
 use std::ffi::OsStr;
@@ -85,7 +86,7 @@ fn execute(cli: Cli, context: &ExecutionContext) -> Result<(), AppError> {
         return Err(interrupted_error());
     }
     let json = output_is_json(&cli)?;
-    match cli.command {
+    match cli.command.as_ref() {
         None => print_help(),
         Some(Command::Version) => emit_version(json),
         Some(Command::Schema(schema)) => emit_schema(schema.kind.as_deref(), json),
@@ -108,7 +109,20 @@ fn execute(cli: Cli, context: &ExecutionContext) -> Result<(), AppError> {
             );
             Ok(())
         }
-        Some(command) => Err(not_implemented_error(&command)),
+        Some(Command::Explain) => emit_explain(&cli, context, json),
+        Some(command) => Err(not_implemented_error(command)),
+    }
+}
+
+fn emit_explain(cli: &Cli, context: &ExecutionContext, json: bool) -> Result<(), AppError> {
+    let model = explain::detect(cli, context.cancellation_flag())?;
+    if json {
+        let diagnostics = model.diagnostics.clone();
+        let mut envelope = Envelope::success(SchemaKind::ProjectModel, TOOL_VERSION, model);
+        envelope.diagnostics = diagnostics;
+        emit_json(&envelope)
+    } else {
+        write_stdout(format_args!("{}", explain::render_human(&model)))
     }
 }
 
@@ -160,6 +174,7 @@ fn emit_version(json: bool) -> Result<(), AppError> {
                 String::from("version"),
                 String::from("schema"),
                 String::from("completions"),
+                String::from("explain"),
             ],
         };
         emit_json(&Envelope::success(SchemaKind::Version, TOOL_VERSION, data))
