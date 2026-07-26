@@ -29,6 +29,17 @@ impl Hasher for Blake3Hasher {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::OsString;
+    use std::time::Duration;
+
+    use forge_core::domain::{
+        CommandEnforcement, CommandSource, CommandSpec, Confidence, CoverageDimension, Intent,
+        Mutability, NetworkIntent, Provenance, SuccessPredicate,
+    };
+    use forge_core::evidence::DependencyValue;
+    use forge_core::fingerprint::command_dependency_digest;
+    use forge_core::path::RepoRelativePath;
     use forge_core::ports::Hasher as _;
 
     use super::Blake3Hasher;
@@ -61,5 +72,52 @@ mod tests {
             digest.as_str(),
             "blake3:31595b9c96bff2671c0be809b6728fc16028a717f5fb81e4bd48617906b9f62c"
         );
+    }
+
+    #[test]
+    fn command_dependency_has_a_fixed_production_digest_vector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = CommandSpec::new(
+            "rust.check",
+            Intent::Check,
+            "cargo",
+            RepoRelativePath::new("crates/core")?,
+            CommandSource::LanguageDefault {
+                provider: String::from("rust"),
+                rule: String::from("cargo-check"),
+            },
+        )
+        .with_args(["check", "--workspace"]);
+        command.env = BTreeMap::from([
+            (OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")),
+            (OsString::from("RUSTUP_AUTO_INSTALL"), OsString::from("0")),
+        ]);
+        command.timeout = Duration::from_millis(12_345);
+        command.mutability = Mutability::ReadOnly;
+        command.network = NetworkIntent::OfflineRequested;
+        command.enforcement = CommandEnforcement::Required;
+        command.success = SuccessPredicate::All(vec![
+            SuccessPredicate::ExitZero,
+            SuccessPredicate::JsonHasNoErrors,
+        ]);
+        command.confidence = Confidence::High;
+        command.coverage = BTreeSet::from([CoverageDimension::Compile, CoverageDimension::Lint]);
+        let provenance = [Provenance {
+            rule_id: String::from("command/base"),
+            source_path: None,
+            source_range: None,
+            detail: String::from("source for command/base"),
+        }];
+
+        let DependencyValue::Known(digest) =
+            command_dependency_digest(&Blake3Hasher, &command, &provenance)?
+        else {
+            return Err("authoritative command fixture unexpectedly became unknown".into());
+        };
+        assert_eq!(
+            digest.as_str(),
+            "blake3:b6843661067f3213110e31343d11b80ce41b1e0367e85e9a8bd448f5dceb3392"
+        );
+        Ok(())
     }
 }

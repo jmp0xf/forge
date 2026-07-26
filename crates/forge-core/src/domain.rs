@@ -979,7 +979,10 @@ impl ProjectModel {
     }
 }
 
-fn validate_provenance(location: &str, provenance: &[Provenance]) -> Result<(), ProjectModelError> {
+pub(crate) fn validate_provenance(
+    location: &str,
+    provenance: &[Provenance],
+) -> Result<(), ProjectModelError> {
     if provenance.is_empty() {
         return Err(ProjectModelError::EmptyProvenance {
             location: location.to_owned(),
