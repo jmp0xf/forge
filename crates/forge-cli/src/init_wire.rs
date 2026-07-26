@@ -176,8 +176,8 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use forge_core::{Assumption, Confidence, Digest, Provenance, RepoId, RepoRelativePath};
     use forge_render::{
-        AdapterTarget, ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, ManagedBlockKind,
-        RollbackPlan, SkippedChange, SkippedReason,
+        AdapterTarget, ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, FileEditReason,
+        ManagedBlockKind, RollbackPlan, SkippedChange, SkippedReason,
     };
     use forge_schema::{ConfidenceData, FileEditData, PathEncoding};
 
@@ -205,10 +205,12 @@ mod tests {
                 SkippedChange {
                     path: claude_path.clone(),
                     reason: SkippedReason::EquivalentUnmanaged,
+                    satisfied_managed: None,
                 },
                 SkippedChange {
                     path: agents_path.clone(),
                     reason: SkippedReason::ReusesAgents(AdapterTarget::Cursor),
+                    satisfied_managed: None,
                 },
             ],
             rollback: RollbackPlan {
@@ -317,6 +319,7 @@ mod tests {
     fn create_edit(path: RepoRelativePath, content: Vec<u8>) -> FileEdit {
         FileEdit {
             kind: FileEditKind::Create,
+            reason: FileEditReason::MissingFile,
             path,
             desired: DesiredManagedBlock {
                 kind: ManagedBlockKind::ProjectIndex,
@@ -332,6 +335,7 @@ mod tests {
     fn replacement_edit(path: RepoRelativePath, content: Vec<u8>) -> FileEdit {
         FileEdit {
             kind: FileEditKind::ReplaceManagedBlock,
+            reason: FileEditReason::AssetChanged,
             path,
             desired: DesiredManagedBlock {
                 kind: ManagedBlockKind::ClaudePointer,

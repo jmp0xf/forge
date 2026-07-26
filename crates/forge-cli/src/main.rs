@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod adapter_manifest;
+mod adapters;
 mod args;
 mod explain;
 mod init;
@@ -15,7 +17,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use args::{Cli, Command, InitArgs, OutputFormat};
+use args::{AdaptersArgs, Cli, Command, InitArgs, OutputFormat};
 use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
 use forge_core::branding::CLI_NAME;
 use forge_core::{AppError, ExitCode};
@@ -122,9 +124,29 @@ fn execute(cli: Cli, context: &ExecutionContext) -> Result<ExitCode, AppError> {
             Ok(ExitCode::Ok)
         }
         Some(Command::Init(args)) => emit_init(&cli, args, context, json),
+        Some(Command::Adapters(args)) => emit_adapters(&cli, args, context, json),
         Some(Command::Explain) => emit_explain(&cli, context, json),
         Some(command) => Err(not_implemented_error(command)),
     }
+}
+
+fn emit_adapters(
+    cli: &Cli,
+    args: &AdaptersArgs,
+    context: &ExecutionContext,
+    json: bool,
+) -> Result<ExitCode, AppError> {
+    let outcome = adapters::execute(cli, args, context.cancellation_flag())?;
+    if json {
+        emit_json(&Envelope::success(
+            SchemaKind::Adapters,
+            TOOL_VERSION,
+            outcome.wire.clone(),
+        ))?;
+    } else {
+        write_stdout(format_args!("{}", adapters::render_human(&outcome)))?;
+    }
+    Ok(outcome.exit_code)
 }
 
 fn emit_init(
@@ -223,6 +245,7 @@ fn emit_version(json: bool) -> Result<(), AppError> {
                 String::from("completions"),
                 String::from("init"),
                 String::from("explain"),
+                String::from("adapters"),
             ],
         };
         emit_json(&Envelope::success(SchemaKind::Version, TOOL_VERSION, data))
@@ -275,7 +298,7 @@ fn not_implemented_error(command: &Command) -> AppError {
         Command::Doctor => "doctor",
         Command::Next => "next",
         Command::Evidence(_) => "evidence",
-        Command::Adapters(_) => "adapters",
+        Command::Adapters(_) => "implemented-command",
         Command::Schema(_) | Command::Version | Command::Completions(_) => "implemented-command",
     };
     AppError::environment_unmet(

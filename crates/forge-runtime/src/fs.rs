@@ -1,7 +1,7 @@
 //! Native filesystem primitives and repository-confined writes.
 
 use std::fs::{self, File};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use forge_core::ports::{FileSystemPort, RepositoryFilePort};
@@ -116,6 +116,23 @@ impl RepositoryFilePort for NativeFileSystem {
         let writer =
             RepositoryWriter::new(repository_root).map_err(FileSystemError::into_io_error)?;
         match writer.read(path.as_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(FileSystemError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into_io_error()),
+        }
+    }
+
+    fn read_confined_bounded(
+        &self,
+        repository_root: &Path,
+        path: &RepoRelativePath,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let writer =
+            RepositoryWriter::new(repository_root).map_err(FileSystemError::into_io_error)?;
+        match writer.read_bounded(path.as_path(), max_bytes) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(FileSystemError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 Ok(None)
@@ -260,6 +277,17 @@ impl RepositoryWriter {
         self.filesystem
             .read(&target)
             .map_err(|source| FileSystemError::io("read repository file", &target, source))
+    }
+
+    /// Reads a confined regular file while retaining at most `max_bytes`.
+    pub fn read_bounded(
+        &self,
+        relative_path: impl AsRef<Path>,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let target = self.checked_target(relative_path.as_ref())?;
+        read_file_bounded(&target, max_bytes)
+            .map_err(|source| FileSystemError::io("read bounded repository file", &target, source))
     }
 
     pub fn exists(&self, relative_path: impl AsRef<Path>) -> Result<bool, FileSystemError> {
@@ -463,6 +491,28 @@ impl RepositoryWriter {
         }
         Ok(())
     }
+}
+
+fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds its bounded regular-file contract",
+        ));
+    }
+    let capacity = usize::try_from(metadata.len()).map_or(max_bytes, |bytes| bytes.min(max_bytes));
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file grew beyond its read limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// A failure to confine a filesystem operation to its intended root.
@@ -678,6 +728,26 @@ mod tests {
             RepositoryFilePort::read_confined(&filesystem, repository.path(), &path)?,
             Some(b"project guidance".to_vec())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_file_port_enforces_the_bounded_read_contract() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let filesystem = NativeFileSystem;
+        let path = RepoRelativePath::new("AGENTS.md")?;
+        fs::write(repository.path().join("AGENTS.md"), b"12345")?;
+
+        assert_eq!(
+            RepositoryFilePort::read_confined_bounded(&filesystem, repository.path(), &path, 5,)?,
+            Some(b"12345".to_vec())
+        );
+        let oversized =
+            RepositoryFilePort::read_confined_bounded(&filesystem, repository.path(), &path, 4);
+        assert!(matches!(
+            oversized,
+            Err(ref error) if error.kind() == io::ErrorKind::InvalidData
+        ));
         Ok(())
     }
 

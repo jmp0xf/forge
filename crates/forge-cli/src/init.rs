@@ -17,8 +17,13 @@ use forge_render::{
 };
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::hash::Blake3Hasher;
+use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError};
 use forge_schema::{Diagnostic, InitPlanData, Severity};
 
+use crate::adapter_manifest::{
+    AdapterManifest, AdapterManifestError, GeneratedManifestError, load_adapter_manifest,
+    manifest_from_converged_plan, store_adapter_manifest,
+};
 use crate::args::{AdapterChoice, CiChoice, Cli, InitArgs, RunnerChoice};
 use crate::explain;
 use crate::init_wire::{InitPlanWireError, project_init_plan_to_wire};
@@ -32,6 +37,14 @@ pub(crate) struct InitOutcome {
     pub(crate) apply_report: Option<ApplyReport>,
     pub(crate) completion: ModelDetectionCompletion,
     pub(crate) postcheck_completion: Option<ModelDetectionCompletion>,
+    pub(crate) postcheck_plan: Option<ChangePlan>,
+    pub(crate) manifest: Option<AdapterManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdapterManifestPrecondition {
+    Unchecked,
+    Expected(Option<AdapterManifest>),
 }
 
 /// An init failure coupled to any writes that completed before the failure was observed.
@@ -105,6 +118,20 @@ pub(crate) fn execute(
     args: &InitArgs,
     cancellation: Arc<AtomicBool>,
 ) -> Result<InitOutcome, InitFailure> {
+    execute_with_manifest_precondition(
+        cli,
+        args,
+        cancellation,
+        AdapterManifestPrecondition::Unchecked,
+    )
+}
+
+pub(crate) fn execute_with_manifest_precondition(
+    cli: &Cli,
+    args: &InitArgs,
+    cancellation: Arc<AtomicBool>,
+    manifest_precondition: AdapterManifestPrecondition,
+) -> Result<InitOutcome, InitFailure> {
     validate_request(args)?;
     let options = init_plan_options(args)?;
     let detected = explain::detect(cli, Arc::clone(&cancellation))?;
@@ -130,6 +157,8 @@ pub(crate) fn execute(
             apply_report: None,
             completion: detected.completion,
             postcheck_completion: None,
+            postcheck_plan: None,
+            manifest: None,
         });
     }
 
@@ -170,6 +199,34 @@ pub(crate) fn execute(
         )));
     }
 
+    let state_store = AtomicStateStore::new(GitStateLayout::new(
+        &preapply.model.repository.git_dir,
+        &preapply.model.repository.git_common_dir,
+    ))
+    .map_err(|error| InitFailure::plain(map_state_error(error, "init apply state")))?;
+    let _state_lock = state_store
+        .try_lock()
+        .map_err(|error| InitFailure::plain(map_state_error(error, "init apply lock")))?;
+    if let AdapterManifestPrecondition::Expected(expected) = &manifest_precondition {
+        let current = load_adapter_manifest(&state_store, &preapply.model.repository.id).map_err(
+            |error| {
+                InitFailure::plain(map_manifest_read_error(error, "init manifest precondition"))
+            },
+        )?;
+        if &current != expected {
+            return Err(InitFailure::plain(AppError::new(
+                ExitCode::Temporary,
+                Diagnostic::new(
+                    "FGE2224",
+                    Severity::Error,
+                    "adapter manifest changed before synchronization",
+                    "init manifest precondition",
+                    "the locked private manifest no longer matches the state used to select adapter targets",
+                    "rerun adapters sync, review the fresh preview, then request --apply again",
+                ),
+            )));
+        }
+    }
     let report = apply_change_plan(&repository_root, &plan, &filesystem, &hasher)
         .map_err(map_apply_error)?;
     let postcheck = explain::detect(cli, cancellation)
@@ -177,14 +234,16 @@ pub(crate) fn execute(
     ensure_postcheck_completed(postcheck.completion, &report)?;
     if postcheck.model.repository.id != plan.repository
         || postcheck.model.repository.root != repository_root
+        || postcheck.model.repository.git_dir != preapply.model.repository.git_dir
+        || postcheck.model.repository.git_common_dir != preapply.model.repository.git_common_dir
     {
         return Err(InitFailure::after_apply(
             AppError::internal(
                 "FGE0210",
-                "post-apply detection resolved a different repository",
+                "post-apply detection resolved a different repository state layout",
                 "init post-check",
                 format!(
-                    "the reviewed repository was `{}` at `{}`, but the post-check resolved `{}` at `{}`",
+                    "the reviewed repository was `{}` at `{}`, but its post-check identity, root, or Git state layout no longer matched `{}` at `{}`",
                     plan.repository.as_str(),
                     display_repository_path(&repository_root),
                     postcheck.model.repository.id.as_str(),
@@ -217,6 +276,19 @@ pub(crate) fn execute(
             report,
         ));
     }
+    let manifest = manifest_from_converged_plan(&post_plan, &repository_root, &filesystem, &hasher)
+        .map_err(|error| {
+            InitFailure::after_apply(
+                map_generated_manifest_error(error, "init adapter manifest"),
+                report.clone(),
+            )
+        })?;
+    store_adapter_manifest(&state_store, &post_plan.repository, &manifest).map_err(|error| {
+        InitFailure::after_apply(
+            map_manifest_error(error, "init adapter manifest"),
+            report.clone(),
+        )
+    })?;
 
     Ok(InitOutcome {
         plan,
@@ -225,7 +297,82 @@ pub(crate) fn execute(
         apply_report: Some(report),
         completion: detected.completion,
         postcheck_completion: Some(postcheck.completion),
+        postcheck_plan: Some(post_plan),
+        manifest: Some(manifest),
     })
+}
+
+fn map_state_error(error: StateError, location: &str) -> AppError {
+    AppError::environment_unmet(
+        "FGE2217",
+        "Forge private state is unavailable for adapter persistence",
+        location,
+        sanitize_text(&error.to_string()),
+        "fix the Git private-state path, permissions, or competing Forge process, then rerun init --apply",
+    )
+}
+
+fn map_generated_manifest_error(error: GeneratedManifestError, location: &str) -> AppError {
+    let detail = sanitize_text(&error.to_string());
+    if error.io_kind().is_some() {
+        AppError::environment_unmet(
+            "FGE2219",
+            "generated adapter state could not be derived",
+            location,
+            detail,
+            "fix the generated target path or permissions, then rerun init --apply",
+        )
+    } else {
+        AppError::internal(
+            "FGE0219",
+            "generated adapter state violated its post-check contract",
+            location,
+            detail,
+            "report this as a Forge implementation defect",
+        )
+    }
+}
+
+fn map_manifest_error(error: AdapterManifestError, location: &str) -> AppError {
+    let detail = sanitize_text(&error.to_string());
+    if error.io_kind().is_some() {
+        AppError::environment_unmet(
+            "FGE2218",
+            "the adapter manifest could not be persisted",
+            location,
+            detail,
+            "fix the Git private-state path or permissions, then rerun init --apply",
+        )
+    } else {
+        AppError::internal(
+            "FGE0218",
+            "the generated adapter manifest violated its state contract",
+            location,
+            detail,
+            "report this as a Forge implementation defect",
+        )
+    }
+}
+
+fn map_manifest_read_error(error: AdapterManifestError, location: &str) -> AppError {
+    let detail = sanitize_text(&error.to_string());
+    if error.io_kind().is_some() {
+        AppError::environment_unmet(
+            "FGE2225",
+            "the adapter manifest precondition could not be read",
+            location,
+            detail,
+            "fix the Git private-state path or permissions, then rerun adapters sync",
+        )
+    } else {
+        AppError::data(
+            "FGE1212",
+            "the adapter manifest precondition is invalid",
+            location,
+            detail,
+            "upgrade Forge or delete this rebuildable private state, then rerun forge init --apply",
+        )
+    }
 }
 
 fn validate_request(args: &InitArgs) -> Result<(), InitFailure> {
@@ -445,7 +592,7 @@ fn map_plan_error(error: PlanError) -> InitFailure {
     InitFailure::plain(map_plan_error_app(error, "init plan"))
 }
 
-fn map_plan_error_app(error: PlanError, location: &str) -> AppError {
+pub(crate) fn map_plan_error_app(error: PlanError, location: &str) -> AppError {
     let detail = error.to_string();
     match error {
         PlanError::NoProjectFacts => AppError::environment_unmet(
@@ -486,10 +633,30 @@ fn map_plan_error_app(error: PlanError, location: &str) -> AppError {
                 next,
             )
         }
+        PlanError::AdapterFileLimit {
+            path,
+            stage,
+            observed_bytes,
+            max_bytes,
+        } => AppError::environment_unmet(
+            "FGE2226",
+            "an adapter target is too large for bounded planning",
+            display_repository_path(path.as_path()),
+            observed_bytes.map_or_else(
+                || format!(
+                    "the {stage:?} complete file exceeds the {max_bytes}-byte review limit"
+                ),
+                |bytes| format!(
+                    "the {stage:?} complete file is {bytes} bytes, above the {max_bytes}-byte review limit"
+                ),
+            ),
+            "reduce or split the user-owned file before asking Forge to append a managed block",
+        ),
         PlanError::InvalidTarget(_)
         | PlanError::DuplicateTarget(_)
         | PlanError::InvalidModel(_)
-        | PlanError::GeneratedBlockLimit { .. } => AppError::internal(
+        | PlanError::GeneratedBlockLimit { .. }
+        | PlanError::InspectionInvariant { .. } => AppError::internal(
             "FGE0212",
             "init planning violated a rendering invariant",
             location,
@@ -563,6 +730,7 @@ fn map_apply_error(error: ApplyError) -> InitFailure {
             "review a fresh dry-run and resolve the managed block conflict; force only the named block when replacement is intentional",
         ),
         ApplyErrorKind::ReadPreimage
+        | ApplyErrorKind::ExistingFileTooLarge
         | ApplyErrorKind::ReadBeforeWrite
         | ApplyErrorKind::Write
         | ApplyErrorKind::ReadAfterWrite
@@ -577,6 +745,7 @@ fn map_apply_error(error: ApplyError) -> InitFailure {
         ApplyErrorKind::UnsupportedPlanSchema
         | ApplyErrorKind::DuplicateTarget
         | ApplyErrorKind::InvalidEdit
+        | ApplyErrorKind::PostimageTooLarge
         | ApplyErrorKind::UnexpectedMergeAction
         | ApplyErrorKind::PostimageDigestMismatch => AppError::internal(
             "FGE0214",
@@ -737,11 +906,11 @@ fn render_postimage(output: &mut String, bytes: &[u8]) {
     }
 }
 
-fn display_repository_path(path: &Path) -> String {
+pub(crate) fn display_repository_path(path: &Path) -> String {
     sanitize_text(&path.as_os_str().to_string_lossy())
 }
 
-fn sanitize_text(value: &str) -> String {
+pub(crate) fn sanitize_text(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for character in value.chars() {
         if character.is_control() {

@@ -13,8 +13,11 @@ use crate::adapters::{
     AGENTS_MAX_BYTES, AGENTS_MAX_LINES, AdapterRenderError, render_agents_body,
     render_claude_pointer,
 };
-use crate::digest::repository_file_digest;
-use crate::managed_block::{ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block};
+use crate::inspection::{
+    AdapterInspectionError, AdapterInspectionKind, AdapterInspectionRequest,
+    AdapterInspectionState, FileEditReason, inspect_adapter_targets,
+};
+use crate::managed_block::{ManagedBlock, ManagedBlockError};
 
 const PLAN_SCHEMA: u16 = 1;
 const MODEL_PROJECTION_DOMAIN: &[u8] = b"forge.init-model-projection/v1";
@@ -63,11 +66,14 @@ pub enum FileEditKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEdit {
     pub kind: FileEditKind,
+    /// Observed repository fact that made this edit necessary.
+    pub reason: FileEditReason,
     pub path: RepoRelativePath,
     pub desired: DesiredManagedBlock,
     pub expected_preimage: Option<Digest>,
     pub preview_postimage: Vec<u8>,
     pub expected_postimage: Digest,
+    /// Explicit authorization to replace a user-edited block; never evidence that it was edited.
     pub force: bool,
 }
 
@@ -88,6 +94,46 @@ pub enum SkippedReason {
 pub struct SkippedChange {
     pub path: RepoRelativePath,
     pub reason: SkippedReason,
+    pub satisfied_managed: Option<SatisfiedManagedBlock>,
+}
+
+/// The exact managed output proven satisfied during planning.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SatisfiedManagedBlock {
+    pub kind: ManagedBlockKind,
+    /// Digest of the complete satisfied file, including surrounding user-owned bytes.
+    pub full_postimage_digest: Digest,
+}
+
+/// One desired init target coupled to its read-only repository observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitAdapterTargetInspection {
+    pub path: RepoRelativePath,
+    pub desired: DesiredManagedBlock,
+    pub state: AdapterInspectionState,
+}
+
+impl InitAdapterTargetInspection {
+    #[must_use]
+    pub const fn kind(&self) -> AdapterInspectionKind {
+        self.state.kind()
+    }
+}
+
+/// Complete high-level init inspection before any write authorization is considered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitAdapterInspection {
+    pub repository: RepoId,
+    pub model_digest: Digest,
+    pub assumptions: Vec<Assumption>,
+    pub targets: Vec<InitAdapterTargetInspection>,
+    pub reused_adapters: Vec<AdapterTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterFileLimitStage {
+    Existing,
+    Resulting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +166,16 @@ pub enum PlanError {
     GeneratedBlockLimit {
         lines: usize,
         bytes: usize,
+    },
+    AdapterFileLimit {
+        path: RepoRelativePath,
+        stage: AdapterFileLimitStage,
+        observed_bytes: Option<usize>,
+        max_bytes: usize,
+    },
+    InspectionInvariant {
+        path: RepoRelativePath,
+        detail: String,
     },
 }
 
@@ -164,6 +220,28 @@ impl fmt::Display for PlanError {
                 formatter,
                 "generated AGENTS block exceeds its limit ({lines} lines, {bytes} bytes)"
             ),
+            Self::AdapterFileLimit {
+                path,
+                stage,
+                observed_bytes,
+                max_bytes,
+            } => {
+                let observed = observed_bytes.map_or_else(
+                    || String::from("an unknown oversized length"),
+                    |bytes| format!("{bytes} bytes"),
+                );
+                write!(
+                    formatter,
+                    "{:?} adapter file `{}` is {observed}, above the {max_bytes}-byte limit",
+                    stage,
+                    path.as_path().display()
+                )
+            }
+            Self::InspectionInvariant { path, detail } => write!(
+                formatter,
+                "adapter inspection invariant failed for `{}`: {detail}",
+                path.as_path().display()
+            ),
         }
     }
 }
@@ -190,16 +268,95 @@ where
     F: RepositoryFilePort + ?Sized,
     H: Hasher + ?Sized,
 {
+    let forced = unique_forced_blocks(options)?;
+    let inspection = inspect_init_targets(model, filesystem, hasher, options)?;
+    let mut edits = Vec::new();
+    let mut skipped = Vec::new();
+    let agents_path = target_path("AGENTS.md")?;
+    for adapter in &inspection.reused_adapters {
+        skipped.push(SkippedChange {
+            path: agents_path.clone(),
+            reason: SkippedReason::ReusesAgents(*adapter),
+            satisfied_managed: None,
+        });
+    }
+    for target in inspection.targets {
+        match target.state {
+            AdapterInspectionState::Satisfied {
+                full_postimage_digest,
+            } => skipped.push(SkippedChange {
+                path: target.path,
+                reason: SkippedReason::AlreadySatisfied,
+                satisfied_managed: Some(SatisfiedManagedBlock {
+                    kind: target.desired.kind,
+                    full_postimage_digest,
+                }),
+            }),
+            AdapterInspectionState::EquivalentUnmanaged { .. } => {
+                skipped.push(SkippedChange {
+                    path: target.path,
+                    reason: SkippedReason::EquivalentUnmanaged,
+                    satisfied_managed: None,
+                });
+            }
+            AdapterInspectionState::Edit(observed_edit) => {
+                let force = forced.contains(&target.desired.kind);
+                if observed_edit.reason == FileEditReason::UserEdited && !force {
+                    return Err(PlanError::ManagedBlock {
+                        path: target.path,
+                        source: ManagedBlockError::UserEdited {
+                            id: target.desired.kind.id().to_owned(),
+                        },
+                    });
+                }
+                edits.push(FileEdit {
+                    kind: edit_kind(observed_edit.reason),
+                    reason: observed_edit.reason,
+                    path: target.path,
+                    desired: target.desired,
+                    expected_preimage: observed_edit.expected_preimage,
+                    expected_postimage: observed_edit.full_postimage_digest,
+                    preview_postimage: observed_edit.preview_postimage,
+                    force,
+                });
+            }
+        }
+    }
+    edits.sort_by(|left, right| left.path.cmp(&right.path));
+    skipped.sort();
+    let rollback = rollback_plan(&edits);
+    Ok(ChangePlan {
+        schema: PLAN_SCHEMA,
+        repository: inspection.repository,
+        model_digest: inspection.model_digest,
+        edits,
+        assumptions: inspection.assumptions,
+        skipped,
+        rollback,
+    })
+}
+
+/// Renders and inspects every selected init target without considering force authorization.
+pub fn inspect_init_targets<F, H>(
+    model: &ProjectModel,
+    filesystem: &F,
+    hasher: &H,
+    options: &InitPlanOptions,
+) -> Result<InitAdapterInspection, PlanError>
+where
+    F: RepositoryFilePort + ?Sized,
+    H: Hasher + ?Sized,
+{
     let model = model.clone().finalize().map_err(PlanError::InvalidModel)?;
     if model.units.is_empty() && !has_resolved_command(&model) {
         return Err(PlanError::NoProjectFacts);
     }
     let requested = unique_options(options)?;
-    let forced = unique_forced_blocks(options)?;
+    let _ = unique_forced_blocks(options)?;
     let agents_path = target_path("AGENTS.md")?;
     let claude_path = target_path("CLAUDE.md")?;
-    let mut targets = vec![(
-        agents_path.clone(),
+    let mut desired_targets = vec![(
+        agents_path,
         DesiredManagedBlock {
             kind: ManagedBlockKind::ProjectIndex,
             body: render_agents_body(&model).map_err(map_render_error)?,
@@ -214,7 +371,7 @@ where
                 )
         })
     {
-        targets.push((
+        desired_targets.push((
             claude_path,
             DesiredManagedBlock {
                 kind: ManagedBlockKind::ClaudePointer,
@@ -222,27 +379,9 @@ where
             },
         ));
     }
-    targets.sort_by(|left, right| left.0.cmp(&right.0));
-    reject_duplicate_targets(&targets)?;
-
-    let mut edits = Vec::new();
-    let mut skipped = Vec::new();
-    for adapter in [AdapterTarget::Cursor, AdapterTarget::Codex] {
-        if requested.contains(&adapter) {
-            skipped.push(SkippedChange {
-                path: agents_path.clone(),
-                reason: SkippedReason::ReusesAgents(adapter),
-            });
-        }
-    }
-    for (path, desired) in &targets {
-        let existing = filesystem
-            .read_confined(&model.repository.root, path)
-            .map_err(|source| PlanError::Read {
-                path: path.clone(),
-                source,
-            })?;
-        let force = forced.contains(&desired.kind);
+    desired_targets.sort_by(|left, right| left.0.cmp(&right.0));
+    reject_duplicate_targets(&desired_targets)?;
+    for (path, desired) in &desired_targets {
         let block = ManagedBlock {
             id: desired.kind.id(),
             body: &desired.body,
@@ -250,58 +389,44 @@ where
         if desired.kind == ManagedBlockKind::ProjectIndex {
             enforce_complete_agents_limit(path, &block, hasher)?;
         }
-        if desired.kind == ManagedBlockKind::ClaudePointer
-            && existing.as_deref().is_some_and(equivalent_claude_pointer)
-        {
-            skipped.push(SkippedChange {
-                path: path.clone(),
-                reason: SkippedReason::EquivalentUnmanaged,
+    }
+    let requests = desired_targets
+        .iter()
+        .map(|(path, desired)| AdapterInspectionRequest {
+            path,
+            block_id: desired.kind.id(),
+            desired_body: &desired.body,
+            equivalent_unmanaged: (desired.kind == ManagedBlockKind::ClaudePointer)
+                .then_some(render_claude_pointer()),
+        })
+        .collect::<Vec<_>>();
+    let model_digest = projection_digest(hasher, &model.repository.id, &desired_targets);
+    let report = inspect_adapter_targets(&model.repository.root, &requests, filesystem, hasher)
+        .map_err(map_inspection_error)?;
+    let mut targets = Vec::with_capacity(desired_targets.len());
+    for ((path, desired), observed) in desired_targets.into_iter().zip(report.targets) {
+        if observed.path != path || observed.block_id != desired.kind.id() {
+            return Err(PlanError::InspectionInvariant {
+                path,
+                detail: String::from("inspection result identity differs from its request"),
             });
-            continue;
         }
-        let outcome =
-            merge_markdown_block(existing.as_deref(), &block, hasher, force).map_err(|source| {
-                PlanError::ManagedBlock {
-                    path: path.clone(),
-                    source,
-                }
-            })?;
-        if outcome.action == MergeAction::NoOp {
-            skipped.push(SkippedChange {
-                path: path.clone(),
-                reason: SkippedReason::AlreadySatisfied,
-            });
-            continue;
-        }
-        edits.push(FileEdit {
-            kind: if existing.is_some() {
-                FileEditKind::ReplaceManagedBlock
-            } else {
-                FileEditKind::Create
-            },
-            path: path.clone(),
-            desired: desired.clone(),
-            expected_preimage: existing
-                .as_deref()
-                .map(|bytes| repository_file_digest(hasher, bytes)),
-            expected_postimage: repository_file_digest(hasher, &outcome.content),
-            preview_postimage: outcome.content,
-            force,
+        targets.push(InitAdapterTargetInspection {
+            path: observed.path,
+            desired,
+            state: observed.state,
         });
     }
-    edits.sort_by(|left, right| left.path.cmp(&right.path));
-    skipped.sort();
-    let rollback = rollback_plan(&edits);
-    let model_digest = projection_digest(hasher, &model.repository.id, &targets);
-    let assumptions = model.assumptions;
-    Ok(ChangePlan {
-        schema: PLAN_SCHEMA,
+    let reused_adapters = [AdapterTarget::Cursor, AdapterTarget::Codex]
+        .into_iter()
+        .filter(|adapter| requested.contains(adapter))
+        .collect();
+    Ok(InitAdapterInspection {
         repository: model.repository.id,
         model_digest,
-        edits,
-        assumptions,
-        skipped,
-        rollback,
+        assumptions: model.assumptions,
+        targets,
+        reused_adapters,
     })
 }
 
@@ -363,6 +488,51 @@ fn target_path(value: &str) -> Result<RepoRelativePath, PlanError> {
     RepoRelativePath::new(value).map_err(PlanError::InvalidTarget)
 }
 
+const fn edit_kind(reason: FileEditReason) -> FileEditKind {
+    match reason {
+        FileEditReason::MissingFile => FileEditKind::Create,
+        FileEditReason::MissingManagedBlock
+        | FileEditReason::AssetChanged
+        | FileEditReason::UserEdited => FileEditKind::ReplaceManagedBlock,
+    }
+}
+
+fn map_inspection_error(error: AdapterInspectionError) -> PlanError {
+    match error {
+        AdapterInspectionError::DuplicateTarget(path) => PlanError::DuplicateTarget(path),
+        AdapterInspectionError::Read { path, source } => PlanError::Read { path, source },
+        AdapterInspectionError::ManagedBlock { path, source } => {
+            PlanError::ManagedBlock { path, source }
+        }
+        AdapterInspectionError::ExistingFileTooLarge { path, max_bytes } => {
+            PlanError::AdapterFileLimit {
+                path,
+                stage: AdapterFileLimitStage::Existing,
+                observed_bytes: None,
+                max_bytes,
+            }
+        }
+        AdapterInspectionError::ResultingFileTooLarge {
+            path,
+            bytes,
+            max_bytes,
+        } => PlanError::AdapterFileLimit {
+            path,
+            stage: AdapterFileLimitStage::Resulting,
+            observed_bytes: Some(bytes),
+            max_bytes,
+        },
+        AdapterInspectionError::InconsistentMergeAction {
+            path,
+            action,
+            existing,
+        } => PlanError::InspectionInvariant {
+            path,
+            detail: format!("merge returned {action:?} with existing={existing}"),
+        },
+    }
+}
+
 fn projection_digest<H>(
     hasher: &H,
     repository: &RepoId,
@@ -414,22 +584,6 @@ where
     }
 }
 
-fn equivalent_claude_pointer(existing: &[u8]) -> bool {
-    let Ok(mut text) = std::str::from_utf8(existing) else {
-        return false;
-    };
-    loop {
-        if let Some(value) = text.strip_suffix("\r\n") {
-            text = value;
-        } else if let Some(value) = text.strip_suffix('\n') {
-            text = value;
-        } else {
-            break;
-        }
-    }
-    text == render_claude_pointer()
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -447,11 +601,12 @@ mod tests {
     use forge_core::ports::{Hasher, RepositoryFilePort};
     use forge_core::{Digest, RelativePathError, RepoId, RepoRelativePath};
 
+    use crate::inspection::{ADAPTER_FILE_MAX_BYTES, AdapterInspectionKind, FileEditReason};
     use crate::managed_block::ManagedBlockError;
 
     use super::{
-        AdapterTarget, FileEditKind, InitPlanOptions, ManagedBlockKind, PlanError, SkippedReason,
-        plan_init,
+        AdapterFileLimitStage, AdapterTarget, FileEditKind, InitPlanOptions, ManagedBlockKind,
+        PlanError, SkippedReason, inspect_init_targets, plan_init,
     };
 
     #[derive(Debug, Default)]
@@ -467,15 +622,44 @@ mod tests {
                 writes: Cell::new(0),
             }
         }
+
+        fn from_files(files: impl IntoIterator<Item = (&'static str, Vec<u8>)>) -> Self {
+            Self {
+                files: RefCell::new(
+                    files
+                        .into_iter()
+                        .map(|(path, content)| (PathBuf::from(path), content))
+                        .collect(),
+                ),
+                writes: Cell::new(0),
+            }
+        }
     }
 
     impl RepositoryFilePort for MemoryFiles {
         fn read_confined(
             &self,
             _repository_root: &Path,
-            path: &RepoRelativePath,
+            _path: &RepoRelativePath,
         ) -> io::Result<Option<Vec<u8>>> {
-            Ok(self.files.borrow().get(path.as_path()).cloned())
+            Err(io::Error::other("planner fixture forbids unbounded reads"))
+        }
+
+        fn read_confined_bounded(
+            &self,
+            _repository_root: &Path,
+            path: &RepoRelativePath,
+            max_bytes: usize,
+        ) -> io::Result<Option<Vec<u8>>> {
+            let files = self.files.borrow();
+            match files.get(path.as_path()) {
+                Some(bytes) if bytes.len() > max_bytes => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fixture file exceeds read limit",
+                )),
+                Some(bytes) => Ok(Some(bytes.clone())),
+                None => Ok(None),
+            }
         }
 
         fn write_atomic_confined(
@@ -715,6 +899,82 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn high_level_inspection_aggregates_user_edits_before_force_authorizes_a_plan()
+    -> Result<(), Box<dyn Error>> {
+        let model = model_with_command()?;
+        let inspect_options = InitPlanOptions {
+            adapters: vec![AdapterTarget::Claude],
+            force_blocks: Vec::new(),
+        };
+        let initial = plan_init(
+            &model,
+            &MemoryFiles::default(),
+            &FixtureHasher,
+            &inspect_options,
+        )?;
+        let agents = initial
+            .edits
+            .iter()
+            .find(|edit| edit.path.as_path() == Path::new("AGENTS.md"))
+            .ok_or_else(|| io::Error::other("missing initial AGENTS.md edit"))?;
+        let claude = initial
+            .edits
+            .iter()
+            .find(|edit| edit.path.as_path() == Path::new("CLAUDE.md"))
+            .ok_or_else(|| io::Error::other("missing initial CLAUDE.md edit"))?;
+        let edited_agents = String::from_utf8(agents.preview_postimage.clone())?
+            .replace("## Authoritative paths", "## Human-owned paths")
+            .into_bytes();
+        let edited_claude = String::from_utf8(claude.preview_postimage.clone())?
+            .replace("@AGENTS.md", "@HUMAN.md")
+            .into_bytes();
+        let files =
+            MemoryFiles::from_files([("AGENTS.md", edited_agents), ("CLAUDE.md", edited_claude)]);
+
+        let inspection = inspect_init_targets(&model, &files, &FixtureHasher, &inspect_options)?;
+        assert_eq!(inspection.targets.len(), 2);
+        assert!(inspection.targets.iter().all(|target| {
+            target.kind() == AdapterInspectionKind::UserEdited
+                && matches!(
+                    &target.state,
+                    crate::inspection::AdapterInspectionState::Edit(edit)
+                        if edit.reason == FileEditReason::UserEdited
+                            && !edit.preview_postimage.is_empty()
+                )
+        }));
+        assert_eq!(files.writes.get(), 0);
+
+        assert!(matches!(
+            plan_init(&model, &files, &FixtureHasher, &inspect_options),
+            Err(PlanError::ManagedBlock {
+                source: ManagedBlockError::UserEdited { .. },
+                ..
+            })
+        ));
+
+        let forced_options = InitPlanOptions {
+            adapters: vec![AdapterTarget::Claude],
+            force_blocks: vec![
+                ManagedBlockKind::ProjectIndex,
+                ManagedBlockKind::ClaudePointer,
+            ],
+        };
+        let forced_inspection =
+            inspect_init_targets(&model, &files, &FixtureHasher, &forced_options)?;
+        assert_eq!(forced_inspection.targets, inspection.targets);
+        let forced = plan_init(&model, &files, &FixtureHasher, &forced_options)?;
+        assert_eq!(forced.edits.len(), 2);
+        assert!(
+            forced
+                .edits
+                .iter()
+                .all(|edit| { edit.reason == FileEditReason::UserEdited && edit.force })
+        );
+        assert_eq!(files.writes.get(), 0);
         Ok(())
     }
 
@@ -984,6 +1244,29 @@ mod tests {
     }
 
     #[test]
+    fn oversized_adapter_file_maps_to_a_typed_plan_error_without_writing()
+    -> Result<(), Box<dyn Error>> {
+        let files = MemoryFiles::with("AGENTS.md", vec![b'x'; ADAPTER_FILE_MAX_BYTES + 1]);
+
+        assert!(matches!(
+            inspect_init_targets(
+                &model_with_command()?,
+                &files,
+                &FixtureHasher,
+                &InitPlanOptions::default(),
+            ),
+            Err(PlanError::AdapterFileLimit {
+                stage: AdapterFileLimitStage::Existing,
+                observed_bytes: None,
+                max_bytes: ADAPTER_FILE_MAX_BYTES,
+                ..
+            })
+        ));
+        assert_eq!(files.writes.get(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn force_is_recorded_but_apply_is_not_performed() -> Result<(), Box<dyn Error>> {
         let model = model_with_command()?;
         let first = plan_init(
@@ -1002,6 +1285,7 @@ mod tests {
         let forced = plan_init(&model, &files, &FixtureHasher, &options)?;
 
         assert_eq!(forced.edits.len(), 1);
+        assert_eq!(forced.edits[0].reason, FileEditReason::UserEdited);
         assert!(forced.edits[0].force);
         assert_eq!(files.writes.get(), 0);
         Ok(())

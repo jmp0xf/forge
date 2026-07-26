@@ -229,6 +229,17 @@ impl TestWorkspace {
         assert!(!self.worktree.join(".forge").exists());
         assert!(!self.worktree.join("explain-must-not-run").exists());
     }
+
+    fn private_forge_state_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let raw =
+            self.successful_git_stdout(&["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        let path = String::from_utf8(raw)?;
+        Ok(PathBuf::from(path.trim_end()).join("forge"))
+    }
+
+    fn generated_manifest_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        Ok(self.private_forge_state_dir()?.join("generated-v1.json"))
+    }
 }
 
 impl Drop for TestWorkspace {
@@ -497,6 +508,8 @@ fn json_usage_error_never_pollutes_stdout() -> Result<(), Box<dyn std::error::Er
 fn init_defaults_to_a_deterministic_read_only_plan() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = TestWorkspace::zero_config_repository("init-dry-run")?;
     let before = fixture.snapshot()?;
+    let private_state = fixture.private_forge_state_dir()?;
+    assert!(!private_state.exists());
 
     let first = fixture.run_forge(&["init", "--json"])?;
     let second = fixture.run_forge(&["init", "--json"])?;
@@ -515,6 +528,7 @@ fn init_defaults_to_a_deterministic_read_only_plan() -> Result<(), Box<dyn std::
     assert_eq!(edits[0]["path"]["display"], "AGENTS.md");
     assert_eq!(fixture.snapshot()?, before);
     assert!(!fixture.worktree.join("AGENTS.md").exists());
+    assert!(!private_state.exists());
     fixture.assert_no_forge_artifacts();
     Ok(())
 }
@@ -556,6 +570,14 @@ fn init_apply_is_brownfield_safe_and_second_plan_is_empty() -> Result<(), Box<dy
         makefile_before
     );
     assert!(!fixture.worktree.join("explain-must-not-run").exists());
+    let manifest_bytes = fs::read(fixture.generated_manifest_path()?)?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
+    assert_eq!(manifest["schema"], 1);
+    assert_eq!(manifest["behavior_version"], "managed-markdown-v1");
+    assert_eq!(manifest["adapters"][0]["path"]["display"], "AGENTS.md");
+    assert!(
+        !String::from_utf8_lossy(&manifest_bytes).contains(&fixture.worktree.display().to_string())
+    );
 
     let second = fixture.run_forge(&["init", "--json"])?;
     assert_eq!(second.status.code(), Some(0));
@@ -608,6 +630,304 @@ fn init_empty_repository_is_a_structured_environment_failure()
     assert_eq!(structured_diagnostic_code(&document)?, "FGE2209");
     assert_eq!(fixture.snapshot()?, before);
     fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
+#[test]
+fn adapters_check_reports_initial_drift_without_creating_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-initial")?;
+    let before = fixture.snapshot()?;
+    let private_state = fixture.private_forge_state_dir()?;
+    assert!(!private_state.exists());
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(checked.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(document["schema"], "forge.adapters/v1");
+    assert_eq!(document["data"]["changed"], true);
+    assert_eq!(document["data"]["applied"], false);
+    assert_eq!(document["data"]["adapters"][0]["drift"], "asset-changed");
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!private_state.exists());
+
+    let preview = fixture.run_forge(&["adapters", "sync", "--json"])?;
+    assert_eq!(preview.status.code(), Some(0));
+    assert!(preview.stderr.is_empty());
+    let preview_document: Value = serde_json::from_slice(&preview.stdout)?;
+    assert_eq!(preview_document["data"]["changed"], true);
+    assert_eq!(preview_document["data"]["applied"], false);
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!private_state.exists());
+    Ok(())
+}
+
+#[test]
+fn adapters_check_is_read_only_after_init_and_detects_missing_generated_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-check")?;
+    let initialized = fixture.run_forge(&["init", "--apply", "--json"])?;
+    assert_eq!(initialized.status.code(), Some(0));
+    let manifest_path = fixture.generated_manifest_path()?;
+    let manifest_before = fs::read(&manifest_path)?;
+    let before = fixture.snapshot()?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(0));
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(document["data"]["changed"], false);
+    assert_eq!(document["data"]["adapters"][0]["drift"], "no-drift");
+    assert_eq!(fixture.snapshot()?, before);
+    assert_eq!(fs::read(&manifest_path)?, manifest_before);
+
+    fs::remove_file(&manifest_path)?;
+    let stale_before = fixture.snapshot()?;
+    let stale = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(stale.status.code(), Some(1));
+    let stale_document: Value = serde_json::from_slice(&stale.stdout)?;
+    assert_eq!(
+        stale_document["data"]["adapters"][0]["drift"],
+        "manifest-stale"
+    );
+    assert_eq!(fixture.snapshot()?, stale_before);
+    assert!(!manifest_path.exists());
+    fs::write(&manifest_path, &manifest_before)?;
+
+    fs::remove_file(fixture.worktree.join("AGENTS.md"))?;
+    let missing_before = fixture.snapshot()?;
+    let missing = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(missing.status.code(), Some(1));
+    let missing_document: Value = serde_json::from_slice(&missing.stdout)?;
+    assert_eq!(
+        missing_document["data"]["adapters"][0]["drift"],
+        "generated-missing"
+    );
+    assert_eq!(fixture.snapshot()?, missing_before);
+    assert_eq!(fs::read(&manifest_path)?, manifest_before);
+    Ok(())
+}
+
+#[test]
+fn adapters_user_edit_requires_named_force_and_converges_after_apply()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-user-edit")?;
+    let initialized = fixture.run_forge(&["init", "--apply"])?;
+    assert_eq!(initialized.status.code(), Some(0));
+    let agents_path = fixture.worktree.join("AGENTS.md");
+    let edited = fs::read_to_string(&agents_path)?
+        .replace("## Project-native commands", "## Human-edited commands");
+    fs::write(&agents_path, edited)?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(1));
+    let checked_document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(
+        checked_document["data"]["adapters"][0]["drift"],
+        "user-edited"
+    );
+    let rejected = fixture.run_forge(&["adapters", "sync", "--apply", "--json"])?;
+    assert_eq!(rejected.status.code(), Some(1));
+
+    fixture.run_git(&["add", "--", "AGENTS.md"])?;
+    fixture.run_git(&[
+        "-c",
+        "user.name=Forge CLI tests",
+        "-c",
+        "user.email=forge-cli-tests@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "record edited generated block",
+    ])?;
+    let forced = fixture.run_forge(&[
+        "adapters",
+        "sync",
+        "--apply",
+        "--force-block",
+        "project-index",
+        "--json",
+    ])?;
+    assert_eq!(forced.status.code(), Some(0));
+    let final_check = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(final_check.status.code(), Some(0));
+    let final_document: Value = serde_json::from_slice(&final_check.stdout)?;
+    assert_eq!(final_document["data"]["changed"], false);
+    assert_eq!(final_document["data"]["adapters"][0]["drift"], "no-drift");
+    Ok(())
+}
+
+#[test]
+fn adapters_classifies_project_fact_changes_as_asset_drift_even_with_an_old_manifest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-asset-drift")?;
+    assert_eq!(
+        fixture.run_forge(&["init", "--apply"])?.status.code(),
+        Some(0)
+    );
+    let changed_makefile = STATIC_MAKEFILE.replace("test", "spec");
+    fs::write(fixture.worktree.join("Makefile"), changed_makefile)?;
+    let before = fixture.snapshot()?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(document["data"]["adapters"][0]["drift"], "asset-changed");
+    assert_eq!(fixture.snapshot()?, before);
+
+    let forced_preview = fixture.run_forge(&[
+        "adapters",
+        "sync",
+        "--force-block",
+        "project-index",
+        "--json",
+    ])?;
+    assert_eq!(forced_preview.status.code(), Some(0));
+    let forced_document: Value = serde_json::from_slice(&forced_preview.stdout)?;
+    assert_eq!(
+        forced_document["data"]["adapters"][0]["drift"],
+        "asset-changed"
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    Ok(())
+}
+
+#[test]
+fn adapters_distinguishes_a_missing_managed_block_from_a_missing_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-block-missing")?;
+    assert_eq!(
+        fixture.run_forge(&["init", "--apply"])?.status.code(),
+        Some(0)
+    );
+    let agents_path = fixture.worktree.join("AGENTS.md");
+    fs::write(&agents_path, b"# Human-owned guidance remains\n")?;
+    let before = fixture.snapshot()?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(
+        document["data"]["adapters"][0]["drift"],
+        "generated-missing"
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    assert_eq!(fs::read(&agents_path)?, b"# Human-owned guidance remains\n");
+    Ok(())
+}
+
+#[test]
+fn adapters_reports_every_user_edited_target_before_requesting_force()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-all-user-edits")?;
+    assert_eq!(
+        fixture
+            .run_forge(&["init", "--apply", "--adapter", "claude"])?
+            .status
+            .code(),
+        Some(0)
+    );
+    let agents_path = fixture.worktree.join("AGENTS.md");
+    let agents = fs::read_to_string(&agents_path)?
+        .replace("## Project-native commands", "## Human-edited commands");
+    fs::write(&agents_path, agents)?;
+    let claude_path = fixture.worktree.join("CLAUDE.md");
+    let claude = fs::read_to_string(&claude_path)?.replace("@AGENTS.md", "@AGENTS-edited.md");
+    fs::write(&claude_path, claude)?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    let statuses = required_array(&document["data"], "adapters")?;
+    assert_eq!(statuses.len(), 2);
+    assert!(
+        statuses
+            .iter()
+            .all(|status| status["drift"] == "user-edited")
+    );
+    assert_eq!(statuses[0]["path"]["display"], "AGENTS.md");
+    assert_eq!(statuses[1]["path"]["display"], "CLAUDE.md");
+    Ok(())
+}
+
+#[test]
+fn adapters_preserves_user_bytes_outside_a_satisfied_managed_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-outside-bytes")?;
+    assert_eq!(
+        fixture.run_forge(&["init", "--apply"])?.status.code(),
+        Some(0)
+    );
+    let agents_path = fixture.worktree.join("AGENTS.md");
+    let mut agents = fs::read(&agents_path)?;
+    agents.extend_from_slice(b"\n# Human-owned local note\nKeep this byte-for-byte.\n");
+    fs::write(&agents_path, &agents)?;
+    fixture.run_git(&["add", "--", "AGENTS.md"])?;
+    fixture.run_git(&[
+        "-c",
+        "user.name=Forge CLI tests",
+        "-c",
+        "user.email=forge-cli-tests@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "add human-owned adapter context",
+    ])?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(0));
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(document["data"]["adapters"][0]["drift"], "no-drift");
+
+    let synchronized = fixture.run_forge(&["adapters", "sync", "--apply", "--json"])?;
+    assert_eq!(synchronized.status.code(), Some(0));
+    assert_eq!(fs::read(&agents_path)?, agents);
+    Ok(())
+}
+
+#[test]
+fn adapters_rejects_an_unexplained_manifest_source_digest() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = TestWorkspace::clean_runner_repository("adapters-source-stale")?;
+    assert_eq!(
+        fixture.run_forge(&["init", "--apply"])?.status.code(),
+        Some(0)
+    );
+    let manifest_path = fixture.generated_manifest_path()?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    manifest["source_digest"] = Value::from(format!("blake3:{}", "f".repeat(64)));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+
+    let checked = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(checked.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(document["data"]["adapters"][0]["drift"], "manifest-stale");
+    Ok(())
+}
+
+#[test]
+fn adapters_future_and_malformed_manifests_are_data_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("adapters-state-errors")?;
+    let initialized = fixture.run_forge(&["init", "--apply"])?;
+    assert_eq!(initialized.status.code(), Some(0));
+    let manifest_path = fixture.generated_manifest_path()?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    manifest["schema"] = Value::from(2);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    let future_bytes = fs::read(&manifest_path)?;
+
+    let future = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(future.status.code(), Some(65));
+    let future_document: Value = serde_json::from_slice(&future.stdout)?;
+    assert_eq!(structured_diagnostic_code(&future_document)?, "FGE1211");
+    assert_eq!(fs::read(&manifest_path)?, future_bytes);
+
+    fs::write(&manifest_path, b"{ private-state")?;
+    let malformed = fixture.run_forge(&["adapters", "check", "--json"])?;
+    assert_eq!(malformed.status.code(), Some(65));
+    let malformed_document: Value = serde_json::from_slice(&malformed.stdout)?;
+    assert_eq!(structured_diagnostic_code(&malformed_document)?, "FGE1211");
     Ok(())
 }
 

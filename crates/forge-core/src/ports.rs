@@ -271,6 +271,18 @@ pub trait RepositoryFilePort {
         path: &RepoRelativePath,
     ) -> io::Result<Option<Vec<u8>>>;
 
+    /// Reads at most `max_bytes`; a larger target must be rejected without retaining it.
+    ///
+    /// Implementations report the size-bound rejection as [`io::ErrorKind::InvalidData`]. Other
+    /// path-safety and I/O failures must retain their own error kinds so callers can distinguish
+    /// an expected bound from an inaccessible or unsafe target.
+    fn read_confined_bounded(
+        &self,
+        repository_root: &Path,
+        path: &RepoRelativePath,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>>;
+
     /// Atomically writes one safe repository-relative regular file.
     fn write_atomic_confined(
         &self,
@@ -290,6 +302,13 @@ pub trait GitPort {
 
 pub trait StateStore {
     fn load(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
+
+    /// Loads at most `max_bytes`; implementations must reject a larger value without retaining it.
+    ///
+    /// Implementations report the size-bound rejection as [`io::ErrorKind::InvalidData`]. Other
+    /// storage failures must retain their own error kinds.
+    fn load_bounded(&self, key: &str, max_bytes: usize) -> io::Result<Option<Vec<u8>>>;
+
     fn store_atomic(&self, key: &str, bytes: &[u8]) -> io::Result<()>;
 }
 

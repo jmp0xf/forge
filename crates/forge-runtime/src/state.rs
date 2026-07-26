@@ -129,6 +129,16 @@ impl AtomicStateStore {
         }
     }
 
+    /// Loads one state value with a hard retention bound.
+    pub fn load_bounded(&self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, StateError> {
+        let relative = validate_state_key(key)?;
+        match self.writer.read_bounded(&relative, max_bytes) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.io_kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StateError::PathSafety(error)),
+        }
+    }
+
     /// Atomically stores exactly the supplied schema bytes for `key`.
     pub fn store_atomic(&self, key: &str, bytes: &[u8]) -> Result<(), StateError> {
         let relative = validate_state_key(key)?;
@@ -170,6 +180,10 @@ impl AtomicStateStore {
 impl StateStore for AtomicStateStore {
     fn load(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         AtomicStateStore::load(self, key).map_err(StateError::into_io_error)
+    }
+
+    fn load_bounded(&self, key: &str, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+        AtomicStateStore::load_bounded(self, key, max_bytes).map_err(StateError::into_io_error)
     }
 
     fn store_atomic(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
@@ -561,6 +575,26 @@ mod tests {
         );
         assert_eq!(filesystem_snapshot(temporary.path())?, before);
         assert!(!layout.lock_file().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_enforces_the_bounded_load_contract() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let store = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir))?;
+        store.store_atomic("generated-v1.json", b"12345")?;
+
+        assert_eq!(
+            forge_core::ports::StateStore::load_bounded(&store, "generated-v1.json", 5)?,
+            Some(b"12345".to_vec())
+        );
+        let oversized = forge_core::ports::StateStore::load_bounded(&store, "generated-v1.json", 4);
+        assert!(matches!(
+            oversized,
+            Err(ref error) if error.kind() == io::ErrorKind::InvalidData
+        ));
         Ok(())
     }
 
