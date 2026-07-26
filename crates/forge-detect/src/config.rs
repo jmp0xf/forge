@@ -3,13 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::ops::Range;
+use std::path::Path;
 
-use forge_core::{Intent, RepoRelativePath};
+use forge_core::branding::CONFIG_FILE;
+use forge_core::inventory::DEFAULT_MAX_TEXT_FILE_BYTES;
+use forge_core::ports::FileSystemPort;
+use forge_core::{GitErrorKind, Intent, InventoryError, PathKind, RepoRelativePath};
 use serde::Deserialize;
 
 /// The only configuration schema understood by this Forge version.
 pub const CONFIG_SCHEMA_V1: u16 = 1;
+
+/// Bootstrap bound used before repository policy is available.
+pub const DEFAULT_MAX_CONFIG_FILE_BYTES: u64 = DEFAULT_MAX_TEXT_FILE_BYTES;
 
 /// A validated v1 configuration. Absence of the file is represented separately from this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +109,22 @@ pub enum ConfigError {
         field: String,
         reason: String,
     },
+    Load {
+        reason: ConfigLoadError,
+    },
+}
+
+/// A content-safe reason why the optional root configuration could not be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoadError {
+    InvalidDefaultPath,
+    ProbeFailed { kind: io::ErrorKind },
+    ExpectedRegularFile { found: PathKind },
+    ReadFailed { kind: io::ErrorKind },
+    ReadGitFailure { kind: GitErrorKind },
+    Truncated { max_bytes: u64 },
+    Binary,
+    InvalidUtf8,
 }
 
 impl ConfigError {
@@ -109,7 +133,7 @@ impl ConfigError {
     pub fn span(&self) -> Option<Range<usize>> {
         match self {
             Self::Parse { span, .. } => span.clone(),
-            Self::UnsupportedSchema { .. } | Self::InvalidValue { .. } => None,
+            Self::UnsupportedSchema { .. } | Self::InvalidValue { .. } | Self::Load { .. } => None,
         }
     }
 }
@@ -125,11 +149,113 @@ impl fmt::Display for ConfigError {
             Self::InvalidValue { field, reason } => {
                 write!(formatter, "invalid forge.toml field `{field}`: {reason}")
             }
+            Self::Load { reason } => write!(formatter, "cannot load forge.toml: {reason}"),
         }
     }
 }
 
 impl Error for ConfigError {}
+
+impl fmt::Display for ConfigLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDefaultPath => {
+                formatter.write_str("the built-in repository-relative path is invalid")
+            }
+            Self::ProbeFailed { kind } => {
+                write!(formatter, "the repository path probe failed with {kind:?}")
+            }
+            Self::ExpectedRegularFile { found } => write!(
+                formatter,
+                "the repository path must be a regular file, but is {found:?}"
+            ),
+            Self::ReadFailed { kind } => {
+                write!(formatter, "the bounded read failed with {kind:?}")
+            }
+            Self::ReadGitFailure { kind } => {
+                write!(
+                    formatter,
+                    "the bounded read reported a Git failure with {kind:?}"
+                )
+            }
+            Self::Truncated { max_bytes } => write!(
+                formatter,
+                "the file exceeds the fixed {max_bytes}-byte bootstrap bound"
+            ),
+            Self::Binary => formatter.write_str("the file contains NUL bytes"),
+            Self::InvalidUtf8 => formatter.write_str("the file is not valid UTF-8"),
+        }
+    }
+}
+
+/// Loads the optional root `forge.toml` through the bounded repository filesystem port.
+///
+/// Absence preserves zero configuration. Every other non-file path kind is a data error; the
+/// loader never follows symlinks and never includes configuration contents in load diagnostics.
+pub fn load_default_forge_config<F>(
+    filesystem: &F,
+    repository_root: &Path,
+) -> Result<Option<ForgeConfig>, ConfigError>
+where
+    F: FileSystemPort + ?Sized,
+{
+    let path = RepoRelativePath::new(CONFIG_FILE).map_err(|_| ConfigError::Load {
+        reason: ConfigLoadError::InvalidDefaultPath,
+    })?;
+    let kind = filesystem
+        .path_kind(repository_root, &path)
+        .map_err(|error| ConfigError::Load {
+            reason: ConfigLoadError::ProbeFailed { kind: error.kind() },
+        })?;
+    match kind {
+        PathKind::Missing => return Ok(None),
+        PathKind::File => {}
+        found => {
+            return Err(ConfigError::Load {
+                reason: ConfigLoadError::ExpectedRegularFile { found },
+            });
+        }
+    }
+
+    let text = filesystem
+        .read_bounded_text(repository_root, &path, DEFAULT_MAX_CONFIG_FILE_BYTES)
+        .map_err(map_config_read_error)?;
+    if text.truncated {
+        return Err(ConfigError::Load {
+            reason: ConfigLoadError::Truncated {
+                max_bytes: DEFAULT_MAX_CONFIG_FILE_BYTES,
+            },
+        });
+    }
+    if text.binary {
+        return Err(ConfigError::Load {
+            reason: ConfigLoadError::Binary,
+        });
+    }
+    let input = std::str::from_utf8(&text.bytes).map_err(|_| ConfigError::Load {
+        reason: ConfigLoadError::InvalidUtf8,
+    })?;
+    parse_forge_config(input).map(Some)
+}
+
+fn map_config_read_error(error: InventoryError) -> ConfigError {
+    let kind = match error {
+        InventoryError::InvalidRoot(_) => io::ErrorKind::NotADirectory,
+        InventoryError::Io { source, .. } => source.kind(),
+        InventoryError::Symlink(_) => io::ErrorKind::PermissionDenied,
+        InventoryError::EntryLimit { .. } => io::ErrorKind::InvalidData,
+        InventoryError::Git(source) => {
+            return ConfigError::Load {
+                reason: ConfigLoadError::ReadGitFailure {
+                    kind: source.kind(),
+                },
+            };
+        }
+    };
+    ConfigError::Load {
+        reason: ConfigLoadError::ReadFailed { kind },
+    }
+}
 
 /// Parses a present `forge.toml` using reject-unknown semantics at every table level.
 pub fn parse_forge_config(input: &str) -> Result<ForgeConfig, ConfigError> {
@@ -437,13 +563,139 @@ fn invalid_value(field: impl Into<String>, reason: impl Into<String>) -> ConfigE
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::cell::Cell;
+    use std::io;
+    use std::path::{Path, PathBuf};
 
-    use forge_core::Intent;
+    use forge_core::branding::CONFIG_FILE;
+    use forge_core::ports::FileSystemPort;
+    use forge_core::{
+        BoundedText, GitError, GitErrorKind, GitFileSet, Intent, Inventory, InventoryError,
+        InventoryOptions, PathKind, RepoRelativePath,
+    };
 
     use super::{
-        CONFIG_SCHEMA_V1, ConfigError, RiskLevel, parse_forge_config, parse_optional_forge_config,
+        CONFIG_SCHEMA_V1, ConfigError, ConfigLoadError, DEFAULT_MAX_CONFIG_FILE_BYTES, RiskLevel,
+        load_default_forge_config, parse_forge_config, parse_optional_forge_config,
     };
+
+    #[derive(Debug, Clone)]
+    enum TextOutcome {
+        Value(BoundedText),
+        Io(io::ErrorKind),
+        Git(GitErrorKind),
+    }
+
+    #[derive(Debug)]
+    struct MockFileSystem {
+        repository_root: PathBuf,
+        path_kind: Result<PathKind, io::ErrorKind>,
+        text: TextOutcome,
+        probe_calls: Cell<usize>,
+        read_calls: Cell<usize>,
+        observed_read_bound: Cell<Option<u64>>,
+    }
+
+    impl MockFileSystem {
+        fn new(path_kind: Result<PathKind, io::ErrorKind>, text: TextOutcome) -> Self {
+            Self {
+                repository_root: PathBuf::from("repository-root"),
+                path_kind,
+                text,
+                probe_calls: Cell::new(0),
+                read_calls: Cell::new(0),
+                observed_read_bound: Cell::new(None),
+            }
+        }
+
+        fn text(bytes: impl Into<Vec<u8>>) -> Self {
+            Self::new(
+                Ok(PathKind::File),
+                TextOutcome::Value(BoundedText {
+                    bytes: bytes.into(),
+                    truncated: false,
+                    binary: false,
+                }),
+            )
+        }
+
+        fn validate_request(&self, root: &Path, path: &RepoRelativePath) -> io::Result<()> {
+            if root != self.repository_root || path.as_path() != Path::new(CONFIG_FILE) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configuration loader used an unexpected root or path",
+                ));
+            }
+            Ok(())
+        }
+
+        fn unsupported_io() -> io::Error {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "operation is outside this mock's test boundary",
+            )
+        }
+    }
+
+    impl FileSystemPort for MockFileSystem {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Err(Self::unsupported_io())
+        }
+
+        fn inventory(
+            &self,
+            _root: &Path,
+            _file_set: Option<&GitFileSet>,
+            _options: InventoryOptions,
+        ) -> Result<Inventory, InventoryError> {
+            Err(InventoryError::Io {
+                path: PathBuf::from(CONFIG_FILE),
+                source: Self::unsupported_io(),
+            })
+        }
+
+        fn read_bounded_text(
+            &self,
+            root: &Path,
+            path: &RepoRelativePath,
+            max_text_file_bytes: u64,
+        ) -> Result<BoundedText, InventoryError> {
+            self.read_calls.set(self.read_calls.get().saturating_add(1));
+            self.observed_read_bound.set(Some(max_text_file_bytes));
+            self.validate_request(root, path)
+                .map_err(|source| InventoryError::Io {
+                    path: path.as_path().to_path_buf(),
+                    source,
+                })?;
+            match &self.text {
+                TextOutcome::Value(text) => Ok(text.clone()),
+                TextOutcome::Io(kind) => Err(InventoryError::Io {
+                    path: path.as_path().to_path_buf(),
+                    source: io::Error::from(*kind),
+                }),
+                TextOutcome::Git(kind) => Err(InventoryError::Git(GitError::new(
+                    *kind,
+                    "test-config-read",
+                    "bounded mock failure",
+                ))),
+            }
+        }
+
+        fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
+            self.probe_calls
+                .set(self.probe_calls.get().saturating_add(1));
+            self.validate_request(root, path)?;
+            self.path_kind.map_err(io::Error::from)
+        }
+
+        fn write_atomic(&self, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+            Err(Self::unsupported_io())
+        }
+
+        fn exists(&self, _path: &Path) -> bool {
+            false
+        }
+    }
 
     const COMPLETE_CONFIG: &str = r#"
 schema = 1
@@ -483,6 +735,143 @@ level = "critical"
 paths = ["migrations/**"]
 external = ["owner-review", "protected-ci"]
 "#;
+
+    #[test]
+    fn missing_default_config_preserves_zero_configuration_without_reading()
+    -> Result<(), ConfigError> {
+        let filesystem =
+            MockFileSystem::new(Ok(PathKind::Missing), TextOutcome::Io(io::ErrorKind::Other));
+
+        let config = load_default_forge_config(&filesystem, &filesystem.repository_root)?;
+
+        assert_eq!(config, None);
+        assert_eq!(filesystem.probe_calls.get(), 1);
+        assert_eq!(filesystem.read_calls.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn regular_default_config_uses_the_fixed_bound_and_existing_strict_parser()
+    -> Result<(), ConfigError> {
+        let filesystem = MockFileSystem::text(COMPLETE_CONFIG.as_bytes());
+
+        let config = load_default_forge_config(&filesystem, &filesystem.repository_root)?.ok_or(
+            ConfigError::Load {
+                reason: ConfigLoadError::ReadFailed {
+                    kind: io::ErrorKind::UnexpectedEof,
+                },
+            },
+        )?;
+
+        assert_eq!(config.schema, CONFIG_SCHEMA_V1);
+        assert!(config.commands.contains_key(&Intent::Verify));
+        assert_eq!(filesystem.probe_calls.get(), 1);
+        assert_eq!(filesystem.read_calls.get(), 1);
+        assert_eq!(
+            filesystem.observed_read_bound.get(),
+            Some(DEFAULT_MAX_CONFIG_FILE_BYTES)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_regular_default_config_paths_are_typed_errors_without_reads() {
+        for found in [PathKind::Directory, PathKind::Symlink, PathKind::Other] {
+            let filesystem = MockFileSystem::new(Ok(found), TextOutcome::Io(io::ErrorKind::Other));
+
+            assert_eq!(
+                load_default_forge_config(&filesystem, &filesystem.repository_root),
+                Err(ConfigError::Load {
+                    reason: ConfigLoadError::ExpectedRegularFile { found }
+                })
+            );
+            assert_eq!(filesystem.read_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_text_rejections_do_not_echo_configuration_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "sensitive-config-value";
+        let cases = [
+            (
+                BoundedText {
+                    bytes: secret.as_bytes().to_vec(),
+                    truncated: true,
+                    binary: false,
+                },
+                ConfigLoadError::Truncated {
+                    max_bytes: DEFAULT_MAX_CONFIG_FILE_BYTES,
+                },
+            ),
+            (
+                BoundedText {
+                    bytes: format!("{secret}\0").into_bytes(),
+                    truncated: false,
+                    binary: true,
+                },
+                ConfigLoadError::Binary,
+            ),
+            (
+                BoundedText {
+                    bytes: [secret.as_bytes(), &[0xff]].concat(),
+                    truncated: false,
+                    binary: false,
+                },
+                ConfigLoadError::InvalidUtf8,
+            ),
+        ];
+
+        for (text, reason) in cases {
+            let filesystem = MockFileSystem::new(Ok(PathKind::File), TextOutcome::Value(text));
+            let error = load_default_forge_config(&filesystem, &filesystem.repository_root)
+                .err()
+                .ok_or("unsafe bounded text unexpectedly loaded")?;
+            assert_eq!(error, ConfigError::Load { reason });
+            assert!(!error.to_string().contains(secret));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn probe_and_bounded_read_failures_preserve_only_the_io_kind() {
+        let probe = MockFileSystem::new(
+            Err(io::ErrorKind::PermissionDenied),
+            TextOutcome::Io(io::ErrorKind::Other),
+        );
+        assert_eq!(
+            load_default_forge_config(&probe, &probe.repository_root),
+            Err(ConfigError::Load {
+                reason: ConfigLoadError::ProbeFailed {
+                    kind: io::ErrorKind::PermissionDenied
+                }
+            })
+        );
+
+        let read =
+            MockFileSystem::new(Ok(PathKind::File), TextOutcome::Io(io::ErrorKind::TimedOut));
+        assert_eq!(
+            load_default_forge_config(&read, &read.repository_root),
+            Err(ConfigError::Load {
+                reason: ConfigLoadError::ReadFailed {
+                    kind: io::ErrorKind::TimedOut
+                }
+            })
+        );
+
+        let git = MockFileSystem::new(
+            Ok(PathKind::File),
+            TextOutcome::Git(GitErrorKind::InvalidData),
+        );
+        assert_eq!(
+            load_default_forge_config(&git, &git.repository_root),
+            Err(ConfigError::Load {
+                reason: ConfigLoadError::ReadGitFailure {
+                    kind: GitErrorKind::InvalidData
+                }
+            })
+        );
+    }
 
     #[test]
     fn complete_v1_config_is_typed_and_argv_safe() -> Result<(), ConfigError> {
