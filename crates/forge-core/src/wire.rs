@@ -7,18 +7,18 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use forge_schema::{
     AdapterData, AdapterDetailData, AdapterDriftData, AssetData, AssetDetailData, AssumptionData,
-    AssumptionDetailData, CommandData, CommandDetailData, CommandId, CommandResolutionData,
-    CommandSetData, CommandSourceData, ConfidenceData, DerivationEvidenceData, IntentData,
-    MutabilityData, NativeStringData, NativeStringEncodingData, NetworkIntentData,
-    ProjectModelData, ProjectUnitData, ProjectUnitDetailData, ProvenanceData, SuccessPredicateData,
-    TextRangeData, UnitDependencyDetailData, WirePath,
+    AssumptionDetailData, CommandData, CommandDetailData, CommandEnforcementData, CommandId,
+    CommandResolutionData, CommandSetData, CommandSourceData, ConfidenceData,
+    DerivationEvidenceData, IntentData, MutabilityData, NativeStringData, NativeStringEncodingData,
+    NetworkIntentData, ProjectModelData, ProjectUnitData, ProjectUnitDetailData, ProvenanceData,
+    SuccessPredicateData, TextRangeData, UnitDependencyDetailData, WirePath,
 };
 use thiserror::Error;
 
 use crate::domain::{
-    CommandResolution, CommandSource, CommandSpec, Confidence, CoverageDimension, Intent,
-    Mutability, NetworkIntent, ProjectKind, ProjectModel, ProjectModelError, Provenance,
-    SuccessPredicate, WorkState,
+    CommandEnforcement, CommandResolution, CommandSource, CommandSpec, Confidence,
+    CoverageDimension, Intent, Mutability, NetworkIntent, ProjectKind, ProjectModel,
+    ProjectModelError, Provenance, SuccessPredicate, WorkState,
 };
 
 /// A domain model cannot be represented by the additive `forge.model/v1` wire contract.
@@ -183,6 +183,7 @@ fn project_command_detail(
             .map(|name| native_string_data(name))
             .collect(),
         source_detail: command_source(&command.source),
+        enforcement: command_enforcement(command.enforcement),
         success: success_predicate(&command.success),
     })
 }
@@ -478,6 +479,13 @@ const fn confidence(value: Confidence) -> ConfidenceData {
     }
 }
 
+const fn command_enforcement(value: CommandEnforcement) -> CommandEnforcementData {
+    match value {
+        CommandEnforcement::Required => CommandEnforcementData::Required,
+        CommandEnforcement::Advisory => CommandEnforcementData::Advisory,
+    }
+}
+
 const fn mutability(value: Mutability) -> MutabilityData {
     match value {
         Mutability::ReadOnly => MutabilityData::ReadOnly,
@@ -552,13 +560,13 @@ mod tests {
     use std::time::Duration;
 
     use forge_schema::{
-        AdapterDriftData, CommandResolutionData, ConfidenceData, Digest, LanguageId,
-        NativeStringEncodingData, RepoId, UnitId, WirePath,
+        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ConfidenceData, Digest,
+        LanguageId, NativeStringEncodingData, RepoId, UnitId, WirePath,
     };
 
     use crate::domain::{
-        AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, Assumption, CommandSource,
-        CommandSpec, Confidence, CoverageDimension, EffectivePolicy, Intent,
+        AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, Assumption, CommandEnforcement,
+        CommandSource, CommandSpec, Confidence, CoverageDimension, EffectivePolicy, Intent,
         InvalidCommandResolution, Mutability, NetworkIntent, ProjectKind, ProjectModel,
         ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance, RepoFacts,
         ResolvedCommandSet, SuccessPredicate, TextRange, ToolchainInfo, UnitEdge, WorkState,
@@ -775,6 +783,7 @@ mod tests {
         verify.timeout = Duration::from_secs(42);
         verify.mutability = Mutability::ReadOnly;
         verify.network = NetworkIntent::OfflineRequested;
+        verify.enforcement = CommandEnforcement::Advisory;
         verify.success = SuccessPredicate::All(vec![
             SuccessPredicate::ExitZero,
             SuccessPredicate::JsonHasNoErrors,
@@ -891,6 +900,7 @@ mod tests {
             .as_ref()
             .ok_or_else(|| missing("command_sets"))?;
         let detail = &command_sets["verify"].candidates[0];
+        assert_eq!(detail.enforcement, CommandEnforcementData::Advisory);
         assert!(matches!(
             &detail.source_detail,
             forge_schema::CommandSourceData::ExistingProjectTarget { target, .. }

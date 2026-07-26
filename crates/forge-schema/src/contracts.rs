@@ -324,6 +324,18 @@ pub enum NetworkIntentData {
     Unknown,
 }
 
+/// Whether failure of a command blocks the enclosing verification decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum CommandEnforcementData {
+    #[default]
+    Required,
+    Advisory,
+    #[serde(other)]
+    Unknown,
+}
+
 /// A shell-free project command representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandData {
@@ -394,6 +406,8 @@ pub struct CommandDetailData {
     pub native_args: Vec<NativeStringData>,
     pub native_environment_names: Vec<NativeStringData>,
     pub source_detail: CommandSourceData,
+    #[serde(default)]
+    pub enforcement: CommandEnforcementData,
     pub success: SuccessPredicateData,
 }
 
@@ -891,9 +905,10 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        CheckStatusData, CommandResolutionData, CommandSourceData, ConfidenceData, Envelope,
-        NativeStringEncodingData, ProjectModelData, ProjectUnitDetailData, SchemaIndexData,
-        SchemaKind, SuccessPredicateData, VersionData, schema_json,
+        CheckStatusData, CommandDetailData, CommandEnforcementData, CommandResolutionData,
+        CommandSourceData, ConfidenceData, Envelope, NativeStringEncodingData, ProjectModelData,
+        ProjectUnitDetailData, SchemaIndexData, SchemaKind, SuccessPredicateData, VersionData,
+        schema_json,
     };
 
     #[test]
@@ -1063,6 +1078,7 @@ mod tests {
     fn unknown_companion_enums_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
         let resolution: CommandResolutionData = serde_json::from_str("\"future-resolution\"")?;
         let confidence: ConfidenceData = serde_json::from_str("\"future-confidence\"")?;
+        let enforcement: CommandEnforcementData = serde_json::from_str("\"future-enforcement\"")?;
         let encoding: NativeStringEncodingData = serde_json::from_str("\"future-encoding\"")?;
         let source: CommandSourceData =
             serde_json::from_str(r#"{"kind":"future-source","detail":"ignored"}"#)?;
@@ -1070,9 +1086,60 @@ mod tests {
 
         assert_eq!(resolution, CommandResolutionData::Unknown);
         assert_eq!(confidence, ConfidenceData::Unknown);
+        assert_eq!(enforcement, CommandEnforcementData::Unknown);
         assert_eq!(encoding, NativeStringEncodingData::Unknown);
         assert_eq!(source, CommandSourceData::Unknown);
         assert_eq!(success, SuccessPredicateData::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn previous_command_detail_without_enforcement_defaults_to_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let detail: CommandDetailData = serde_json::from_str(
+            r#"{
+                "command": {
+                    "id": "test",
+                    "intent": "test",
+                    "program": "cargo",
+                    "args": ["test"],
+                    "cwd": {"display": "", "encoding": "utf8"},
+                    "environment_names": [],
+                    "timeout_seconds": 300,
+                    "mutability": "read-only",
+                    "network": "inherit",
+                    "source": "explicit-config",
+                    "confidence": "high",
+                    "coverage": ["unit-test"]
+                },
+                "native_program": {"display": "cargo", "encoding": "utf8"},
+                "native_args": [{"display": "test", "encoding": "utf8"}],
+                "native_environment_names": [],
+                "source_detail": {"kind": "explicit-config"},
+                "success": {"kind": "exit-zero"}
+            }"#,
+        )?;
+
+        assert_eq!(detail.enforcement, CommandEnforcementData::Required);
+        Ok(())
+    }
+
+    #[test]
+    fn command_enforcement_is_optional_in_the_v1_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::ProjectModel)?)?;
+        let detail = schema
+            .pointer("/$defs/CommandDetailData")
+            .ok_or_else(|| std::io::Error::other("CommandDetailData definition is missing"))?;
+        let required = detail["required"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("CommandDetailData.required is not an array"))?;
+        let properties = detail["properties"].as_object().ok_or_else(|| {
+            std::io::Error::other("CommandDetailData.properties is not an object")
+        })?;
+
+        assert!(properties.contains_key("enforcement"));
+        assert!(required.iter().all(|value| value != "enforcement"));
         Ok(())
     }
 

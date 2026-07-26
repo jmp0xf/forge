@@ -59,6 +59,14 @@ pub enum NetworkIntent {
     Unknown,
 }
 
+/// Whether failure of a command blocks the enclosing verification decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandEnforcement {
+    #[default]
+    Required,
+    Advisory,
+}
+
 /// Why Forge selected a command.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandSource {
@@ -116,6 +124,7 @@ pub struct CommandSpec {
     pub timeout: Duration,
     pub mutability: Mutability,
     pub network: NetworkIntent,
+    pub enforcement: CommandEnforcement,
     pub success: SuccessPredicate,
     pub source: CommandSource,
     pub confidence: Confidence,
@@ -142,6 +151,7 @@ impl CommandSpec {
             timeout: Duration::from_secs(300),
             mutability: Mutability::Unknown,
             network: NetworkIntent::Unknown,
+            enforcement: CommandEnforcement::Required,
             success: SuccessPredicate::ExitZero,
             source,
             confidence: Confidence::Low,
@@ -1047,11 +1057,11 @@ mod tests {
     use crate::path::RepoRelativePath;
 
     use super::{
-        AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, CommandResolution, CommandSource,
-        CommandSpec, Confidence, EffectivePolicy, Intent, InvalidCommandResolution,
-        InvalidTextRange, ProjectKind, ProjectModel, ProjectModelError, ProjectModelInputs,
-        ProjectUnit, Provenance, RepoFacts, ResolvedCommandSet, TextRange, ToolchainInfo, UnitEdge,
-        WorkState,
+        AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, CommandEnforcement,
+        CommandResolution, CommandSource, CommandSpec, Confidence, EffectivePolicy, Intent,
+        InvalidCommandResolution, InvalidTextRange, ProjectKind, ProjectModel, ProjectModelError,
+        ProjectModelInputs, ProjectUnit, Provenance, RepoFacts, ResolvedCommandSet, TextRange,
+        ToolchainInfo, UnitEdge, WorkState,
     };
 
     fn provenance(rule_id: impl Into<String>) -> Provenance {
@@ -1175,6 +1185,7 @@ mod tests {
             spec.args,
             vec![OsString::from("check"), OsString::from("--workspace")]
         );
+        assert_eq!(spec.enforcement, CommandEnforcement::Required);
     }
 
     #[test]

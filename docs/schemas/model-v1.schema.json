@@ -295,6 +295,10 @@
         "command": {
           "$ref": "#/$defs/CommandData"
         },
+        "enforcement": {
+          "$ref": "#/$defs/CommandEnforcementData",
+          "default": "required"
+        },
         "native_args": {
           "type": "array",
           "items": {
@@ -324,6 +328,15 @@
         "native_environment_names",
         "source_detail",
         "success"
+      ]
+    },
+    "CommandEnforcementData": {
+      "description": "Whether failure of a command blocks the enclosing verification decision.",
+      "type": "string",
+      "enum": [
+        "required",
+        "advisory",
+        "unknown"
       ]
     },
     "CommandId": {
