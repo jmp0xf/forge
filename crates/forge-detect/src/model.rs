@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use forge_core::ports::{FileSystemPort, GitPort, Hasher, ProcessPort};
 use forge_core::{
-    Assumption, CommandSource, CommandSpec, Confidence, Diagnostic, EffectivePolicy, GitError,
-    GitFileSet, Intent, InvalidCommandResolution, Inventory, InventoryError, InventoryKind,
-    InventoryOptions, ProjectModel, ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance,
+    Assumption, CommandSource, CommandSpec, Confidence, Diagnostic, GitError, GitFileSet, Intent,
+    InvalidCommandResolution, Inventory, InventoryError, InventoryKind, InventoryOptions,
+    ProjectModel, ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance,
     RelativePathError, RepoRelativePath, Severity,
 };
 
@@ -19,6 +19,7 @@ use crate::config::{ConfigError, ForgeConfig, load_default_forge_config, load_fo
 use crate::go::{
     GoProvider, GoProviderContext, GoProviderError, GoProviderIssue, GoProviderIssueKind,
 };
+use crate::policy::{PolicyBaseCompleteness, PolicyResolutionError, resolve_effective_policy};
 use crate::repository::{RepositoryDetection, RepositoryDetectionError, detect_repository};
 use crate::resolution::{
     CommandLayer, CommandLayerKind, CommandPlanCandidate, CommandResolutionLayers,
@@ -78,6 +79,9 @@ pub struct NavigationSnapshot {
     pub inventory: Inventory,
     pub config: Option<ForgeConfig>,
     pub config_path: RepoRelativePath,
+    /// Known lower-bound content used by risk/navigation, paired with explicit base completeness.
+    pub effective_policy: forge_core::EffectivePolicyContent,
+    pub policy_base_completeness: PolicyBaseCompleteness,
 }
 
 impl NavigationSnapshot {
@@ -98,6 +102,7 @@ pub enum ModelDetectionError {
     Inventory(InventoryError),
     Assets(AssetDiscoveryError),
     Config(ConfigError),
+    Policy(PolicyResolutionError),
     RustProvider(RustDetectionError),
     GoProvider(GoProviderError),
     InvalidInventoryPath {
@@ -116,6 +121,7 @@ impl fmt::Display for ModelDetectionError {
             Self::Inventory(error) => error.fmt(formatter),
             Self::Assets(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
+            Self::Policy(error) => write!(formatter, "effective policy resolution failed: {error}"),
             Self::RustProvider(error) => write!(formatter, "Rust provider failed: {error}"),
             Self::GoProvider(error) => write!(formatter, "Go provider failed: {error}"),
             Self::InvalidInventoryPath { path, source } => write!(
@@ -136,6 +142,7 @@ impl Error for ModelDetectionError {
             Self::Inventory(error) => Some(error),
             Self::Assets(error) => Some(error),
             Self::Config(error) => Some(error),
+            Self::Policy(error) => Some(error),
             Self::RustProvider(error) => Some(error),
             Self::GoProvider(error) => Some(error),
             Self::InvalidInventoryPath { source, .. } => Some(source),
@@ -189,8 +196,11 @@ pub fn detect_project_model(
         repository,
         inventory,
         standard_assets,
-        config,
-        &config_path,
+        PolicyAssemblyInput {
+            config,
+            config_path: &config_path,
+            hasher,
+        },
         runners,
         language,
     )
@@ -518,15 +528,25 @@ fn go_issue_reason(kind: GoProviderIssueKind) -> &'static str {
     }
 }
 
+struct PolicyAssemblyInput<'a> {
+    config: Option<ForgeConfig>,
+    config_path: &'a RepoRelativePath,
+    hasher: &'a dyn Hasher,
+}
+
 fn assemble_project_model(
     repository: RepositoryDetection,
     inventory: Inventory,
     standard_assets: StandardAssetDiscovery,
-    config: Option<ForgeConfig>,
-    config_path: &RepoRelativePath,
+    policy_input: PolicyAssemblyInput<'_>,
     runners: RunnerScan,
     language: LanguageDetection,
 ) -> Result<ModelDetectionOutcome, ModelDetectionError> {
+    let PolicyAssemblyInput {
+        config,
+        config_path,
+        hasher,
+    } = policy_input;
     let timeout = config
         .as_ref()
         .and_then(|config| config.policy.default_timeout_seconds)
@@ -550,7 +570,16 @@ fn assemble_project_model(
         language_default,
     })
     .map_err(ModelDetectionError::CommandResolution)?;
-    let policy = unresolved_effective_policy(config.as_ref(), config_path);
+    let policy_base_completeness =
+        policy_base_completeness(repository.facts.work_state, repository.facts.head.is_some());
+    let policy_resolution = resolve_effective_policy(
+        config.as_ref(),
+        config_path,
+        policy_base_completeness,
+        hasher,
+    )
+    .map_err(ModelDetectionError::Policy)?;
+    let policy = policy_resolution.model_policy.clone();
 
     let RepositoryDetection {
         facts,
@@ -586,6 +615,8 @@ fn assemble_project_model(
             inventory,
             config,
             config_path: config_path.clone(),
+            effective_policy: policy_resolution.effective,
+            policy_base_completeness,
         },
     })
 }
@@ -603,6 +634,17 @@ fn model_detection_completion(
         ModelDetectionCompletion::Partial
     } else {
         ModelDetectionCompletion::Complete
+    }
+}
+
+fn policy_base_completeness(
+    work_state: forge_core::WorkState,
+    has_head: bool,
+) -> PolicyBaseCompleteness {
+    if work_state == forge_core::WorkState::Unborn && !has_head {
+        PolicyBaseCompleteness::Complete
+    } else {
+        PolicyBaseCompleteness::Unknown
     }
 }
 
@@ -706,22 +748,6 @@ fn language_default_layer(language: &LanguageDetection) -> CommandLayer {
             language.provenance.clone(),
         )
     }
-}
-
-fn unresolved_effective_policy(
-    config: Option<&ForgeConfig>,
-    config_path: &RepoRelativePath,
-) -> EffectivePolicy {
-    EffectivePolicy::unknown(vec![Provenance {
-        rule_id: String::from("policy.effective.pending-v1"),
-        source_path: config.is_some().then(|| config_path.as_path().into()),
-        source_range: None,
-        detail: if config.is_some() {
-            String::from("configuration was parsed, but effective policy merging belongs to M5")
-        } else {
-            String::from("effective built-in policy resolution belongs to M5")
-        },
-    }])
 }
 
 fn config_provenance(path: &RepoRelativePath, detail: &str) -> Provenance {
@@ -1068,13 +1094,16 @@ mod tests {
             repository(),
             inventory,
             standard_assets,
-            config.cloned(),
-            &RepoRelativePath::new("forge.toml").map_err(|source| {
-                ModelDetectionError::InvalidInventoryPath {
-                    path: PathBuf::from("forge.toml"),
-                    source,
-                }
-            })?,
+            PolicyAssemblyInput {
+                config: config.cloned(),
+                config_path: &RepoRelativePath::new("forge.toml").map_err(|source| {
+                    ModelDetectionError::InvalidInventoryPath {
+                        path: PathBuf::from("forge.toml"),
+                        source,
+                    }
+                })?,
+                hasher: &ModelHasher,
+            },
             RunnerScan {
                 discoveries,
                 failures: Vec::new(),
@@ -1083,6 +1112,13 @@ mod tests {
             language,
         )
         .map(|outcome| outcome.model)
+    }
+
+    fn policy_completeness_for_fixture(
+        work_state: WorkState,
+        has_head: bool,
+    ) -> PolicyBaseCompleteness {
+        policy_base_completeness(work_state, has_head)
     }
 
     #[test]
@@ -1251,6 +1287,13 @@ args = ["test", "--workspace"]
             outcome.navigation.config_path.as_path(),
             Path::new("forge.toml")
         );
+        assert_eq!(
+            outcome.navigation.policy_base_completeness,
+            PolicyBaseCompleteness::Complete
+        );
+        assert_eq!(outcome.navigation.effective_policy.rules().len(), 9);
+        assert!(outcome.model.policy.digest.is_some());
+        assert_eq!(outcome.model.policy.confidence, Confidence::High);
         let calls = process.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].program, OsString::from("cargo"));
@@ -1425,6 +1468,22 @@ args = ["test", "--workspace"]
         assert_eq!(
             ModelDetectionOptions::default().metadata_timeout,
             Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn only_an_unborn_repository_has_a_complete_policy_base() {
+        assert_eq!(
+            policy_completeness_for_fixture(WorkState::Unborn, false),
+            PolicyBaseCompleteness::Complete
+        );
+        assert_eq!(
+            policy_completeness_for_fixture(WorkState::Clean, true),
+            PolicyBaseCompleteness::Unknown
+        );
+        assert_eq!(
+            policy_completeness_for_fixture(WorkState::Unknown, false),
+            PolicyBaseCompleteness::Unknown
         );
     }
 }

@@ -6,6 +6,7 @@ pub mod assets;
 pub mod config;
 pub mod go;
 pub mod model;
+pub mod policy;
 pub mod repository;
 pub mod resolution;
 pub mod runner;

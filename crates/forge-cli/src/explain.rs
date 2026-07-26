@@ -178,6 +178,13 @@ fn map_detection_error(error: ModelDetectionError) -> AppError {
                 "correct or remove the selected configuration, then rerun `{CLI_NAME} explain`"
             ),
         ),
+        ModelDetectionError::Policy(error) => AppError::internal(
+            "FGE0009",
+            "the effective policy could not be assembled",
+            "effective policy",
+            error.to_string(),
+            "report this as a Forge implementation defect",
+        ),
         ModelDetectionError::RustProvider(error) => internal_detection_error(error.to_string()),
         ModelDetectionError::GoProvider(error) => internal_detection_error(error.to_string()),
         ModelDetectionError::Assets(error) => internal_detection_error(error.to_string()),
