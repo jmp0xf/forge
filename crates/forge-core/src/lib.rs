@@ -7,6 +7,7 @@
 pub mod branding;
 pub mod domain;
 pub mod error;
+pub mod git;
 pub mod path;
 pub mod ports;
 
@@ -16,4 +17,10 @@ pub use domain::{
 };
 pub use error::{AppError, ExitCode};
 pub use forge_schema::Digest;
+pub use git::{
+    AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitMode, GitObjectFormat,
+    GitObjectId, GitRefName, OrdinaryEntry, PorcelainV2ParseError, PorcelainV2ParseErrorKind,
+    PorcelainV2Status, RenameOrCopy, RenamedOrCopiedEntry, StatusEntry, SubmoduleState,
+    UnmergedEntry, XyStatus, parse_status_porcelain_v2,
+};
 pub use path::{RelativePathError, RepoRelativePath};
