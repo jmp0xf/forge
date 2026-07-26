@@ -1,7 +1,7 @@
 //! Hardened Git CLI implementation of the typed core port.
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, BufReader, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,32 +9,45 @@ use forge_core::domain::{
     CommandSource, CommandSpec, Confidence, Intent, Mutability, NetworkIntent,
 };
 use forge_core::ports::{GitPort, ProcessObservation, ProcessPort as _};
-use forge_core::{GitObjectFormat, PorcelainV2Status, RepoRelativePath, parse_status_porcelain_v2};
+use forge_core::{
+    GitObjectFormat, PorcelainV2ReadError, PorcelainV2Status, RepoRelativePath,
+    parse_status_porcelain_v2_reader,
+};
 
-use crate::process::SynchronousProcessRunner;
+use crate::process::{
+    DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES, SpooledProcessObservation, SynchronousProcessRunner,
+};
 
 /// Maximum wall-clock duration for one Git inspection.
 pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum retained status bytes per stream.
+/// Maximum Git status bytes retained in an anonymous disk spool.
+pub const DEFAULT_GIT_STATUS_SPOOL_LIMIT_BYTES: usize = DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES;
+
+/// Maximum bytes retained in memory for one NUL-delimited porcelain v2 record.
+pub const DEFAULT_GIT_STATUS_RECORD_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Maximum typed worktree entries accepted from one porcelain v2 status.
 ///
-/// This Git-specific provisional cap avoids applying the much smaller generic diagnostic-retention
-/// limit to status. It is not an unbounded or streaming guarantee: exceeding it is a diagnostic
-/// failure, never a partial status result.
-pub const DEFAULT_GIT_STATUS_OUTPUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// This supports repositories with at least 100,000 entries while bounding typed allocation.
+pub const DEFAULT_GIT_STATUS_ENTRY_LIMIT: usize = 200_000;
 
 /// Typed wrapper around the installed `git` executable and unified process runner.
 #[derive(Debug, Clone, Copy)]
 pub struct GitCli {
     timeout: Duration,
-    status_output_limit_bytes: usize,
+    status_spool_limit_bytes: usize,
+    status_record_limit_bytes: usize,
+    status_entry_limit: usize,
 }
 
 impl Default for GitCli {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_GIT_TIMEOUT,
-            status_output_limit_bytes: DEFAULT_GIT_STATUS_OUTPUT_LIMIT_BYTES,
+            status_spool_limit_bytes: DEFAULT_GIT_STATUS_SPOOL_LIMIT_BYTES,
+            status_record_limit_bytes: DEFAULT_GIT_STATUS_RECORD_LIMIT_BYTES,
+            status_entry_limit: DEFAULT_GIT_STATUS_ENTRY_LIMIT,
         }
     }
 }
@@ -87,16 +100,20 @@ impl GitCli {
         self
     }
 
-    /// Overrides the per-stream status retention bound.
+    /// Overrides the anonymous status spool bound.
     #[must_use]
-    pub fn with_status_output_limit_bytes(mut self, limit: usize) -> Self {
-        self.status_output_limit_bytes = limit;
+    pub fn with_status_spool_limit_bytes(mut self, limit: usize) -> Self {
+        self.status_spool_limit_bytes = limit;
         self
     }
 
-    fn run(&self, start: &Path, operation: GitOperation) -> io::Result<Vec<u8>> {
-        let runner = SynchronousProcessRunner::new(start)?
-            .with_output_limit_bytes(operation.output_limit(self.status_output_limit_bytes));
+    /// Backward-compatible spelling for [`Self::with_status_spool_limit_bytes`].
+    #[must_use]
+    pub fn with_status_output_limit_bytes(self, limit: usize) -> Self {
+        self.with_status_spool_limit_bytes(limit)
+    }
+
+    fn command_spec(&self, operation: GitOperation) -> CommandSpec {
         let mut spec = CommandSpec::new(
             operation.command_id(),
             Intent::Check,
@@ -122,14 +139,36 @@ impl GitCli {
         for (key, value) in HARDENED_GIT_ENV {
             spec.env.insert(OsString::from(key), OsString::from(value));
         }
+        spec
+    }
 
-        let observation = runner.run(&spec).map_err(|error| {
+    fn run(&self, start: &Path, operation: GitOperation) -> io::Result<Vec<u8>> {
+        if matches!(operation, GitOperation::Status) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Git status must use the bounded anonymous spool path",
+            ));
+        }
+        let runner = SynchronousProcessRunner::new(start)?;
+        let observation = runner.run(&self.command_spec(operation)).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("failed to execute git {}: {error}", operation.name()),
             )
         })?;
         checked_stdout(operation.name(), observation)
+    }
+
+    fn run_spooled_status(&self, root: &Path) -> io::Result<SpooledProcessObservation> {
+        let operation = GitOperation::Status;
+        SynchronousProcessRunner::new(root)?
+            .run_spooled_stdout(&self.command_spec(operation), self.status_spool_limit_bytes)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to execute git {}: {error}", operation.name()),
+                )
+            })
     }
 
     fn resolve_path(&self, start: &Path, operation: GitOperation) -> io::Result<PathBuf> {
@@ -157,13 +196,29 @@ impl GitPort for GitCli {
 
     fn status(&self, root: &Path) -> io::Result<PorcelainV2Status> {
         let object_format = self.object_format(root)?;
-        let raw = self.run(root, GitOperation::Status)?;
-        let status = parse_status_porcelain_v2(&raw, object_format).map_err(|error| {
-            io::Error::new(
+        let mut spooled = self.run_spooled_status(root)?;
+        check_observation(GitOperation::Status.name(), &spooled.observation)?;
+        spooled.stdout_file.flush()?;
+        let spool_length = spooled.stdout_file.metadata()?.len();
+        let spool_limit = u64::try_from(self.status_spool_limit_bytes).unwrap_or(u64::MAX);
+        let expected_length = spooled.observation.stdout_total_bytes.min(spool_limit);
+        if spool_length != expected_length {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Git returned malformed porcelain v2 status: {error}"),
-            )
-        })?;
+                format!(
+                    "Git status spool length mismatch: retained {spool_length} bytes, expected {expected_length} from {} total bytes",
+                    spooled.observation.stdout_total_bytes
+                ),
+            ));
+        }
+        spooled.stdout_file.seek(SeekFrom::Start(0))?;
+        let status = parse_status_porcelain_v2_reader(
+            BufReader::new(spooled.stdout_file),
+            object_format,
+            self.status_record_limit_bytes,
+            self.status_entry_limit,
+        )
+        .map_err(map_status_read_error)?;
         if status.branch.oid.is_none() || status.branch.head.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -213,16 +268,14 @@ impl GitOperation {
             Self::Status => STATUS_PORCELAIN_V2_ARGS,
         }
     }
-
-    fn output_limit(self, status_limit: usize) -> usize {
-        match self {
-            Self::Status => status_limit,
-            _ => crate::process::DEFAULT_OUTPUT_LIMIT_BYTES,
-        }
-    }
 }
 
 fn checked_stdout(operation: &str, observation: ProcessObservation) -> io::Result<Vec<u8>> {
+    check_observation(operation, &observation)?;
+    Ok(observation.stdout)
+}
+
+fn check_observation(operation: &str, observation: &ProcessObservation) -> io::Result<()> {
     if observation.timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -251,7 +304,26 @@ fn checked_stdout(operation: &str, observation: ProcessObservation) -> io::Resul
             observation.exit_code, observation.signal,
         )));
     }
-    Ok(observation.stdout)
+    Ok(())
+}
+
+fn map_status_read_error(error: PorcelainV2ReadError) -> io::Error {
+    match error {
+        PorcelainV2ReadError::Input {
+            offset,
+            record,
+            source,
+        } => io::Error::new(
+            source.kind(),
+            format!(
+                "failed to read Git porcelain v2 status at byte {offset}, record {record}: {source}"
+            ),
+        ),
+        PorcelainV2ReadError::Parse(error) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Git returned malformed porcelain v2 status: {error}"),
+        ),
+    }
 }
 
 fn bounded_stderr_context(stderr: &[u8]) -> String {

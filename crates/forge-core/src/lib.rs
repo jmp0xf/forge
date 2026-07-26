@@ -20,7 +20,8 @@ pub use forge_schema::Digest;
 pub use git::{
     AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitMode, GitObjectFormat,
     GitObjectId, GitRefName, OrdinaryEntry, PorcelainV2ParseError, PorcelainV2ParseErrorKind,
-    PorcelainV2Status, RenameOrCopy, RenamedOrCopiedEntry, StatusEntry, SubmoduleState,
-    UnmergedEntry, XyStatus, parse_status_porcelain_v2,
+    PorcelainV2ReadError, PorcelainV2Status, RenameOrCopy, RenamedOrCopiedEntry, StatusEntry,
+    SubmoduleState, UnmergedEntry, XyStatus, parse_status_porcelain_v2,
+    parse_status_porcelain_v2_reader,
 };
 pub use path::{RelativePathError, RepoRelativePath};

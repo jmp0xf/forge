@@ -1,5 +1,6 @@
 //! Typed, side-effect-free Git domain types and porcelain v2 parser.
 
+use std::io::{self, BufRead, Cursor};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -209,6 +210,12 @@ pub enum PorcelainV2ParseErrorKind {
     DuplicateHeader { header: &'static str },
     #[error("rename/copy record is missing its NUL-terminated original path")]
     MissingOriginalPath,
+    #[error("record exceeds the configured {max_bytes}-byte bound")]
+    RecordTooLong { max_bytes: usize },
+    #[error("status contains more than the configured {max_entries} entries")]
+    TooManyEntries { max_entries: usize },
+    #[error("input reader failed with {kind:?}")]
+    InputReadFailure { kind: io::ErrorKind },
 }
 
 /// A parse error located by byte offset and one-based logical record number.
@@ -220,6 +227,20 @@ pub struct PorcelainV2ParseError {
     pub kind: PorcelainV2ParseErrorKind,
 }
 
+/// A bounded streaming parse failure, preserving parser locations separately from input I/O.
+#[derive(Debug, Error)]
+pub enum PorcelainV2ReadError {
+    #[error("failed to read Git porcelain v2 at byte {offset}, record {record}: {source}")]
+    Input {
+        offset: usize,
+        record: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Parse(#[from] PorcelainV2ParseError),
+}
+
 /// Parses raw, NUL-delimited porcelain v2 bytes using one explicit object format.
 ///
 /// Git paths become native [`RepoRelativePath`] values. Unix preserves the original bytes;
@@ -228,6 +249,46 @@ pub fn parse_status_porcelain_v2(
     input: &[u8],
     object_format: GitObjectFormat,
 ) -> Result<PorcelainV2Status, PorcelainV2ParseError> {
+    match parse_status_porcelain_v2_reader(
+        Cursor::new(input),
+        object_format,
+        input.len(),
+        usize::MAX,
+    ) {
+        Ok(status) => Ok(status),
+        Err(PorcelainV2ReadError::Parse(error)) => Err(error),
+        Err(PorcelainV2ReadError::Input {
+            offset,
+            record,
+            source,
+        }) => Err(PorcelainV2ParseError {
+            offset,
+            record,
+            // `Cursor<&[u8]>` cannot produce an I/O error. Retaining a typed fallback keeps this
+            // wrapper total without hiding a theoretically impossible branch behind a panic.
+            kind: PorcelainV2ParseErrorKind::InputReadFailure {
+                kind: source.kind(),
+            },
+        }),
+    }
+}
+
+/// Incrementally parses NUL-delimited porcelain v2 from a buffered reader.
+///
+/// `max_record_bytes` bounds one logical record. A type-2 rename/copy's second path shares that
+/// byte budget and retains the same logical record number and absolute byte offsets. `max_entries`
+/// bounds typed worktree entries; branch headers do not consume this allowance.
+/// Neither bound causes an unbounded read: the implementation only uses [`BufRead::fill_buf`] and
+/// [`BufRead::consume`].
+pub fn parse_status_porcelain_v2_reader<R>(
+    mut reader: R,
+    object_format: GitObjectFormat,
+    max_record_bytes: usize,
+    max_entries: usize,
+) -> Result<PorcelainV2Status, PorcelainV2ReadError>
+where
+    R: BufRead,
+{
     let mut parsed = PorcelainV2Status {
         object_format,
         branch: BranchStatus::default(),
@@ -235,17 +296,24 @@ pub fn parse_status_porcelain_v2(
     };
     let mut offset = 0;
     let mut record_number = 0;
+    let mut record = Vec::with_capacity(max_record_bytes.min(8 * 1024));
 
-    while offset < input.len() {
-        record_number += 1;
+    loop {
+        let next_record_number = record_number + 1;
         let record_start = offset;
-        let record_end = find_nul(input, offset).ok_or(PorcelainV2ParseError {
-            offset: input.len(),
-            record: record_number,
-            kind: PorcelainV2ParseErrorKind::MissingNulTerminator,
-        })?;
-        let record = &input[record_start..record_end];
-        offset = record_end + 1;
+        if !read_nul_record(
+            &mut reader,
+            &mut record,
+            max_record_bytes,
+            max_record_bytes,
+            record_start,
+            next_record_number,
+            RecordExpectation::OptionalStatus,
+        )? {
+            break;
+        }
+        record_number = next_record_number;
+        offset = record_start + record.len() + 1;
 
         let marker = record.first().copied().ok_or(PorcelainV2ParseError {
             offset: record_start,
@@ -253,49 +321,64 @@ pub fn parse_status_porcelain_v2(
             kind: PorcelainV2ParseErrorKind::EmptyRecord,
         })?;
 
+        if matches!(marker, b'1' | b'2' | b'u' | b'?' | b'!') && parsed.entries.len() >= max_entries
+        {
+            return Err(PorcelainV2ParseError {
+                offset: record_start,
+                record: record_number,
+                kind: PorcelainV2ParseErrorKind::TooManyEntries { max_entries },
+            }
+            .into());
+        }
+
         match marker {
             b'#' => parse_header(
-                record,
+                &record,
                 record_start,
                 record_number,
                 object_format,
                 &mut parsed.branch,
             )?,
             b'1' => parsed.entries.push(StatusEntry::Ordinary(parse_ordinary(
-                record,
+                &record,
                 record_start,
                 record_number,
                 object_format,
             )?)),
             b'2' => {
-                let partial = parse_renamed(record, record_start, record_number, object_format)?;
+                let partial = parse_renamed(&record, record_start, record_number, object_format)?;
+                let original_limit = max_record_bytes.saturating_sub(record.len());
                 let original_start = offset;
-                let original_end =
-                    find_nul(input, original_start).ok_or(PorcelainV2ParseError {
-                        offset: input.len(),
-                        record: record_number,
-                        kind: PorcelainV2ParseErrorKind::MissingOriginalPath,
-                    })?;
-                if original_end == original_start {
+                let _present = read_nul_record(
+                    &mut reader,
+                    &mut record,
+                    original_limit,
+                    max_record_bytes,
+                    original_start,
+                    record_number,
+                    RecordExpectation::RequiredOriginalPath,
+                )?;
+                if record.is_empty() {
                     return Err(PorcelainV2ParseError {
                         offset: original_start,
                         record: record_number,
                         kind: PorcelainV2ParseErrorKind::EmptyField {
                             field: "original-path",
                         },
-                    });
+                    }
+                    .into());
                 }
-                offset = original_end + 1;
+                offset = original_start + record.len() + 1;
                 parsed
                     .entries
                     .push(StatusEntry::RenamedOrCopied(partial.finish(
-                        &input[original_start..original_end],
+                        &record,
                         original_start,
                         record_number,
                     )?));
             }
             b'u' => parsed.entries.push(StatusEntry::Unmerged(parse_unmerged(
-                record,
+                &record,
                 record_start,
                 record_number,
                 object_format,
@@ -303,12 +386,12 @@ pub fn parse_status_porcelain_v2(
             b'?' => parsed
                 .entries
                 .push(StatusEntry::Untracked(parse_simple_path(
-                    record,
+                    &record,
                     record_start,
                     record_number,
                 )?)),
             b'!' => parsed.entries.push(StatusEntry::Ignored(parse_simple_path(
-                record,
+                &record,
                 record_start,
                 record_number,
             )?)),
@@ -317,7 +400,8 @@ pub fn parse_status_porcelain_v2(
                     offset: record_start,
                     record: record_number,
                     kind: PorcelainV2ParseErrorKind::UnknownRecordType { marker: unknown },
-                });
+                }
+                .into());
             }
         }
     }
@@ -325,12 +409,79 @@ pub fn parse_status_porcelain_v2(
     Ok(parsed)
 }
 
-fn find_nul(input: &[u8], start: usize) -> Option<usize> {
-    input
-        .get(start..)?
-        .iter()
-        .position(|byte| *byte == 0)
-        .map(|relative| start + relative)
+#[derive(Debug, Clone, Copy)]
+enum RecordExpectation {
+    OptionalStatus,
+    RequiredOriginalPath,
+}
+
+impl RecordExpectation {
+    fn missing_kind(self) -> PorcelainV2ParseErrorKind {
+        match self {
+            Self::OptionalStatus => PorcelainV2ParseErrorKind::MissingNulTerminator,
+            Self::RequiredOriginalPath => PorcelainV2ParseErrorKind::MissingOriginalPath,
+        }
+    }
+
+    fn allows_clean_end(self) -> bool {
+        matches!(self, Self::OptionalStatus)
+    }
+}
+
+fn read_nul_record<R>(
+    reader: &mut R,
+    record: &mut Vec<u8>,
+    buffer_limit_bytes: usize,
+    reported_record_limit_bytes: usize,
+    record_start: usize,
+    record_number: usize,
+    expectation: RecordExpectation,
+) -> Result<bool, PorcelainV2ReadError>
+where
+    R: BufRead,
+{
+    record.clear();
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|source| PorcelainV2ReadError::Input {
+                offset: record_start + record.len(),
+                record: record_number,
+                source,
+            })?;
+        if available.is_empty() {
+            if record.is_empty() && expectation.allows_clean_end() {
+                return Ok(false);
+            }
+            return Err(PorcelainV2ParseError {
+                offset: record_start + record.len(),
+                record: record_number,
+                kind: expectation.missing_kind(),
+            }
+            .into());
+        }
+
+        let terminator = available.iter().position(|byte| *byte == 0);
+        let bytes_before_terminator = terminator.unwrap_or(available.len());
+        let remaining = buffer_limit_bytes.saturating_sub(record.len());
+        if bytes_before_terminator > remaining {
+            return Err(PorcelainV2ParseError {
+                offset: record_start + buffer_limit_bytes,
+                record: record_number,
+                kind: PorcelainV2ParseErrorKind::RecordTooLong {
+                    max_bytes: reported_record_limit_bytes,
+                },
+            }
+            .into());
+        }
+
+        record.extend_from_slice(&available[..bytes_before_terminator]);
+        let consumed = bytes_before_terminator + usize::from(terminator.is_some());
+        reader.consume(consumed);
+        if terminator.is_some() {
+            return Ok(true);
+        }
+    }
 }
 
 fn parse_header(
@@ -956,11 +1107,13 @@ impl<'a> Fields<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufReader, Cursor};
     use std::path::Path;
 
     use super::{
         AheadBehind, BranchHead, BranchOid, GitObjectFormat, PorcelainV2ParseErrorKind,
-        RenameOrCopy, StatusEntry, parse_status_porcelain_v2,
+        PorcelainV2ReadError, RenameOrCopy, StatusEntry, parse_status_porcelain_v2,
+        parse_status_porcelain_v2_reader,
     };
 
     const OID_1: &[u8] = b"1111111111111111111111111111111111111111";
@@ -1097,6 +1250,124 @@ mod tests {
             parsed.entries.get(1),
             Some(StatusEntry::Untracked(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_reader_preserves_type_two_logical_record_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut input = b"2 C. N... 100644 100644 100644 ".to_vec();
+        input.extend_from_slice(OID_1);
+        input.push(b' ');
+        input.extend_from_slice(OID_2);
+        input.extend_from_slice(b" C100 target\0source\0? next\0");
+        let reader = BufReader::with_capacity(3, Cursor::new(input));
+
+        let parsed = parse_status_porcelain_v2_reader(reader, GitObjectFormat::Sha1, 256, 2)?;
+
+        assert_eq!(parsed.entries.len(), 2);
+        let Some(StatusEntry::RenamedOrCopied(renamed)) = parsed.entries.first() else {
+            return Err("type-2 entry was not preserved".into());
+        };
+        assert_eq!(renamed.path.as_path(), Path::new("target"));
+        assert_eq!(renamed.original_path.as_path(), Path::new("source"));
+        assert!(matches!(
+            parsed.entries.get(1),
+            Some(StatusEntry::Untracked(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn type_two_original_path_shares_the_logical_record_byte_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut first_record = b"2 C. N... 100644 100644 100644 ".to_vec();
+        first_record.extend_from_slice(OID_1);
+        first_record.push(b' ');
+        first_record.extend_from_slice(OID_2);
+        first_record.extend_from_slice(b" C100 target");
+        let max_record_bytes = first_record.len() + 3;
+        let original_start = first_record.len() + 1;
+        let mut input = first_record;
+        input.extend_from_slice(b"\0source\0");
+        let reader = BufReader::with_capacity(5, Cursor::new(input));
+
+        let error =
+            parse_status_porcelain_v2_reader(reader, GitObjectFormat::Sha1, max_record_bytes, 1)
+                .err()
+                .ok_or("overlong type-2 original path unexpectedly parsed")?;
+        let PorcelainV2ReadError::Parse(error) = error else {
+            return Err("overlong type-2 original path returned an I/O error".into());
+        };
+        assert_eq!(error.offset, original_start + 3);
+        assert_eq!(error.record, 1);
+        assert_eq!(
+            error.kind,
+            PorcelainV2ParseErrorKind::RecordTooLong {
+                max_bytes: max_record_bytes
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_reader_accepts_one_hundred_thousand_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ENTRY_COUNT: usize = 100_000;
+        let mut input = Vec::with_capacity(1_500_000);
+        for index in 0..ENTRY_COUNT {
+            input.extend_from_slice(b"? file-");
+            input.extend_from_slice(index.to_string().as_bytes());
+            input.push(0);
+        }
+        let reader = BufReader::with_capacity(127, Cursor::new(input));
+
+        let parsed =
+            parse_status_porcelain_v2_reader(reader, GitObjectFormat::Sha1, 64, ENTRY_COUNT)?;
+
+        assert_eq!(parsed.entries.len(), ENTRY_COUNT);
+        assert!(matches!(
+            parsed.entries.last(),
+            Some(StatusEntry::Untracked(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_reader_rejects_overlong_records_at_the_first_excess_byte()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reader = BufReader::with_capacity(2, Cursor::new(b"? abc\0"));
+        let error = parse_status_porcelain_v2_reader(reader, GitObjectFormat::Sha1, 4, 10)
+            .err()
+            .ok_or("overlong record unexpectedly parsed")?;
+        let PorcelainV2ReadError::Parse(error) = error else {
+            return Err("overlong record returned an I/O error".into());
+        };
+        assert_eq!(error.offset, 4);
+        assert_eq!(error.record, 1);
+        assert_eq!(
+            error.kind,
+            PorcelainV2ParseErrorKind::RecordTooLong { max_bytes: 4 }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_reader_rejects_the_first_entry_beyond_the_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reader = BufReader::with_capacity(2, Cursor::new(b"? a\0? b\0"));
+        let error = parse_status_porcelain_v2_reader(reader, GitObjectFormat::Sha1, 16, 1)
+            .err()
+            .ok_or("entry limit unexpectedly accepted too many entries")?;
+        let PorcelainV2ReadError::Parse(error) = error else {
+            return Err("entry limit returned an I/O error".into());
+        };
+        assert_eq!(error.offset, 4);
+        assert_eq!(error.record, 2);
+        assert_eq!(
+            error.kind,
+            PorcelainV2ParseErrorKind::TooManyEntries { max_entries: 1 }
+        );
         Ok(())
     }
 

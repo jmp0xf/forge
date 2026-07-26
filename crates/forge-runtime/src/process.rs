@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -15,6 +16,12 @@ use forge_core::ports::{ProcessObservation, ProcessPort};
 
 /// Default maximum number of bytes retained in memory for each output stream.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
+
+/// Default maximum number of stdout bytes retained in an anonymous temporary file.
+///
+/// The spool keeps large machine-readable output off the heap, but remains explicitly bounded so
+/// an unexpectedly large child cannot consume unbounded local disk space.
+pub const DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -113,6 +120,26 @@ impl SynchronousProcessRunner {
         &self.repository_root
     }
 
+    /// Runs one command with stdout retained in a private anonymous temporary file.
+    ///
+    /// This runtime-only path shares the same process-tree, timeout, cancellation, environment,
+    /// and pipe-draining lifecycle as [`ProcessPort::run`]. Stderr remains an in-memory diagnostic
+    /// capped at [`DEFAULT_OUTPUT_LIMIT_BYTES`]. The temporary file has no caller-visible path and
+    /// is removed by the operating system after its last handle closes.
+    pub(crate) fn run_spooled_stdout(
+        &self,
+        spec: &CommandSpec,
+        spool_limit_bytes: usize,
+    ) -> io::Result<SpooledProcessObservation> {
+        let spool = private_anonymous_tempfile()?;
+        let execution = self.execute(spec, spool, spool_limit_bytes, DEFAULT_OUTPUT_LIMIT_BYTES)?;
+        let (observation, stdout_file) = execution.into_spooled_observation();
+        Ok(SpooledProcessObservation {
+            observation,
+            stdout_file,
+        })
+    }
+
     fn resolve_cwd(&self, relative: &Path) -> io::Result<PathBuf> {
         let resolved = self.repository_root.join(relative).canonicalize()?;
         if !resolved.starts_with(&self.repository_root) {
@@ -129,14 +156,22 @@ impl SynchronousProcessRunner {
         }
         Ok(resolved)
     }
-}
 
-impl ProcessPort for SynchronousProcessRunner {
-    fn run(&self, spec: &CommandSpec) -> io::Result<ProcessObservation> {
+    fn execute<W>(
+        &self,
+        spec: &CommandSpec,
+        stdout_sink: W,
+        stdout_limit_bytes: usize,
+        stderr_limit_bytes: usize,
+    ) -> io::Result<ExecutionObservation<W>>
+    where
+        W: Write + Send + 'static,
+    {
         let cwd = self.resolve_cwd(spec.cwd.as_path())?;
         let environment = sanitized_environment(std::env::vars_os(), &spec.env)?;
+        reject_implicit_shell_program(&spec.program)?;
         if self.cancellation.load(Ordering::Acquire) {
-            return Ok(interrupted_before_spawn());
+            return Ok(ExecutionObservation::interrupted_before_spawn(stdout_sink));
         }
 
         let mut command = Command::new(&spec.program);
@@ -175,23 +210,31 @@ impl ProcessPort for SynchronousProcessRunner {
             }
         };
 
-        let stdout_reader =
-            match spawn_reader("forge-stdout-drain", stdout, self.output_limit_bytes) {
-                Ok(reader) => reader,
-                Err(error) => {
-                    abort_child(&mut child, &tree);
-                    return Err(error);
-                }
-            };
-        let stderr_reader =
-            match spawn_reader("forge-stderr-drain", stderr, self.output_limit_bytes) {
-                Ok(reader) => reader,
-                Err(error) => {
-                    abort_child(&mut child, &tree);
-                    let _ = join_reader(stdout_reader);
-                    return Err(error);
-                }
-            };
+        let stdout_reader = match spawn_reader(
+            "forge-stdout-drain",
+            stdout,
+            stdout_sink,
+            stdout_limit_bytes,
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                abort_child(&mut child, &tree);
+                return Err(error);
+            }
+        };
+        let stderr_reader = match spawn_reader(
+            "forge-stderr-drain",
+            stderr,
+            Vec::with_capacity(stderr_limit_bytes.min(8 * 1024)),
+            stderr_limit_bytes,
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                abort_child(&mut child, &tree);
+                let _ = join_reader(stdout_reader);
+                return Err(error);
+            }
+        };
 
         let wait_result = wait_for_child(
             &mut child,
@@ -203,18 +246,16 @@ impl ProcessPort for SynchronousProcessRunner {
         let stdout_result = join_reader(stdout_reader);
         let stderr_result = join_reader(stderr_reader);
         let (status, timed_out, interrupted) = wait_result?;
-        let stdout = stdout_result?;
-        let stderr = stderr_result?;
+        let mut stdout = stdout_result?;
+        let mut stderr = stderr_result?;
+        reject_sink_error("stdout", &mut stdout)?;
+        reject_sink_error("stderr", &mut stderr)?;
 
-        Ok(ProcessObservation {
+        Ok(ExecutionObservation {
             exit_code: status.code(),
             signal: platform::exit_signal(&status),
-            stdout: stdout.bytes,
-            stderr: stderr.bytes,
-            stdout_total_bytes: stdout.total_bytes,
-            stderr_total_bytes: stderr.total_bytes,
-            stdout_truncated: stdout.truncated,
-            stderr_truncated: stderr.truncated,
+            stdout,
+            stderr,
             duration: started_at.elapsed(),
             timed_out,
             interrupted,
@@ -222,19 +263,120 @@ impl ProcessPort for SynchronousProcessRunner {
     }
 }
 
-fn interrupted_before_spawn() -> ProcessObservation {
-    ProcessObservation {
-        exit_code: None,
-        signal: None,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        stdout_total_bytes: 0,
-        stderr_total_bytes: 0,
-        stdout_truncated: false,
-        stderr_truncated: false,
-        duration: Duration::ZERO,
-        timed_out: false,
-        interrupted: true,
+fn private_anonymous_tempfile() -> io::Result<File> {
+    let file = tempfile::tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn reject_implicit_shell_program(program: &OsStr) -> io::Result<()> {
+    if is_windows_batch_program(program) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Windows .bat/.cmd programs are unsupported because they require implicit cmd.exe shell execution: {program:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_implicit_shell_program(_program: &OsStr) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_batch_program(program: &OsStr) -> bool {
+    // Windows only adds `.exe` when an extension is omitted. A batch program found through PATH
+    // must therefore still be named with `.bat` or `.cmd`, so this lexical gate also covers PATH
+    // resolution without reproducing the operating system's executable-search algorithm.
+    Path::new(program).extension().is_some_and(|extension| {
+        let extension = extension.to_string_lossy();
+        extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+    })
+}
+
+impl ProcessPort for SynchronousProcessRunner {
+    fn run(&self, spec: &CommandSpec) -> io::Result<ProcessObservation> {
+        self.execute(
+            spec,
+            Vec::with_capacity(self.output_limit_bytes.min(8 * 1024)),
+            self.output_limit_bytes,
+            self.output_limit_bytes,
+        )
+        .map(ExecutionObservation::into_process_observation)
+    }
+}
+
+/// Process metadata plus stdout held outside the heap in an anonymous temporary file.
+#[derive(Debug)]
+pub(crate) struct SpooledProcessObservation {
+    /// `stdout` is intentionally empty; its totals and truncation flag describe `stdout_file`.
+    pub(crate) observation: ProcessObservation,
+    pub(crate) stdout_file: File,
+}
+
+#[derive(Debug)]
+struct ExecutionObservation<W> {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stdout: DrainedOutput<W>,
+    stderr: DrainedOutput<Vec<u8>>,
+    duration: Duration,
+    timed_out: bool,
+    interrupted: bool,
+}
+
+impl<W> ExecutionObservation<W> {
+    fn interrupted_before_spawn(stdout_sink: W) -> Self {
+        Self {
+            exit_code: None,
+            signal: None,
+            stdout: DrainedOutput::empty(stdout_sink),
+            stderr: DrainedOutput::empty(Vec::new()),
+            duration: Duration::ZERO,
+            timed_out: false,
+            interrupted: true,
+        }
+    }
+
+    fn into_parts(self) -> (ProcessObservation, W) {
+        let stdout_total_bytes = self.stdout.total_bytes;
+        let stdout_truncated = self.stdout.truncated;
+        let stdout_sink = self.stdout.sink;
+        let observation = ProcessObservation {
+            exit_code: self.exit_code,
+            signal: self.signal,
+            stdout: Vec::new(),
+            stderr: self.stderr.sink,
+            stdout_total_bytes,
+            stderr_total_bytes: self.stderr.total_bytes,
+            stdout_truncated,
+            stderr_truncated: self.stderr.truncated,
+            duration: self.duration,
+            timed_out: self.timed_out,
+            interrupted: self.interrupted,
+        };
+        (observation, stdout_sink)
+    }
+
+    fn into_spooled_observation(self) -> (ProcessObservation, W) {
+        self.into_parts()
+    }
+}
+
+impl ExecutionObservation<Vec<u8>> {
+    fn into_process_observation(self) -> ProcessObservation {
+        let (mut observation, stdout) = self.into_parts();
+        observation.stdout = stdout;
+        observation
     }
 }
 
@@ -290,12 +432,26 @@ fn terminate_and_reap(
     tree: &platform::ChildTree,
     termination_grace: Duration,
 ) -> io::Result<ExitStatus> {
-    let termination_result = platform::terminate_tree(tree);
+    let termination = platform::terminate_tree(tree);
 
-    // Do not call `wait`, `try_wait`, or `wait_timeout` during this grace period. On Unix those
-    // calls reap an exited group leader. Keeping the leader as a zombie reserves its PID/PGID,
-    // so the force-kill below cannot race with PGID reuse and signal an unrelated process group.
-    thread::sleep(termination_grace);
+    if termination
+        .as_ref()
+        .is_ok_and(|mode| !mode.requires_grace())
+    {
+        // Windows Job Objects have no generic graceful signal. The platform has already atomically
+        // requested forced tree termination, so sleeping and issuing the same kill twice only
+        // delays timeout/cancellation reporting.
+        return child.wait();
+    }
+
+    if termination.as_ref().is_ok_and(|mode| mode.requires_grace()) {
+        // Do not call `wait`, `try_wait`, or `wait_timeout` during this grace period. On Unix those
+        // calls reap an exited group leader. Keeping the leader as a zombie reserves its PID/PGID,
+        // so the force-kill below cannot race with PGID reuse and signal an unrelated process
+        // group.
+        thread::sleep(termination_grace);
+    }
+
     let kill_result = platform::kill_tree(tree);
     if kill_result.is_err() {
         // Killing by the still-owned child handle/PID is the safest fallback when group/job
@@ -304,7 +460,7 @@ fn terminate_and_reap(
     }
     let status_result = child.wait();
 
-    termination_result.map_err(|error| {
+    termination.map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("failed to request process-tree termination: {error}"),
@@ -317,6 +473,25 @@ fn terminate_and_reap(
         )
     })?;
     status_result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationMode {
+    #[cfg(any(unix, test))]
+    Graceful,
+    #[cfg(any(windows, test))]
+    Forced,
+}
+
+impl TerminationMode {
+    fn requires_grace(self) -> bool {
+        match self {
+            #[cfg(any(unix, test))]
+            Self::Graceful => true,
+            #[cfg(any(windows, test))]
+            Self::Forced => false,
+        }
+    }
 }
 
 fn kill_tree_and_reap(child: &mut Child, tree: &platform::ChildTree) -> io::Result<ExitStatus> {
@@ -350,36 +525,60 @@ fn reap_direct_child(child: &mut Child) {
 }
 
 #[derive(Debug)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
+struct DrainedOutput<W> {
+    sink: W,
     total_bytes: u64,
     truncated: bool,
+    sink_error: Option<io::Error>,
 }
 
-fn spawn_reader<R>(
+impl<W> DrainedOutput<W> {
+    fn empty(sink: W) -> Self {
+        Self {
+            sink,
+            total_bytes: 0,
+            truncated: false,
+            sink_error: None,
+        }
+    }
+}
+
+fn spawn_reader<R, W>(
     name: &'static str,
     reader: R,
+    sink: W,
     limit: usize,
-) -> io::Result<JoinHandle<io::Result<CapturedOutput>>>
+) -> io::Result<JoinHandle<io::Result<DrainedOutput<W>>>>
 where
     R: Read + Send + 'static,
+    W: Write + Send + 'static,
 {
     thread::Builder::new()
         .name(name.into())
-        .spawn(move || drain_bounded(reader, limit))
+        .spawn(move || drain_bounded(reader, sink, limit))
 }
 
-fn join_reader(reader: JoinHandle<io::Result<CapturedOutput>>) -> io::Result<CapturedOutput> {
+fn join_reader<W>(
+    reader: JoinHandle<io::Result<DrainedOutput<W>>>,
+) -> io::Result<DrainedOutput<W>> {
     match reader.join() {
         Ok(result) => result,
         Err(_) => Err(io::Error::other("subprocess output drain thread failed")),
     }
 }
 
-fn drain_bounded(mut reader: impl Read, limit: usize) -> io::Result<CapturedOutput> {
-    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+fn drain_bounded<W>(
+    mut reader: impl Read,
+    mut sink: W,
+    limit: usize,
+) -> io::Result<DrainedOutput<W>>
+where
+    W: Write,
+{
     let mut total_bytes = 0_u64;
+    let mut retained_bytes = 0_usize;
     let mut truncated = false;
+    let mut sink_error = None;
     let mut buffer = [0_u8; 8 * 1024];
 
     loop {
@@ -389,17 +588,40 @@ fn drain_bounded(mut reader: impl Read, limit: usize) -> io::Result<CapturedOutp
         }
 
         total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-        let remaining = limit.saturating_sub(bytes.len());
+        let remaining = limit.saturating_sub(retained_bytes);
         let retained = remaining.min(read);
-        bytes.extend_from_slice(&buffer[..retained]);
+        retained_bytes += retained;
+        if retained > 0 && sink_error.is_none() {
+            if let Err(error) = sink.write_all(&buffer[..retained]) {
+                // Closing the pipe here could block the child or turn a recoverable local sink
+                // error into SIGPIPE. Remember the first write failure, then continue
+                // draining/discarding until the process lifecycle has completed.
+                sink_error = Some(error);
+                truncated = true;
+            }
+        }
         truncated |= retained < read;
     }
 
-    Ok(CapturedOutput {
-        bytes,
+    Ok(DrainedOutput {
+        sink,
         total_bytes,
         truncated,
+        sink_error,
     })
+}
+
+fn reject_sink_error<W>(stream: &str, output: &mut DrainedOutput<W>) -> io::Result<()> {
+    let Some(error) = output.sink_error.take() else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        error.kind(),
+        format!(
+            "failed to retain {stream} after draining {} total bytes: {error}",
+            output.total_bytes
+        ),
+    ))
 }
 
 fn sanitized_environment<I>(
@@ -583,8 +805,8 @@ mod platform {
         tree.exit_observer.wait_for_exit(timeout)
     }
 
-    pub(super) fn terminate_tree(tree: &ChildTree) -> io::Result<()> {
-        signal_tree(tree, Signal::SIGTERM)
+    pub(super) fn terminate_tree(tree: &ChildTree) -> io::Result<super::TerminationMode> {
+        signal_tree(tree, Signal::SIGTERM).map(|()| super::TerminationMode::Graceful)
     }
 
     pub(super) fn kill_tree(tree: &ChildTree) -> io::Result<()> {
@@ -954,10 +1176,10 @@ mod platform {
         }
     }
 
-    pub(super) fn terminate_tree(_tree: &ChildTree) -> io::Result<()> {
-        // Windows has no generic SIGTERM equivalent for non-console subprocesses. Preserve the
-        // short grace period, then use the Job Object's atomic tree termination path.
-        Ok(())
+    pub(super) fn terminate_tree(tree: &ChildTree) -> io::Result<super::TerminationMode> {
+        // Windows has no generic SIGTERM equivalent for non-console subprocesses. A Job Object is
+        // already the stable tree identity, so request atomic forced termination immediately.
+        kill_tree(tree).map(|()| super::TerminationMode::Forced)
     }
 
     pub(super) fn kill_tree(tree: &ChildTree) -> io::Result<()> {
@@ -1074,7 +1296,7 @@ mod platform {
         }
     }
 
-    pub(super) fn terminate_tree(_tree: &ChildTree) -> io::Result<()> {
+    pub(super) fn terminate_tree(_tree: &ChildTree) -> io::Result<super::TerminationMode> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "process-tree termination is unsupported on this platform",
@@ -1106,7 +1328,7 @@ mod tests {
     use std::error::Error;
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
-    use std::io::{self, Write as _};
+    use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
     use std::process::Command as ProcessCommand;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1118,10 +1340,14 @@ mod tests {
     use forge_core::ports::ProcessPort as _;
     use tempfile::tempdir;
 
-    use super::{SynchronousProcessRunner, platform, sanitized_environment};
+    use super::{
+        DEFAULT_OUTPUT_LIMIT_BYTES, SynchronousProcessRunner, TerminationMode, drain_bounded,
+        is_windows_batch_program, platform, sanitized_environment,
+    };
 
     const PROCESS_TREE_FIXTURE_MODE: &str = "FORGE_PROCESS_FIXTURE_MODE";
     const PROCESS_TREE_FIXTURE_HEARTBEAT: &str = "FORGE_PROCESS_FIXTURE_HEARTBEAT";
+    const PROCESS_TREE_FIXTURE_OUTPUT_BYTES: &str = "FORGE_PROCESS_FIXTURE_OUTPUT_BYTES";
     const PROCESS_TREE_FIXTURE_TEST: &str = "process::tests::process_tree_fixture_helper";
 
     fn spec(program: impl AsRef<OsStr>, args: &[&str]) -> CommandSpec {
@@ -1143,6 +1369,21 @@ mod tests {
         let Some(mode) = std::env::var_os(PROCESS_TREE_FIXTURE_MODE) else {
             return Ok(());
         };
+
+        if mode == OsStr::new("output") {
+            let requested = std::env::var(PROCESS_TREE_FIXTURE_OUTPUT_BYTES)?.parse::<usize>()?;
+            let chunk = [b'x'; 8 * 1024];
+            let mut remaining = requested;
+            let mut stdout = io::stdout().lock();
+            while remaining > 0 {
+                let write = remaining.min(chunk.len());
+                stdout.write_all(&chunk[..write])?;
+                remaining -= write;
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
+
         let heartbeat = std::env::var_os(PROCESS_TREE_FIXTURE_HEARTBEAT)
             .ok_or_else(|| io::Error::other("process-tree fixture heartbeat is missing"))?;
 
@@ -1193,6 +1434,158 @@ mod tests {
         }
 
         Err(io::Error::other("unknown process-tree fixture mode").into())
+    }
+
+    fn output_fixture_command(bytes: usize) -> Result<CommandSpec, Box<dyn Error>> {
+        let executable = std::env::current_exe()?;
+        let mut command = spec(
+            executable,
+            &["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"],
+        );
+        command.env.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_MODE),
+            OsString::from("output"),
+        );
+        command.env.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_OUTPUT_BYTES),
+            OsString::from(bytes.to_string()),
+        );
+        command.timeout = Duration::from_secs(5);
+        Ok(command)
+    }
+
+    #[test]
+    fn spooled_stdout_retains_more_than_the_in_memory_diagnostic_cap() -> Result<(), Box<dyn Error>>
+    {
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let payload_bytes = DEFAULT_OUTPUT_LIMIT_BYTES + 64 * 1024;
+        let mut spooled =
+            runner.run_spooled_stdout(&output_fixture_command(payload_bytes)?, 2 * 1024 * 1024)?;
+
+        assert_eq!(spooled.observation.exit_code, Some(0));
+        assert!(!spooled.observation.timed_out);
+        assert!(!spooled.observation.interrupted);
+        assert!(!spooled.observation.stdout_truncated);
+        assert!(spooled.observation.stdout.is_empty());
+        assert!(spooled.observation.stdout_total_bytes > DEFAULT_OUTPUT_LIMIT_BYTES as u64);
+        assert_eq!(
+            spooled.stdout_file.metadata()?.len(),
+            spooled.observation.stdout_total_bytes
+        );
+        assert!(fs::read_dir(root.path())?.next().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                spooled.stdout_file.metadata()?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        spooled.stdout_file.seek(SeekFrom::Start(0))?;
+        let mut first_byte = [0_u8; 1];
+        spooled.stdout_file.read_exact(&mut first_byte)?;
+        assert_ne!(first_byte, [0]);
+        Ok(())
+    }
+
+    #[test]
+    fn termination_modes_keep_graceful_and_forced_paths_distinct() {
+        assert!(TerminationMode::Graceful.requires_grace());
+        assert!(!TerminationMode::Forced.requires_grace());
+    }
+
+    #[test]
+    fn spooled_stdout_drains_and_counts_bytes_beyond_its_disk_cap() -> Result<(), Box<dyn Error>> {
+        const SPOOL_LIMIT: usize = 32 * 1024;
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let payload_bytes = DEFAULT_OUTPUT_LIMIT_BYTES + 64 * 1024;
+        let spooled =
+            runner.run_spooled_stdout(&output_fixture_command(payload_bytes)?, SPOOL_LIMIT)?;
+
+        assert_eq!(spooled.observation.exit_code, Some(0));
+        assert!(spooled.observation.stdout_truncated);
+        assert!(spooled.observation.stdout_total_bytes > DEFAULT_OUTPUT_LIMIT_BYTES as u64);
+        assert_eq!(spooled.stdout_file.metadata()?.len(), SPOOL_LIMIT as u64);
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingSink;
+
+    impl io::Write for FailingSink {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("synthetic sink failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sink_failure_is_remembered_after_the_input_is_fully_drained() -> Result<(), Box<dyn Error>> {
+        let input = vec![b'x'; 128 * 1024];
+        let drained = drain_bounded(io::Cursor::new(&input), FailingSink, input.len())?;
+
+        assert_eq!(drained.total_bytes, input.len() as u64);
+        assert!(drained.truncated);
+        assert!(drained.sink_error.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn process_sink_failure_returns_only_after_the_pipe_is_drained() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let payload_bytes = DEFAULT_OUTPUT_LIMIT_BYTES + 64 * 1024;
+        let started_at = Instant::now();
+        let error = runner
+            .execute(
+                &output_fixture_command(payload_bytes)?,
+                FailingSink,
+                2 * 1024 * 1024,
+                DEFAULT_OUTPUT_LIMIT_BYTES,
+            )
+            .err()
+            .ok_or("failing process sink unexpectedly succeeded")?;
+
+        assert!(started_at.elapsed() < Duration::from_secs(4));
+        assert!(error.to_string().contains("after draining"));
+        assert!(error.to_string().contains("total bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_batch_extensions_are_identified_case_insensitively() {
+        for program in [
+            "build.cmd",
+            "BUILD.BAT",
+            r"C:\tools\run.CmD",
+            "relative/run.bAt",
+        ] {
+            assert!(is_windows_batch_program(OsStr::new(program)));
+        }
+        for program in ["cmd.exe", "script", "archive.cmd.exe", "command"] {
+            assert!(!is_windows_batch_program(OsStr::new(program)));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_program_is_rejected_before_path_resolution() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let error = runner
+            .run(&spec("missing-tool.CmD", &["untrusted & argument"]))
+            .err()
+            .ok_or("Windows batch program unexpectedly reached process creation")?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("implicit cmd.exe"));
+        Ok(())
     }
 
     #[test]
