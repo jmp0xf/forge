@@ -9,6 +9,6 @@ pub mod domain;
 pub mod ports;
 
 pub use domain::{
-    CommandSource, CommandSpec, Confidence, CoverageDimension, Intent, Mutability,
-    NetworkIntent, ProjectModel, ProjectUnit,
+    CommandSource, CommandSpec, Confidence, CoverageDimension, Intent, Mutability, NetworkIntent,
+    ProjectModel, ProjectUnit,
 };

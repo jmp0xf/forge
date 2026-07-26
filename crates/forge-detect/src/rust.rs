@@ -18,16 +18,18 @@ impl LanguageProvider for RustProvider {
     }
 
     fn default_commands(&self, _model: &ProjectModel, _units: &[ProjectUnit]) -> Vec<CommandSpec> {
-        vec![CommandSpec::new(
-            "rust.check",
-            Intent::Check,
-            "cargo",
-            ".",
-            CommandSource::LanguageDefault {
-                provider: self.id().into(),
-                rule: "cargo-check".into(),
-            },
-        )
-        .with_args(["check", "--workspace"])]
+        vec![
+            CommandSpec::new(
+                "rust.check",
+                Intent::Check,
+                "cargo",
+                ".",
+                CommandSource::LanguageDefault {
+                    provider: self.id().into(),
+                    rule: "cargo-check".into(),
+                },
+            )
+            .with_args(["check", "--workspace"]),
+        ]
     }
 }

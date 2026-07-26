@@ -84,7 +84,9 @@ mod tests {
 
     #[test]
     fn project_command_wrappers_are_not_reserved() {
-        for command in ["check", "fix", "test", "build", "task", "context", "improve"] {
+        for command in [
+            "check", "fix", "test", "build", "task", "context", "improve",
+        ] {
             assert!(!is_planned_command(command));
         }
     }

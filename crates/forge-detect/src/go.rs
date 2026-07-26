@@ -18,16 +18,18 @@ impl LanguageProvider for GoProvider {
     }
 
     fn default_commands(&self, _model: &ProjectModel, _units: &[ProjectUnit]) -> Vec<CommandSpec> {
-        vec![CommandSpec::new(
-            "go.test",
-            Intent::Test,
-            "go",
-            ".",
-            CommandSource::LanguageDefault {
-                provider: self.id().into(),
-                rule: "go-test".into(),
-            },
-        )
-        .with_args(["test", "./..."])]
+        vec![
+            CommandSpec::new(
+                "go.test",
+                Intent::Test,
+                "go",
+                ".",
+                CommandSource::LanguageDefault {
+                    provider: self.id().into(),
+                    rule: "go-test".into(),
+                },
+            )
+            .with_args(["test", "./..."]),
+        ]
     }
 }
