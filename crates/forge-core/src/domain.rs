@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use forge_schema::{
-    CommandId, Diagnostic, Digest, LanguageId, PathEncoding, SchemaKind, SchemaVersion, UnitId,
-    WirePath,
+    CommandId, Diagnostic, Digest, LanguageId, PathEncoding, SchemaKind, SchemaVersion, Severity,
+    UnitId, WirePath,
 };
 use thiserror::Error;
 
@@ -28,8 +28,21 @@ pub enum Intent {
     Build,
 }
 
+impl Intent {
+    pub const ALL: [Self; 8] = [
+        Self::Setup,
+        Self::FormatCheck,
+        Self::Format,
+        Self::Check,
+        Self::Fix,
+        Self::Test,
+        Self::Verify,
+        Self::Build,
+    ];
+}
+
 /// Whether a command may mutate local or external state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mutability {
     ReadOnly,
     WorkingTreeWrite,
@@ -38,7 +51,7 @@ pub enum Mutability {
 }
 
 /// Declared network behavior. This is intent metadata, not a sandbox guarantee.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NetworkIntent {
     Inherit,
     OfflineRequested,
@@ -47,7 +60,7 @@ pub enum NetworkIntent {
 }
 
 /// Why Forge selected a command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandSource {
     ExplicitConfig,
     ExistingProjectTarget {
@@ -83,7 +96,7 @@ pub enum CoverageDimension {
 }
 
 /// How command output is normalized into success or failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SuccessPredicate {
     ExitZero,
     ExitZeroAndStdoutEmpty,
@@ -92,7 +105,7 @@ pub enum SuccessPredicate {
 }
 
 /// An argv-safe command specification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CommandSpec {
     pub id: CommandId,
     pub intent: Intent,
@@ -393,31 +406,21 @@ pub enum CommandResolution {
 }
 
 impl ResolvedCommandSet {
-    /// Builds a command resolution while enforcing the executable-state invariants.
-    pub fn new(
+    fn new(
         resolution: CommandResolution,
         commands: Vec<CommandSpec>,
         mut provenance: Vec<Provenance>,
         resolution_confidence: Confidence,
         coverage_confidence: Confidence,
-    ) -> Result<Self, InvalidCommandResolution> {
-        if resolution == CommandResolution::Resolved && commands.is_empty() {
-            return Err(InvalidCommandResolution::ResolvedWithoutCommands);
-        }
-        if resolution == CommandResolution::Absent && !commands.is_empty() {
-            return Err(InvalidCommandResolution::AbsentWithCommands);
-        }
-        if resolution == CommandResolution::Ambiguous && commands.len() < 2 {
-            return Err(InvalidCommandResolution::AmbiguousWithoutAlternatives);
-        }
+    ) -> Self {
         canonicalize_provenance(&mut provenance);
-        Ok(Self {
+        Self {
             resolution,
             commands,
             provenance,
             resolution_confidence,
             coverage_confidence,
-        })
+        }
     }
 
     /// Creates an executable, non-empty command chain.
@@ -427,35 +430,37 @@ impl ResolvedCommandSet {
         resolution_confidence: Confidence,
         coverage_confidence: Confidence,
     ) -> Result<Self, InvalidCommandResolution> {
-        Self::new(
+        if commands.is_empty() {
+            return Err(InvalidCommandResolution::ResolvedWithoutCommands);
+        }
+        Ok(Self::new(
             CommandResolution::Resolved,
             commands,
             provenance,
             resolution_confidence,
             coverage_confidence,
-        )
+        ))
     }
 
     /// Records that a complete resolution found no command for the intent.
     #[must_use]
     pub fn absent(provenance: Vec<Provenance>, confidence: Confidence) -> Self {
-        // The arguments satisfy `new` by construction, so no fallible public combination is
-        // hidden here.
-        Self {
-            resolution: CommandResolution::Absent,
-            commands: Vec::new(),
-            provenance: canonicalized_provenance(provenance),
-            resolution_confidence: confidence,
-            coverage_confidence: Confidence::Unknown,
-        }
+        Self::new(
+            CommandResolution::Absent,
+            Vec::new(),
+            provenance,
+            confidence,
+            Confidence::Unknown,
+        )
     }
 
     /// Preserves conflicting candidates without making any of them executable.
+    #[must_use]
     pub fn ambiguous(
         candidates: Vec<CommandSpec>,
         provenance: Vec<Provenance>,
         confidence: Confidence,
-    ) -> Result<Self, InvalidCommandResolution> {
+    ) -> Self {
         Self::new(
             CommandResolution::Ambiguous,
             candidates,
@@ -467,14 +472,14 @@ impl ResolvedCommandSet {
 
     /// Represents an intent whose command surface could not be resolved.
     #[must_use]
-    pub fn unknown(provenance: Vec<Provenance>) -> Self {
-        Self {
-            resolution: CommandResolution::Unknown,
-            commands: Vec::new(),
-            provenance: canonicalized_provenance(provenance),
-            resolution_confidence: Confidence::Unknown,
-            coverage_confidence: Confidence::Unknown,
-        }
+    pub fn unknown(candidates: Vec<CommandSpec>, provenance: Vec<Provenance>) -> Self {
+        Self::new(
+            CommandResolution::Unknown,
+            candidates,
+            provenance,
+            Confidence::Unknown,
+            Confidence::Unknown,
+        )
     }
 
     /// The explicit state that controls whether retained commands are executable.
@@ -501,10 +506,6 @@ impl ResolvedCommandSet {
 pub enum InvalidCommandResolution {
     #[error("a resolved command intent must contain at least one command")]
     ResolvedWithoutCommands,
-    #[error("an absent command intent cannot contain command candidates")]
-    AbsentWithCommands,
-    #[error("an ambiguous command intent must contain at least two candidates")]
-    AmbiguousWithoutAlternatives,
 }
 
 /// One standard repository asset.
@@ -553,7 +554,6 @@ impl AssetInventory {
             canonicalize_provenance(&mut entry.provenance);
         }
         entries.sort();
-        entries.dedup();
         canonicalize_provenance(&mut provenance);
         Self {
             entries,
@@ -615,7 +615,6 @@ impl AdapterInventory {
             canonicalize_provenance(&mut entry.provenance);
         }
         entries.sort();
-        entries.dedup();
         canonicalize_provenance(&mut provenance);
         Self {
             entries,
@@ -678,6 +677,52 @@ pub struct ProjectModel {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// A finalized project model invariant violation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProjectModelError {
+    #[error("project model schema is {found:?}, expected {expected:?}")]
+    InvalidSchema {
+        expected: SchemaVersion,
+        found: SchemaVersion,
+    },
+    #[error("project model does not explicitly resolve intent {intent:?}")]
+    MissingIntent { intent: Intent },
+    #[error("resolved intent {intent:?} has no command")]
+    ResolvedWithoutCommands { intent: Intent },
+    #[error("absent intent {intent:?} retains command candidates")]
+    AbsentWithCommands { intent: Intent },
+    #[error(
+        "command {command_id} is stored under intent {map_intent:?} but declares {command_intent:?}"
+    )]
+    CommandIntentMismatch {
+        map_intent: Intent,
+        command_id: CommandId,
+        command_intent: Intent,
+    },
+    #[error("project unit id {unit_id} occurs more than once")]
+    DuplicateUnitId { unit_id: UnitId },
+    #[error("command id {command_id} refers to different command specifications")]
+    ConflictingCommandId { command_id: CommandId },
+    #[error("asset identity ({kind:?}, {path:?}) occurs more than once")]
+    DuplicateAssetIdentity {
+        kind: String,
+        path: RepoRelativePath,
+    },
+    #[error("adapter identity ({host:?}, {path:?}) occurs more than once")]
+    DuplicateAdapterIdentity {
+        host: String,
+        path: RepoRelativePath,
+    },
+    #[error("{location} has no provenance")]
+    EmptyProvenance { location: String },
+    #[error("{location} has an empty provenance rule id")]
+    EmptyProvenanceRuleId { location: String },
+    #[error("{location} has empty provenance detail")]
+    EmptyProvenanceDetail { location: String },
+    #[error("{location} has a source range without a source path")]
+    ProvenanceRangeWithoutPath { location: String },
+}
+
 impl ProjectModel {
     #[must_use]
     pub fn new(
@@ -719,18 +764,19 @@ impl ProjectModel {
         });
         for command_set in self.commands.values_mut() {
             canonicalize_provenance(&mut command_set.provenance);
+            if command_set.resolution != CommandResolution::Resolved {
+                command_set.commands.sort();
+            }
         }
         for asset in &mut self.assets.entries {
             canonicalize_provenance(&mut asset.provenance);
         }
         self.assets.entries.sort();
-        self.assets.entries.dedup();
         canonicalize_provenance(&mut self.assets.provenance);
         for adapter in &mut self.adapters.entries {
             canonicalize_provenance(&mut adapter.provenance);
         }
         self.adapters.entries.sort();
-        self.adapters.entries.dedup();
         canonicalize_provenance(&mut self.adapters.provenance);
         canonicalize_provenance(&mut self.policy.provenance);
         for assumption in &mut self.assumptions {
@@ -745,20 +791,173 @@ impl ProjectModel {
         self.diagnostics.sort_by(|left, right| {
             left.code
                 .cmp(&right.code)
-                .then_with(|| left.location.cmp(&right.location))
+                .then_with(|| {
+                    diagnostic_severity_rank(left.severity)
+                        .cmp(&diagnostic_severity_rank(right.severity))
+                })
                 .then_with(|| left.what.cmp(&right.what))
+                .then_with(|| left.location.cmp(&right.location))
+                .then_with(|| left.why.cmp(&right.why))
+                .then_with(|| left.next.cmp(&right.next))
         });
     }
+
+    /// Canonicalizes all unordered fields, then rejects any invalid model shape.
+    pub fn finalize(mut self) -> Result<Self, ProjectModelError> {
+        self.canonicalize();
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<(), ProjectModelError> {
+        let expected_schema = SchemaVersion::for_kind(SchemaKind::ProjectModel);
+        if self.schema != expected_schema {
+            return Err(ProjectModelError::InvalidSchema {
+                expected: expected_schema,
+                found: self.schema.clone(),
+            });
+        }
+
+        for intent in Intent::ALL {
+            if !self.commands.contains_key(&intent) {
+                return Err(ProjectModelError::MissingIntent { intent });
+            }
+        }
+
+        let mut command_specs = BTreeMap::<&CommandId, &CommandSpec>::new();
+        for (intent, command_set) in &self.commands {
+            match command_set.resolution {
+                CommandResolution::Resolved if command_set.commands.is_empty() => {
+                    return Err(ProjectModelError::ResolvedWithoutCommands { intent: *intent });
+                }
+                CommandResolution::Absent if !command_set.commands.is_empty() => {
+                    return Err(ProjectModelError::AbsentWithCommands { intent: *intent });
+                }
+                CommandResolution::Resolved
+                | CommandResolution::Absent
+                | CommandResolution::Ambiguous
+                | CommandResolution::Unknown => {}
+            }
+            for command in &command_set.commands {
+                if command.intent != *intent {
+                    return Err(ProjectModelError::CommandIntentMismatch {
+                        map_intent: *intent,
+                        command_id: command.id.clone(),
+                        command_intent: command.intent,
+                    });
+                }
+                if let Some(existing) = command_specs.insert(&command.id, command) {
+                    if existing != command {
+                        return Err(ProjectModelError::ConflictingCommandId {
+                            command_id: command.id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut unit_ids = BTreeSet::new();
+        for unit in &self.units {
+            if !unit_ids.insert(&unit.id) {
+                return Err(ProjectModelError::DuplicateUnitId {
+                    unit_id: unit.id.clone(),
+                });
+            }
+        }
+
+        let mut asset_identities = BTreeSet::new();
+        for asset in &self.assets.entries {
+            if !asset_identities.insert((&asset.kind, &asset.path)) {
+                return Err(ProjectModelError::DuplicateAssetIdentity {
+                    kind: asset.kind.clone(),
+                    path: asset.path.clone(),
+                });
+            }
+        }
+
+        let mut adapter_identities = BTreeSet::new();
+        for adapter in &self.adapters.entries {
+            if !adapter_identities.insert((&adapter.host, &adapter.path)) {
+                return Err(ProjectModelError::DuplicateAdapterIdentity {
+                    host: adapter.host.clone(),
+                    path: adapter.path.clone(),
+                });
+            }
+        }
+
+        for (intent, command_set) in &self.commands {
+            validate_provenance(
+                &format!("commands.{intent:?}.provenance"),
+                &command_set.provenance,
+            )?;
+        }
+        for unit in &self.units {
+            validate_provenance(
+                &format!("units.{}.toolchain.provenance", unit.id),
+                &unit.toolchain.provenance,
+            )?;
+            for (index, dependency) in unit.dependencies.iter().enumerate() {
+                validate_provenance(
+                    &format!("units.{}.dependencies[{index}].provenance", unit.id),
+                    &dependency.provenance,
+                )?;
+            }
+        }
+        validate_provenance("assets.provenance", &self.assets.provenance)?;
+        for (index, asset) in self.assets.entries.iter().enumerate() {
+            validate_provenance(
+                &format!("assets.entries[{index}].provenance"),
+                &asset.provenance,
+            )?;
+        }
+        validate_provenance("adapters.provenance", &self.adapters.provenance)?;
+        for (index, adapter) in self.adapters.entries.iter().enumerate() {
+            validate_provenance(
+                &format!("adapters.entries[{index}].provenance"),
+                &adapter.provenance,
+            )?;
+        }
+        validate_provenance("policy.provenance", &self.policy.provenance)?;
+        for (index, assumption) in self.assumptions.iter().enumerate() {
+            validate_provenance(
+                &format!("assumptions[{index}].provenance"),
+                &assumption.provenance,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_provenance(location: &str, provenance: &[Provenance]) -> Result<(), ProjectModelError> {
+    if provenance.is_empty() {
+        return Err(ProjectModelError::EmptyProvenance {
+            location: location.to_owned(),
+        });
+    }
+    for (index, source) in provenance.iter().enumerate() {
+        let source_location = format!("{location}[{index}]");
+        if source.rule_id.trim().is_empty() {
+            return Err(ProjectModelError::EmptyProvenanceRuleId {
+                location: source_location,
+            });
+        }
+        if source.detail.trim().is_empty() {
+            return Err(ProjectModelError::EmptyProvenanceDetail {
+                location: source_location,
+            });
+        }
+        if source.source_range.is_some() && source.source_path.is_none() {
+            return Err(ProjectModelError::ProvenanceRangeWithoutPath {
+                location: source_location,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn canonicalize_provenance(provenance: &mut Vec<Provenance>) {
     provenance.sort();
     provenance.dedup();
-}
-
-fn canonicalized_provenance(mut provenance: Vec<Provenance>) -> Vec<Provenance> {
-    canonicalize_provenance(&mut provenance);
-    provenance
 }
 
 fn compare_wire_paths(left: Option<&WirePath>, right: Option<&WirePath>) -> Ordering {
@@ -770,6 +969,16 @@ fn compare_wire_paths(left: Option<&WirePath>, right: Option<&WirePath>) -> Orde
             .cmp(&path_encoding_rank(right.encoding))
             .then_with(|| left.raw_base64.cmp(&right.raw_base64))
             .then_with(|| left.display.cmp(&right.display)),
+    }
+}
+
+fn diagnostic_severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Info => 0,
+        Severity::Warning => 1,
+        Severity::Error => 2,
+        Severity::Unknown => 3,
+        _ => 4,
     }
 }
 
@@ -785,19 +994,109 @@ fn path_encoding_rank(encoding: PathEncoding) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use forge_schema::{Diagnostic, LanguageId, Severity, UnitId};
+    use forge_schema::{
+        CommandId, Diagnostic, LanguageId, SchemaKind, SchemaVersion, Severity, UnitId, WirePath,
+    };
 
     use crate::path::RepoRelativePath;
 
     use super::{
-        AdapterInventory, AssetInventory, CommandResolution, CommandSource, CommandSpec,
-        Confidence, EffectivePolicy, Intent, InvalidCommandResolution, InvalidTextRange,
-        ProjectKind, ProjectModel, ProjectUnit, RepoFacts, ResolvedCommandSet, TextRange,
-        ToolchainInfo, UnitEdge, WorkState,
+        AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, CommandResolution, CommandSource,
+        CommandSpec, Confidence, EffectivePolicy, Intent, InvalidCommandResolution,
+        InvalidTextRange, ProjectKind, ProjectModel, ProjectModelError, ProjectUnit, Provenance,
+        RepoFacts, ResolvedCommandSet, TextRange, ToolchainInfo, UnitEdge, WorkState,
     };
+
+    fn provenance(rule_id: impl Into<String>) -> Provenance {
+        let rule_id = rule_id.into();
+        Provenance {
+            detail: format!("evidence for {rule_id}"),
+            rule_id,
+            source_path: Some(WirePath::from_path(Path::new("forge.toml"))),
+            source_range: None,
+        }
+    }
+
+    fn command(id: &str, intent: Intent, program: &str) -> CommandSpec {
+        CommandSpec::new(
+            id,
+            intent,
+            program,
+            RepoRelativePath::root(),
+            CommandSource::ExplicitConfig,
+        )
+    }
+
+    fn unit(id: &str, root: &str) -> Result<ProjectUnit, Box<dyn std::error::Error>> {
+        Ok(ProjectUnit {
+            id: UnitId::from(id),
+            display_name: id.into(),
+            language: LanguageId::from("rust"),
+            kind: ProjectKind::RustPackage,
+            root: RepoRelativePath::new(root)?,
+            manifest: RepoRelativePath::new(format!("{root}/Cargo.toml"))?,
+            workspace_root: None,
+            members: vec![UnitId::from("z"), UnitId::from("a"), UnitId::from("a")],
+            dependencies: vec![
+                UnitEdge::new(
+                    UnitId::from("z"),
+                    vec![provenance(format!("unit/{id}/dependency/z"))],
+                    Confidence::High,
+                ),
+                UnitEdge::new(
+                    UnitId::from("a"),
+                    vec![provenance(format!("unit/{id}/dependency/a"))],
+                    Confidence::High,
+                ),
+            ],
+            toolchain: ToolchainInfo::new(
+                BTreeMap::new(),
+                vec![provenance(format!("unit/{id}/toolchain"))],
+                Confidence::High,
+            ),
+        })
+    }
+
+    fn valid_model() -> ProjectModel {
+        let repository = RepoFacts {
+            root: PathBuf::from("/repo"),
+            git_dir: PathBuf::from("/repo/.git"),
+            git_common_dir: PathBuf::from("/repo/.git"),
+            is_linked_worktree: false,
+            head: None,
+            branch: None,
+            upstream: None,
+            work_state: WorkState::Unknown,
+        };
+        let mut model = ProjectModel::new(
+            repository,
+            AssetInventory::new(
+                Vec::new(),
+                vec![provenance("inventory/assets")],
+                Confidence::High,
+            ),
+            AdapterInventory::new(
+                Vec::new(),
+                vec![provenance("inventory/adapters")],
+                Confidence::High,
+            ),
+            EffectivePolicy::new(None, vec![provenance("policy/effective")], Confidence::High),
+        );
+        for intent in Intent::ALL {
+            model.commands.insert(
+                intent,
+                ResolvedCommandSet::absent(
+                    vec![provenance(format!("commands/{intent:?}"))],
+                    Confidence::High,
+                ),
+            );
+        }
+        model
+    }
 
     #[test]
     fn command_spec_keeps_program_and_arguments_separate() {
@@ -822,7 +1121,7 @@ mod tests {
 
     #[test]
     fn unknown_is_distinct_from_known_empty_detection() {
-        let unknown_commands = ResolvedCommandSet::unknown(Vec::new());
+        let unknown_commands = ResolvedCommandSet::unknown(Vec::new(), Vec::new());
         let known_empty_assets = AssetInventory::new(Vec::new(), Vec::new(), Confidence::High);
         let unknown_assets = AssetInventory::unknown(Vec::new());
 
@@ -840,38 +1139,77 @@ mod tests {
     }
 
     #[test]
-    fn command_resolution_cannot_conflate_absent_ambiguous_and_executable_states() {
-        let command = CommandSpec::new(
-            "check",
-            Intent::Check,
-            "cargo",
-            RepoRelativePath::root(),
-            CommandSource::ExplicitConfig,
-        );
+    fn intent_all_is_complete_and_in_stable_order() {
         assert_eq!(
-            ResolvedCommandSet::new(
-                CommandResolution::Resolved,
+            Intent::ALL,
+            [
+                Intent::Setup,
+                Intent::FormatCheck,
+                Intent::Format,
+                Intent::Check,
+                Intent::Fix,
+                Intent::Test,
+                Intent::Verify,
+                Intent::Build,
+            ]
+        );
+    }
+
+    #[test]
+    fn command_resolution_keeps_only_nonempty_resolved_sets_executable()
+    -> Result<(), InvalidCommandResolution> {
+        assert_eq!(
+            ResolvedCommandSet::resolved(
                 Vec::new(),
-                Vec::new(),
+                vec![provenance("commands/check")],
                 Confidence::High,
                 Confidence::Unknown,
             ),
             Err(InvalidCommandResolution::ResolvedWithoutCommands)
         );
-        assert_eq!(
-            ResolvedCommandSet::new(
-                CommandResolution::Absent,
-                vec![command.clone()],
-                Vec::new(),
-                Confidence::High,
-                Confidence::Unknown,
-            ),
-            Err(InvalidCommandResolution::AbsentWithCommands)
+
+        let resolved = ResolvedCommandSet::resolved(
+            vec![command("check", Intent::Check, "cargo")],
+            vec![provenance("commands/check")],
+            Confidence::High,
+            Confidence::High,
+        )?;
+        let absent =
+            ResolvedCommandSet::absent(vec![provenance("commands/check/absent")], Confidence::High);
+        let ambiguous_empty = ResolvedCommandSet::ambiguous(
+            Vec::new(),
+            vec![provenance("commands/check/ambiguous-empty")],
+            Confidence::Unknown,
         );
-        assert_eq!(
-            ResolvedCommandSet::ambiguous(vec![command], Vec::new(), Confidence::Unknown,),
-            Err(InvalidCommandResolution::AmbiguousWithoutAlternatives)
+        let ambiguous_candidate = ResolvedCommandSet::ambiguous(
+            vec![command("candidate", Intent::Check, "cargo")],
+            vec![provenance("commands/check/ambiguous-candidate")],
+            Confidence::Unknown,
         );
+        let unknown_empty = ResolvedCommandSet::unknown(
+            Vec::new(),
+            vec![provenance("commands/check/unknown-empty")],
+        );
+        let unknown_candidate = ResolvedCommandSet::unknown(
+            vec![command("candidate", Intent::Check, "cargo")],
+            vec![provenance("commands/check/unknown-candidate")],
+        );
+
+        assert_eq!(resolved.resolution(), CommandResolution::Resolved);
+        assert!(resolved.executable_commands().is_some());
+        assert_eq!(absent.commands(), []);
+        for command_set in [
+            &absent,
+            &ambiguous_empty,
+            &ambiguous_candidate,
+            &unknown_empty,
+            &unknown_candidate,
+        ] {
+            assert_eq!(command_set.executable_commands(), None);
+        }
+        assert_eq!(ambiguous_candidate.commands().len(), 1);
+        assert_eq!(unknown_candidate.commands().len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -891,98 +1229,368 @@ mod tests {
     }
 
     #[test]
-    fn project_model_canonicalization_is_stable_without_reordering_commands()
+    fn project_model_finalize_is_stable_without_reordering_resolved_commands()
     -> Result<(), Box<dyn std::error::Error>> {
-        let repository = RepoFacts {
-            root: PathBuf::from("/repo"),
-            git_dir: PathBuf::from("/repo/.git"),
-            git_common_dir: PathBuf::from("/repo/.git"),
-            is_linked_worktree: false,
-            head: None,
-            branch: None,
-            upstream: None,
-            work_state: WorkState::Unknown,
-        };
-        let mut model = ProjectModel::new(
-            repository,
-            AssetInventory::unknown(Vec::new()),
-            AdapterInventory::unknown(Vec::new()),
-            EffectivePolicy::unknown(Vec::new()),
-        );
-        let make_unit = |id: &'static str,
-                         root: &'static str|
-         -> Result<ProjectUnit, Box<dyn std::error::Error>> {
-            Ok(ProjectUnit {
-                id: UnitId::from(id),
-                display_name: id.into(),
-                language: LanguageId::from("rust"),
-                kind: ProjectKind::RustPackage,
-                root: RepoRelativePath::new(root)?,
-                manifest: RepoRelativePath::new(format!("{root}/Cargo.toml"))?,
-                workspace_root: None,
-                members: vec![UnitId::from("z"), UnitId::from("a"), UnitId::from("a")],
-                dependencies: vec![
-                    UnitEdge::new(UnitId::from("z"), Vec::new(), Confidence::High),
-                    UnitEdge::new(UnitId::from("a"), Vec::new(), Confidence::High),
-                ],
-                toolchain: ToolchainInfo::unknown(Vec::new()),
-            })
-        };
-        model.units = vec![make_unit("b", "z")?, make_unit("a", "a")?];
-        let first = CommandSpec::new(
-            "first",
-            Intent::Verify,
-            "first-program",
-            RepoRelativePath::root(),
-            CommandSource::ExplicitConfig,
-        );
-        let second = CommandSpec::new(
-            "second",
-            Intent::Verify,
-            "second-program",
-            RepoRelativePath::root(),
-            CommandSource::ExplicitConfig,
-        );
+        let mut model = valid_model();
+        model.units = vec![unit("b", "z")?, unit("a", "a")?];
+        let first = command("first", Intent::Verify, "first-program");
+        let second = command("second", Intent::Verify, "second-program");
         model.commands.insert(
             Intent::Verify,
             ResolvedCommandSet::resolved(
                 vec![first, second],
-                Vec::new(),
+                vec![provenance("commands/verify/resolved")],
                 Confidence::High,
                 Confidence::Unknown,
             )?,
         );
-        model.diagnostics = vec![
-            Diagnostic::new("FGE2002", Severity::Warning, "second", "z", "why", "next"),
-            Diagnostic::new("FGE2001", Severity::Warning, "first", "a", "why", "next"),
+        model.commands.insert(
+            Intent::Check,
+            ResolvedCommandSet::ambiguous(
+                vec![
+                    command("z-candidate", Intent::Check, "z-program"),
+                    command("a-candidate", Intent::Check, "a-program"),
+                ],
+                vec![provenance("commands/check/ambiguous")],
+                Confidence::Medium,
+            ),
+        );
+        let diagnostics = vec![
+            Diagnostic::new("FGE1000", Severity::Error, "same", "same", "same", "same"),
+            Diagnostic::new("FGE2001", Severity::Info, "same", "same", "same", "same"),
+            Diagnostic::new(
+                "FGE2001",
+                Severity::Warning,
+                "a-what",
+                "same",
+                "same",
+                "same",
+            ),
+            Diagnostic::new(
+                "FGE2001",
+                Severity::Warning,
+                "same",
+                "a-location",
+                "same",
+                "same",
+            ),
+            Diagnostic::new(
+                "FGE2001",
+                Severity::Warning,
+                "same",
+                "same",
+                "a-why",
+                "same",
+            ),
+            Diagnostic::new(
+                "FGE2001",
+                Severity::Warning,
+                "same",
+                "same",
+                "same",
+                "a-next",
+            ),
+            Diagnostic::new(
+                "FGE2001",
+                Severity::Warning,
+                "same",
+                "same",
+                "same",
+                "z-next",
+            ),
         ];
+        model.diagnostics = diagnostics.iter().cloned().rev().collect();
 
-        model.canonicalize();
-        let once = model.clone();
-        model.canonicalize();
+        let once = model.finalize()?;
+        let twice = once.clone().finalize()?;
 
-        assert_eq!(model, once);
-        assert_eq!(model.units[0].id, UnitId::from("a"));
+        assert_eq!(twice, once);
+        assert_eq!(once.units[0].id, UnitId::from("a"));
         assert_eq!(
-            model.units[0].members,
+            once.units[0].members,
             vec![UnitId::from("a"), UnitId::from("z")]
         );
         assert_eq!(
-            model.units[0]
+            once.units[0]
                 .dependencies
                 .iter()
                 .map(|edge| edge.dependency.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "z"]
         );
-        assert_eq!(model.diagnostics[0].code.as_str(), "FGE2001");
+        assert_eq!(once.diagnostics, diagnostics);
         assert_eq!(
-            model.commands[&Intent::Verify]
+            once.commands[&Intent::Verify]
                 .commands()
                 .iter()
                 .map(|command| command.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["first", "second"]
+        );
+        assert_eq!(
+            once.commands[&Intent::Check]
+                .commands()
+                .iter()
+                .map(|command| command.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-candidate", "z-candidate"]
+        );
+        assert_eq!(once.commands[&Intent::Check].executable_commands(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn project_model_finalize_requires_schema_all_intents_and_valid_resolution_shapes() {
+        let mut wrong_schema = valid_model();
+        wrong_schema.schema = SchemaVersion::new("model", 2);
+        assert_eq!(
+            wrong_schema.finalize(),
+            Err(ProjectModelError::InvalidSchema {
+                expected: SchemaVersion::for_kind(SchemaKind::ProjectModel),
+                found: SchemaVersion::new("model", 2),
+            })
+        );
+
+        let mut missing_intent = valid_model();
+        missing_intent.commands.remove(&Intent::Build);
+        assert_eq!(
+            missing_intent.finalize(),
+            Err(ProjectModelError::MissingIntent {
+                intent: Intent::Build,
+            })
+        );
+
+        let mut empty_resolved = valid_model();
+        empty_resolved.commands.insert(
+            Intent::Check,
+            ResolvedCommandSet::new(
+                CommandResolution::Resolved,
+                Vec::new(),
+                vec![provenance("commands/check")],
+                Confidence::High,
+                Confidence::High,
+            ),
+        );
+        assert_eq!(
+            empty_resolved.finalize(),
+            Err(ProjectModelError::ResolvedWithoutCommands {
+                intent: Intent::Check,
+            })
+        );
+
+        let mut nonempty_absent = valid_model();
+        nonempty_absent.commands.insert(
+            Intent::Check,
+            ResolvedCommandSet::new(
+                CommandResolution::Absent,
+                vec![command("check", Intent::Check, "cargo")],
+                vec![provenance("commands/check")],
+                Confidence::High,
+                Confidence::Unknown,
+            ),
+        );
+        assert_eq!(
+            nonempty_absent.finalize(),
+            Err(ProjectModelError::AbsentWithCommands {
+                intent: Intent::Check,
+            })
+        );
+    }
+
+    #[test]
+    fn project_model_finalize_rejects_conflicting_domain_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mismatched_intent = valid_model();
+        mismatched_intent.commands.insert(
+            Intent::Check,
+            ResolvedCommandSet::resolved(
+                vec![command("mismatch", Intent::Test, "cargo")],
+                vec![provenance("commands/check")],
+                Confidence::High,
+                Confidence::High,
+            )?,
+        );
+        assert_eq!(
+            mismatched_intent.finalize(),
+            Err(ProjectModelError::CommandIntentMismatch {
+                map_intent: Intent::Check,
+                command_id: CommandId::from("mismatch"),
+                command_intent: Intent::Test,
+            })
+        );
+
+        let mut conflicting_command = valid_model();
+        conflicting_command.commands.insert(
+            Intent::Check,
+            ResolvedCommandSet::resolved(
+                vec![
+                    command("duplicate", Intent::Check, "cargo"),
+                    command("duplicate", Intent::Check, "other-program"),
+                ],
+                vec![provenance("commands/check")],
+                Confidence::High,
+                Confidence::High,
+            )?,
+        );
+        assert_eq!(
+            conflicting_command.finalize(),
+            Err(ProjectModelError::ConflictingCommandId {
+                command_id: CommandId::from("duplicate"),
+            })
+        );
+
+        let mut duplicate_unit = valid_model();
+        duplicate_unit.units = vec![unit("duplicate", "a")?, unit("duplicate", "b")?];
+        assert_eq!(
+            duplicate_unit.finalize(),
+            Err(ProjectModelError::DuplicateUnitId {
+                unit_id: UnitId::from("duplicate"),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_model_finalize_rejects_duplicate_inventory_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let asset_path = RepoRelativePath::new(".github/workflows/ci.yml")?;
+        let mut duplicate_asset = valid_model();
+        duplicate_asset.assets.entries = vec![
+            AssetInfo::new(
+                "workflow",
+                asset_path.clone(),
+                vec![provenance("asset/first")],
+                Confidence::High,
+            ),
+            AssetInfo::new(
+                "workflow",
+                asset_path.clone(),
+                vec![provenance("asset/second")],
+                Confidence::Low,
+            ),
+        ];
+        assert_eq!(
+            duplicate_asset.finalize(),
+            Err(ProjectModelError::DuplicateAssetIdentity {
+                kind: "workflow".into(),
+                path: asset_path,
+            })
+        );
+
+        let adapter_path = RepoRelativePath::new("AGENTS.md")?;
+        let mut duplicate_adapter = valid_model();
+        duplicate_adapter.adapters.entries = vec![
+            AdapterInfo::new(
+                "codex",
+                adapter_path.clone(),
+                vec![provenance("adapter/first")],
+                Confidence::High,
+            ),
+            AdapterInfo::new(
+                "codex",
+                adapter_path.clone(),
+                vec![provenance("adapter/second")],
+                Confidence::Low,
+            ),
+        ];
+        assert_eq!(
+            duplicate_adapter.finalize(),
+            Err(ProjectModelError::DuplicateAdapterIdentity {
+                host: "codex".into(),
+                path: adapter_path,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_model_finalize_requires_complete_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut empty = valid_model();
+        empty.commands.insert(
+            Intent::Setup,
+            ResolvedCommandSet::absent(Vec::new(), Confidence::High),
+        );
+        assert_eq!(
+            empty.finalize(),
+            Err(ProjectModelError::EmptyProvenance {
+                location: "commands.Setup.provenance".into(),
+            })
+        );
+
+        let mut empty_rule = valid_model();
+        empty_rule.commands.insert(
+            Intent::Setup,
+            ResolvedCommandSet::absent(
+                vec![Provenance {
+                    rule_id: "  ".into(),
+                    source_path: None,
+                    source_range: None,
+                    detail: "evidence".into(),
+                }],
+                Confidence::High,
+            ),
+        );
+        assert_eq!(
+            empty_rule.finalize(),
+            Err(ProjectModelError::EmptyProvenanceRuleId {
+                location: "commands.Setup.provenance[0]".into(),
+            })
+        );
+
+        let mut empty_detail = valid_model();
+        empty_detail.commands.insert(
+            Intent::Setup,
+            ResolvedCommandSet::absent(
+                vec![Provenance {
+                    rule_id: "commands/setup".into(),
+                    source_path: None,
+                    source_range: None,
+                    detail: "\t".into(),
+                }],
+                Confidence::High,
+            ),
+        );
+        assert_eq!(
+            empty_detail.finalize(),
+            Err(ProjectModelError::EmptyProvenanceDetail {
+                location: "commands.Setup.provenance[0]".into(),
+            })
+        );
+
+        let mut orphaned_range = valid_model();
+        orphaned_range.commands.insert(
+            Intent::Setup,
+            ResolvedCommandSet::absent(
+                vec![Provenance {
+                    rule_id: "commands/setup".into(),
+                    source_path: None,
+                    source_range: Some(TextRange::new(0, 1)?),
+                    detail: "evidence".into(),
+                }],
+                Confidence::High,
+            ),
+        );
+        assert_eq!(
+            orphaned_range.finalize(),
+            Err(ProjectModelError::ProvenanceRangeWithoutPath {
+                location: "commands.Setup.provenance[0]".into(),
+            })
+        );
+
+        let asset_path = RepoRelativePath::new("README.md")?;
+        let mut nested_empty = valid_model();
+        nested_empty.assets.entries = vec![AssetInfo::new(
+            "documentation",
+            asset_path,
+            Vec::new(),
+            Confidence::High,
+        )];
+        assert_eq!(
+            nested_empty.finalize(),
+            Err(ProjectModelError::EmptyProvenance {
+                location: "assets.entries[0].provenance".into(),
+            })
         );
         Ok(())
     }

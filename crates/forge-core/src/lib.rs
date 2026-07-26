@@ -16,8 +16,8 @@ pub use domain::{
     AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, Assumption, CommandResolution,
     CommandSource, CommandSpec, CommitId, Confidence, CoverageDimension, EffectivePolicy, Intent,
     InvalidCommandResolution, InvalidTextRange, Mutability, NetworkIntent, ProjectKind,
-    ProjectModel, ProjectUnit, Provenance, RepoFacts, ResolvedCommandSet, SuccessPredicate,
-    TextRange, ToolchainInfo, UnitEdge, UpstreamState, WorkState,
+    ProjectModel, ProjectModelError, ProjectUnit, Provenance, RepoFacts, ResolvedCommandSet,
+    SuccessPredicate, TextRange, ToolchainInfo, UnitEdge, UpstreamState, WorkState,
 };
 pub use error::{AppError, ExitCode};
 pub use forge_schema::{Diagnostic, Digest, Severity};
