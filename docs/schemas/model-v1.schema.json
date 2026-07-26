@@ -63,6 +63,37 @@
         "status"
       ]
     },
+    "AdapterDetailData": {
+      "description": "Structured evidence that accompanies one legacy adapter projection.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvenanceData"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/AdapterDriftData"
+        }
+      },
+      "required": [
+        "host",
+        "path",
+        "status",
+        "provenance",
+        "confidence"
+      ]
+    },
     "AdapterDriftData": {
       "description": "Adapter drift classification.",
       "type": "string",
@@ -117,6 +148,33 @@
         "provenance"
       ]
     },
+    "AssetDetailData": {
+      "description": "Structured evidence that accompanies one legacy asset projection.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvenanceData"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "provenance",
+        "confidence"
+      ]
+    },
     "AssumptionData": {
       "description": "A fact that could not be proven directly from repository inputs.",
       "type": "object",
@@ -128,6 +186,29 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "statement",
+        "provenance",
+        "confidence"
+      ]
+    },
+    "AssumptionDetailData": {
+      "description": "Structured evidence that accompanies one legacy assumption projection.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvenanceData"
           }
         },
         "statement": {
@@ -207,9 +288,160 @@
         "coverage"
       ]
     },
+    "CommandDetailData": {
+      "description": "Lossless and structured details that accompany a legacy command projection.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/CommandData"
+        },
+        "native_args": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativeStringData"
+          }
+        },
+        "native_environment_names": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativeStringData"
+          }
+        },
+        "native_program": {
+          "$ref": "#/$defs/NativeStringData"
+        },
+        "source_detail": {
+          "$ref": "#/$defs/CommandSourceData"
+        },
+        "success": {
+          "$ref": "#/$defs/SuccessPredicateData"
+        }
+      },
+      "required": [
+        "command",
+        "native_program",
+        "native_args",
+        "native_environment_names",
+        "source_detail",
+        "success"
+      ]
+    },
     "CommandId": {
       "description": "Stable project-command identity.",
       "type": "string"
+    },
+    "CommandResolutionData": {
+      "description": "Whether a project intent resolved to one authoritative command chain.",
+      "type": "string",
+      "enum": [
+        "resolved",
+        "absent",
+        "ambiguous",
+        "unknown"
+      ]
+    },
+    "CommandSetData": {
+      "description": "Complete resolution state for one project intent.",
+      "type": "object",
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandDetailData"
+          }
+        },
+        "coverage_confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvenanceData"
+          }
+        },
+        "resolution": {
+          "$ref": "#/$defs/CommandResolutionData"
+        },
+        "resolution_confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        }
+      },
+      "required": [
+        "resolution",
+        "candidates",
+        "provenance",
+        "resolution_confidence",
+        "coverage_confidence"
+      ]
+    },
+    "CommandSourceData": {
+      "description": "Stable classification of where a project command came from.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "explicit-config"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "existing-project-target"
+            },
+            "path": {
+              "$ref": "#/$defs/WirePath"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "language-default"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "rule": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "rule"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
     },
     "ConfidenceData": {
       "description": "Confidence in a derived fact.",
@@ -219,6 +451,25 @@
         "medium",
         "high",
         "unknown"
+      ]
+    },
+    "DerivationEvidenceData": {
+      "description": "Provenance and confidence shared by aggregate project-model facts.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvenanceData"
+          }
+        }
+      },
+      "required": [
+        "provenance",
+        "confidence"
       ]
     },
     "Diagnostic": {
@@ -286,6 +537,46 @@
         "unknown"
       ]
     },
+    "NativeStringData": {
+      "description": "A displayable and, when needed, lossless platform-native string.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/NativeStringEncodingData"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    },
+    "NativeStringEncodingData": {
+      "description": "Encoding used to preserve a platform-native string on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
     "NetworkIntentData": {
       "description": "Declared network behavior; it is not a sandbox guarantee.",
       "type": "string",
@@ -318,11 +609,49 @@
       "description": "Root data for the detected project model.",
       "type": "object",
       "properties": {
+        "adapter_details": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AdapterDetailData"
+          }
+        },
+        "adapter_inventory_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivationEvidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "adapters": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/AdapterData"
           }
+        },
+        "asset_details": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AssetDetailData"
+          }
+        },
+        "asset_inventory_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivationEvidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "assets": {
           "type": "array",
@@ -330,10 +659,28 @@
             "$ref": "#/$defs/AssetData"
           }
         },
+        "assumption_details": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AssumptionDetailData"
+          }
+        },
         "assumptions": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/AssumptionData"
+          }
+        },
+        "command_sets": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/CommandSetData"
           }
         },
         "commands": {
@@ -361,11 +708,50 @@
             }
           ]
         },
+        "policy_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivationEvidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "repository": {
           "$ref": "#/$defs/RepoId"
         },
+        "repository_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivationEvidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "repository_root": {
           "$ref": "#/$defs/WirePath"
+        },
+        "unit_details": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ProjectUnitDetailData"
+          }
+        },
+        "unit_inventory_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DerivationEvidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "units": {
           "type": "array",
@@ -451,6 +837,65 @@
         "toolchain"
       ]
     },
+    "ProjectUnitDetailData": {
+      "description": "Structured evidence that accompanies a legacy project-unit projection.",
+      "type": "object",
+      "properties": {
+        "dependency_edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnitDependencyDetailData"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/UnitId"
+        },
+        "toolchain_evidence": {
+          "$ref": "#/$defs/DerivationEvidenceData"
+        }
+      },
+      "required": [
+        "id",
+        "dependency_edges",
+        "toolchain_evidence"
+      ]
+    },
+    "ProvenanceData": {
+      "description": "Structured evidence for a derived project-model fact.",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "source_path": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WirePath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextRangeData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "rule_id",
+        "detail"
+      ]
+    },
     "RepoId": {
       "description": "Stable repository identity.",
       "type": "string"
@@ -463,6 +908,121 @@
         "warning",
         "error",
         "unknown"
+      ]
+    },
+    "SuccessPredicateData": {
+      "description": "Predicate used to decide whether a command observation succeeded.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exit-zero"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exit-zero-and-stdout-empty"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "json-has-no-errors"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "all"
+            },
+            "predicates": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SuccessPredicateData"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "predicates"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "TextRangeData": {
+      "description": "A half-open byte range within a provenance source.",
+      "type": "object",
+      "properties": {
+        "end_byte": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "start_byte": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start_byte",
+        "end_byte"
+      ]
+    },
+    "UnitDependencyDetailData": {
+      "description": "Evidence for one dependency edge in a project unit.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "dependency": {
+          "$ref": "#/$defs/UnitId"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProvenanceData"
+          }
+        }
+      },
+      "required": [
+        "dependency",
+        "provenance",
+        "confidence"
       ]
     },
     "UnitId": {
