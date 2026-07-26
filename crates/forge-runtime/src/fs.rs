@@ -321,6 +321,25 @@ impl RepositoryWriter {
         self.write_atomic_with_mode(relative_path.as_ref(), bytes, NewFileMode::Private)
     }
 
+    /// Atomically creates one private file without replacing an existing identity.
+    pub(crate) fn write_atomic_private_new(
+        &self,
+        relative_path: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<(), FileSystemError> {
+        let relative_path = relative_path.as_ref();
+        let normalized = normalize_relative_path(relative_path)?;
+        self.validate_target(&normalized)?;
+        self.create_parent_directories(&normalized)?;
+        let target = self.validate_target(&normalized)?;
+        write_atomic_new_impl_with_recheck(&target, bytes, NewFileMode::Private, || {
+            self.validate_target(&normalized)
+                .map(|_| ())
+                .map_err(FileSystemError::into_io_error)
+        })
+        .map_err(|source| FileSystemError::io("atomically create repository file", target, source))
+    }
+
     fn write_atomic_with_mode(
         &self,
         relative_path: &Path,
@@ -645,6 +664,42 @@ fn write_atomic_impl_with_recheck(
     recheck_before_rename()?;
     temporary
         .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)?;
+    sync_parent_directory(parent)
+}
+
+fn write_atomic_new_impl_with_recheck(
+    path: &Path,
+    bytes: &[u8],
+    new_file_mode: NewFileMode,
+    recheck_before_rename: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("atomic create target has no parent: `{}`", path.display()),
+        )
+    })?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("atomic create target already exists: `{}`", path.display()),
+            ));
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source),
+    }
+
+    let mut temporary = new_atomic_temporary_file(parent, new_file_mode)?;
+    temporary.as_file_mut().write_all(bytes)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+
+    recheck_before_rename()?;
+    temporary
+        .persist_noclobber(path)
         .map(|_| ())
         .map_err(|error| error.error)?;
     sync_parent_directory(parent)

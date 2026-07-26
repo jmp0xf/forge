@@ -157,6 +157,81 @@ impl AtomicStateStore {
             .map_err(StateError::PathSafety)
     }
 
+    /// Atomically stores a new immutable value and refuses to replace an existing key.
+    pub fn store_new_atomic(&self, key: &str, bytes: &[u8]) -> Result<(), StateError> {
+        let relative = validate_state_key(key)?;
+        if relative == Path::new("lock") {
+            return Err(StateError::UnsafeKey {
+                key: key.to_owned(),
+                reason: "`lock` is reserved for the state lock".to_owned(),
+            });
+        }
+
+        if let Some(parent) = relative.parent() {
+            ensure_private_relative_directories(self.layout.worktree_dir(), parent)?;
+        }
+        self.writer
+            .write_atomic_private_new(relative, bytes)
+            .map_err(StateError::PathSafety)
+    }
+
+    /// Lists direct regular-file keys under one existing private state directory.
+    ///
+    /// Results use the portable state-key syntax and stable byte ordering. Missing directories
+    /// are empty; symlinks, nested directories, non-regular entries, and over-limit results fail
+    /// closed so callers cannot silently omit Receipt or Evidence state.
+    pub fn list_regular_keys_bounded(
+        &self,
+        directory: &str,
+        max_entries: usize,
+    ) -> Result<Vec<String>, StateError> {
+        let relative = validate_state_key(directory)?;
+        let Some(path) = validate_existing_state_directory(self.layout.worktree_dir(), &relative)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(&path)
+            .map_err(|source| StateError::io("list private state directory", &path, source))?
+        {
+            let entry = entry
+                .map_err(|source| StateError::io("read private state entry", &path, source))?;
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path).map_err(|source| {
+                StateError::io("inspect private state entry", &entry_path, source)
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(StateError::PathSafety(FileSystemError::SymlinkComponent {
+                    path: entry_path,
+                }));
+            }
+            if !metadata.is_file() {
+                return Err(StateError::InvalidLayout {
+                    path: entry_path,
+                    reason: "listed state directory contains a non-regular entry".to_owned(),
+                });
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StateError::InvalidLayout {
+                    path: entry.path(),
+                    reason: "state keys must use portable ASCII names".to_owned(),
+                })?;
+            let key = format!("{directory}/{name}");
+            validate_state_key(&key)?;
+            keys.push(key);
+            if keys.len() > max_entries {
+                return Err(StateError::EntryLimit {
+                    directory: directory.to_owned(),
+                    max_entries,
+                });
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
     /// Attempts to acquire the per-worktree exclusive lock.
     ///
     /// The returned guard owns the locked file descriptor, so dropping it
@@ -217,6 +292,13 @@ pub enum StateError {
     PathSafety(#[from] FileSystemError),
     #[error("state lock is already held: `{path}`")]
     LockBusy { path: PathBuf },
+    #[error(
+        "state directory `{directory}` contains more than the configured {max_entries} entries"
+    )]
+    EntryLimit {
+        directory: String,
+        max_entries: usize,
+    },
     #[error("state operation `{operation}` failed for `{path}`: {source}")]
     Io {
         operation: &'static str,
@@ -241,6 +323,7 @@ impl StateError {
             Self::InvalidLayout { .. } | Self::UnsafeKey { .. } => io::ErrorKind::InvalidInput,
             Self::PathSafety(error) => error.io_kind(),
             Self::LockBusy { .. } => io::ErrorKind::WouldBlock,
+            Self::EntryLimit { .. } => io::ErrorKind::InvalidData,
             Self::Io { source, .. } => source.kind(),
         }
     }
@@ -310,6 +393,35 @@ fn validate_existing_private_directory(path: &Path) -> Result<bool, StateError> 
     };
     validate_private_directory(path, &metadata)?;
     Ok(true)
+}
+
+fn validate_existing_state_directory(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<PathBuf>, StateError> {
+    let mut candidate = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Err(StateError::UnsafeKey {
+                key: relative.to_string_lossy().into_owned(),
+                reason: "state hierarchy is not normalized".to_owned(),
+            });
+        };
+        candidate.push(segment);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StateError::io(
+                    "inspect private state directory",
+                    &candidate,
+                    source,
+                ));
+            }
+        };
+        validate_private_directory(&candidate, &metadata)?;
+    }
+    Ok(Some(candidate))
 }
 
 fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), StateError> {
@@ -825,6 +937,62 @@ mod tests {
                 Err(StateError::UnsafeKey { .. })
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_state_create_never_replaces_an_existing_identity() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let store = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir))?;
+
+        store.store_new_atomic("receipts/01ABC.json", b"first")?;
+        let collision = store.store_new_atomic("receipts/01ABC.json", b"second");
+
+        assert!(matches!(
+            collision,
+            Err(ref error) if error.io_kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(store.load("receipts/01ABC.json")?, Some(b"first".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_state_listing_is_stable_complete_and_read_only() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let store = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir))?;
+        store.store_new_atomic("receipts/Z.json", b"z")?;
+        store.store_new_atomic("receipts/A.json", b"a")?;
+        let before = filesystem_snapshot(temporary.path())?;
+
+        assert_eq!(
+            store.list_regular_keys_bounded("receipts", 2)?,
+            ["receipts/A.json", "receipts/Z.json"]
+        );
+        assert!(matches!(
+            store.list_regular_keys_bounded("receipts", 1),
+            Err(StateError::EntryLimit { max_entries: 1, .. })
+        ));
+        assert!(store.list_regular_keys_bounded("evidence", 2)?.is_empty());
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_state_listing_rejects_nested_entries() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let store = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir))?;
+        store.store_new_atomic("receipts/nested/value.json", b"nested")?;
+
+        assert!(matches!(
+            store.list_regular_keys_bounded("receipts", 10),
+            Err(StateError::InvalidLayout { .. })
+        ));
         Ok(())
     }
 
