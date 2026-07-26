@@ -257,6 +257,29 @@ pub trait FileSystemPort {
     fn exists(&self, path: &Path) -> bool;
 }
 
+/// Repository-confined file access used by reviewed working-tree change plans.
+///
+/// Implementations must reject absolute or parent-traversing paths, symbolic-link targets or
+/// ancestors, non-regular targets, and repository-root changes. `write_atomic_confined` must write
+/// through a same-directory temporary file and replace the target atomically at the single-file
+/// boundary. Multi-file atomicity is deliberately not promised by this port.
+pub trait RepositoryFilePort {
+    /// Reads a safe repository-relative regular file, or returns `None` when it does not exist.
+    fn read_confined(
+        &self,
+        repository_root: &Path,
+        path: &RepoRelativePath,
+    ) -> io::Result<Option<Vec<u8>>>;
+
+    /// Atomically writes one safe repository-relative regular file.
+    fn write_atomic_confined(
+        &self,
+        repository_root: &Path,
+        path: &RepoRelativePath,
+        bytes: &[u8],
+    ) -> io::Result<()>;
+}
+
 pub trait GitPort {
     fn repository_root(&self, start: &Path) -> Result<PathBuf, GitError>;
     fn git_dir(&self, start: &Path) -> Result<PathBuf, GitError>;

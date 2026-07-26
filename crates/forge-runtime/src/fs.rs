@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 
-use forge_core::ports::FileSystemPort;
+use forge_core::ports::{FileSystemPort, RepositoryFilePort};
 use forge_core::{
     BoundedText, GitFileSet, Inventory, InventoryError, InventoryOptions, PathKind,
     RepoRelativePath,
@@ -104,6 +104,36 @@ impl FileSystemPort for NativeFileSystem {
 
     fn exists(&self, path: &Path) -> bool {
         NativeFileSystem::exists(self, path)
+    }
+}
+
+impl RepositoryFilePort for NativeFileSystem {
+    fn read_confined(
+        &self,
+        repository_root: &Path,
+        path: &RepoRelativePath,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let writer =
+            RepositoryWriter::new(repository_root).map_err(FileSystemError::into_io_error)?;
+        match writer.read(path.as_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(FileSystemError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into_io_error()),
+        }
+    }
+
+    fn write_atomic_confined(
+        &self,
+        repository_root: &Path,
+        path: &RepoRelativePath,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        RepositoryWriter::new(repository_root)
+            .map_err(FileSystemError::into_io_error)?
+            .write_atomic(path.as_path(), bytes)
+            .map_err(FileSystemError::into_io_error)
     }
 }
 
@@ -604,9 +634,10 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::io;
     use std::path::Path;
 
-    use forge_core::ports::FileSystemPort;
+    use forge_core::ports::{FileSystemPort, RepositoryFilePort};
     use forge_core::{GitFileSet, InventoryOptions, PathKind, RepoRelativePath};
     use tempfile::tempdir;
 
@@ -623,6 +654,62 @@ mod tests {
 
         assert!(filesystem.exists(&target));
         assert_eq!(filesystem.read(&target)?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn repository_file_port_distinguishes_missing_and_round_trips_content()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let filesystem = NativeFileSystem;
+        let path = RepoRelativePath::new("nested/AGENTS.md")?;
+
+        assert_eq!(
+            RepositoryFilePort::read_confined(&filesystem, repository.path(), &path)?,
+            None
+        );
+        RepositoryFilePort::write_atomic_confined(
+            &filesystem,
+            repository.path(),
+            &path,
+            b"project guidance",
+        )?;
+        assert_eq!(
+            RepositoryFilePort::read_confined(&filesystem, repository.path(), &path)?,
+            Some(b"project guidance".to_vec())
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_file_port_rejects_symlink_reads_and_writes() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempdir()?;
+        let outside = tempdir()?;
+        fs::write(outside.path().join("secret"), b"secret")?;
+        symlink(outside.path(), repository.path().join("linked"))?;
+        let filesystem = NativeFileSystem;
+        let path = RepoRelativePath::new("linked/secret")?;
+
+        let read = RepositoryFilePort::read_confined(&filesystem, repository.path(), &path);
+        let write = RepositoryFilePort::write_atomic_confined(
+            &filesystem,
+            repository.path(),
+            &path,
+            b"replacement",
+        );
+
+        assert!(matches!(
+            read,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(matches!(
+            write,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(outside.path().join("secret"))?, b"secret");
         Ok(())
     }
 
