@@ -9,13 +9,11 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
-bstr.workspace = true
 forge-core = { path = "../forge-core" }
 fs2.workspace = true
 ignore.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-wait-timeout.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
