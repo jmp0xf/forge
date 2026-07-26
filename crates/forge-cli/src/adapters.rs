@@ -46,6 +46,15 @@ pub(crate) struct AdaptersOutcome {
     completion: ModelDetectionCompletion,
 }
 
+/// Read-only adapter facts shared by `doctor` and `next`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdapterObservation {
+    /// Whether a private manifest proves that this repository adopted managed adapters.
+    pub(crate) managed: bool,
+    pub(crate) statuses: Vec<AdapterStatusData>,
+    pub(crate) changed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AdapterPreview {
     kind: FileEditKind,
@@ -57,6 +66,37 @@ struct AdapterPreview {
     force_authorized: bool,
 }
 
+#[derive(Debug)]
+struct InspectionOutcome {
+    options: InitPlanOptions,
+    plan: Option<ChangePlan>,
+    statuses: Vec<AdapterStatusData>,
+    previews: Vec<AdapterPreview>,
+    changed: bool,
+    user_edited: bool,
+}
+
+/// Observes only adapters already adopted through the private manifest.
+///
+/// An unmanaged repository is not drifted merely because Forge could initialize it.
+pub(crate) fn observe_managed(
+    model: &forge_core::ProjectModel,
+) -> Result<AdapterObservation, AppError> {
+    let Some(manifest) = load_manifest(model)? else {
+        return Ok(AdapterObservation {
+            managed: false,
+            statuses: Vec::new(),
+            changed: false,
+        });
+    };
+    let inspected = inspect_adapter_state(model, Some(&manifest), &[])?;
+    Ok(AdapterObservation {
+        managed: true,
+        statuses: inspected.statuses,
+        changed: inspected.changed,
+    })
+}
+
 pub(crate) fn execute(
     cli: &Cli,
     args: &AdaptersArgs,
@@ -65,41 +105,15 @@ pub(crate) fn execute(
     let (mode, force_values) = request_mode(args)?;
     let detected = explain::detect(cli, Arc::clone(&cancellation))?;
     let manifest = load_manifest(&detected.model)?;
-    let options = plan_options(manifest.as_ref(), force_values)?;
-    let filesystem = NativeFileSystem;
-    let hasher = Blake3Hasher;
-    let mut inspection = inspect_init_targets(&detected.model, &filesystem, &hasher, &options)
-        .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
-    let plan = match plan_init(&detected.model, &filesystem, &hasher, &options) {
-        Ok(plan) => Some(plan),
-        Err(PlanError::ManagedBlock {
-            source: ManagedBlockError::UserEdited { .. },
-            ..
-        }) => {
-            // Refresh the complete target set after the fail-closed planner observes a conflict.
-            // This avoids collapsing a multi-target check to only the first edited block.
-            inspection = inspect_init_targets(&detected.model, &filesystem, &hasher, &options)
-                .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
-            None
-        }
-        Err(error) => return Err(init::map_plan_error_app(error, "adapter drift plan")),
-    };
-    let statuses = classify_inspection(
-        &inspection,
-        manifest.as_ref(),
-        &detected.model.repository.root,
-        &filesystem,
-    )?;
-    let previews = inspection_previews(&inspection, &options);
-    let changed = statuses
-        .iter()
-        .any(|status| status.drift != AdapterDriftData::NoDrift);
-    let user_edited = statuses
-        .iter()
-        .any(|status| status.drift == AdapterDriftData::UserEdited);
-    if plan.is_none() && !user_edited {
-        return Err(inspection_changed_error());
-    }
+    let inspected = inspect_adapter_state(&detected.model, manifest.as_ref(), force_values)?;
+    let InspectionOutcome {
+        options,
+        plan,
+        statuses,
+        previews,
+        changed,
+        user_edited,
+    } = inspected;
 
     if mode != AdaptersMode::SyncApply || plan.is_none() {
         let requested_exit = if (mode == AdaptersMode::Check && changed) || user_edited {
@@ -179,6 +193,52 @@ pub(crate) fn execute(
         previews,
         mode,
         completion: applied.completion,
+    })
+}
+
+fn inspect_adapter_state(
+    model: &forge_core::ProjectModel,
+    manifest: Option<&AdapterManifest>,
+    force_values: &[String],
+) -> Result<InspectionOutcome, AppError> {
+    let options = plan_options(manifest, force_values)?;
+    let filesystem = NativeFileSystem;
+    let hasher = Blake3Hasher;
+    let mut inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
+        .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
+    let plan = match plan_init(model, &filesystem, &hasher, &options) {
+        Ok(plan) => Some(plan),
+        Err(PlanError::ManagedBlock {
+            source: ManagedBlockError::UserEdited { .. },
+            ..
+        }) => {
+            // Refresh the complete target set after the fail-closed planner observes a conflict.
+            // This avoids collapsing a multi-target check to only the first edited block.
+            inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
+                .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
+            None
+        }
+        Err(error) => return Err(init::map_plan_error_app(error, "adapter drift plan")),
+    };
+    let statuses = classify_inspection(&inspection, manifest, &model.repository.root, &filesystem)?;
+    let previews = inspection_previews(&inspection, &options);
+    let changed = statuses
+        .iter()
+        .any(|status| status.drift != AdapterDriftData::NoDrift);
+    let user_edited = statuses
+        .iter()
+        .any(|status| status.drift == AdapterDriftData::UserEdited);
+    if plan.is_none() && !user_edited {
+        return Err(inspection_changed_error());
+    }
+
+    Ok(InspectionOutcome {
+        options,
+        plan,
+        statuses,
+        previews,
+        changed,
+        user_edited,
     })
 }
 

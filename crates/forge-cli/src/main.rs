@@ -5,6 +5,7 @@
 mod adapter_manifest;
 mod adapters;
 mod args;
+mod doctor;
 mod explain;
 mod init;
 mod init_wire;
@@ -125,9 +126,24 @@ fn execute(cli: Cli, context: &ExecutionContext) -> Result<ExitCode, AppError> {
         }
         Some(Command::Init(args)) => emit_init(&cli, args, context, json),
         Some(Command::Adapters(args)) => emit_adapters(&cli, args, context, json),
+        Some(Command::Doctor) => emit_doctor(&cli, context, json),
         Some(Command::Explain) => emit_explain(&cli, context, json),
         Some(command) => Err(not_implemented_error(command)),
     }
+}
+
+fn emit_doctor(cli: &Cli, context: &ExecutionContext, json: bool) -> Result<ExitCode, AppError> {
+    let outcome = doctor::execute(cli, context.cancellation_flag())?;
+    if json {
+        emit_json(&Envelope::success(
+            SchemaKind::Doctor,
+            TOOL_VERSION,
+            outcome.wire.clone(),
+        ))?;
+    } else {
+        write_stdout(format_args!("{}", doctor::render_human(&outcome)))?;
+    }
+    Ok(outcome.exit_code)
 }
 
 fn emit_adapters(
@@ -244,6 +260,7 @@ fn emit_version(json: bool) -> Result<(), AppError> {
                 String::from("schema"),
                 String::from("completions"),
                 String::from("init"),
+                String::from("doctor"),
                 String::from("explain"),
                 String::from("adapters"),
             ],
@@ -295,7 +312,7 @@ fn print_help() -> Result<(), AppError> {
 fn not_implemented_error(command: &Command) -> AppError {
     let name = match command {
         Command::Init(_) | Command::Explain => "implemented-command",
-        Command::Doctor => "doctor",
+        Command::Doctor => "implemented-command",
         Command::Next => "next",
         Command::Evidence(_) => "evidence",
         Command::Adapters(_) => "implemented-command",
@@ -399,7 +416,7 @@ mod tests {
 
     #[test]
     fn planned_commands_remain_explicit_environment_failures() {
-        let error = not_implemented_error(&Command::Doctor);
+        let error = not_implemented_error(&Command::Next);
 
         assert_eq!(error.exit_code(), ExitCode::EnvironmentUnmet);
         assert_eq!(error.diagnostic().code.as_str(), "FGE2001");

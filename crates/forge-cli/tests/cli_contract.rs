@@ -1030,3 +1030,94 @@ fn explain_with_missing_explicit_config_fails_closed_without_writes()
     fixture.assert_no_forge_artifacts();
     Ok(())
 }
+
+#[test]
+fn doctor_json_is_complete_deterministic_and_read_only() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::zero_config_repository("doctor-read-only")?;
+    let before = fixture.snapshot()?;
+    let private_state = fixture.private_forge_state_dir()?;
+    assert!(!private_state.exists());
+
+    let first = fixture.run_forge(&["doctor", "--json"])?;
+    let second = fixture.run_forge(&["doctor", "--json"])?;
+
+    // CI protection and ownership are deliberately unknown from a local clone.
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(second.status.code(), Some(1));
+    assert!(first.stderr.is_empty());
+    assert!(second.stderr.is_empty());
+    assert_eq!(first.stdout, second.stdout);
+    let document: Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(document["schema"], "forge.doctor/v1");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["overall"], "unknown");
+    let ids = required_array(&document["data"], "checks")?
+        .iter()
+        .map(|check| check["id"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "git.repository",
+            "git.operation",
+            "state.layout",
+            "config.schema",
+            "project.units",
+            "project.commands",
+            "toolchain.required",
+            "adapters.drift",
+            "ci.visible",
+            "ownership.visible",
+            "path.safety",
+            "process.capability",
+        ]
+    );
+    for check in required_array(&document["data"], "checks")? {
+        assert!(
+            check["detail"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            check["next"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!private_state.exists());
+    fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_unsafe_private_state_without_following_or_writing_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestWorkspace::clean_runner_repository("doctor-unsafe-state")?;
+    let before = fixture.snapshot()?;
+    let state = fixture.private_forge_state_dir()?;
+    let outside = fixture.root.join("outside-state");
+    fs::create_dir(&outside)?;
+    symlink(&outside, &state)?;
+
+    let output = fixture.run_forge(&["doctor", "--json"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["schema"], "forge.doctor/v1");
+    assert_eq!(document["data"]["overall"], "fail");
+    let checks = required_array(&document["data"], "checks")?;
+    let state_check = checks
+        .iter()
+        .find(|check| check["id"] == "state.layout")
+        .ok_or_else(|| io::Error::other("state.layout check is missing"))?;
+    assert_eq!(state_check["status"], "fail");
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(outside.read_dir()?.next().is_none());
+    assert!(!fixture.worktree.join("explain-must-not-run").exists());
+    Ok(())
+}
