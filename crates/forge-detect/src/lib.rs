@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod go;
+pub mod repository;
 pub mod rust;
 
 use forge_core::{CommandSpec, ProjectModel, ProjectUnit};

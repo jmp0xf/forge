@@ -20,7 +20,7 @@ pub use domain::{
     TextRange, ToolchainInfo, UnitEdge, UpstreamState, WorkState,
 };
 pub use error::{AppError, ExitCode};
-pub use forge_schema::Digest;
+pub use forge_schema::{Diagnostic, Digest, Severity};
 pub use git::{
     AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitError, GitErrorKind,
     GitFileSet, GitMode, GitObjectFormat, GitObjectId, GitPathListReadError, GitRefName,
