@@ -1090,6 +1090,143 @@ fn doctor_json_is_complete_deterministic_and_read_only() -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[test]
+fn next_on_unborn_changes_is_deterministic_read_only_and_never_executes_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::zero_config_repository("next-changed")?;
+    let before = fixture.snapshot()?;
+    let private_state = fixture.private_forge_state_dir()?;
+    assert!(!private_state.exists());
+
+    let first = fixture.run_forge(&["next", "--json"])?;
+    let second = fixture.run_forge(&["next", "--json"])?;
+
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(second.status.code(), Some(1));
+    assert!(first.stderr.is_empty());
+    assert!(second.stderr.is_empty());
+    assert_eq!(first.stdout, second.stdout);
+    let document: Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(document["schema"], "forge.next/v1");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["state"], "changed-unverified");
+    assert_eq!(document["data"]["required_action"], "run-intent");
+    assert_eq!(document["data"]["intent"], "check");
+    assert!(
+        document["data"]["project_commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| {
+                command["program"] == "make"
+                    && command["args"]
+                        .as_array()
+                        .is_some_and(|args| args.iter().any(|arg| arg == "check"))
+            }))
+    );
+    assert!(document["data"]["receipt_command"].is_null());
+    assert!(
+        document["data"]["context_paths"]
+            .as_array()
+            .is_some_and(|paths| paths
+                .iter()
+                .any(|path| path["path"]["display"] == "Makefile"))
+    );
+    assert_eq!(document["data"]["risk"]["level"], "unknown");
+    assert!(
+        document["data"]["provenance"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty())
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!private_state.exists());
+    assert!(!fixture.worktree.join("explain-must-not-run").exists());
+    Ok(())
+}
+
+#[test]
+fn next_does_not_call_a_committed_repository_idle_without_an_approved_base()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("next-base-unknown")?;
+    let before = fixture.snapshot()?;
+
+    let output = fixture.run_forge(&["next", "--json"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["schema"], "forge.next/v1");
+    assert_eq!(document["data"]["state"], "unknown");
+    assert_eq!(document["data"]["required_action"], "run-doctor");
+    assert_eq!(document["data"]["risk"]["level"], "unknown");
+    assert!(
+        document["data"]["uncertain_assumptions"]
+            .as_array()
+            .is_some_and(|assumptions| assumptions.iter().any(|assumption| {
+                assumption["provenance"].as_array().is_some_and(|sources| {
+                    sources
+                        .iter()
+                        .any(|source| source == "navigation.approved-base-unknown.v1")
+                })
+            }))
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!fixture.worktree.join("explain-must-not-run").exists());
+    Ok(())
+}
+
+#[test]
+fn next_reports_an_empty_unborn_repository_as_idle() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::plain("next-idle")?;
+    fixture.run_git(&["init", "--quiet"])?;
+    let before = fixture.snapshot()?;
+
+    let output = fixture.run_forge(&["next", "--json"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["data"]["state"], "idle");
+    assert_eq!(document["data"]["required_action"], "none");
+    assert!(
+        document["data"]["project_commands"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
+#[test]
+fn next_stops_at_external_authority_for_a_critical_policy_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::plain("next-protected")?;
+    fixture.run_git(&["init", "--quiet"])?;
+    fs::write(fixture.worktree.join("AGENTS.md"), b"repository policy\n")?;
+    let before = fixture.snapshot()?;
+
+    let output = fixture.run_forge(&["next", "--json"])?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["data"]["state"], "blocked");
+    assert_eq!(document["data"]["required_action"], "stop-and-escalate");
+    assert_eq!(document["data"]["risk"]["level"], "critical");
+    assert!(
+        document["data"]["risk"]["matched"]
+            .as_array()
+            .is_some_and(|matches| matches.iter().any(|rule| rule == "risk/ci-policy"))
+    );
+    assert!(
+        document["data"]["blockers"]
+            .as_array()
+            .is_some_and(|blockers| !blockers.is_empty())
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_reports_unsafe_private_state_without_following_or_writing_it()
