@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 forge-core = { path = "../forge-core" }
+serde.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true
