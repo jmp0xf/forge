@@ -500,6 +500,7 @@ struct CargoMetadataDocument {
     workspace_default_members: Vec<String>,
     resolve: Value,
     workspace_root: PathBuf,
+    #[serde(rename = "version")]
     format_version: u32,
 }
 
@@ -1285,7 +1286,7 @@ mod tests {
             "workspace_default_members": [cargo_id],
             "resolve": null,
             "workspace_root": root,
-            "format_version": 1
+            "version": 1
         })
     }
 
@@ -1315,7 +1316,7 @@ mod tests {
             ],
             "resolve": null,
             "workspace_root": "/repo",
-            "format_version": 1
+            "version": 1
         })
     }
 
@@ -1686,7 +1687,7 @@ mod tests {
             "format",
             "format 0.1.0 (path+file:///repo/format)",
         );
-        format["format_version"] = json!(2);
+        format["version"] = json!(2);
         let mut members = package_document(
             "/repo/members",
             "members",
