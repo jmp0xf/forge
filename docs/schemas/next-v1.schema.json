@@ -1,0 +1,448 @@
+{
+  "$id": "forge.next/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge next v1",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/NextData"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.next/v1"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "AssumptionData": {
+      "description": "A fact that could not be proven directly from repository inputs.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "statement",
+        "provenance",
+        "confidence"
+      ]
+    },
+    "CommandData": {
+      "description": "A shell-free project command representation.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "environment_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "mutability": {
+          "$ref": "#/$defs/MutabilityData"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkIntentData"
+        },
+        "program": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "program",
+        "args",
+        "cwd",
+        "environment_names",
+        "timeout_seconds",
+        "mutability",
+        "network",
+        "source",
+        "confidence",
+        "coverage"
+      ]
+    },
+    "CommandId": {
+      "description": "Stable project-command identity.",
+      "type": "string"
+    },
+    "ConfidenceData": {
+      "description": "Confidence in a derived fact.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "ContextPathData": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "why"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "IntentData": {
+      "description": "Project operation intent on the wire.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "format-check",
+        "format",
+        "check",
+        "fix",
+        "test",
+        "verify",
+        "build",
+        "unknown"
+      ]
+    },
+    "MutabilityData": {
+      "description": "Declared command mutability.",
+      "type": "string",
+      "enum": [
+        "read-only",
+        "working-tree-write",
+        "external-side-effect",
+        "unknown"
+      ]
+    },
+    "NetworkIntentData": {
+      "description": "Declared network behavior; it is not a sandbox guarantee.",
+      "type": "string",
+      "enum": [
+        "inherit",
+        "offline-requested",
+        "required",
+        "unknown"
+      ]
+    },
+    "NextActionData": {
+      "description": "Deterministic primary action returned by `forge next`.",
+      "type": "string",
+      "enum": [
+        "run-doctor",
+        "resolve-blocker",
+        "stop-and-escalate",
+        "sync-adapters",
+        "none",
+        "fix-failures",
+        "run-intent",
+        "collect-evidence",
+        "unknown"
+      ]
+    },
+    "NextData": {
+      "description": "Root data for `forge next`.",
+      "type": "object",
+      "properties": {
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "context_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextPathData"
+          }
+        },
+        "intent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IntentData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "project_commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandData"
+          }
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason": {
+          "type": "string"
+        },
+        "receipt_command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required_action": {
+          "$ref": "#/$defs/NextActionData"
+        },
+        "risk": {
+          "$ref": "#/$defs/RiskAssessmentData"
+        },
+        "state": {
+          "$ref": "#/$defs/NextStateData"
+        },
+        "uncertain_assumptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssumptionData"
+          }
+        }
+      },
+      "required": [
+        "state",
+        "required_action",
+        "project_commands",
+        "context_paths",
+        "risk",
+        "blockers",
+        "reason",
+        "provenance",
+        "uncertain_assumptions"
+      ]
+    },
+    "NextStateData": {
+      "description": "Deterministic `forge next` state.",
+      "type": "string",
+      "enum": [
+        "blocked",
+        "adapters-drifted",
+        "idle",
+        "checks-failing",
+        "changed-unverified",
+        "partially-verified",
+        "local-verified",
+        "unknown"
+      ]
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "RiskAssessmentData": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/RiskLevelData"
+        },
+        "matched": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "level",
+        "matched",
+        "provenance"
+      ]
+    },
+    "RiskLevelData": {
+      "description": "Risk level. Unknown values are never interpreted as low risk.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical",
+        "unknown"
+      ]
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}

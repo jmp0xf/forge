@@ -1,0 +1,447 @@
+{
+  "$id": "forge.evidence/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge evidence v1",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/EvidenceData"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.evidence/v1"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "CoverageStatementData": {
+      "type": "object",
+      "properties": {
+        "advisory": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "external_required": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_verified": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verified": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "verified",
+        "advisory",
+        "not_verified",
+        "external_required"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Versioned content or policy digest.",
+      "type": "string"
+    },
+    "EvidenceData": {
+      "description": "Root data for an evidence bundle.",
+      "type": "object",
+      "properties": {
+        "base_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage_and_gaps": {
+          "$ref": "#/$defs/CoverageStatementData"
+        },
+        "diff_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "external_attestations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExternalAttestationData"
+          }
+        },
+        "external_requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExternalRequirementData"
+          }
+        },
+        "head_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/EvidenceId"
+        },
+        "local_state": {
+          "$ref": "#/$defs/LocalEvidenceStateData"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepoId"
+        },
+        "risk": {
+          "$ref": "#/$defs/RiskAssessmentData"
+        },
+        "stale_receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StaleReceiptData"
+          }
+        },
+        "task_reference": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid_receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReceiptRefData"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "repository",
+        "diff_digest",
+        "risk",
+        "valid_receipts",
+        "stale_receipts",
+        "coverage_and_gaps",
+        "local_state",
+        "external_requirements",
+        "external_attestations"
+      ]
+    },
+    "EvidenceId": {
+      "description": "Stable evidence-bundle identity.",
+      "type": "string"
+    },
+    "ExternalAttestationData": {
+      "type": "object",
+      "properties": {
+        "reference": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "trust_level": {
+          "$ref": "#/$defs/TrustLevelData"
+        },
+        "verified": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "trust_level",
+        "verified",
+        "reference"
+      ]
+    },
+    "ExternalRequirementData": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "trust_level": {
+          "$ref": "#/$defs/TrustLevelData"
+        }
+      },
+      "required": [
+        "id",
+        "trust_level",
+        "reason"
+      ]
+    },
+    "IntentData": {
+      "description": "Project operation intent on the wire.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "format-check",
+        "format",
+        "check",
+        "fix",
+        "test",
+        "verify",
+        "build",
+        "unknown"
+      ]
+    },
+    "LocalEvidenceStateData": {
+      "description": "Local evidence state. It intentionally has no merge-ready state.",
+      "type": "string",
+      "enum": [
+        "insufficient",
+        "failing",
+        "sufficient",
+        "unknown"
+      ]
+    },
+    "OutcomeData": {
+      "description": "Normalized command outcome. Unknown values cannot satisfy evidence.",
+      "type": "string",
+      "enum": [
+        "pass",
+        "product-failure",
+        "infrastructure-failure",
+        "inconclusive",
+        "timed-out",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "ReceiptId": {
+      "description": "Stable local receipt identity.",
+      "type": "string"
+    },
+    "ReceiptRefData": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ReceiptId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeData"
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "outcome"
+      ]
+    },
+    "RepoId": {
+      "description": "Stable repository identity.",
+      "type": "string"
+    },
+    "RiskAssessmentData": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/RiskLevelData"
+        },
+        "matched": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "level",
+        "matched",
+        "provenance"
+      ]
+    },
+    "RiskLevelData": {
+      "description": "Risk level. Unknown values are never interpreted as low risk.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical",
+        "unknown"
+      ]
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "StaleReceiptData": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ReceiptId"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "reasons"
+      ]
+    },
+    "TrustLevelData": {
+      "description": "Trust level of an evidence item. Unknown never upgrades authority.",
+      "type": "string",
+      "enum": [
+        "local-observation",
+        "external-attestation",
+        "approval",
+        "deployed-observation",
+        "unknown"
+      ]
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}

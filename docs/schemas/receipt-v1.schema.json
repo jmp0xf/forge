@@ -1,0 +1,434 @@
+{
+  "$id": "forge.receipt/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge receipt v1",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/ReceiptData"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.receipt/v1"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "CommandData": {
+      "description": "A shell-free project command representation.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "environment_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "mutability": {
+          "$ref": "#/$defs/MutabilityData"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkIntentData"
+        },
+        "program": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "program",
+        "args",
+        "cwd",
+        "environment_names",
+        "timeout_seconds",
+        "mutability",
+        "network",
+        "source",
+        "confidence",
+        "coverage"
+      ]
+    },
+    "CommandId": {
+      "description": "Stable project-command identity.",
+      "type": "string"
+    },
+    "CommandObservationData": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/CommandData"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "log_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeData"
+        },
+        "output_truncated": {
+          "type": "boolean"
+        },
+        "raw_exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "signal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "stderr_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "stdout_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "timed_out": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "command",
+        "outcome",
+        "duration_ms",
+        "timed_out",
+        "interrupted",
+        "stdout_digest",
+        "stderr_digest",
+        "output_truncated",
+        "log_refs"
+      ]
+    },
+    "ConfidenceData": {
+      "description": "Confidence in a derived fact.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Versioned content or policy digest.",
+      "type": "string"
+    },
+    "IntentData": {
+      "description": "Project operation intent on the wire.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "format-check",
+        "format",
+        "check",
+        "fix",
+        "test",
+        "verify",
+        "build",
+        "unknown"
+      ]
+    },
+    "MutabilityData": {
+      "description": "Declared command mutability.",
+      "type": "string",
+      "enum": [
+        "read-only",
+        "working-tree-write",
+        "external-side-effect",
+        "unknown"
+      ]
+    },
+    "NetworkIntentData": {
+      "description": "Declared network behavior; it is not a sandbox guarantee.",
+      "type": "string",
+      "enum": [
+        "inherit",
+        "offline-requested",
+        "required",
+        "unknown"
+      ]
+    },
+    "OutcomeData": {
+      "description": "Normalized command outcome. Unknown values cannot satisfy evidence.",
+      "type": "string",
+      "enum": [
+        "pass",
+        "product-failure",
+        "infrastructure-failure",
+        "inconclusive",
+        "timed-out",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "ReceiptData": {
+      "description": "Root data for a local receipt.",
+      "type": "object",
+      "properties": {
+        "command_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "environment_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ReceiptId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "log_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandObservationData"
+          }
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeData"
+        },
+        "policy_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "scope_digest_after": {
+          "$ref": "#/$defs/Digest"
+        },
+        "scope_digest_before": {
+          "$ref": "#/$defs/Digest"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "toolchain_digest": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "observations",
+        "scope_digest_before",
+        "scope_digest_after",
+        "command_digest",
+        "toolchain_digest",
+        "environment_digest",
+        "policy_digest",
+        "started_at",
+        "duration_ms",
+        "outcome",
+        "coverage",
+        "log_refs"
+      ]
+    },
+    "ReceiptId": {
+      "description": "Stable local receipt identity.",
+      "type": "string"
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}

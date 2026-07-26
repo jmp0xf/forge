@@ -5,19 +5,20 @@ It discovers the repository's own build and verification interface, produces min
 computes the next verifiable action, and records scope-bound local evidence. It does **not** own project
 build logic, call an LLM, run an agent loop, or replace independent CI and approval.
 
-This repository is the pre-implementation bootstrap for Forge. It contains:
+This repository contains:
 
 - the accepted implementation design in [`docs/design-proposal.md`](docs/design-proposal.md);
 - the initial architecture decision records in [`docs/adr/`](docs/adr/);
-- a dependency-free Rust workspace skeleton that fixes crate boundaries before implementation;
+- a Rust workspace that fixes crate boundaries before implementation;
 - thin `AGENTS.md` and `CLAUDE.md` entry points;
 - a CI skeleton whose main verification path uses Cargo directly and does not depend on a built Forge binary.
 
 ## Status
 
-The design is ready for implementation. The Rust sources are deliberately small: they establish package names,
-dependency direction, public boundary types, and a minimal `forge version` / `forge schema` bootstrap without
-pretending that `init`, `doctor`, `next`, adapters, or evidence already work.
+M0 is implemented: typed protocol primitives, structured diagnostics and exit codes, the full clap command surface,
+`version --json`, checked-in JSON Schemas, schema drift checks, and shell completions are executable and tested. M1
+runtime work is next. `init`, `doctor`, `next`, adapters, explain, and evidence still fail explicitly rather than
+pretending placeholder behavior is complete.
 
 ## Bootstrap commands
 
@@ -26,7 +27,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p forge-cli -- version
+cargo run -p forge-cli -- version --json
 cargo run -p forge-cli -- schema
+cargo run -p xtask -- check-schemas
 ```
 
 Rust 2024 Edition is required. The declared MSRV is Rust 1.85; CI should test both 1.85 and current stable.
@@ -46,14 +49,10 @@ xtask                 schema export, fixture generation, and compatibility check
 The stable interface of projects analyzed by Forge remains their own commands (`cargo`, `go`, `make`, `just`,
 `task`, or existing scripts). Removing Forge must not break a project's build, tests, verification, or release.
 
-## First implementation milestone
+## Current implementation boundary
 
-Start with M0 and M1 in the design proposal:
-
-1. add the selected serialization, CLI, diagnostic, hashing, file-locking, and test dependencies after a joint
-   compatibility spike;
-2. freeze the first JSON Schemas and exit-code mapping;
-3. implement Git porcelain-v2 parsing, native path handling, atomic state, and the synchronous process runner;
-4. add the invariant and fixture tests before implementing higher-level commands.
+M0 is complete. Continue with M1 in the design proposal: typed Git porcelain-v2 access, atomic private state,
+synchronous bounded subprocess execution, timeout/process-tree termination, hashing, and invariant tests. Higher-level
+commands must remain explicit failures until those runtime boundaries are real.
 
 Do not add a feature that changes an accepted decision without an ADR that supersedes the relevant record.

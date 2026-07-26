@@ -1,5 +1,15 @@
 # Machine-readable Schemas
 
-M0 will export versioned JSON Schemas here from `forge-schema` using `schemars`. Generated Schema files are checked
-in because Forge's output is a behavior interface consumed by agents, scripts, and CI. `xtask check-schemas` will
-fail when code and checked-in schemas differ without an explicit version or compatibility decision.
+These versioned JSON Schemas are generated from `forge-schema` and checked in because Forge output is a behavior
+interface consumed by humans, agents, scripts, and CI. Each root document fixes its `$id` and the envelope's `schema`
+field to the same `forge.<domain>/v<n>` identifier.
+
+Regenerate and verify them with:
+
+```bash
+cargo run -p xtask -- schema-export
+cargo run -p xtask -- check-schemas
+```
+
+Do not edit generated files by hand. A reviewed wire-contract change belongs in `forge-schema`, with a major Schema
+version change when a field is removed, renamed, retyped, or changes meaning.

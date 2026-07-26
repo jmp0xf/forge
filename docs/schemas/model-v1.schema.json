@@ -1,0 +1,495 @@
+{
+  "$id": "forge.model/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge model v1",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/ProjectModelData"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.model/v1"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "AdapterData": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "status": {
+          "$ref": "#/$defs/AdapterDriftData"
+        }
+      },
+      "required": [
+        "host",
+        "path",
+        "status"
+      ]
+    },
+    "AdapterDriftData": {
+      "description": "Adapter drift classification.",
+      "type": "string",
+      "enum": [
+        "asset-changed",
+        "user-edited",
+        "generated-missing",
+        "manifest-stale",
+        "no-drift",
+        "unknown"
+      ]
+    },
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "AssetData": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "provenance"
+      ]
+    },
+    "AssumptionData": {
+      "description": "A fact that could not be proven directly from repository inputs.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "statement",
+        "provenance",
+        "confidence"
+      ]
+    },
+    "CommandData": {
+      "description": "A shell-free project command representation.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "environment_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "mutability": {
+          "$ref": "#/$defs/MutabilityData"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkIntentData"
+        },
+        "program": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "program",
+        "args",
+        "cwd",
+        "environment_names",
+        "timeout_seconds",
+        "mutability",
+        "network",
+        "source",
+        "confidence",
+        "coverage"
+      ]
+    },
+    "CommandId": {
+      "description": "Stable project-command identity.",
+      "type": "string"
+    },
+    "ConfidenceData": {
+      "description": "Confidence in a derived fact.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Versioned content or policy digest.",
+      "type": "string"
+    },
+    "IntentData": {
+      "description": "Project operation intent on the wire.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "format-check",
+        "format",
+        "check",
+        "fix",
+        "test",
+        "verify",
+        "build",
+        "unknown"
+      ]
+    },
+    "MutabilityData": {
+      "description": "Declared command mutability.",
+      "type": "string",
+      "enum": [
+        "read-only",
+        "working-tree-write",
+        "external-side-effect",
+        "unknown"
+      ]
+    },
+    "NetworkIntentData": {
+      "description": "Declared network behavior; it is not a sandbox guarantee.",
+      "type": "string",
+      "enum": [
+        "inherit",
+        "offline-requested",
+        "required",
+        "unknown"
+      ]
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "ProjectModelData": {
+      "description": "Root data for the detected project model.",
+      "type": "object",
+      "properties": {
+        "adapters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AdapterData"
+          }
+        },
+        "assets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssetData"
+          }
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssumptionData"
+          }
+        },
+        "commands": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/CommandData"
+            }
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          }
+        },
+        "policy_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repository": {
+          "$ref": "#/$defs/RepoId"
+        },
+        "repository_root": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectUnitData"
+          }
+        },
+        "work_state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "repository_root",
+        "work_state",
+        "units",
+        "commands",
+        "assets",
+        "adapters",
+        "assumptions",
+        "diagnostics"
+      ]
+    },
+    "ProjectUnitData": {
+      "type": "object",
+      "properties": {
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnitId"
+          }
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/UnitId"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "manifest": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnitId"
+          }
+        },
+        "root": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "toolchain": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "workspace_root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WirePath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "language",
+        "kind",
+        "root",
+        "manifest",
+        "members",
+        "dependencies",
+        "toolchain"
+      ]
+    },
+    "RepoId": {
+      "description": "Stable repository identity.",
+      "type": "string"
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "UnitId": {
+      "description": "Stable project-unit identity.",
+      "type": "string"
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}

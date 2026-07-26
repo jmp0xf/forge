@@ -1,0 +1,343 @@
+{
+  "$id": "forge.init-plan/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge init-plan v1",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/InitPlanData"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.init-plan/v1"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "AssumptionData": {
+      "description": "A fact that could not be proven directly from repository inputs.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "statement",
+        "provenance",
+        "confidence"
+      ]
+    },
+    "ConfidenceData": {
+      "description": "Confidence in a derived fact.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Versioned content or policy digest.",
+      "type": "string"
+    },
+    "FileEditData": {
+      "description": "A reviewable file edit in an init plan.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "content_base64": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "create"
+            },
+            "path": {
+              "$ref": "#/$defs/WirePath"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "content_base64"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "block_id": {
+              "$ref": "#/$defs/ManagedBlockId"
+            },
+            "content_base64": {
+              "type": "string"
+            },
+            "expected_preimage": {
+              "$ref": "#/$defs/Digest"
+            },
+            "kind": {
+              "type": "string",
+              "const": "replace-managed-block"
+            },
+            "path": {
+              "$ref": "#/$defs/WirePath"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "block_id",
+            "expected_preimage",
+            "content_base64"
+          ]
+        }
+      ]
+    },
+    "InitPlanData": {
+      "description": "Root data for `forge init`.",
+      "type": "object",
+      "properties": {
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssumptionData"
+          }
+        },
+        "edits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileEditData"
+          }
+        },
+        "model_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepoId"
+        },
+        "repository_root": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "rollback": {
+          "$ref": "#/$defs/RollbackPlanData"
+        },
+        "skipped": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkippedChangeData"
+          }
+        }
+      },
+      "required": [
+        "repository",
+        "repository_root",
+        "model_digest",
+        "edits",
+        "assumptions",
+        "skipped",
+        "rollback"
+      ]
+    },
+    "ManagedBlockId": {
+      "description": "Stable managed-block identity.",
+      "type": "string"
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "RepoId": {
+      "description": "Stable repository identity.",
+      "type": "string"
+    },
+    "RollbackPlanData": {
+      "type": "object",
+      "properties": {
+        "created_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        },
+        "guidance": {
+          "type": "string"
+        },
+        "modified_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        }
+      },
+      "required": [
+        "modified_paths",
+        "created_paths",
+        "guidance"
+      ]
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "SkippedChangeData": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WirePath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}
