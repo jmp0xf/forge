@@ -408,11 +408,15 @@ mod tests {
     #[test]
     fn forbidden_project_wrappers_are_not_top_level_commands() {
         for command in [
-            "check", "fix", "test", "build", "context", "task", "improve",
+            "check", "fix", "test", "build", "context", "task", "improve", "evolve",
         ] {
-            assert!(
-                Cli::try_parse_from(["forge", command]).is_err(),
-                "unexpected top-level command: {command}"
+            let error_kind = Cli::try_parse_from(["forge", command])
+                .err()
+                .map(|error| error.kind());
+            assert_eq!(
+                error_kind,
+                Some(ErrorKind::InvalidSubcommand),
+                "unexpected parse result for top-level command: {command}"
             );
         }
     }
