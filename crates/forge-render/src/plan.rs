@@ -13,10 +13,10 @@ use crate::adapters::{
     AGENTS_MAX_BYTES, AGENTS_MAX_LINES, AdapterRenderError, render_agents_body,
     render_claude_pointer,
 };
+use crate::digest::repository_file_digest;
 use crate::managed_block::{ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block};
 
 const PLAN_SCHEMA: u16 = 1;
-const FILE_DIGEST_DOMAIN: &[u8] = b"forge.repository-file/v1";
 const MODEL_PROJECTION_DOMAIN: &[u8] = b"forge.init-model-projection/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -281,8 +281,10 @@ where
             },
             path: path.clone(),
             desired: desired.clone(),
-            expected_preimage: existing.as_deref().map(|bytes| file_digest(hasher, bytes)),
-            expected_postimage: file_digest(hasher, &outcome.content),
+            expected_preimage: existing
+                .as_deref()
+                .map(|bytes| repository_file_digest(hasher, bytes)),
+            expected_postimage: repository_file_digest(hasher, &outcome.content),
             preview_postimage: outcome.content,
             force,
         });
@@ -359,13 +361,6 @@ fn rollback_plan(edits: &[FileEdit]) -> RollbackPlan {
 
 fn target_path(value: &str) -> Result<RepoRelativePath, PlanError> {
     RepoRelativePath::new(value).map_err(PlanError::InvalidTarget)
-}
-
-fn file_digest<H>(hasher: &H, bytes: &[u8]) -> Digest
-where
-    H: Hasher + ?Sized,
-{
-    hasher.digest(&[FILE_DIGEST_DOMAIN, bytes])
 }
 
 fn projection_digest<H>(

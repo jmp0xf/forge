@@ -10,11 +10,9 @@ use forge_core::{Digest, RepoRelativePath};
 
 use crate::managed_block::{ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block};
 use crate::plan::{ChangePlan, FileEdit, FileEditKind};
+use crate::repository_file_digest;
 
 const SUPPORTED_PLAN_SCHEMA: u16 = 1;
-// This is the file identity contract used by `plan`. Apply intentionally recomputes it rather
-// than trusting preview bytes from a serialized or long-lived plan.
-const FILE_DIGEST_DOMAIN: &[u8] = b"forge.repository-file/v1";
 
 /// One target for which the confined file port confirmed a completed write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,7 +288,7 @@ where
                     report.clone(),
                 )
             })?;
-        let observed_digest = file_digest(hasher, &observed);
+        let observed_digest = repository_file_digest(hasher, &observed);
         if observed != edit.postimage || observed_digest != edit.postimage_digest {
             return Err(ApplyError::plain(
                 ApplyErrorKind::PostwriteMismatch,
@@ -363,7 +361,9 @@ where
             report.clone(),
         ));
     }
-    let observed_preimage = existing.as_deref().map(|bytes| file_digest(hasher, bytes));
+    let observed_preimage = existing
+        .as_deref()
+        .map(|bytes| repository_file_digest(hasher, bytes));
     if observed_preimage != edit.expected_preimage {
         return Err(ApplyError::plain(
             ApplyErrorKind::PreimageDigestMismatch,
@@ -396,7 +396,7 @@ where
             report.clone(),
         ));
     }
-    let postimage_digest = file_digest(hasher, &merged.content);
+    let postimage_digest = repository_file_digest(hasher, &merged.content);
     if postimage_digest != edit.expected_postimage {
         return Err(ApplyError::plain(
             ApplyErrorKind::PostimageDigestMismatch,
@@ -419,13 +419,6 @@ where
     })
 }
 
-fn file_digest<H>(hasher: &H, bytes: &[u8]) -> Digest
-where
-    H: Hasher + ?Sized,
-{
-    hasher.digest(&[FILE_DIGEST_DOMAIN, bytes])
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -442,7 +435,8 @@ mod tests {
         ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, ManagedBlockKind, RollbackPlan,
     };
 
-    use super::{ApplyError, ApplyErrorKind, ApplyReport, apply_change_plan, file_digest};
+    use super::{ApplyError, ApplyErrorKind, ApplyReport, apply_change_plan};
+    use crate::repository_file_digest;
 
     #[derive(Debug)]
     struct ReadMutation {
@@ -592,8 +586,9 @@ mod tests {
             },
             path: RepoRelativePath::new(path)?,
             desired,
-            expected_preimage: existing.map(|content| file_digest(&FixtureHasher, content)),
-            expected_postimage: file_digest(&FixtureHasher, &merged.content),
+            expected_preimage: existing
+                .map(|content| repository_file_digest(&FixtureHasher, content)),
+            expected_postimage: repository_file_digest(&FixtureHasher, &merged.content),
             preview_postimage: merged.content,
             force,
         })
@@ -941,9 +936,9 @@ mod tests {
             kind: FileEditKind::ReplaceManagedBlock,
             path: RepoRelativePath::new("AGENTS.md")?,
             desired: created.desired,
-            expected_preimage: Some(file_digest(&FixtureHasher, &existing)),
+            expected_preimage: Some(repository_file_digest(&FixtureHasher, &existing)),
             preview_postimage: existing.clone(),
-            expected_postimage: file_digest(&FixtureHasher, &existing),
+            expected_postimage: repository_file_digest(&FixtureHasher, &existing),
             force: false,
         };
         let files = ScriptedFiles::with_files([("AGENTS.md", existing)]);
