@@ -6,10 +6,12 @@
 
 pub mod branding;
 pub mod context;
+pub mod doctor;
 pub mod domain;
 pub mod error;
 pub mod git;
 pub mod inventory;
+pub mod navigation;
 pub mod path;
 pub mod policy;
 pub mod ports;
