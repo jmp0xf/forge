@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufReader, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use forge_core::domain::{
@@ -35,12 +37,13 @@ pub const DEFAULT_GIT_STATUS_RECORD_LIMIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_GIT_STATUS_ENTRY_LIMIT: usize = 200_000;
 
 /// Typed wrapper around the installed `git` executable and unified process runner.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GitCli {
     timeout: Duration,
     status_spool_limit_bytes: usize,
     status_record_limit_bytes: usize,
     status_entry_limit: usize,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl Default for GitCli {
@@ -50,6 +53,7 @@ impl Default for GitCli {
             status_spool_limit_bytes: DEFAULT_GIT_STATUS_SPOOL_LIMIT_BYTES,
             status_record_limit_bytes: DEFAULT_GIT_STATUS_RECORD_LIMIT_BYTES,
             status_entry_limit: DEFAULT_GIT_STATUS_ENTRY_LIMIT,
+            cancellation: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -139,6 +143,16 @@ impl GitCli {
         self
     }
 
+    /// Replaces the independent default cancellation flag with one shared by the caller.
+    ///
+    /// The flag is sticky: setting it to `true` interrupts all current and later Git operations
+    /// performed by this value or any of its clones until the caller resets it.
+    #[must_use]
+    pub fn with_cancellation_flag(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
     /// Overrides the anonymous status spool bound.
     #[must_use]
     pub fn with_status_spool_limit_bytes(mut self, limit: usize) -> Self {
@@ -196,8 +210,10 @@ impl GitCli {
                 ),
             ));
         }
+        self.fail_if_cancelled(operation)?;
         let runner = SynchronousProcessRunner::new(start)
-            .map_err(|error| map_io_error(operation, "prepare repository process root", error))?;
+            .map_err(|error| map_io_error(operation, "prepare repository process root", error))?
+            .with_cancellation_flag(Arc::clone(&self.cancellation));
         let observation = runner
             .run(&self.command_spec(operation)?)
             .map_err(|error| map_execution_error(operation, error))?;
@@ -219,13 +235,26 @@ impl GitCli {
                 ),
             ));
         }
+        self.fail_if_cancelled(operation)?;
         SynchronousProcessRunner::new(root)
             .map_err(|error| map_io_error(operation, "prepare repository process root", error))?
+            .with_cancellation_flag(Arc::clone(&self.cancellation))
             .run_spooled_stdout(
                 &self.command_spec(operation)?,
                 self.status_spool_limit_bytes,
             )
             .map_err(|error| map_execution_error(operation, error))
+    }
+
+    fn fail_if_cancelled(&self, operation: GitOperation) -> Result<(), GitError> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(GitError::new(
+                GitErrorKind::Interrupted,
+                operation.name(),
+                "operation was interrupted before Git started",
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_path(&self, start: &Path, operation: GitOperation) -> Result<PathBuf, GitError> {
@@ -667,6 +696,8 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::io;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use forge_core::ports::{GitPort as _, ProcessObservation};
@@ -838,6 +869,51 @@ mod tests {
                 .iter()
                 .any(|path| path.as_path() == Path::new("Cargo.toml"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn preset_cancellation_interrupts_in_memory_and_spooled_git_before_spawn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let missing_root = root.path().join("must-not-be-inspected");
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let git = GitCli::new().with_cancellation_flag(cancellation);
+
+        let in_memory_error = git
+            .repository_root(&missing_root)
+            .err()
+            .ok_or("pre-cancelled repository-root unexpectedly completed")?;
+        let spooled_error = git
+            .file_set(&missing_root)
+            .err()
+            .ok_or("pre-cancelled file-set unexpectedly completed")?;
+
+        assert_eq!(in_memory_error.kind(), GitErrorKind::Interrupted);
+        assert_eq!(spooled_error.kind(), GitErrorKind::Interrupted);
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_git_clients_share_only_their_explicit_cancellation_flag()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let git = GitCli::new().with_cancellation_flag(Arc::clone(&cancellation));
+        let cloned = git.clone();
+        let independent = GitCli::new();
+
+        assert!(Arc::ptr_eq(&git.cancellation, &cancellation));
+        assert!(Arc::ptr_eq(&git.cancellation, &cloned.cancellation));
+        assert!(!Arc::ptr_eq(&git.cancellation, &independent.cancellation));
+        assert!(!independent.cancellation.load(Ordering::Acquire));
+
+        cancellation.store(true, Ordering::Release);
+        let error = cloned
+            .repository_root(root.path())
+            .err()
+            .ok_or("clone did not observe the shared cancellation flag")?;
+        assert_eq!(error.kind(), GitErrorKind::Interrupted);
         Ok(())
     }
 
