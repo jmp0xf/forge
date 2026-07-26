@@ -10,7 +10,9 @@ pub mod error;
 pub mod git;
 pub mod inventory;
 pub mod path;
+pub mod policy;
 pub mod ports;
+pub mod risk;
 pub mod wire;
 
 pub use domain::{
@@ -36,4 +38,8 @@ pub use inventory::{
     InventorySkip, PathKind,
 };
 pub use path::{RelativePathError, RepoRelativePath};
+pub use policy::{
+    EffectivePolicyContent, EvidenceRequirements, PathPattern, PolicyError, RiskLevel, RiskRule,
+};
+pub use risk::{RiskAssessment, RiskMatch, assess_risk, built_in_policy};
 pub use wire::{ProjectModelWireError, project_model_to_wire};
