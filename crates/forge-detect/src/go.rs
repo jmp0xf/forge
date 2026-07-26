@@ -1,5 +1,6 @@
 //! Go provider bootstrap.
 
+use forge_core::path::RepoRelativePath;
 use forge_core::{CommandSource, CommandSpec, Intent, ProjectModel, ProjectUnit};
 
 use crate::LanguageProvider;
@@ -23,7 +24,7 @@ impl LanguageProvider for GoProvider {
                 "go.test",
                 Intent::Test,
                 "go",
-                ".",
+                RepoRelativePath::root(),
                 CommandSource::LanguageDefault {
                     provider: self.id().into(),
                     rule: "go-test".into(),

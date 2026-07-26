@@ -12,11 +12,15 @@ name = "forge"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
+clap_complete.workspace = true
 forge-core = { path = "../forge-core" }
 forge-detect = { path = "../forge-detect" }
 forge-render = { path = "../forge-render" }
 forge-runtime = { path = "../forge-runtime" }
 forge-schema = { path = "../forge-schema" }
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

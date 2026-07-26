@@ -6,9 +6,13 @@
 
 pub mod branding;
 pub mod domain;
+pub mod error;
+pub mod path;
 pub mod ports;
 
 pub use domain::{
     CommandSource, CommandSpec, Confidence, CoverageDimension, Intent, Mutability, NetworkIntent,
-    ProjectModel, ProjectUnit,
+    ProjectModel, ProjectUnit, SuccessPredicate,
 };
+pub use error::{AppError, ExitCode};
+pub use path::{RelativePathError, RepoRelativePath};

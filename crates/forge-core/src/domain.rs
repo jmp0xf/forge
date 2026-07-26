@@ -5,6 +5,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use forge_schema::{CommandId, UnitId};
+
+use crate::path::RepoRelativePath;
+
 /// A stable project operation intent. The project owns the resolved command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Intent {
@@ -40,8 +44,14 @@ pub enum NetworkIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandSource {
     ExplicitConfig,
-    ExistingProjectTarget { path: PathBuf, target: String },
-    LanguageDefault { provider: String, rule: String },
+    ExistingProjectTarget {
+        path: RepoRelativePath,
+        target: String,
+    },
+    LanguageDefault {
+        provider: String,
+        rule: String,
+    },
 }
 
 /// Confidence in a detected fact.
@@ -65,18 +75,28 @@ pub enum CoverageDimension {
     Custom(String),
 }
 
+/// How command output is normalized into success or failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessPredicate {
+    ExitZero,
+    ExitZeroAndStdoutEmpty,
+    JsonHasNoErrors,
+    All(Vec<SuccessPredicate>),
+}
+
 /// An argv-safe command specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
-    pub id: String,
+    pub id: CommandId,
     pub intent: Intent,
     pub program: OsString,
     pub args: Vec<OsString>,
-    pub cwd: PathBuf,
+    pub cwd: RepoRelativePath,
     pub env: BTreeMap<OsString, OsString>,
     pub timeout: Duration,
     pub mutability: Mutability,
     pub network: NetworkIntent,
+    pub success: SuccessPredicate,
     pub source: CommandSource,
     pub confidence: Confidence,
     pub coverage: BTreeSet<CoverageDimension>,
@@ -86,10 +106,10 @@ impl CommandSpec {
     /// Creates a command without invoking a shell.
     #[must_use]
     pub fn new(
-        id: impl Into<String>,
+        id: impl Into<CommandId>,
         intent: Intent,
         program: impl AsRef<OsStr>,
-        cwd: impl Into<PathBuf>,
+        cwd: RepoRelativePath,
         source: CommandSource,
     ) -> Self {
         Self {
@@ -97,11 +117,12 @@ impl CommandSpec {
             intent,
             program: program.as_ref().to_os_string(),
             args: Vec::new(),
-            cwd: cwd.into(),
+            cwd,
             env: BTreeMap::new(),
             timeout: Duration::from_secs(300),
             mutability: Mutability::Unknown,
             network: NetworkIntent::Unknown,
+            success: SuccessPredicate::ExitZero,
             source,
             confidence: Confidence::Low,
             coverage: BTreeSet::new(),
@@ -125,10 +146,10 @@ impl CommandSpec {
 /// A detected Rust package/workspace, Go module/workspace, or future provider unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectUnit {
-    pub id: String,
+    pub id: UnitId,
     pub language: String,
-    pub root: PathBuf,
-    pub manifest: PathBuf,
+    pub root: RepoRelativePath,
+    pub manifest: RepoRelativePath,
     pub kind: String,
 }
 
@@ -156,6 +177,8 @@ impl ProjectModel {
 mod tests {
     use std::ffi::OsString;
 
+    use crate::path::RepoRelativePath;
+
     use super::{CommandSource, CommandSpec, Intent};
 
     #[test]
@@ -164,7 +187,7 @@ mod tests {
             "rust.check",
             Intent::Check,
             "cargo",
-            ".",
+            RepoRelativePath::root(),
             CommandSource::LanguageDefault {
                 provider: "rust".into(),
                 rule: "default-check".into(),

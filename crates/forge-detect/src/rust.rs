@@ -1,5 +1,6 @@
 //! Rust provider bootstrap.
 
+use forge_core::path::RepoRelativePath;
 use forge_core::{CommandSource, CommandSpec, Intent, ProjectModel, ProjectUnit};
 
 use crate::LanguageProvider;
@@ -23,7 +24,7 @@ impl LanguageProvider for RustProvider {
                 "rust.check",
                 Intent::Check,
                 "cargo",
-                ".",
+                RepoRelativePath::root(),
                 CommandSource::LanguageDefault {
                     provider: self.id().into(),
                     rule: "cargo-check".into(),
