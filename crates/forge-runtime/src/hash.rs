@@ -51,4 +51,15 @@ mod tests {
             hasher.digest(&[b"repository", b"scope"])
         );
     }
+
+    #[test]
+    fn repository_identity_input_has_a_fixed_digest_vector() {
+        let digest =
+            Blake3Hasher::digest_chunks(&[b"forge.repository-id/v1", b"unix-bytes", b"/repo/.git"]);
+
+        assert_eq!(
+            digest.as_str(),
+            "blake3:31595b9c96bff2671c0be809b6728fc16028a717f5fb81e4bd48617906b9f62c"
+        );
+    }
 }

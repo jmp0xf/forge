@@ -5,12 +5,18 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use forge_core::ports::{FileSystemPort, GitPort};
+use forge_core::ports::{FileSystemPort, GitPort, Hasher};
 use forge_core::{
     BranchHead, BranchOid, CommitId, Confidence, Diagnostic, GitError, GitErrorKind, PathKind,
-    PorcelainV2Status, Provenance, RepoFacts, RepoRelativePath, Severity, StatusEntry,
+    PorcelainV2Status, Provenance, RepoFacts, RepoId, RepoRelativePath, Severity, StatusEntry,
     UpstreamState, WorkState,
 };
+
+const REPOSITORY_ID_DOMAIN: &[u8] = b"forge.repository-id/v1";
+#[cfg(unix)]
+const NATIVE_PATH_ENCODING: &[u8] = b"unix-bytes";
+#[cfg(windows)]
+const NATIVE_PATH_ENCODING: &[u8] = b"windows-wide";
 
 /// Repository facts plus the evidence and bounded degradations used to derive them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,21 +64,35 @@ impl Error for RepositoryDetectionError {
 
 /// Detects repository identity, linked-worktree boundaries, branch state, and work state.
 ///
-/// The function invokes only typed Git and filesystem ports. A corrupt or unreadable status may
-/// produce explicit `Corrupt`/`Unknown` facts with diagnostics; failures that prevent repository
-/// identification, exceed bounds, time out, or are interrupted remain fatal to the caller.
-pub fn detect_repository<G, F>(
+/// The function invokes only typed Git, filesystem, and hashing ports. A corrupt or unreadable
+/// status may produce explicit `Corrupt`/`Unknown` facts with diagnostics; failures that prevent
+/// repository identification, exceed bounds, time out, or are interrupted remain fatal to the
+/// caller.
+pub fn detect_repository<G, F, H>(
     start: &Path,
     git: &G,
     filesystem: &F,
+    hasher: &H,
 ) -> Result<RepositoryDetection, RepositoryDetectionError>
 where
     G: GitPort + ?Sized,
     F: FileSystemPort + ?Sized,
+    H: Hasher + ?Sized,
 {
     let root = required_git_step("repository root", git.repository_root(start))?;
     let git_dir = required_git_step("worktree Git directory", git.git_dir(&root))?;
     let git_common_dir = required_git_step("common Git directory", git.git_common_dir(&root))?;
+    if !git_common_dir.is_absolute() {
+        return Err(RepositoryDetectionError {
+            step: "common Git directory",
+            source: GitError::new(
+                GitErrorKind::InvalidData,
+                "git-common-dir",
+                "Git returned a non-absolute common directory",
+            ),
+        });
+    }
+    let id = derive_repository_id(&git_common_dir, hasher);
     let is_linked_worktree = git_dir != git_common_dir;
 
     let mut provenance = vec![
@@ -87,6 +107,10 @@ where
         git_provenance(
             "git.common-dir",
             "common Git directory returned by git rev-parse --git-common-dir",
+        ),
+        git_provenance(
+            "forge.repository-id/v1",
+            "local repository identity derived from the native absolute Git common directory",
         ),
     ];
     let mut diagnostics = Vec::new();
@@ -141,6 +165,7 @@ where
 
     Ok(RepositoryDetection {
         facts: RepoFacts {
+            id,
             root,
             git_dir,
             git_common_dir,
@@ -154,6 +179,43 @@ where
         confidence: status_confidence,
         diagnostics,
     })
+}
+
+#[cfg(unix)]
+fn derive_repository_id<H>(git_common_dir: &Path, hasher: &H) -> RepoId
+where
+    H: Hasher + ?Sized,
+{
+    use std::os::unix::ffi::OsStrExt as _;
+
+    repository_id_from_native_path(
+        NATIVE_PATH_ENCODING,
+        git_common_dir.as_os_str().as_bytes(),
+        hasher,
+    )
+}
+
+#[cfg(windows)]
+fn derive_repository_id<H>(git_common_dir: &Path, hasher: &H) -> RepoId
+where
+    H: Hasher + ?Sized,
+{
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let native_path: Vec<u8> = git_common_dir
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    repository_id_from_native_path(NATIVE_PATH_ENCODING, &native_path, hasher)
+}
+
+fn repository_id_from_native_path<H>(encoding: &[u8], native_path: &[u8], hasher: &H) -> RepoId
+where
+    H: Hasher + ?Sized,
+{
+    let digest = hasher.digest(&[REPOSITORY_ID_DOMAIN, encoding, native_path]);
+    RepoId::new(format!("local:{digest}"))
 }
 
 fn required_git_step<T>(
@@ -341,18 +403,55 @@ fn status_diagnostic(root: &Path, state: WorkState, kind: GitErrorKind) -> Diagn
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use forge_core::ports::{FileSystemPort, GitPort};
+    use forge_core::ports::{FileSystemPort, GitPort, Hasher};
     use forge_core::{
-        BoundedText, GitError, GitErrorKind, GitFileSet, GitObjectFormat, Inventory,
+        BoundedText, Digest, GitError, GitErrorKind, GitFileSet, GitObjectFormat, Inventory,
         InventoryError, InventoryOptions, PathKind, PorcelainV2Status, RepoRelativePath,
         parse_status_porcelain_v2,
     };
 
-    use super::{Confidence, OperationState, WorkState, classify_work_state, detect_repository};
+    use super::{
+        Confidence, OperationState, WorkState, classify_work_state, derive_repository_id,
+        detect_repository,
+    };
+
+    #[derive(Debug)]
+    struct RecordingHasher {
+        digest: Digest,
+        calls: RefCell<Vec<Vec<Vec<u8>>>>,
+    }
+
+    impl RecordingHasher {
+        fn returning(digest: &str) -> Self {
+            Self {
+                digest: Digest::from(digest),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Hasher for RecordingHasher {
+        fn digest(&self, chunks: &[&[u8]]) -> Digest {
+            self.calls
+                .borrow_mut()
+                .push(chunks.iter().map(|chunk| (*chunk).to_vec()).collect());
+            self.digest.clone()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct InputSensitiveHasher;
+
+    impl Hasher for InputSensitiveHasher {
+        fn digest(&self, chunks: &[&[u8]]) -> Digest {
+            Digest::new(format!("test:{chunks:?}"))
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct MockGit {
@@ -469,6 +568,148 @@ mod tests {
         parsed_status(&input)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn repository_identity_uses_the_fixed_native_path_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let git = MockGit::with_status(Ok(committed_status(b"")?));
+        let hasher = RecordingHasher::returning("blake3:fixed-vector");
+
+        let detection = detect_repository(
+            Path::new("/repo"),
+            &git,
+            &MarkerFileSystem::default(),
+            &hasher,
+        )?;
+
+        assert_eq!(detection.facts.id.as_str(), "local:blake3:fixed-vector");
+        assert_eq!(
+            hasher.calls.borrow().as_slice(),
+            &[vec![
+                b"forge.repository-id/v1".to_vec(),
+                b"unix-bytes".to_vec(),
+                b"/repo/.git".to_vec(),
+            ]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_identity_is_equal_only_for_the_same_common_dir() {
+        let first = derive_repository_id(Path::new("/repo/.git"), &InputSensitiveHasher);
+        let repeated = derive_repository_id(Path::new("/repo/.git"), &InputSensitiveHasher);
+        let other = derive_repository_id(Path::new("/other/.git"), &InputSensitiveHasher);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn linked_worktrees_share_the_main_worktree_repository_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let main = MockGit::with_status(Ok(committed_status(b"")?));
+        let mut linked = MockGit::with_status(Ok(committed_status(b"")?));
+        linked.root = Ok(PathBuf::from("/repo-linked"));
+        linked.git_dir = Ok(PathBuf::from("/repo/.git/worktrees/repo-linked"));
+
+        let main_detection = detect_repository(
+            Path::new("/repo"),
+            &main,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )?;
+        let linked_detection = detect_repository(
+            Path::new("/repo-linked"),
+            &linked,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )?;
+
+        assert!(!main_detection.facts.is_linked_worktree);
+        assert!(linked_detection.facts.is_linked_worktree);
+        assert_eq!(main_detection.facts.id, linked_detection.facts.id);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_identity_preserves_non_utf8_unix_common_dir_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let native_common_dir = b"/repo/non-utf8-\xff/.git".to_vec();
+        let common_dir = PathBuf::from(OsString::from_vec(native_common_dir.clone()));
+        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+        git.git_dir = Ok(common_dir.clone());
+        git.common_dir = Ok(common_dir.clone());
+        let hasher = RecordingHasher::returning("blake3:non-utf8");
+
+        let detection = detect_repository(
+            Path::new("/repo"),
+            &git,
+            &MarkerFileSystem::default(),
+            &hasher,
+        )?;
+
+        assert_eq!(detection.facts.git_common_dir, common_dir);
+        assert_eq!(detection.facts.id.as_str(), "local:blake3:non-utf8");
+        assert_eq!(
+            hasher.calls.borrow().as_slice(),
+            &[vec![
+                b"forge.repository-id/v1".to_vec(),
+                b"unix-bytes".to_vec(),
+                native_common_dir,
+            ]]
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repository_identity_encodes_windows_wide_units_little_endian() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let wide = [b'C' as u16, b':' as u16, b'\\' as u16, 0xd800];
+        let common_dir = PathBuf::from(OsString::from_wide(&wide));
+        let hasher = RecordingHasher::returning("blake3:windows-wide");
+
+        let id = derive_repository_id(&common_dir, &hasher);
+
+        assert_eq!(id.as_str(), "local:blake3:windows-wide");
+        assert_eq!(
+            hasher.calls.borrow().as_slice(),
+            &[vec![
+                b"forge.repository-id/v1".to_vec(),
+                b"windows-wide".to_vec(),
+                wide.into_iter().flat_map(u16::to_le_bytes).collect(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn repository_detection_rejects_a_relative_common_dir_before_hashing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+        git.common_dir = Ok(PathBuf::from(".git"));
+        let hasher = RecordingHasher::returning("blake3:must-not-be-used");
+
+        let error = detect_repository(
+            Path::new("/repo"),
+            &git,
+            &MarkerFileSystem::default(),
+            &hasher,
+        )
+        .err()
+        .ok_or("relative common directory unexpectedly produced facts")?;
+
+        assert_eq!(error.step(), "common Git directory");
+        assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
+        assert!(hasher.calls.borrow().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn assembles_clean_linked_worktree_facts_with_git_provenance()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -478,8 +719,10 @@ mod tests {
             Path::new("/repo/subdir"),
             &git,
             &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
         )?;
 
+        assert!(detection.facts.id.as_str().starts_with("local:"));
         assert_eq!(detection.facts.root, Path::new("/repo"));
         assert!(detection.facts.is_linked_worktree);
         assert!(detection.facts.head.is_some());
@@ -494,7 +737,7 @@ mod tests {
         assert_eq!(upstream.ahead_behind.map(|value| value.ahead), Some(1));
         assert_eq!(upstream.ahead_behind.map(|value| value.behind), Some(2));
         assert_eq!(detection.confidence, Confidence::High);
-        assert_eq!(detection.provenance.len(), 4);
+        assert_eq!(detection.provenance.len(), 5);
         assert!(detection.diagnostics.is_empty());
         Ok(())
     }
@@ -549,7 +792,8 @@ mod tests {
             failure: Some(io::ErrorKind::PermissionDenied),
         };
 
-        let detection = detect_repository(Path::new("/repo"), &git, &filesystem)?;
+        let detection =
+            detect_repository(Path::new("/repo"), &git, &filesystem, &InputSensitiveHasher)?;
 
         assert_eq!(detection.facts.work_state, WorkState::Unknown);
         assert_eq!(detection.confidence, Confidence::Unknown);
@@ -565,8 +809,12 @@ mod tests {
             "status",
             "bounded test failure",
         )));
-        let detection =
-            detect_repository(Path::new("/repo"), &corrupt, &MarkerFileSystem::default())?;
+        let detection = detect_repository(
+            Path::new("/repo"),
+            &corrupt,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )?;
         assert_eq!(detection.facts.work_state, WorkState::Corrupt);
         assert_eq!(detection.confidence, Confidence::Unknown);
 
@@ -575,9 +823,14 @@ mod tests {
             "status",
             "bounded test failure",
         )));
-        let error = detect_repository(Path::new("/repo"), &timeout, &MarkerFileSystem::default())
-            .err()
-            .ok_or("timed-out Git status unexpectedly produced facts")?;
+        let error = detect_repository(
+            Path::new("/repo"),
+            &timeout,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )
+        .err()
+        .ok_or("timed-out Git status unexpectedly produced facts")?;
         assert_eq!(error.source_error().kind(), GitErrorKind::TimedOut);
         Ok(())
     }
@@ -590,7 +843,12 @@ mod tests {
         input.push(0);
         let git = MockGit::with_status(Ok(parsed_status(&input)?));
 
-        let detection = detect_repository(Path::new("/repo"), &git, &MarkerFileSystem::default())?;
+        let detection = detect_repository(
+            Path::new("/repo"),
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )?;
 
         assert_eq!(detection.facts.branch, None);
         assert_eq!(detection.confidence, Confidence::Unknown);
@@ -611,8 +869,13 @@ mod tests {
             "bounded test failure",
         ));
 
-        let error =
-            detect_repository(Path::new("/outside"), &git, &MarkerFileSystem::default()).err();
+        let error = detect_repository(
+            Path::new("/outside"),
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+        )
+        .err();
         assert_eq!(
             error.as_ref().map(|error| error.source_error().kind()),
             Some(GitErrorKind::NotRepository)

@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use forge_schema::{
-    CommandId, Diagnostic, Digest, LanguageId, PathEncoding, SchemaKind, SchemaVersion, Severity,
-    UnitId, WirePath,
+    CommandId, Diagnostic, Digest, LanguageId, PathEncoding, RepoId, SchemaKind, SchemaVersion,
+    Severity, UnitId, WirePath,
 };
 use thiserror::Error;
 
@@ -208,6 +208,7 @@ pub enum WorkState {
 /// Git and worktree facts detected before project-specific discovery begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoFacts {
+    pub id: RepoId,
     pub root: PathBuf,
     pub git_dir: PathBuf,
     pub git_common_dir: PathBuf,
@@ -999,7 +1000,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use forge_schema::{
-        CommandId, Diagnostic, LanguageId, SchemaKind, SchemaVersion, Severity, UnitId, WirePath,
+        CommandId, Diagnostic, LanguageId, RepoId, SchemaKind, SchemaVersion, Severity, UnitId,
+        WirePath,
     };
 
     use crate::path::RepoRelativePath;
@@ -1063,6 +1065,7 @@ mod tests {
 
     fn valid_model() -> ProjectModel {
         let repository = RepoFacts {
+            id: RepoId::from("local:blake3:test-repository"),
             root: PathBuf::from("/repo"),
             git_dir: PathBuf::from("/repo/.git"),
             git_common_dir: PathBuf::from("/repo/.git"),
