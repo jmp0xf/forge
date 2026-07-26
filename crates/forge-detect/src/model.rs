@@ -1033,7 +1033,7 @@ mod tests {
             "workspace_default_members": ["path+file:///repo#rust-root@0.1.0"],
             "resolve": null,
             "workspace_root": "/repo",
-            "format_version": 1
+            "version": 1
         }))
     }
 
@@ -1279,6 +1279,7 @@ args = ["test", "--workspace"]
         )?;
 
         assert_eq!(outcome.completion, ModelDetectionCompletion::Complete);
+        assert!(outcome.model.diagnostics.is_empty());
         assert_eq!(outcome.navigation.inventory, expected_inventory);
         assert_eq!(outcome.navigation.status, Some(git.status.clone()));
         assert_eq!(outcome.navigation.changed_paths(), Some(Vec::new()));
@@ -1305,6 +1306,9 @@ args = ["test", "--workspace"]
                 .iter()
                 .any(|unit| unit.language.as_str() == "rust")
         );
+        assert!(outcome.model.units.iter().any(|unit| {
+            unit.language.as_str() == "rust" && unit.confidence == Confidence::High
+        }));
         assert!(
             outcome
                 .model
