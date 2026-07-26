@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::domain::CommandSpec;
 use crate::git::{GitFileSet, PorcelainV2Status};
+use crate::inventory::{BoundedText, Inventory, InventoryError, InventoryOptions, PathKind};
+use crate::path::RepoRelativePath;
 use forge_schema::Digest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,29 @@ pub trait ProcessPort {
 
 pub trait FileSystemPort {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Inventories a repository using an explicit authority for candidate paths.
+    ///
+    /// `Some(file_set)` preserves every Git-tracked path, applies Git ignore semantics only to
+    /// untracked candidates, and applies supplementary `.ignore` rules only to those untracked
+    /// candidates. `None` selects the filesystem-walking fallback and must only be used after the
+    /// caller has established that the root is not a Git repository.
+    fn inventory(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+    ) -> Result<Inventory, InventoryError>;
+    /// Reads a repository-relative text candidate up to the configured byte bound.
+    fn read_bounded_text(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+    ) -> Result<BoundedText, InventoryError>;
+    /// Inspects one repository-relative path without following symbolic links.
+    ///
+    /// Missing paths are represented explicitly; permission and other I/O failures remain errors.
+    fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind>;
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
     fn exists(&self, path: &Path) -> bool;
 }

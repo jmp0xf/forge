@@ -3,92 +3,19 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use forge_core::ports::GitPort;
+pub use forge_core::{
+    BoundedText, Inventory, InventoryEntry, InventoryError, InventoryKind, InventoryOptions,
+    InventorySkip, PathKind,
+};
 use forge_core::{GitFileSet, RepoRelativePath};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{Match, WalkBuilder};
-use thiserror::Error;
 
 const GENERATED_DIRECTORIES: &[&str] = &[".git", "target", "vendor", "node_modules"];
-
-/// Startup limits for a repository inventory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InventoryOptions {
-    pub max_entries: usize,
-    pub max_text_file_bytes: u64,
-}
-
-impl Default for InventoryOptions {
-    fn default() -> Self {
-        Self {
-            max_entries: 200_000,
-            max_text_file_bytes: 1024 * 1024,
-        }
-    }
-}
-
-/// Filesystem kind without following symlinks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum InventoryKind {
-    Directory,
-    File,
-    Symlink,
-    Other,
-}
-
-/// One stable, repository-relative inventory item.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InventoryEntry {
-    pub path: PathBuf,
-    pub kind: InventoryKind,
-    pub size_bytes: u64,
-}
-
-/// A skipped item or bounded degradation that remains visible to callers.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InventorySkip {
-    pub path: Option<PathBuf>,
-    pub reason: String,
-}
-
-/// Deterministically ordered repository inventory.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Inventory {
-    pub entries: Vec<InventoryEntry>,
-    pub skipped: Vec<InventorySkip>,
-}
-
-/// Bounded text probe result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundedText {
-    pub bytes: Vec<u8>,
-    pub truncated: bool,
-    pub binary: bool,
-}
-
-/// Inventory or bounded-read failure.
-#[derive(Debug, Error)]
-pub enum InventoryError {
-    #[error("repository root is not a directory: {0}")]
-    InvalidRoot(PathBuf),
-    #[error("repository inventory I/O failed at {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("repository-relative path points through a symlink: {0}")]
-    Symlink(PathBuf),
-    #[error("Git-backed repository inventory failed: {0}")]
-    Git(#[source] io::Error),
-    #[error(
-        "repository inventory contains {observed} entries, exceeding the configured {max_entries}-entry bound"
-    )]
-    EntryLimit { max_entries: usize, observed: usize },
-}
 
 /// Builds a Git-backed inventory from the index plus untracked, non-Git-ignored paths.
 ///
@@ -109,11 +36,14 @@ where
     build_inventory_from_git_file_set(root, &file_set, options)
 }
 
-fn build_inventory_from_git_file_set(
+pub(crate) fn build_inventory_from_git_file_set(
     root: &Path,
     file_set: &GitFileSet,
     options: InventoryOptions,
 ) -> Result<Inventory, InventoryError> {
+    // This function is also the FileSystemPort entrypoint, so it cannot rely on the convenience
+    // wrapper having validated the root first.
+    validate_root(root)?;
     let mut inventory = Inventory::default();
     let dot_ignore_matchers = load_dot_ignore_matchers(
         root,
@@ -136,7 +66,7 @@ fn build_inventory_from_git_file_set(
         inventory_path(root, path, &mut inventory);
     }
 
-    finish_inventory(inventory, options)
+    inventory.finalize(options)
 }
 
 /// Filesystem-only fallback for callers that have explicitly established a non-Git context.
@@ -217,7 +147,7 @@ pub fn build_non_git_filesystem_inventory(
         });
     }
 
-    finish_inventory(inventory, options)
+    inventory.finalize(options)
 }
 
 fn validate_root(root: &Path) -> Result<(), InventoryError> {
@@ -229,21 +159,6 @@ fn validate_root(root: &Path) -> Result<(), InventoryError> {
         return Err(InventoryError::InvalidRoot(root.to_path_buf()));
     }
     Ok(())
-}
-
-fn finish_inventory(
-    mut inventory: Inventory,
-    options: InventoryOptions,
-) -> Result<Inventory, InventoryError> {
-    inventory.entries.sort();
-    inventory.skipped.sort();
-    if inventory.entries.len() > options.max_entries {
-        return Err(InventoryError::EntryLimit {
-            max_entries: options.max_entries,
-            observed: inventory.entries.len(),
-        });
-    }
-    Ok(inventory)
 }
 
 fn inventory_path(root: &Path, relative: &RepoRelativePath, inventory: &mut Inventory) {

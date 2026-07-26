@@ -5,8 +5,17 @@ use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use forge_core::ports::FileSystemPort;
+use forge_core::{
+    BoundedText, GitFileSet, Inventory, InventoryError, InventoryOptions, PathKind,
+    RepoRelativePath,
+};
 use tempfile::NamedTempFile;
 use thiserror::Error;
+
+use crate::inventory::{
+    build_inventory_from_git_file_set, build_non_git_filesystem_inventory,
+    read_bounded_text as read_repository_bounded_text,
+};
 
 /// The native implementation of [`FileSystemPort`].
 ///
@@ -26,6 +35,32 @@ impl NativeFileSystem {
         path.exists()
     }
 
+    pub fn inventory(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+    ) -> Result<Inventory, InventoryError> {
+        match file_set {
+            Some(file_set) => build_inventory_from_git_file_set(root, file_set, options),
+            None => build_non_git_filesystem_inventory(root, options),
+        }
+    }
+
+    pub fn read_bounded_text(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+    ) -> Result<BoundedText, InventoryError> {
+        read_repository_bounded_text(root, path, max_text_file_bytes)
+    }
+
+    /// Inspects one path without following the target or any symbolic-link ancestor.
+    pub fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
+        path_kind(root, path)
+    }
+
     /// Replaces one file through a temporary file in the target directory.
     ///
     /// Existing permissions are copied to the replacement. The temporary file
@@ -41,12 +76,113 @@ impl FileSystemPort for NativeFileSystem {
         NativeFileSystem::read(self, path)
     }
 
+    fn inventory(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+    ) -> Result<Inventory, InventoryError> {
+        NativeFileSystem::inventory(self, root, file_set, options)
+    }
+
+    fn read_bounded_text(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+    ) -> Result<BoundedText, InventoryError> {
+        NativeFileSystem::read_bounded_text(self, root, path, max_text_file_bytes)
+    }
+
+    fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
+        NativeFileSystem::path_kind(self, root, path)
+    }
+
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         NativeFileSystem::write_atomic(self, path, bytes)
     }
 
     fn exists(&self, path: &Path) -> bool {
         NativeFileSystem::exists(self, path)
+    }
+}
+
+fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|source| {
+        FileSystemError::io("inspect repository root", root, source).into_io_error()
+    })?;
+    if root_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("repository root is a symbolic link: `{}`", root.display()),
+        ));
+    }
+    if !root_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("repository root is not a directory: `{}`", root.display()),
+        ));
+    }
+
+    let mut current = root.to_path_buf();
+    let mut components = relative.as_path().components().peekable();
+    while let Some(component) = components.next() {
+        if component == Component::CurDir {
+            continue;
+        }
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(PathKind::Missing);
+            }
+            Err(source) => {
+                return Err(
+                    FileSystemError::io("inspect repository path", &current, source)
+                        .into_io_error(),
+                );
+            }
+        };
+        let is_target = components.peek().is_none();
+        if metadata.file_type().is_symlink() {
+            if is_target {
+                return Ok(PathKind::Symlink);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "repository-relative path points through a symbolic link: `{}`",
+                    current.display()
+                ),
+            ));
+        }
+        if !is_target && !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!(
+                    "repository-relative path ancestor is not a directory: `{}`",
+                    current.display()
+                ),
+            ));
+        }
+        if is_target {
+            return Ok(metadata_path_kind(&metadata));
+        }
+    }
+
+    Ok(PathKind::Directory)
+}
+
+fn metadata_path_kind(metadata: &fs::Metadata) -> PathKind {
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        PathKind::Directory
+    } else if file_type.is_file() {
+        PathKind::File
+    } else if file_type.is_symlink() {
+        PathKind::Symlink
+    } else {
+        PathKind::Other
     }
 }
 
@@ -470,6 +606,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use forge_core::ports::FileSystemPort;
+    use forge_core::{GitFileSet, InventoryOptions, PathKind, RepoRelativePath};
     use tempfile::tempdir;
 
     use super::{FileSystemError, NativeFileSystem, RepositoryWriter};
@@ -485,6 +623,148 @@ mod tests {
 
         assert!(filesystem.exists(&target));
         assert_eq!(filesystem.read(&target)?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_port_exposes_git_authoritative_inventory_and_bounded_text()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        fs::create_dir(repository.path().join("target"))?;
+        fs::write(repository.path().join("target/tracked.txt"), "tracked")?;
+        fs::write(repository.path().join(".ignore"), "ignored.txt\n")?;
+        fs::write(repository.path().join("ignored.txt"), "ignored")?;
+        let file_set = GitFileSet::new(
+            vec![
+                RepoRelativePath::new(".ignore")?,
+                RepoRelativePath::new("target/tracked.txt")?,
+            ],
+            vec![RepoRelativePath::new("ignored.txt")?],
+        );
+        let filesystem = NativeFileSystem;
+
+        let inventory = FileSystemPort::inventory(
+            &filesystem,
+            repository.path(),
+            Some(&file_set),
+            InventoryOptions::default(),
+        )?;
+        let paths: Vec<_> = inventory
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_path())
+            .collect();
+        assert!(paths.contains(&Path::new("target/tracked.txt")));
+        assert!(!paths.contains(&Path::new("ignored.txt")));
+
+        let non_git_inventory = FileSystemPort::inventory(
+            &filesystem,
+            repository.path(),
+            None,
+            InventoryOptions::default(),
+        )?;
+        assert!(
+            !non_git_inventory
+                .entries
+                .iter()
+                .any(|entry| entry.path.starts_with("target"))
+        );
+
+        let text = FileSystemPort::read_bounded_text(
+            &filesystem,
+            repository.path(),
+            &RepoRelativePath::new(".ignore")?,
+            7,
+        )?;
+        assert_eq!(text.bytes, b"ignored");
+        assert!(text.truncated);
+        assert!(!text.binary);
+        Ok(())
+    }
+
+    #[test]
+    fn path_kind_distinguishes_missing_from_probe_failures() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        fs::write(repository.path().join("file"), "contents")?;
+        fs::create_dir(repository.path().join("directory"))?;
+        let filesystem = NativeFileSystem;
+
+        assert_eq!(
+            FileSystemPort::path_kind(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("missing")?,
+            )?,
+            PathKind::Missing
+        );
+        assert_eq!(
+            FileSystemPort::path_kind(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("file")?,
+            )?,
+            PathKind::File
+        );
+        assert_eq!(
+            FileSystemPort::path_kind(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("directory")?,
+            )?,
+            PathKind::Directory
+        );
+
+        let invalid_ancestor = FileSystemPort::path_kind(
+            &filesystem,
+            repository.path(),
+            &RepoRelativePath::new("file/child")?,
+        );
+        assert!(matches!(
+            invalid_ancestor,
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotADirectory
+        ));
+
+        let missing_root = FileSystemPort::path_kind(
+            &filesystem,
+            &repository.path().join("missing-root"),
+            &RepoRelativePath::new("marker")?,
+        );
+        assert!(matches!(
+            missing_root,
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_kind_reports_a_target_symlink_but_rejects_a_symlink_ancestor()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempdir()?;
+        let outside = tempdir()?;
+        fs::write(outside.path().join("secret"), "secret")?;
+        symlink(outside.path(), repository.path().join("link"))?;
+        let filesystem = NativeFileSystem;
+
+        assert_eq!(
+            FileSystemPort::path_kind(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("link")?,
+            )?,
+            PathKind::Symlink
+        );
+        let through_link = FileSystemPort::path_kind(
+            &filesystem,
+            repository.path(),
+            &RepoRelativePath::new("link/secret")?,
+        );
+        assert!(matches!(
+            through_link,
+            Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
         Ok(())
     }
 
