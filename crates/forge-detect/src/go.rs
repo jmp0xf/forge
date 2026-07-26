@@ -1662,12 +1662,19 @@ mod tests {
             .map_err(Into::into)
     }
 
+    /// Opaque placeholder: these Go-provider tests do not consume process-output digests.
+    fn ignored_process_digest(stream: &str) -> Digest {
+        Digest::new(format!("fixture:non-canonical-go-{stream}"))
+    }
+
     fn observation(stdout: &[u8]) -> ProcessObservation {
         ProcessObservation {
             exit_code: Some(0),
             signal: None,
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
+            stdout_digest: ignored_process_digest("stdout"),
+            stderr_digest: ignored_process_digest("stderr"),
             stdout_total_bytes: stdout.len() as u64,
             stderr_total_bytes: 0,
             stdout_truncated: false,

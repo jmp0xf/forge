@@ -1241,6 +1241,11 @@ mod tests {
         }
     }
 
+    /// Opaque placeholder: these Rust-provider tests do not consume process-output digests.
+    fn ignored_process_digest(stream: &str) -> Digest {
+        Digest::new(format!("fixture:non-canonical-rust-{stream}"))
+    }
+
     fn metadata_observation(document: Value) -> Result<ProcessObservation, serde_json::Error> {
         let stdout = serde_json::to_vec(&document)?;
         Ok(ProcessObservation {
@@ -1250,6 +1255,8 @@ mod tests {
             stderr_total_bytes: 0,
             stdout,
             stderr: Vec::new(),
+            stdout_digest: ignored_process_digest("stdout"),
+            stderr_digest: ignored_process_digest("stderr"),
             stdout_truncated: false,
             stderr_truncated: false,
             duration: Duration::from_millis(12),
@@ -1264,6 +1271,8 @@ mod tests {
             signal: None,
             stdout: Vec::new(),
             stderr: b"redacted by provider result".to_vec(),
+            stdout_digest: ignored_process_digest("stdout"),
+            stderr_digest: ignored_process_digest("stderr"),
             stdout_total_bytes: 0,
             stderr_total_bytes: 27,
             stdout_truncated: false,

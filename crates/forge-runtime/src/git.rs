@@ -712,7 +712,7 @@ mod tests {
     use forge_core::ports::{
         GitPort as _, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation, StdinPolicy,
     };
-    use forge_core::{GitErrorKind, GitObjectFormat};
+    use forge_core::{Digest, GitErrorKind, GitObjectFormat};
 
     use super::{
         GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, OBJECT_FORMAT_ARGS,
@@ -982,12 +982,19 @@ mod tests {
         Ok(())
     }
 
+    /// Opaque placeholder: these Git classification tests do not consume process-output digests.
+    fn ignored_process_digest(stream: &str) -> Digest {
+        Digest::new(format!("fixture:non-canonical-git-{stream}"))
+    }
+
     fn successful_observation() -> ProcessObservation {
         ProcessObservation {
             exit_code: Some(0),
             signal: None,
             stdout: b"output".to_vec(),
             stderr: Vec::new(),
+            stdout_digest: ignored_process_digest("stdout"),
+            stderr_digest: ignored_process_digest("stderr"),
             stdout_total_bytes: 6,
             stderr_total_bytes: 0,
             stdout_truncated: false,

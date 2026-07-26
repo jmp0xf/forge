@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use forge_core::Digest;
 use forge_core::ports::{
     DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, ProcessError, ProcessErrorKind,
     ProcessObservation, ProcessPort, StdinPolicy,
@@ -259,6 +260,7 @@ impl SynchronousProcessRunner {
 
         let stdout_reader = match spawn_reader(
             "forge-stdout-drain",
+            OutputStream::Stdout,
             stdout,
             stdout_sink,
             stdout_limit_bytes,
@@ -275,6 +277,7 @@ impl SynchronousProcessRunner {
         };
         let stderr_reader = match spawn_reader(
             "forge-stderr-drain",
+            OutputStream::Stderr,
             stderr,
             Vec::with_capacity(stderr_limit_bytes.min(8 * 1024)),
             stderr_limit_bytes,
@@ -413,8 +416,8 @@ impl<W> ExecutionObservation<W> {
         Self {
             exit_code: None,
             signal: None,
-            stdout: DrainedOutput::empty(stdout_sink),
-            stderr: DrainedOutput::empty(Vec::new()),
+            stdout: DrainedOutput::empty(OutputStream::Stdout, stdout_sink),
+            stderr: DrainedOutput::empty(OutputStream::Stderr, Vec::new()),
             duration: Duration::ZERO,
             timed_out: false,
             interrupted: true,
@@ -430,6 +433,8 @@ impl<W> ExecutionObservation<W> {
             signal: self.signal,
             stdout: Vec::new(),
             stderr: self.stderr.sink,
+            stdout_digest: self.stdout.digest,
+            stderr_digest: self.stderr.digest,
             stdout_total_bytes,
             stderr_total_bytes: self.stderr.total_bytes,
             stdout_truncated,
@@ -601,15 +606,17 @@ fn reap_direct_child(child: &mut Child) {
 #[derive(Debug)]
 struct DrainedOutput<W> {
     sink: W,
+    digest: Digest,
     total_bytes: u64,
     truncated: bool,
     sink_error: Option<io::Error>,
 }
 
 impl<W> DrainedOutput<W> {
-    fn empty(sink: W) -> Self {
+    fn empty(stream: OutputStream, sink: W) -> Self {
         Self {
             sink,
+            digest: stream.empty_digest(),
             total_bytes: 0,
             truncated: false,
             sink_error: None,
@@ -617,8 +624,51 @@ impl<W> DrainedOutput<W> {
     }
 }
 
+/// Identifies one subprocess pipe in the process-output digest domain.
+///
+/// The `forge.process-output/v1\0` preimage is, in order: the domain/version bytes; the stream
+/// label length as an eight-byte little-endian unsigned integer; the raw `stdout` or `stderr`
+/// label; the `\0stream-bytes\0` separator; and every raw pipe byte in read order through EOF.
+/// Read chunk boundaries and retained-output bounds are not encoded. This keeps the digest stable
+/// across buffering policies while making identical stdout and stderr byte streams distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    const DOMAIN: &'static [u8] = b"forge.process-output/v1\0";
+
+    const fn label(self) -> &'static [u8] {
+        match self {
+            Self::Stdout => b"stdout",
+            Self::Stderr => b"stderr",
+        }
+    }
+
+    fn hasher(self) -> blake3::Hasher {
+        let label = self.label();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(Self::DOMAIN);
+        hasher.update(&(label.len() as u64).to_le_bytes());
+        hasher.update(label);
+        hasher.update(b"\0stream-bytes\0");
+        hasher
+    }
+
+    fn empty_digest(self) -> Digest {
+        finish_output_digest(self.hasher())
+    }
+}
+
+fn finish_output_digest(hasher: blake3::Hasher) -> Digest {
+    Digest::new(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
 fn spawn_reader<R, W>(
     name: &'static str,
+    stream: OutputStream,
     reader: R,
     sink: W,
     limit: usize,
@@ -629,7 +679,7 @@ where
 {
     thread::Builder::new()
         .name(name.into())
-        .spawn(move || drain_bounded(reader, sink, limit))
+        .spawn(move || drain_bounded(stream, reader, sink, limit))
 }
 
 fn join_reader<W>(
@@ -642,6 +692,7 @@ fn join_reader<W>(
 }
 
 fn drain_bounded<W>(
+    stream: OutputStream,
     mut reader: impl Read,
     mut sink: W,
     limit: usize,
@@ -654,6 +705,7 @@ where
     let mut truncated = false;
     let mut sink_error = None;
     let mut buffer = [0_u8; 8 * 1024];
+    let mut hasher = stream.hasher();
 
     loop {
         let read = reader.read(&mut buffer)?;
@@ -661,6 +713,7 @@ where
             break;
         }
 
+        hasher.update(&buffer[..read]);
         total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         let remaining = limit.saturating_sub(retained_bytes);
         let retained = remaining.min(read);
@@ -679,6 +732,7 @@ where
 
     Ok(DrainedOutput {
         sink,
+        digest: finish_output_digest(hasher),
         total_bytes,
         truncated,
         sink_error,
@@ -1432,8 +1486,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DEFAULT_OUTPUT_LIMIT_BYTES, SynchronousProcessRunner, TerminationMode, drain_bounded,
-        is_windows_batch_program, platform, sanitized_environment,
+        DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SynchronousProcessRunner, TerminationMode,
+        drain_bounded, is_windows_batch_program, platform, private_anonymous_tempfile,
+        sanitized_environment,
     };
 
     const PROCESS_TREE_FIXTURE_MODE: &str = "FORGE_PROCESS_FIXTURE_MODE";
@@ -1627,11 +1682,124 @@ mod tests {
     #[test]
     fn sink_failure_is_remembered_after_the_input_is_fully_drained() -> Result<(), Box<dyn Error>> {
         let input = vec![b'x'; 128 * 1024];
-        let drained = drain_bounded(io::Cursor::new(&input), FailingSink, input.len())?;
+        let drained = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(&input),
+            FailingSink,
+            input.len(),
+        )?;
 
         assert_eq!(drained.total_bytes, input.len() as u64);
         assert!(drained.truncated);
         assert!(drained.sink_error.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_drain_digest_covers_bytes_beyond_the_retained_prefix() -> Result<(), Box<dyn Error>>
+    {
+        let mut input = vec![b'a'; 16 * 1024];
+        input.extend(vec![b'b'; 16 * 1024]);
+        let bounded = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(&input),
+            Vec::new(),
+            17,
+        )?;
+        let complete = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(&input),
+            io::sink(),
+            input.len(),
+        )?;
+        let prefix = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(&input[..17]),
+            io::sink(),
+            17,
+        )?;
+
+        assert_eq!(bounded.sink, input[..17]);
+        assert_eq!(bounded.total_bytes, input.len() as u64);
+        assert!(bounded.truncated);
+        assert_eq!(bounded.digest, complete.digest);
+        assert_ne!(bounded.digest, prefix.digest);
+        Ok(())
+    }
+
+    #[test]
+    fn process_output_digest_separates_stream_and_content() -> Result<(), Box<dyn Error>> {
+        let stdout = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(b"same"),
+            io::sink(),
+            0,
+        )?;
+        let stderr = drain_bounded(
+            OutputStream::Stderr,
+            io::Cursor::new(b"same"),
+            io::sink(),
+            0,
+        )?;
+        let changed = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(b"different"),
+            io::sink(),
+            0,
+        )?;
+
+        assert_ne!(stdout.digest, stderr.digest);
+        assert_ne!(stdout.digest, changed.digest);
+        Ok(())
+    }
+
+    #[test]
+    fn process_output_digest_has_fixed_vectors() -> Result<(), Box<dyn Error>> {
+        let empty_stdout =
+            drain_bounded(OutputStream::Stdout, io::Cursor::new(b""), io::sink(), 0)?;
+        let empty_stderr =
+            drain_bounded(OutputStream::Stderr, io::Cursor::new(b""), io::sink(), 0)?;
+        let raw_stdout = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(b"raw\0bytes\xff\n"),
+            io::sink(),
+            0,
+        )?;
+
+        assert_eq!(
+            empty_stdout.digest.as_str(),
+            "blake3:9aa4ab96d0ae1f71c26db70c010010a28f44bf36091b92500c6ac152af8d71fe"
+        );
+        assert_eq!(
+            empty_stderr.digest.as_str(),
+            "blake3:dd372cad62e2ad3de5ea9ffdd82b6ab63d7a5c787aefd40e3a2878bc4741cfe9"
+        );
+        assert_eq!(
+            raw_stdout.digest.as_str(),
+            "blake3:4d70b2b7e18af8e9543e8555740968433713c232fe75747101cae8156adb9304"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anonymous_spool_digest_covers_bytes_beyond_its_bound() -> Result<(), Box<dyn Error>> {
+        let input = vec![b'x'; 64 * 1024];
+        let spooled = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(&input),
+            private_anonymous_tempfile()?,
+            31,
+        )?;
+        let complete = drain_bounded(
+            OutputStream::Stdout,
+            io::Cursor::new(&input),
+            io::sink(),
+            input.len(),
+        )?;
+
+        assert_eq!(spooled.sink.metadata()?.len(), 31);
+        assert!(spooled.truncated);
+        assert_eq!(spooled.digest, complete.digest);
         Ok(())
     }
 
@@ -1724,6 +1892,14 @@ mod tests {
         assert!(!observation.timed_out);
         assert_eq!(observation.exit_code, None);
         assert_eq!(observation.duration, Duration::ZERO);
+        assert_eq!(
+            observation.stdout_digest.as_str(),
+            "blake3:9aa4ab96d0ae1f71c26db70c010010a28f44bf36091b92500c6ac152af8d71fe"
+        );
+        assert_eq!(
+            observation.stderr_digest.as_str(),
+            "blake3:dd372cad62e2ad3de5ea9ffdd82b6ab63d7a5c787aefd40e3a2878bc4741cfe9"
+        );
         Ok(())
     }
 
@@ -1766,6 +1942,8 @@ mod tests {
 
         assert!(observation.timed_out);
         assert!(!observation.interrupted);
+        assert!(observation.stdout_digest.as_str().starts_with("blake3:"));
+        assert!(observation.stderr_digest.as_str().starts_with("blake3:"));
         let stopped_at = fs::metadata(&heartbeat)?.len();
         assert!(stopped_at > 0, "the fixture descendant never ran");
         thread::sleep(Duration::from_millis(300));
@@ -2006,6 +2184,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn discarded_output_still_has_complete_stream_digests() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let mut discarded = spec(
+            "/bin/sh",
+            &["-c", "printf 'same-output'; printf 'same-output' >&2"],
+        );
+        discarded.stdout = OutputPolicy::Discard;
+        discarded.stderr = OutputPolicy::Discard;
+        let captured = runner.run(&spec(
+            "/bin/sh",
+            &["-c", "printf 'same-output'; printf 'same-output' >&2"],
+        ))?;
+        let discarded = runner.run(&discarded)?;
+
+        assert!(discarded.stdout.is_empty());
+        assert!(discarded.stderr.is_empty());
+        assert!(discarded.stdout_truncated);
+        assert!(discarded.stderr_truncated);
+        assert_eq!(discarded.stdout_total_bytes, 11);
+        assert_eq!(discarded.stderr_total_bytes, 11);
+        assert_eq!(discarded.stdout_digest, captured.stdout_digest);
+        assert_eq!(discarded.stderr_digest, captured.stderr_digest);
+        assert_ne!(discarded.stdout_digest, discarded.stderr_digest);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn huge_output_is_drained_but_retained_within_each_limit() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let runner = SynchronousProcessRunner::new(root.path())?;
@@ -2126,6 +2333,8 @@ mod tests {
         assert!(observation.interrupted);
         assert!(!observation.timed_out);
         assert!(observation.signal.is_some());
+        assert!(observation.stdout_digest.as_str().starts_with("blake3:"));
+        assert!(observation.stderr_digest.as_str().starts_with("blake3:"));
         let stopped_at = fs::metadata(&heartbeat)?.len();
         thread::sleep(Duration::from_millis(250));
         let after = fs::metadata(&heartbeat)?.len();

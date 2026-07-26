@@ -1005,6 +1005,11 @@ mod tests {
         })
     }
 
+    /// Opaque placeholder: these model-provider tests do not consume process-output digests.
+    fn ignored_process_digest(stream: &str) -> Digest {
+        Digest::new(format!("fixture:non-canonical-model-{stream}"))
+    }
+
     fn observation(stdout: Vec<u8>) -> ProcessObservation {
         ProcessObservation {
             exit_code: Some(0),
@@ -1013,6 +1018,8 @@ mod tests {
             stderr_total_bytes: 0,
             stdout,
             stderr: Vec::new(),
+            stdout_digest: ignored_process_digest("stdout"),
+            stderr_digest: ignored_process_digest("stderr"),
             stdout_truncated: false,
             stderr_truncated: false,
             duration: Duration::from_millis(1),

@@ -19,6 +19,14 @@ pub struct ProcessObservation {
     pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Digest of the complete stdout stream, including bytes not retained in `stdout`.
+    ///
+    /// A producer must give its algorithm a behavior version before receipts may reuse the value.
+    pub stdout_digest: Digest,
+    /// Digest of the complete stderr stream, including bytes not retained in `stderr`.
+    ///
+    /// A producer must give its algorithm a behavior version before receipts may reuse the value.
+    pub stderr_digest: Digest,
     pub stdout_total_bytes: u64,
     pub stderr_total_bytes: u64,
     pub stdout_truncated: bool,
