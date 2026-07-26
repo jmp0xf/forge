@@ -7,14 +7,18 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use forge_core::branding::{CLI_NAME, CONFIG_FILE};
+use forge_core::ports::{GitPort as _, ProcessError};
 use forge_core::{
-    AppError, ExitCode, GitError, GitErrorKind, InventoryError, ProjectModelWireError,
-    RepoRelativePath, project_model_to_wire,
+    AppError, ExitCode, GitError, GitErrorKind, InventoryError, ProjectModel,
+    ProjectModelWireError, RepoRelativePath, project_model_to_wire,
 };
-use forge_detect::model::{ModelDetectionError, ModelDetectionOptions, detect_project_model};
+use forge_detect::model::{
+    ModelDetectionCompletion, ModelDetectionError, ModelDetectionOptions, detect_project_model,
+};
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::git::GitCli;
 use forge_runtime::hash::Blake3Hasher;
+use forge_runtime::process::SynchronousProcessRunner;
 use forge_schema::{
     CommandResolutionData, ConfidenceData, Diagnostic, ProjectModelData, ProvenanceData,
     SchemaKind, Severity,
@@ -22,11 +26,19 @@ use forge_schema::{
 
 use crate::args::Cli;
 
+/// One repository scan retained in both its domain and public wire forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetectedProject {
+    pub(crate) model: ProjectModel,
+    pub(crate) wire: ProjectModelData,
+    pub(crate) completion: ModelDetectionCompletion,
+}
+
 /// Detects and projects the model used by both human and JSON explain output.
 pub(crate) fn detect(
     cli: &Cli,
     cancellation: Arc<AtomicBool>,
-) -> Result<ProjectModelData, AppError> {
+) -> Result<DetectedProject, AppError> {
     let start = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
     let config_path = cli
         .config
@@ -45,22 +57,37 @@ pub(crate) fn detect(
     let timeout = cli.timeout.as_deref().map(parse_duration).transpose()?;
     let git = timeout
         .map_or_else(GitCli::new, |timeout| GitCli::new().with_timeout(timeout))
+        .with_cancellation_flag(Arc::clone(&cancellation));
+    let repository_root = git.repository_root(start).map_err(|error| {
+        let detail = error.to_string();
+        map_git_error(&error, "repository root", detail)
+    })?;
+    let process = SynchronousProcessRunner::new(&repository_root)
+        .map_err(map_process_setup_error)?
         .with_cancellation_flag(cancellation);
     let filesystem = NativeFileSystem;
     let hasher = Blake3Hasher;
-    let model = detect_project_model(
-        start,
+    let default_options = ModelDetectionOptions::default();
+    let outcome = detect_project_model(
+        &repository_root,
         &git,
         &filesystem,
+        &process,
         &hasher,
         &ModelDetectionOptions {
             config_path,
-            ..ModelDetectionOptions::default()
+            metadata_timeout: timeout.unwrap_or(default_options.metadata_timeout),
+            ..default_options
         },
     )
     .map_err(map_detection_error)?;
+    let wire = project_model_to_wire(&outcome.model).map_err(map_projection_error)?;
 
-    project_model_to_wire(&model).map_err(map_projection_error)
+    Ok(DetectedProject {
+        model: outcome.model,
+        wire,
+        completion: outcome.completion,
+    })
 }
 
 fn parse_duration(value: &str) -> Result<Duration, AppError> {
@@ -148,6 +175,8 @@ fn map_detection_error(error: ModelDetectionError) -> AppError {
                 "correct or remove the selected configuration, then rerun `{CLI_NAME} explain`"
             ),
         ),
+        ModelDetectionError::RustProvider(error) => internal_detection_error(error.to_string()),
+        ModelDetectionError::GoProvider(error) => internal_detection_error(error.to_string()),
         ModelDetectionError::Assets(error) => internal_detection_error(error.to_string()),
         ModelDetectionError::InvalidInventoryPath { path, source } => {
             internal_detection_error(format!("invalid inventory path {path:?}: {source}"))
@@ -157,6 +186,18 @@ fn map_detection_error(error: ModelDetectionError) -> AppError {
         }
         ModelDetectionError::InvalidModel(error) => internal_detection_error(error.to_string()),
     }
+}
+
+fn map_process_setup_error(error: ProcessError) -> AppError {
+    AppError::environment_unmet(
+        "FGE2002",
+        "the bounded metadata process runner could not be initialized",
+        "repository process boundary",
+        error.to_string(),
+        format!(
+            "ensure the repository root is a readable real directory, then rerun `{CLI_NAME} explain`"
+        ),
+    )
 }
 
 fn map_git_error(error: &GitError, location: &str, detail: String) -> AppError {

@@ -17,6 +17,7 @@ use args::{Cli, Command, OutputFormat};
 use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
 use forge_core::branding::CLI_NAME;
 use forge_core::{AppError, ExitCode};
+use forge_detect::model::ModelDetectionCompletion;
 use forge_runtime::interrupt::{InterruptInstallError, InterruptToken};
 use forge_schema::{
     Diagnostic, DiagnosticData, Envelope, SchemaIndexData, SchemaKind, Severity, VersionData,
@@ -53,7 +54,7 @@ fn main() -> ProcessExitCode {
     };
     match Cli::try_parse() {
         Ok(cli) => match execute(cli, &context) {
-            Ok(()) => ProcessExitCode::from(ExitCode::Ok.as_u8()),
+            Ok(exit_code) => ProcessExitCode::from(exit_code.as_u8()),
             Err(error) => emit_error(&error, json_requested),
         },
         Err(error)
@@ -80,16 +81,25 @@ fn main() -> ProcessExitCode {
     }
 }
 
-fn execute(cli: Cli, context: &ExecutionContext) -> Result<(), AppError> {
+fn execute(cli: Cli, context: &ExecutionContext) -> Result<ExitCode, AppError> {
     let cancellation = context.cancellation_flag();
     if cancellation.load(Ordering::Acquire) {
         return Err(interrupted_error());
     }
     let json = output_is_json(&cli)?;
     match cli.command.as_ref() {
-        None => print_help(),
-        Some(Command::Version) => emit_version(json),
-        Some(Command::Schema(schema)) => emit_schema(schema.kind.as_deref(), json),
+        None => {
+            print_help()?;
+            Ok(ExitCode::Ok)
+        }
+        Some(Command::Version) => {
+            emit_version(json)?;
+            Ok(ExitCode::Ok)
+        }
+        Some(Command::Schema(schema)) => {
+            emit_schema(schema.kind.as_deref(), json)?;
+            Ok(ExitCode::Ok)
+        }
         Some(Command::Completions(completions)) => {
             if json {
                 return Err(AppError::usage(
@@ -107,22 +117,33 @@ fn execute(cli: Cli, context: &ExecutionContext) -> Result<(), AppError> {
                 CLI_NAME,
                 &mut io::stdout().lock(),
             );
-            Ok(())
+            Ok(ExitCode::Ok)
         }
         Some(Command::Explain) => emit_explain(&cli, context, json),
         Some(command) => Err(not_implemented_error(command)),
     }
 }
 
-fn emit_explain(cli: &Cli, context: &ExecutionContext, json: bool) -> Result<(), AppError> {
-    let model = explain::detect(cli, context.cancellation_flag())?;
+fn emit_explain(cli: &Cli, context: &ExecutionContext, json: bool) -> Result<ExitCode, AppError> {
+    let detected = explain::detect(cli, context.cancellation_flag())?;
+    let exit_code = detection_exit_code(detected.completion);
+    let model = detected.wire;
     if json {
         let diagnostics = model.diagnostics.clone();
         let mut envelope = Envelope::success(SchemaKind::ProjectModel, TOOL_VERSION, model);
         envelope.diagnostics = diagnostics;
-        emit_json(&envelope)
+        emit_json(&envelope)?;
     } else {
-        write_stdout(format_args!("{}", explain::render_human(&model)))
+        write_stdout(format_args!("{}", explain::render_human(&model)))?;
+    }
+    Ok(exit_code)
+}
+
+const fn detection_exit_code(completion: ModelDetectionCompletion) -> ExitCode {
+    match completion {
+        ModelDetectionCompletion::Complete | ModelDetectionCompletion::Partial => ExitCode::Ok,
+        ModelDetectionCompletion::TimedOut => ExitCode::Timeout,
+        ModelDetectionCompletion::Interrupted => ExitCode::Interrupted,
     }
 }
 
@@ -301,8 +322,9 @@ fn raw_args_request_json() -> bool {
 #[cfg(test)]
 mod tests {
     use forge_core::ExitCode;
+    use forge_detect::model::ModelDetectionCompletion;
 
-    use super::{not_implemented_error, output_is_json};
+    use super::{detection_exit_code, not_implemented_error, output_is_json};
     use crate::args::{Cli, Command, OutputFormat};
 
     #[test]
@@ -332,5 +354,25 @@ mod tests {
 
         assert_eq!(error.exit_code(), ExitCode::EnvironmentUnmet);
         assert_eq!(error.diagnostic().code.as_str(), "FGE2001");
+    }
+
+    #[test]
+    fn partial_models_are_successful_but_timeout_and_interrupt_remain_typed() {
+        assert_eq!(
+            detection_exit_code(ModelDetectionCompletion::Complete),
+            ExitCode::Ok
+        );
+        assert_eq!(
+            detection_exit_code(ModelDetectionCompletion::Partial),
+            ExitCode::Ok
+        );
+        assert_eq!(
+            detection_exit_code(ModelDetectionCompletion::TimedOut),
+            ExitCode::Timeout
+        );
+        assert_eq!(
+            detection_exit_code(ModelDetectionCompletion::Interrupted),
+            ExitCode::Interrupted
+        );
     }
 }
