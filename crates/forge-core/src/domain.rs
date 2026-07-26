@@ -672,6 +672,8 @@ pub struct ProjectModel {
     pub repository_provenance: Vec<Provenance>,
     pub repository_confidence: Confidence,
     pub units: Vec<ProjectUnit>,
+    pub unit_inventory_provenance: Vec<Provenance>,
+    pub unit_inventory_confidence: Confidence,
     pub commands: BTreeMap<Intent, ResolvedCommandSet>,
     pub assets: AssetInventory,
     pub adapters: AdapterInventory,
@@ -732,17 +734,22 @@ impl ProjectModel {
         repository: RepoFacts,
         mut repository_provenance: Vec<Provenance>,
         repository_confidence: Confidence,
+        mut unit_inventory_provenance: Vec<Provenance>,
+        unit_inventory_confidence: Confidence,
         assets: AssetInventory,
         adapters: AdapterInventory,
         policy: EffectivePolicy,
     ) -> Self {
         canonicalize_provenance(&mut repository_provenance);
+        canonicalize_provenance(&mut unit_inventory_provenance);
         Self {
             schema: SchemaVersion::for_kind(SchemaKind::ProjectModel),
             repository,
             repository_provenance,
             repository_confidence,
             units: Vec::new(),
+            unit_inventory_provenance,
+            unit_inventory_confidence,
             commands: BTreeMap::new(),
             assets,
             adapters,
@@ -755,6 +762,7 @@ impl ProjectModel {
     /// Canonicalizes unordered discovery output while preserving command execution order.
     pub fn canonicalize(&mut self) {
         canonicalize_provenance(&mut self.repository_provenance);
+        canonicalize_provenance(&mut self.unit_inventory_provenance);
         for unit in &mut self.units {
             unit.members.sort();
             unit.members.dedup();
@@ -866,6 +874,7 @@ impl ProjectModel {
         }
 
         validate_provenance("repository.provenance", &self.repository_provenance)?;
+        validate_provenance("units.provenance", &self.unit_inventory_provenance)?;
 
         let mut unit_ids = BTreeSet::new();
         for unit in &self.units {
@@ -1088,6 +1097,8 @@ mod tests {
         let mut model = ProjectModel::new(
             repository,
             vec![provenance("repository/detection")],
+            Confidence::High,
+            vec![provenance("units/detection")],
             Confidence::High,
             AssetInventory::new(
                 Vec::new(),
@@ -1527,6 +1538,15 @@ mod tests {
             repository_empty.finalize(),
             Err(ProjectModelError::EmptyProvenance {
                 location: "repository.provenance".into(),
+            })
+        );
+
+        let mut units_empty = valid_model();
+        units_empty.unit_inventory_provenance.clear();
+        assert_eq!(
+            units_empty.finalize(),
+            Err(ProjectModelError::EmptyProvenance {
+                location: "units.provenance".into(),
             })
         );
 
