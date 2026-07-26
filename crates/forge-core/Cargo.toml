@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 forge-schema = { path = "../forge-schema" }
 thiserror.workspace = true
 

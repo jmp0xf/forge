@@ -682,6 +682,22 @@ pub struct ProjectModel {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Required aggregate inputs for constructing an initially empty project model.
+///
+/// Named fields keep repository, unit, asset, adapter, and policy evidence from being
+/// accidentally swapped at cross-crate assembly sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectModelInputs {
+    pub repository: RepoFacts,
+    pub repository_provenance: Vec<Provenance>,
+    pub repository_confidence: Confidence,
+    pub unit_inventory_provenance: Vec<Provenance>,
+    pub unit_inventory_confidence: Confidence,
+    pub assets: AssetInventory,
+    pub adapters: AdapterInventory,
+    pub policy: EffectivePolicy,
+}
+
 /// A finalized project model invariant violation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProjectModelError {
@@ -730,16 +746,17 @@ pub enum ProjectModelError {
 
 impl ProjectModel {
     #[must_use]
-    pub fn new(
-        repository: RepoFacts,
-        mut repository_provenance: Vec<Provenance>,
-        repository_confidence: Confidence,
-        mut unit_inventory_provenance: Vec<Provenance>,
-        unit_inventory_confidence: Confidence,
-        assets: AssetInventory,
-        adapters: AdapterInventory,
-        policy: EffectivePolicy,
-    ) -> Self {
+    pub fn new(inputs: ProjectModelInputs) -> Self {
+        let ProjectModelInputs {
+            repository,
+            mut repository_provenance,
+            repository_confidence,
+            mut unit_inventory_provenance,
+            unit_inventory_confidence,
+            assets,
+            adapters,
+            policy,
+        } = inputs;
         canonicalize_provenance(&mut repository_provenance);
         canonicalize_provenance(&mut unit_inventory_provenance);
         Self {
@@ -1028,8 +1045,9 @@ mod tests {
     use super::{
         AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, CommandResolution, CommandSource,
         CommandSpec, Confidence, EffectivePolicy, Intent, InvalidCommandResolution,
-        InvalidTextRange, ProjectKind, ProjectModel, ProjectModelError, ProjectUnit, Provenance,
-        RepoFacts, ResolvedCommandSet, TextRange, ToolchainInfo, UnitEdge, WorkState,
+        InvalidTextRange, ProjectKind, ProjectModel, ProjectModelError, ProjectModelInputs,
+        ProjectUnit, Provenance, RepoFacts, ResolvedCommandSet, TextRange, ToolchainInfo, UnitEdge,
+        WorkState,
     };
 
     fn provenance(rule_id: impl Into<String>) -> Provenance {
@@ -1094,24 +1112,28 @@ mod tests {
             upstream: None,
             work_state: WorkState::Unknown,
         };
-        let mut model = ProjectModel::new(
+        let mut model = ProjectModel::new(ProjectModelInputs {
             repository,
-            vec![provenance("repository/detection")],
-            Confidence::High,
-            vec![provenance("units/detection")],
-            Confidence::High,
-            AssetInventory::new(
+            repository_provenance: vec![provenance("repository/detection")],
+            repository_confidence: Confidence::High,
+            unit_inventory_provenance: vec![provenance("units/detection")],
+            unit_inventory_confidence: Confidence::High,
+            assets: AssetInventory::new(
                 Vec::new(),
                 vec![provenance("inventory/assets")],
                 Confidence::High,
             ),
-            AdapterInventory::new(
+            adapters: AdapterInventory::new(
                 Vec::new(),
                 vec![provenance("inventory/adapters")],
                 Confidence::High,
             ),
-            EffectivePolicy::new(None, vec![provenance("policy/effective")], Confidence::High),
-        );
+            policy: EffectivePolicy::new(
+                None,
+                vec![provenance("policy/effective")],
+                Confidence::High,
+            ),
+        });
         for intent in Intent::ALL {
             model.commands.insert(
                 intent,

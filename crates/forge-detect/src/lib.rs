@@ -2,9 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assets;
 pub mod config;
 pub mod go;
+pub mod model;
 pub mod repository;
+pub mod resolution;
+pub mod runner;
 pub mod rust;
 
 use forge_core::{CommandSpec, ProjectModel, ProjectUnit};
