@@ -1,0 +1,29 @@
+[package]
+name = "forge-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+forge-core = { path = "../crates/forge-core" }
+libfuzzer-sys = "=0.4.13"
+
+[[bin]]
+name = "parse_status_porcelain_v2"
+path = "fuzz_targets/parse_status_porcelain_v2.rs"
+test = false
+doc = false
+bench = false
+
+# Keep fuzz-only dependencies and lock resolution outside the product workspace.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[profile.release]
+debug = 1
