@@ -198,6 +198,59 @@ pub struct GitFileSet {
     pub untracked: Vec<RepoRelativePath>,
 }
 
+/// Stable failure categories exposed by the Git side-effect port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitErrorKind {
+    ExecutableUnavailable,
+    UnsafeEnvironment,
+    NotRepository,
+    CorruptRepository,
+    TimedOut,
+    Interrupted,
+    OutputLimit,
+    InvalidData,
+    CommandFailed,
+    Io,
+}
+
+/// A bounded, operation-scoped Git failure suitable for deterministic policy decisions.
+///
+/// `detail` may contain a bounded diagnostic emitted by Git, but never command environment
+/// values. Callers should branch on [`GitError::kind`] rather than parsing this text.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("git {operation} failed ({kind:?}): {detail}")]
+pub struct GitError {
+    kind: GitErrorKind,
+    operation: &'static str,
+    detail: String,
+}
+
+impl GitError {
+    #[must_use]
+    pub fn new(kind: GitErrorKind, operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> GitErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
 impl GitFileSet {
     #[must_use]
     pub fn new(mut tracked: Vec<RepoRelativePath>, mut untracked: Vec<RepoRelativePath>) -> Self {

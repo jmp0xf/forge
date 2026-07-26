@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::GitError;
+
 /// Default cap for repository entries retained during startup detection.
 pub const DEFAULT_MAX_INVENTORY_ENTRIES: usize = 200_000;
 
@@ -105,7 +107,7 @@ pub enum InventoryError {
     #[error("repository-relative path points through a symlink: {0}")]
     Symlink(PathBuf),
     #[error("Git-backed repository inventory failed: {0}")]
-    Git(#[source] io::Error),
+    Git(#[source] GitError),
     #[error(
         "repository inventory contains {observed} entries, exceeding the configured {max_entries}-entry bound"
     )]

@@ -11,8 +11,9 @@ use forge_core::domain::{
 };
 use forge_core::ports::{GitPort, ProcessObservation, ProcessPort as _};
 use forge_core::{
-    GitFileSet, GitObjectFormat, GitPathListReadError, PorcelainV2ReadError, PorcelainV2Status,
-    RepoRelativePath, parse_git_path_list_reader, parse_status_porcelain_v2_reader,
+    GitError, GitErrorKind, GitFileSet, GitObjectFormat, GitPathListReadError,
+    PorcelainV2ReadError, PorcelainV2Status, RepoRelativePath, parse_git_path_list_reader,
+    parse_status_porcelain_v2_reader,
 };
 
 use crate::process::{
@@ -151,7 +152,7 @@ impl GitCli {
         self.with_status_spool_limit_bytes(limit)
     }
 
-    fn command_spec(&self, operation: GitOperation) -> io::Result<CommandSpec> {
+    fn command_spec(&self, operation: GitOperation) -> Result<CommandSpec, GitError> {
         let mut spec = CommandSpec::new(
             operation.command_id(),
             Intent::Check,
@@ -174,66 +175,78 @@ impl GitCli {
         // ecosystem offline flags were requested when Git has no such flag for these operations.
         spec.network = NetworkIntent::Unknown;
         spec.confidence = Confidence::High;
-        spec.env = hardened_git_environment(std::env::vars_os())?;
+        spec.env = hardened_git_environment(std::env::vars_os()).map_err(|error| {
+            GitError::new(
+                GitErrorKind::UnsafeEnvironment,
+                operation.name(),
+                error.to_string(),
+            )
+        })?;
         Ok(spec)
     }
 
-    fn run(&self, start: &Path, operation: GitOperation) -> io::Result<Vec<u8>> {
+    fn run(&self, start: &Path, operation: GitOperation) -> Result<Vec<u8>, GitError> {
         if operation.uses_spool() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(GitError::new(
+                GitErrorKind::InvalidData,
+                operation.name(),
                 format!(
-                    "Git {} must use the bounded anonymous spool path",
+                    "operation {} must use the bounded anonymous spool path",
                     operation.name()
                 ),
             ));
         }
-        let runner = SynchronousProcessRunner::new(start)?;
+        let runner = SynchronousProcessRunner::new(start)
+            .map_err(|error| map_io_error(operation, "prepare repository process root", error))?;
         let observation = runner
             .run(&self.command_spec(operation)?)
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("failed to execute git {}: {error}", operation.name()),
-                )
-            })?;
-        checked_stdout(operation.name(), observation)
+            .map_err(|error| map_execution_error(operation, error))?;
+        checked_stdout(operation, observation)
     }
 
     fn run_spooled(
         &self,
         root: &Path,
         operation: GitOperation,
-    ) -> io::Result<SpooledProcessObservation> {
+    ) -> Result<SpooledProcessObservation, GitError> {
         if !operation.uses_spool() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(GitError::new(
+                GitErrorKind::InvalidData,
+                operation.name(),
                 format!(
-                    "git {} does not use the bounded spool path",
+                    "operation {} does not use the bounded spool path",
                     operation.name()
                 ),
             ));
         }
-        SynchronousProcessRunner::new(root)?
+        SynchronousProcessRunner::new(root)
+            .map_err(|error| map_io_error(operation, "prepare repository process root", error))?
             .run_spooled_stdout(
                 &self.command_spec(operation)?,
                 self.status_spool_limit_bytes,
             )
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("failed to execute git {}: {error}", operation.name()),
-                )
-            })
+            .map_err(|error| map_execution_error(operation, error))
     }
 
-    fn resolve_path(&self, start: &Path, operation: GitOperation) -> io::Result<PathBuf> {
+    fn resolve_path(&self, start: &Path, operation: GitOperation) -> Result<PathBuf, GitError> {
         let bytes = self.run(start, operation)?;
-        parse_absolute_git_path(bytes, operation.name())
+        parse_absolute_git_path(bytes, operation.name()).map_err(|error| {
+            GitError::new(
+                GitErrorKind::InvalidData,
+                operation.name(),
+                error.to_string(),
+            )
+        })
     }
 
-    fn object_format(&self, root: &Path) -> io::Result<GitObjectFormat> {
-        parse_object_format(self.run(root, GitOperation::ObjectFormat)?)
+    fn object_format(&self, root: &Path) -> Result<GitObjectFormat, GitError> {
+        parse_object_format(self.run(root, GitOperation::ObjectFormat)?).map_err(|error| {
+            GitError::new(
+                GitErrorKind::InvalidData,
+                GitOperation::ObjectFormat.name(),
+                error.to_string(),
+            )
+        })
     }
 
     fn spooled_paths(
@@ -241,19 +254,15 @@ impl GitCli {
         root: &Path,
         operation: GitOperation,
         max_paths: usize,
-    ) -> io::Result<Vec<RepoRelativePath>> {
+    ) -> Result<Vec<RepoRelativePath>, GitError> {
         let mut spooled = self.run_spooled(root, operation)?;
-        check_spooled_observation(
-            operation.name(),
-            &mut spooled,
-            self.status_spool_limit_bytes,
-        )?;
+        check_spooled_observation(operation, &mut spooled, self.status_spool_limit_bytes)?;
         parse_git_path_list_reader(
             BufReader::new(spooled.stdout_file),
             self.status_record_limit_bytes,
             max_paths,
         )
-        .map_err(map_path_list_read_error)
+        .map_err(|error| map_path_list_read_error(operation, error))
     }
 }
 
@@ -316,23 +325,23 @@ fn indexed_git_config_key(key: &OsStr, prefix: &str) -> bool {
 }
 
 impl GitPort for GitCli {
-    fn repository_root(&self, start: &Path) -> io::Result<PathBuf> {
+    fn repository_root(&self, start: &Path) -> Result<PathBuf, GitError> {
         self.resolve_path(start, GitOperation::RepositoryRoot)
     }
 
-    fn git_dir(&self, start: &Path) -> io::Result<PathBuf> {
+    fn git_dir(&self, start: &Path) -> Result<PathBuf, GitError> {
         self.resolve_path(start, GitOperation::GitDir)
     }
 
-    fn git_common_dir(&self, start: &Path) -> io::Result<PathBuf> {
+    fn git_common_dir(&self, start: &Path) -> Result<PathBuf, GitError> {
         self.resolve_path(start, GitOperation::GitCommonDir)
     }
 
-    fn status(&self, root: &Path) -> io::Result<PorcelainV2Status> {
+    fn status(&self, root: &Path) -> Result<PorcelainV2Status, GitError> {
         let object_format = self.object_format(root)?;
         let mut spooled = self.run_spooled(root, GitOperation::Status)?;
         check_spooled_observation(
-            GitOperation::Status.name(),
+            GitOperation::Status,
             &mut spooled,
             self.status_spool_limit_bytes,
         )?;
@@ -342,17 +351,18 @@ impl GitPort for GitCli {
             self.status_record_limit_bytes,
             self.status_entry_limit,
         )
-        .map_err(map_status_read_error)?;
+        .map_err(|error| map_status_read_error(GitOperation::Status, error))?;
         if status.branch.oid.is_none() || status.branch.head.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(GitError::new(
+                GitErrorKind::InvalidData,
+                GitOperation::Status.name(),
                 "Git porcelain v2 status omitted required branch.oid or branch.head headers",
             ));
         }
         Ok(status)
     }
 
-    fn file_set(&self, root: &Path) -> io::Result<GitFileSet> {
+    fn file_set(&self, root: &Path) -> Result<GitFileSet, GitError> {
         let tracked =
             self.spooled_paths(root, GitOperation::TrackedFiles, self.status_entry_limit)?;
         let remaining = self.status_entry_limit.saturating_sub(tracked.len());
@@ -418,94 +428,159 @@ impl GitOperation {
 }
 
 fn check_spooled_observation(
-    operation: &str,
+    operation: GitOperation,
     spooled: &mut SpooledProcessObservation,
     spool_limit_bytes: usize,
-) -> io::Result<()> {
+) -> Result<(), GitError> {
     check_observation(operation, &spooled.observation)?;
-    spooled.stdout_file.flush()?;
-    let spool_length = spooled.stdout_file.metadata()?.len();
+    spooled
+        .stdout_file
+        .flush()
+        .map_err(|error| map_io_error(operation, "flush bounded stdout spool", error))?;
+    let spool_length = spooled
+        .stdout_file
+        .metadata()
+        .map_err(|error| map_io_error(operation, "inspect bounded stdout spool", error))?
+        .len();
     let spool_limit = u64::try_from(spool_limit_bytes).unwrap_or(u64::MAX);
     let expected_length = spooled.observation.stdout_total_bytes.min(spool_limit);
     if spool_length != expected_length {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(GitError::new(
+            GitErrorKind::InvalidData,
+            operation.name(),
             format!(
-                "Git {operation} spool length mismatch: retained {spool_length} bytes, expected {expected_length} from {} total bytes",
+                "bounded stdout spool retained {spool_length} bytes, expected {expected_length} from {} total bytes",
                 spooled.observation.stdout_total_bytes
             ),
         ));
     }
-    spooled.stdout_file.seek(SeekFrom::Start(0))?;
+    spooled
+        .stdout_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| map_io_error(operation, "rewind bounded stdout spool", error))?;
     Ok(())
 }
 
-fn checked_stdout(operation: &str, observation: ProcessObservation) -> io::Result<Vec<u8>> {
+fn checked_stdout(
+    operation: GitOperation,
+    observation: ProcessObservation,
+) -> Result<Vec<u8>, GitError> {
     check_observation(operation, &observation)?;
     Ok(observation.stdout)
 }
 
-fn check_observation(operation: &str, observation: &ProcessObservation) -> io::Result<()> {
+fn check_observation(
+    operation: GitOperation,
+    observation: &ProcessObservation,
+) -> Result<(), GitError> {
     if observation.timed_out {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("git {operation} exceeded its timeout"),
+        return Err(GitError::new(
+            GitErrorKind::TimedOut,
+            operation.name(),
+            "operation exceeded its timeout",
         ));
     }
     if observation.interrupted {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            format!("git {operation} was interrupted"),
+        return Err(GitError::new(
+            GitErrorKind::Interrupted,
+            operation.name(),
+            "operation was interrupted",
         ));
     }
     if observation.stdout_truncated || observation.stderr_truncated {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(GitError::new(
+            GitErrorKind::OutputLimit,
+            operation.name(),
             format!(
-                "git {operation} output exceeded the configured bound (stdout total {} bytes, stderr total {} bytes)",
+                "output exceeded the configured bound (stdout total {} bytes, stderr total {} bytes)",
                 observation.stdout_total_bytes, observation.stderr_total_bytes,
             ),
         ));
     }
     if observation.exit_code != Some(0) {
         let stderr = bounded_stderr_context(&observation.stderr);
-        return Err(io::Error::other(format!(
-            "git {operation} failed (exit code {:?}, signal {:?}){stderr}",
-            observation.exit_code, observation.signal,
-        )));
+        return Err(GitError::new(
+            classify_command_failure(&observation.stderr),
+            operation.name(),
+            format!(
+                "exit code {:?}, signal {:?}{stderr}",
+                observation.exit_code, observation.signal,
+            ),
+        ));
     }
     Ok(())
 }
 
-fn map_status_read_error(error: PorcelainV2ReadError) -> io::Error {
+fn map_status_read_error(operation: GitOperation, error: PorcelainV2ReadError) -> GitError {
     match error {
         PorcelainV2ReadError::Input {
             offset,
             record,
             source,
-        } => io::Error::new(
-            source.kind(),
+        } => GitError::new(
+            GitErrorKind::Io,
+            operation.name(),
             format!(
                 "failed to read Git porcelain v2 status at byte {offset}, record {record}: {source}"
             ),
         ),
-        PorcelainV2ReadError::Parse(error) => io::Error::new(
-            io::ErrorKind::InvalidData,
+        PorcelainV2ReadError::Parse(error) => GitError::new(
+            GitErrorKind::InvalidData,
+            operation.name(),
             format!("Git returned malformed porcelain v2 status: {error}"),
         ),
     }
 }
 
-fn map_path_list_read_error(error: GitPathListReadError) -> io::Error {
+fn map_path_list_read_error(operation: GitOperation, error: GitPathListReadError) -> GitError {
     match error {
-        GitPathListReadError::Input { source, .. } => io::Error::new(
-            source.kind(),
+        GitPathListReadError::Input { source, .. } => GitError::new(
+            GitErrorKind::Io,
+            operation.name(),
             format!("failed to read Git path list: {source}"),
         ),
-        error => io::Error::new(
-            io::ErrorKind::InvalidData,
+        error => GitError::new(
+            GitErrorKind::InvalidData,
+            operation.name(),
             format!("Git returned a malformed path list: {error}"),
         ),
+    }
+}
+
+fn map_io_error(operation: GitOperation, action: &str, error: io::Error) -> GitError {
+    GitError::new(
+        GitErrorKind::Io,
+        operation.name(),
+        format!("{action}: {error}"),
+    )
+}
+
+fn map_execution_error(operation: GitOperation, error: io::Error) -> GitError {
+    let kind = if error.kind() == io::ErrorKind::NotFound {
+        GitErrorKind::ExecutableUnavailable
+    } else {
+        GitErrorKind::Io
+    };
+    GitError::new(kind, operation.name(), error.to_string())
+}
+
+fn classify_command_failure(stderr: &[u8]) -> GitErrorKind {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if stderr.contains("not a git repository") {
+        GitErrorKind::NotRepository
+    } else if [
+        "corrupt",
+        "bad object",
+        "bad signature",
+        "invalid object",
+        "index file smaller than expected",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
+    {
+        GitErrorKind::CorruptRepository
+    } else {
+        GitErrorKind::CommandFailed
     }
 }
 
@@ -594,14 +669,14 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use forge_core::GitObjectFormat;
     use forge_core::ports::{GitPort as _, ProcessObservation};
+    use forge_core::{GitErrorKind, GitObjectFormat};
 
     use super::{
-        GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, OBJECT_FORMAT_ARGS,
+        GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, OBJECT_FORMAT_ARGS,
         STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS, checked_stdout,
-        hardened_git_environment, indexed_git_config_key, parse_absolute_git_path,
-        parse_object_format,
+        classify_command_failure, hardened_git_environment, indexed_git_config_key,
+        parse_absolute_git_path, parse_object_format,
     };
 
     #[test]
@@ -776,7 +851,7 @@ mod tests {
             .err()
             .ok_or("one-byte status bound unexpectedly produced a typed result")?;
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), GitErrorKind::OutputLimit);
         assert!(error.to_string().contains("stdout total"));
         Ok(())
     }
@@ -802,28 +877,28 @@ mod tests {
         let mut timed_out = successful_observation();
         timed_out.timed_out = true;
         assert_eq!(
-            checked_stdout("test", timed_out)
+            checked_stdout(GitOperation::Status, timed_out)
                 .err()
                 .map(|error| error.kind()),
-            Some(io::ErrorKind::TimedOut)
+            Some(GitErrorKind::TimedOut)
         );
 
         let mut interrupted = successful_observation();
         interrupted.interrupted = true;
         assert_eq!(
-            checked_stdout("test", interrupted)
+            checked_stdout(GitOperation::Status, interrupted)
                 .err()
                 .map(|error| error.kind()),
-            Some(io::ErrorKind::Interrupted)
+            Some(GitErrorKind::Interrupted)
         );
 
         let mut truncated = successful_observation();
         truncated.stdout_truncated = true;
         truncated.stdout_total_bytes = 123_456;
-        let error = checked_stdout("test", truncated).err();
+        let error = checked_stdout(GitOperation::Status, truncated).err();
         assert_eq!(
-            error.as_ref().map(io::Error::kind),
-            Some(io::ErrorKind::InvalidData)
+            error.as_ref().map(|error| error.kind()),
+            Some(GitErrorKind::OutputLimit)
         );
         assert!(
             error
@@ -834,10 +909,26 @@ mod tests {
         let mut failed = successful_observation();
         failed.exit_code = Some(1);
         assert_eq!(
-            checked_stdout("test", failed)
+            checked_stdout(GitOperation::Status, failed)
                 .err()
                 .map(|error| error.kind()),
-            Some(io::ErrorKind::Other)
+            Some(GitErrorKind::CommandFailed)
+        );
+    }
+
+    #[test]
+    fn command_failure_categories_do_not_require_callers_to_parse_diagnostics() {
+        assert_eq!(
+            classify_command_failure(b"fatal: not a git repository (or any parent)"),
+            GitErrorKind::NotRepository
+        );
+        assert_eq!(
+            classify_command_failure(b"fatal: index file corrupt"),
+            GitErrorKind::CorruptRepository
+        );
+        assert_eq!(
+            classify_command_failure(b"fatal: unrelated failure"),
+            GitErrorKind::CommandFailed
         );
     }
 

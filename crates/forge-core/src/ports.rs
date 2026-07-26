@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::domain::CommandSpec;
-use crate::git::{GitFileSet, PorcelainV2Status};
+use crate::git::{GitError, GitFileSet, PorcelainV2Status};
 use crate::inventory::{BoundedText, Inventory, InventoryError, InventoryOptions, PathKind};
 use crate::path::RepoRelativePath;
 use forge_schema::Digest;
@@ -59,11 +59,11 @@ pub trait FileSystemPort {
 }
 
 pub trait GitPort {
-    fn repository_root(&self, start: &Path) -> io::Result<PathBuf>;
-    fn git_dir(&self, start: &Path) -> io::Result<PathBuf>;
-    fn git_common_dir(&self, start: &Path) -> io::Result<PathBuf>;
-    fn status(&self, root: &Path) -> io::Result<PorcelainV2Status>;
-    fn file_set(&self, root: &Path) -> io::Result<GitFileSet>;
+    fn repository_root(&self, start: &Path) -> Result<PathBuf, GitError>;
+    fn git_dir(&self, start: &Path) -> Result<PathBuf, GitError>;
+    fn git_common_dir(&self, start: &Path) -> Result<PathBuf, GitError>;
+    fn status(&self, root: &Path) -> Result<PorcelainV2Status, GitError>;
+    fn file_set(&self, root: &Path) -> Result<GitFileSet, GitError>;
 }
 
 pub trait StateStore {

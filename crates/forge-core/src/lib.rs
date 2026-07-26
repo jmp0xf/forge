@@ -22,11 +22,12 @@ pub use domain::{
 pub use error::{AppError, ExitCode};
 pub use forge_schema::Digest;
 pub use git::{
-    AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitFileSet, GitMode,
-    GitObjectFormat, GitObjectId, GitPathListReadError, GitRefName, OrdinaryEntry,
-    PorcelainV2ParseError, PorcelainV2ParseErrorKind, PorcelainV2ReadError, PorcelainV2Status,
-    RenameOrCopy, RenamedOrCopiedEntry, StatusEntry, SubmoduleState, UnmergedEntry, XyStatus,
-    parse_git_path_list_reader, parse_status_porcelain_v2, parse_status_porcelain_v2_reader,
+    AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitError, GitErrorKind,
+    GitFileSet, GitMode, GitObjectFormat, GitObjectId, GitPathListReadError, GitRefName,
+    OrdinaryEntry, PorcelainV2ParseError, PorcelainV2ParseErrorKind, PorcelainV2ReadError,
+    PorcelainV2Status, RenameOrCopy, RenamedOrCopiedEntry, StatusEntry, SubmoduleState,
+    UnmergedEntry, XyStatus, parse_git_path_list_reader, parse_status_porcelain_v2,
+    parse_status_porcelain_v2_reader,
 };
 pub use inventory::{
     BoundedText, Inventory, InventoryEntry, InventoryError, InventoryKind, InventoryOptions,

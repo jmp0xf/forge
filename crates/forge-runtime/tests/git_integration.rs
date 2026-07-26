@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use forge_core::ports::GitPort as _;
-use forge_core::{BranchHead, BranchOid, GitObjectFormat, StatusEntry};
+use forge_core::{BranchHead, BranchOid, GitErrorKind, GitObjectFormat, StatusEntry};
 use forge_runtime::git::GitCli;
 use forge_runtime::inventory::{InventoryOptions, build_git_inventory};
 use forge_runtime::state::{AtomicStateStore, GitStateLayout};
@@ -336,7 +336,7 @@ fn non_repository_fails_closed_with_operation_context() -> Result<(), Box<dyn st
         .repository_root(directory.path())
         .err()
         .ok_or("non-repository path unexpectedly resolved to a repository")?;
-    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(error.kind(), GitErrorKind::NotRepository);
     assert!(error.to_string().contains("repository-root"));
     Ok(())
 }
@@ -359,10 +359,9 @@ fn status_preserves_a_non_utf8_worktree_path() -> Result<(), Box<dyn std::error:
 
     let git = GitCli::new();
     let status = git.status(&fixture.repository).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to read typed status for non-UTF-8 fixture: {error}"),
-        )
+        io::Error::other(format!(
+            "failed to read typed status for non-UTF-8 fixture: {error}"
+        ))
     })?;
     let found = status.entries.iter().any(|entry| match entry {
         StatusEntry::Untracked(path) => {
