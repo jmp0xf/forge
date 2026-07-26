@@ -669,6 +669,8 @@ impl EffectivePolicy {
 pub struct ProjectModel {
     pub schema: SchemaVersion,
     pub repository: RepoFacts,
+    pub repository_provenance: Vec<Provenance>,
+    pub repository_confidence: Confidence,
     pub units: Vec<ProjectUnit>,
     pub commands: BTreeMap<Intent, ResolvedCommandSet>,
     pub assets: AssetInventory,
@@ -728,13 +730,18 @@ impl ProjectModel {
     #[must_use]
     pub fn new(
         repository: RepoFacts,
+        mut repository_provenance: Vec<Provenance>,
+        repository_confidence: Confidence,
         assets: AssetInventory,
         adapters: AdapterInventory,
         policy: EffectivePolicy,
     ) -> Self {
+        canonicalize_provenance(&mut repository_provenance);
         Self {
             schema: SchemaVersion::for_kind(SchemaKind::ProjectModel),
             repository,
+            repository_provenance,
+            repository_confidence,
             units: Vec::new(),
             commands: BTreeMap::new(),
             assets,
@@ -747,6 +754,7 @@ impl ProjectModel {
 
     /// Canonicalizes unordered discovery output while preserving command execution order.
     pub fn canonicalize(&mut self) {
+        canonicalize_provenance(&mut self.repository_provenance);
         for unit in &mut self.units {
             unit.members.sort();
             unit.members.dedup();
@@ -856,6 +864,8 @@ impl ProjectModel {
                 }
             }
         }
+
+        validate_provenance("repository.provenance", &self.repository_provenance)?;
 
         let mut unit_ids = BTreeSet::new();
         for unit in &self.units {
@@ -1077,6 +1087,8 @@ mod tests {
         };
         let mut model = ProjectModel::new(
             repository,
+            vec![provenance("repository/detection")],
+            Confidence::High,
             AssetInventory::new(
                 Vec::new(),
                 vec![provenance("inventory/assets")],
@@ -1509,6 +1521,15 @@ mod tests {
     #[test]
     fn project_model_finalize_requires_complete_provenance()
     -> Result<(), Box<dyn std::error::Error>> {
+        let mut repository_empty = valid_model();
+        repository_empty.repository_provenance.clear();
+        assert_eq!(
+            repository_empty.finalize(),
+            Err(ProjectModelError::EmptyProvenance {
+                location: "repository.provenance".into(),
+            })
+        );
+
         let mut empty = valid_model();
         empty.commands.insert(
             Intent::Setup,
