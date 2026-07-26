@@ -12,6 +12,7 @@ name = "forge"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 forge-core = { path = "../forge-core" }

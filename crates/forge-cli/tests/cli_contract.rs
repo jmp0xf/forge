@@ -96,6 +96,24 @@ impl TestWorkspace {
         Ok(fixture)
     }
 
+    fn clean_runner_repository(label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let fixture = Self::plain(label)?;
+        fixture.run_git(&["init", "--quiet"])?;
+        fs::write(fixture.worktree.join("Makefile"), STATIC_MAKEFILE)?;
+        fixture.run_git(&["add", "--", "Makefile"])?;
+        fixture.run_git(&[
+            "-c",
+            "user.name=Forge CLI tests",
+            "-c",
+            "user.email=forge-cli-tests@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture baseline",
+        ])?;
+        Ok(fixture)
+    }
+
     fn run_forge(&self, arguments: &[&str]) -> Result<Output, Box<dyn std::error::Error>> {
         let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_forge"));
         command.current_dir(&self.worktree).args(arguments);
@@ -476,15 +494,120 @@ fn json_usage_error_never_pollutes_stdout() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn planned_command_reports_environment_unmet_without_claiming_behavior()
--> Result<(), Box<dyn std::error::Error>> {
-    let output = run(&["init"])?;
+fn init_defaults_to_a_deterministic_read_only_plan() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::zero_config_repository("init-dry-run")?;
+    let before = fixture.snapshot()?;
+
+    let first = fixture.run_forge(&["init", "--json"])?;
+    let second = fixture.run_forge(&["init", "--json"])?;
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(second.status.code(), Some(0));
+    assert!(first.stderr.is_empty());
+    assert!(second.stderr.is_empty());
+    assert_eq!(first.stdout, second.stdout);
+    let document: Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(document["schema"], "forge.init-plan/v1");
+    assert_eq!(document["ok"], true);
+    let edits = required_array(&document["data"], "edits")?;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0]["kind"], "create");
+    assert_eq!(edits[0]["path"]["display"], "AGENTS.md");
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!fixture.worktree.join("AGENTS.md").exists());
+    fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
+#[test]
+fn init_apply_rejects_dirty_state_without_writing() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::zero_config_repository("init-dirty-rejected")?;
+    let before = fixture.snapshot()?;
+
+    let output = fixture.run_forge(&["init", "--apply"])?;
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("error[FGE2001]"));
-    assert!(stderr.contains("not implemented"));
+    assert!(String::from_utf8(output.stderr)?.contains("error[FGE2205]"));
+    assert_eq!(fixture.snapshot()?, before);
+    assert!(!fixture.worktree.join("AGENTS.md").exists());
+    fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
+#[test]
+fn init_apply_is_brownfield_safe_and_second_plan_is_empty() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = TestWorkspace::clean_runner_repository("init-apply")?;
+    let makefile_before = fs::read(fixture.worktree.join("Makefile"))?;
+
+    let applied = fixture.run_forge(&["init", "--apply", "--json"])?;
+
+    assert_eq!(applied.status.code(), Some(0));
+    assert!(applied.stderr.is_empty());
+    let applied_document: Value = serde_json::from_slice(&applied.stdout)?;
+    assert_eq!(applied_document["schema"], "forge.init-plan/v1");
+    assert_eq!(required_array(&applied_document["data"], "edits")?.len(), 1);
+    let agents = fs::read_to_string(fixture.worktree.join("AGENTS.md"))?;
+    assert!(agents.contains("<!-- forge:begin block=project-index schema=1"));
+    assert!(agents.contains("## Project-native commands"));
+    assert_eq!(
+        fs::read(fixture.worktree.join("Makefile"))?,
+        makefile_before
+    );
+    assert!(!fixture.worktree.join("explain-must-not-run").exists());
+
+    let second = fixture.run_forge(&["init", "--json"])?;
+    assert_eq!(second.status.code(), Some(0));
+    assert!(second.stderr.is_empty());
+    let second_document: Value = serde_json::from_slice(&second.stdout)?;
+    assert!(required_array(&second_document["data"], "edits")?.is_empty());
+
+    let second_apply = fixture.run_forge(&["init", "--apply", "--allow-dirty", "--json"])?;
+    assert_eq!(second_apply.status.code(), Some(0));
+    let second_apply_document: Value = serde_json::from_slice(&second_apply.stdout)?;
+    assert!(required_array(&second_apply_document["data"], "edits")?.is_empty());
+    assert_eq!(
+        fs::read_to_string(fixture.worktree.join("AGENTS.md"))?,
+        agents
+    );
+    Ok(())
+}
+
+#[test]
+fn init_allow_dirty_preserves_existing_unmanaged_agents_text()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::zero_config_repository("init-brownfield-dirty")?;
+    let existing = b"# Human-owned guidance\n\nKeep this paragraph byte-for-byte.\n";
+    fs::write(fixture.worktree.join("AGENTS.md"), existing)?;
+
+    let output = fixture.run_forge(&["init", "--apply", "--allow-dirty", "--json"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let observed = fs::read(fixture.worktree.join("AGENTS.md"))?;
+    assert!(observed.starts_with(existing));
+    assert!(String::from_utf8_lossy(&observed).contains("forge:begin block=project-index"));
+    assert!(!fixture.worktree.join("explain-must-not-run").exists());
+    Ok(())
+}
+
+#[test]
+fn init_empty_repository_is_a_structured_environment_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::plain("init-empty")?;
+    fixture.run_git(&["init", "--quiet"])?;
+    let before = fixture.snapshot()?;
+
+    let output = fixture.run_forge(&["init", "--json"])?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["schema"], "forge.diagnostic/v1");
+    assert_eq!(structured_diagnostic_code(&document)?, "FGE2209");
+    assert_eq!(fixture.snapshot()?, before);
+    fixture.assert_no_forge_artifacts();
     Ok(())
 }
 

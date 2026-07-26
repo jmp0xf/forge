@@ -4,6 +4,8 @@
 
 mod args;
 mod explain;
+mod init;
+mod init_wire;
 
 use std::env;
 use std::ffi::OsStr;
@@ -13,7 +15,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use args::{Cli, Command, OutputFormat};
+use args::{Cli, Command, InitArgs, OutputFormat};
 use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
 use forge_core::branding::CLI_NAME;
 use forge_core::{AppError, ExitCode};
@@ -119,9 +121,33 @@ fn execute(cli: Cli, context: &ExecutionContext) -> Result<ExitCode, AppError> {
             );
             Ok(ExitCode::Ok)
         }
+        Some(Command::Init(args)) => emit_init(&cli, args, context, json),
         Some(Command::Explain) => emit_explain(&cli, context, json),
         Some(command) => Err(not_implemented_error(command)),
     }
+}
+
+fn emit_init(
+    cli: &Cli,
+    args: &InitArgs,
+    context: &ExecutionContext,
+    json: bool,
+) -> Result<ExitCode, AppError> {
+    let outcome = init::execute(cli, args, context.cancellation_flag()).map_err(|failure| {
+        let (error, _partial_apply_report) = failure.into_parts();
+        error
+    })?;
+    let exit_code = detection_exit_code(outcome.completion);
+    if json {
+        emit_json(&Envelope::success(
+            SchemaKind::InitPlan,
+            TOOL_VERSION,
+            outcome.wire.clone(),
+        ))?;
+    } else {
+        write_stdout(format_args!("{}", init::render_human(&outcome)))?;
+    }
+    Ok(exit_code)
 }
 
 fn emit_explain(cli: &Cli, context: &ExecutionContext, json: bool) -> Result<ExitCode, AppError> {
@@ -195,6 +221,7 @@ fn emit_version(json: bool) -> Result<(), AppError> {
                 String::from("version"),
                 String::from("schema"),
                 String::from("completions"),
+                String::from("init"),
                 String::from("explain"),
             ],
         };
@@ -244,12 +271,11 @@ fn print_help() -> Result<(), AppError> {
 
 fn not_implemented_error(command: &Command) -> AppError {
     let name = match command {
-        Command::Init(_) => "init",
+        Command::Init(_) | Command::Explain => "implemented-command",
         Command::Doctor => "doctor",
         Command::Next => "next",
         Command::Evidence(_) => "evidence",
         Command::Adapters(_) => "adapters",
-        Command::Explain => "explain",
         Command::Schema(_) | Command::Version | Command::Completions(_) => "implemented-command",
     };
     AppError::environment_unmet(
