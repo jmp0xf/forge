@@ -31,5 +31,6 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0015](0015-isolate-worktree-state-and-share-only-content-addressed-cache.md) | Accepted | worktree 状态隔离，只共享内容寻址缓存 |
 | [0016](0016-use-dependency-based-evidence-invalidation.md) | Accepted | Evidence 按依赖变化失效 |
 | [0017](0017-do-not-generate-runner-ci-or-organization-docs-by-default.md) | Accepted | 默认不生成 runner、CI 或组织文档 |
+| [0018](0018-derive-local-repository-identity-from-git-common-dir.md) | Accepted | 从 Git common-dir 派生本地仓库身份 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。
