@@ -9,6 +9,7 @@ pub mod context;
 pub mod doctor;
 pub mod domain;
 pub mod error;
+pub mod evidence;
 pub mod git;
 pub mod inventory;
 pub mod navigation;
