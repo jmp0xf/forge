@@ -403,6 +403,7 @@ fn cargo_metadata_exec_spec(manifest: &RepoRelativePath, timeout: Duration) -> E
             OsString::from("metadata"),
             OsString::from("--format-version=1"),
             OsString::from("--no-deps"),
+            OsString::from("--locked"),
             OsString::from("--manifest-path"),
             manifest_argument,
         ],
@@ -416,7 +417,7 @@ fn cargo_metadata_exec_spec(manifest: &RepoRelativePath, timeout: Duration) -> E
         stderr: OutputPolicy::CaptureBounded {
             max_bytes: CARGO_METADATA_CAPTURE_LIMIT_BYTES,
         },
-        mutability: Mutability::Unknown,
+        mutability: Mutability::ReadOnly,
         network: NetworkIntent::OfflineRequested,
         concurrency_key: Some(String::from("cargo-metadata")),
     }
@@ -1365,6 +1366,7 @@ mod tests {
                 "metadata",
                 "--format-version=1",
                 "--no-deps",
+                "--locked",
                 "--manifest-path",
                 "Cargo.toml"
             ]
@@ -1373,7 +1375,7 @@ mod tests {
         assert_eq!(specs[0].timeout, Duration::from_secs(17));
         assert_eq!(specs[0].stdin, StdinPolicy::Closed);
         assert_eq!(specs[0].network, NetworkIntent::OfflineRequested);
-        assert_eq!(specs[0].mutability, Mutability::Unknown);
+        assert_eq!(specs[0].mutability, Mutability::ReadOnly);
         assert_eq!(
             specs[0]
                 .env
