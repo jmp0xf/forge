@@ -1,0 +1,22 @@
+[package]
+name = "forge-cli"
+description = "Forge command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-detect = { path = "../forge-detect" }
+forge-render = { path = "../forge-render" }
+forge-runtime = { path = "../forge-runtime" }
+forge-schema = { path = "../forge-schema" }
+
+[lints]
+workspace = true
