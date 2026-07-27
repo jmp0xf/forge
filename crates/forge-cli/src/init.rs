@@ -21,7 +21,7 @@ use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError};
-use forge_schema::{Diagnostic, InitPlanData, Severity};
+use forge_schema::{Diagnostic, DoctorData, InitPlanData, Severity};
 
 use crate::adapter_manifest::{
     AdapterManifest, AdapterManifestError, GeneratedManifestError, load_adapter_manifest,
@@ -335,7 +335,7 @@ pub(crate) fn execute_with_manifest_precondition_controlled(
     checkpoint_after_apply(control, "init post-apply doctor", &report)?;
     let postdoctor = doctor::execute_postcheck_controlled(cli, &postcheck, control)
         .map_err(|error| InitFailure::after_apply(error, report.clone()))?;
-    ensure_generated_state_postdoctor(&postdoctor, &report)?;
+    ensure_generated_state_postdoctor(&postdoctor.wire, &report)?;
     if control.checkpoint().is_ok() {
         explain::publish_inventory_cache_after_state_write(&preapply);
     }
@@ -483,11 +483,10 @@ const fn intent_name(intent: Intent) -> &'static str {
 }
 
 fn ensure_generated_state_postdoctor(
-    outcome: &doctor::DoctorOutcome,
+    outcome: &DoctorData,
     report: &ApplyReport,
 ) -> Result<(), InitFailure> {
     let failed = outcome
-        .wire
         .checks
         .iter()
         .filter(|check| {
@@ -1211,13 +1210,19 @@ pub(crate) fn sanitize_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     use forge_core::{AppError, ExitCode, RepoRelativePath, WorkState};
+    use forge_detect::model::ModelDetectionCompletion;
     use forge_render::{ApplyReport, ManagedBlockKind, PlanError, RunnerRenderError, RunnerTarget};
-    use forge_schema::{Diagnostic, Severity};
+    use forge_runtime::control::OperationBudget;
+    use forge_schema::{CheckStatusData, Diagnostic, DoctorCheckData, DoctorData, Severity};
 
     use super::{
-        display_repository_path, ensure_work_state_can_apply, map_plan_error_app,
+        checkpoint_after_apply, display_repository_path, ensure_generated_state_postdoctor,
+        ensure_postcheck_completed, ensure_work_state_can_apply, map_plan_error_app,
         parse_force_blocks, render_postimage, sanitize_text, validate_request, with_apply_report,
     };
     use crate::args::{CiChoice, InitArgs, RunnerChoice};
@@ -1248,6 +1253,145 @@ mod tests {
         assert!(error.diagnostic().why.contains("apply report:"));
         assert!(error.diagnostic().why.contains("unwritten=[AGENTS.md]"));
         Ok(())
+    }
+
+    #[test]
+    fn generated_state_postdoctor_rejects_only_critical_generated_checks()
+    -> Result<(), Box<dyn Error>> {
+        let report = apply_report_fixture()?;
+        for id in ["state.layout", "adapters.drift", "path.safety"] {
+            let doctor = doctor_data(vec![doctor_check(id, CheckStatusData::Fail)]);
+            let failure = match ensure_generated_state_postdoctor(&doctor, &report) {
+                Ok(()) => {
+                    return Err(format!("critical post-doctor failure `{id}` was accepted").into());
+                }
+                Err(failure) => failure,
+            };
+            let (error, observed_report) = failure.into_parts();
+            assert_eq!(error.exit_code(), ExitCode::Internal);
+            assert_eq!(error.diagnostic().code.as_str(), "FGE0215");
+            assert_eq!(error.diagnostic().location, "init post-doctor");
+            assert!(
+                error
+                    .diagnostic()
+                    .why
+                    .contains(&format!("failed checks: {id}"))
+            );
+            assert_eq!(observed_report, Some(report.clone()));
+        }
+
+        let non_terminal = doctor_data(vec![
+            doctor_check("state.layout", CheckStatusData::Pass),
+            doctor_check("adapters.drift", CheckStatusData::Unknown),
+            doctor_check("path.safety", CheckStatusData::Pass),
+            doctor_check("ci.visible", CheckStatusData::Fail),
+        ]);
+        ensure_generated_state_postdoctor(&non_terminal, &report)?;
+
+        let ordered = doctor_data(vec![
+            doctor_check("state.layout", CheckStatusData::Fail),
+            doctor_check("adapters.drift", CheckStatusData::Fail),
+            doctor_check("path.safety", CheckStatusData::Fail),
+        ]);
+        let failure = match ensure_generated_state_postdoctor(&ordered, &report) {
+            Ok(()) => return Err("multiple critical post-doctor failures were accepted".into()),
+            Err(failure) => failure,
+        };
+        assert!(
+            failure
+                .into_parts()
+                .0
+                .diagnostic()
+                .why
+                .contains("failed checks: state.layout, adapters.drift, path.safety")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_apply_completion_and_checkpoints_preserve_write_progress() -> Result<(), Box<dyn Error>>
+    {
+        let report = apply_report_fixture()?;
+        ensure_postcheck_completed(ModelDetectionCompletion::Complete, &report)?;
+        ensure_postcheck_completed(ModelDetectionCompletion::Partial, &report)?;
+
+        for (completion, exit_code, code) in [
+            (
+                ModelDetectionCompletion::TimedOut,
+                ExitCode::Timeout,
+                "FGE2207",
+            ),
+            (
+                ModelDetectionCompletion::Interrupted,
+                ExitCode::Interrupted,
+                "FGE2208",
+            ),
+        ] {
+            let failure = match ensure_postcheck_completed(completion, &report) {
+                Ok(()) => {
+                    return Err(format!("terminal post-check `{completion:?}` was accepted").into());
+                }
+                Err(failure) => failure,
+            };
+            assert_post_apply_failure(failure, &report, exit_code, code)?;
+        }
+
+        let expired = OperationBudget::until(Instant::now(), Arc::new(AtomicBool::new(false)));
+        let failure = match checkpoint_after_apply(&expired, "fixture checkpoint", &report) {
+            Ok(()) => return Err("expired post-apply checkpoint was accepted".into()),
+            Err(failure) => failure,
+        };
+        assert_post_apply_failure(failure, &report, ExitCode::Timeout, "FGE2004")?;
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let interrupted = OperationBudget::unlimited(Arc::clone(&cancellation));
+        cancellation.store(true, Ordering::Release);
+        let failure = match checkpoint_after_apply(&interrupted, "fixture checkpoint", &report) {
+            Ok(()) => return Err("interrupted post-apply checkpoint was accepted".into()),
+            Err(failure) => failure,
+        };
+        assert_post_apply_failure(failure, &report, ExitCode::Interrupted, "FGE2005")?;
+        Ok(())
+    }
+
+    fn assert_post_apply_failure(
+        failure: super::InitFailure,
+        report: &ApplyReport,
+        exit_code: ExitCode,
+        code: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let (error, observed_report) = failure.into_parts();
+        assert_eq!(error.exit_code(), exit_code);
+        assert_eq!(error.diagnostic().code.as_str(), code);
+        assert!(error.diagnostic().why.contains("apply report:"));
+        assert_eq!(observed_report.as_ref(), Some(report));
+        Ok(())
+    }
+
+    fn apply_report_fixture() -> Result<ApplyReport, Box<dyn Error>> {
+        Ok(ApplyReport {
+            written: Vec::new(),
+            unwritten: vec![RepoRelativePath::new("AGENTS.md")?],
+        })
+    }
+
+    fn doctor_data(checks: Vec<DoctorCheckData>) -> DoctorData {
+        DoctorData {
+            overall: CheckStatusData::Unknown,
+            checks,
+            tool_versions: std::collections::BTreeMap::new(),
+            assumptions: Vec::new(),
+        }
+    }
+
+    fn doctor_check(id: &str, status: CheckStatusData) -> DoctorCheckData {
+        DoctorCheckData {
+            id: String::from(id),
+            status,
+            skip_reason: None,
+            detail: String::from("fixture detail"),
+            next: String::from("fixture next action"),
+        }
     }
 
     #[test]
