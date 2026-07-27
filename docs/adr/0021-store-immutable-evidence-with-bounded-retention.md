@@ -26,9 +26,18 @@ v0 使用以下 worktree 私有布局：
 └── logs/v1/<digest>.log         # optional immutable bounded logs
 ```
 
-Receipt/Evidence public ID 使用带 domain 的 BLAKE3 identity；文件名只使用经过校验的 64 位小写
-hex payload。identity 覆盖除自身 ID 外的完整 canonical body，包括时间和 observation，因此不同
-执行不会因命令和 scope 相同而覆盖历史。
+Receipt/Evidence public ID 分别使用 `receipt:blake3:<64-lowercase-hex>` 和
+`evidence:blake3:<64-lowercase-hex>`；文件名只使用经过校验的 64 位小写 hex payload。identity
+输入通过 `Blake3Hasher::digest_chunks([domain, canonical_json])` 计算，domain 分别为
+`forge.receipt-identity/v1`、`forge.evidence-identity/v1`，并覆盖
+移除 `data.id` 后的完整 JSON 信封，包括时间、observation 和同 major 的未知字段。canonical JSON
+递归按对象键的 UTF-8 字节排序、保留数组顺序，并使用无额外空白的 UTF-8 JSON 编码。读取时先
+验证支持的 schema 与 required 字段，再从原始 JSON 值重算 identity；不能通过重新序列化已知字段
+而丢弃同 major 的未知字段。
+
+若显式保存日志，文件名 payload 通过
+`Blake3Hasher::digest_chunks(["forge.log-identity/v1", complete_redacted_log_bytes])` 计算；日志没有可
+覆盖的 public ID 字段。默认 `log_refs` 为空。
 
 写入必须在 worktree lock 下通过 `store_new_atomic` 完成：
 
