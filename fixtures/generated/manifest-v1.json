@@ -2,7 +2,7 @@
   "schema": 1,
   "generator_protocol": 1,
   "source_manifest": "../definitions/manifest-v1.json",
-  "source_manifest_identity": "blake3:0310213e942bb103d1f3a949b0cb9a09e7e234a557870e0529ac944c0f98f05b",
+  "source_manifest_identity": "blake3:4d76ce45968b2bdb9794d2f87bb3b2e739cdb2d1541e43691b1b0718cd9d475a",
   "fixtures": [
     {
       "id": "brownfield-adapters",
@@ -760,13 +760,23 @@
       "files": [
         {
           "path": "Cargo.toml",
-          "bytes": 118,
-          "blake3": "blake3:51506a8bf43f3e83d57c6768a4e0f3d5e2ab49fde55aabd1beaaadcec29fde44"
+          "bytes": 186,
+          "blake3": "blake3:fe262ae312b067796ffe6e4931cdc957f0fe0218b6483135ef20b7860276615a"
         },
         {
           "path": "src/lib.rs",
-          "bytes": 150,
-          "blake3": "blake3:39dd593168dc5daa87f84b9b9088f272db83adf9f658e07ad5d6f9d806a7d85b"
+          "bytes": 186,
+          "blake3": "blake3:9e4db419890fe31eac0431b092834dd2379b45556c46cf59c765d1e899fc092f"
+        },
+        {
+          "path": "support/Cargo.toml",
+          "bytes": 126,
+          "blake3": "blake3:e9359bf51ddb98c90dcce2ab78e0a232abcc85543543721a09fa568629272ce4"
+        },
+        {
+          "path": "support/src/lib.rs",
+          "bytes": 33,
+          "blake3": "blake3:c9b80e76f6b0af933186a5aa387e195aede4aa3e533c49ac1ad65582e239abce"
         }
       ]
     },

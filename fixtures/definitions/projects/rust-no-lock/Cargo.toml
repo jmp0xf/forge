@@ -6,3 +6,6 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+fixture-rust-no-lock-support = { path = "support" }

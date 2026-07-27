@@ -316,7 +316,9 @@
       ],
       "files": [
         "Cargo.toml",
-        "src/lib.rs"
+        "src/lib.rs",
+        "support/Cargo.toml",
+        "support/src/lib.rs"
       ]
     },
     {

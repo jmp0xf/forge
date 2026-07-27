@@ -1,5 +1,5 @@
 pub fn answer() -> u8 {
-    42
+    fixture_rust_no_lock_support::answer()
 }
 
 #[cfg(test)]

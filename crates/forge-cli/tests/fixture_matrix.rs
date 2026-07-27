@@ -78,7 +78,7 @@ fn public_manifest_contains_the_exact_v0_matrix_without_forge_owned_project_comm
 }
 
 #[test]
-fn rust_package_without_a_lockfile_uses_metadata_without_writing_one()
+fn rust_package_with_a_path_dependency_uses_metadata_without_writing_a_lockfile()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureWorkspace::from_generated("rust-no-lock")?;
     let lockfile = fixture.worktree.join("Cargo.lock");
@@ -104,20 +104,33 @@ fn rust_package_without_a_lockfile_uses_metadata_without_writing_one()
 
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let units = required_array(&document["data"], "units")?;
-    assert_eq!(units.len(), 1);
-    assert_eq!(units[0]["display_name"], "fixture-rust-no-lock");
-    assert_eq!(units[0]["language"], "rust");
+    let mut display_names = BTreeSet::new();
+    for unit in units {
+        let display_name = unit["display_name"]
+            .as_str()
+            .ok_or("Rust unit omitted display_name")?;
+        assert!(display_names.insert(display_name));
+        assert_eq!(unit["language"], "rust");
+    }
+    assert_eq!(
+        display_names,
+        ["fixture-rust-no-lock", "fixture-rust-no-lock-support",]
+            .into_iter()
+            .collect()
+    );
 
     let unit_details = required_array(&document["data"], "unit_details")?;
-    assert_eq!(unit_details.len(), 1);
-    let derivation = &unit_details[0]["derivation_evidence"];
-    assert_eq!(derivation["confidence"], "high");
-    assert!(
-        required_array(derivation, "provenance")?
-            .iter()
-            .any(|source| source["rule_id"] == "rust.cargo-metadata-v1"),
-        "the Rust unit came from static fallback instead of validated cargo metadata"
-    );
+    assert_eq!(unit_details.len(), 2);
+    for unit_detail in unit_details {
+        let derivation = &unit_detail["derivation_evidence"];
+        assert_eq!(derivation["confidence"], "high");
+        assert!(
+            required_array(derivation, "provenance")?
+                .iter()
+                .any(|source| source["rule_id"] == "rust.cargo-metadata-v1"),
+            "a Rust unit came from static fallback instead of validated cargo metadata"
+        );
+    }
     Ok(())
 }
 
