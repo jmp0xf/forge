@@ -12,8 +12,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use forge_core::Digest;
+use forge_core::evidence::DependencyValue;
+use forge_core::fingerprint::environment_dependency_digest;
 use forge_core::ports::{
-    DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, ProcessError, ProcessErrorKind,
+    DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, Hasher, ProcessError, ProcessErrorKind,
     ProcessObservation, ProcessPort, StdinPolicy,
 };
 
@@ -25,6 +27,31 @@ pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = DEFAULT_CAPTURE_LIMIT_BYTES;
 /// The spool keeps large machine-readable output off the heap, but remains explicitly bounded so
 /// an unexpectedly large child cannot consume unbounded local disk space.
 pub const DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Fingerprints the exact sanitized environment that the runner would supply to `spec`.
+///
+/// Raw values never leave this boundary. Privacy-unsafe names and invalid process environment
+/// entries become a typed process error, so callers can record an unknown dependency while still
+/// deciding separately whether executing the observation is allowed.
+pub fn process_environment_dependency_digest<H: Hasher + ?Sized>(
+    spec: &ExecSpec,
+    hasher: &H,
+) -> Result<DependencyValue<Digest>, ProcessError> {
+    let environment = sanitized_environment(std::env::vars_os(), &spec.env).map_err(|error| {
+        ProcessError::new(
+            ProcessErrorKind::InvalidEnvironment,
+            "build command environment fingerprint",
+            error,
+        )
+    })?;
+    environment_dependency_digest(hasher, &environment).map_err(|error| {
+        ProcessError::new(
+            ProcessErrorKind::InvalidEnvironment,
+            "fingerprint command environment",
+            io::Error::new(io::ErrorKind::InvalidInput, error),
+        )
+    })
+}
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -1467,7 +1494,7 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::error::Error;
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
@@ -1480,6 +1507,7 @@ mod tests {
 
     use forge_core::RepoRelativePath;
     use forge_core::domain::{CommandSource, CommandSpec, Intent};
+    use forge_core::evidence::DependencyValue;
     use forge_core::ports::{
         EnvPolicy, ExecSpec, OutputPolicy, ProcessErrorKind, ProcessPort as _,
     };
@@ -1488,8 +1516,9 @@ mod tests {
     use super::{
         DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SynchronousProcessRunner, TerminationMode,
         drain_bounded, is_windows_batch_program, platform, private_anonymous_tempfile,
-        sanitized_environment,
+        process_environment_dependency_digest, sanitized_environment,
     };
+    use crate::hash::Blake3Hasher;
 
     const PROCESS_TREE_FIXTURE_MODE: &str = "FORGE_PROCESS_FIXTURE_MODE";
     const PROCESS_TREE_FIXTURE_HEARTBEAT: &str = "FORGE_PROCESS_FIXTURE_HEARTBEAT";
@@ -2147,6 +2176,48 @@ mod tests {
             let policy = EnvPolicy::minimal_with_overrides(restricted);
             assert!(sanitized_environment([], &policy).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn environment_fingerprint_uses_the_same_sanitized_process_map() -> Result<(), Box<dyn Error>> {
+        let mut first = spec("tool", &[]);
+        first.env = EnvPolicy {
+            inherit: BTreeSet::new(),
+            overrides: BTreeMap::from([(OsString::from("SAFE_FLAG"), OsString::from("first"))]),
+        };
+        let mut second = first.clone();
+        second
+            .env
+            .overrides
+            .insert(OsString::from("SAFE_FLAG"), OsString::from("second"));
+
+        let first = process_environment_dependency_digest(&first, &Blake3Hasher)?;
+        let second = process_environment_dependency_digest(&second, &Blake3Hasher)?;
+
+        assert!(matches!(first, DependencyValue::Known(_)));
+        assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn environment_fingerprint_rejects_secret_like_overrides_without_values_in_errors()
+    -> Result<(), Box<dyn Error>> {
+        let mut command = spec("tool", &[]);
+        command.env = EnvPolicy {
+            inherit: BTreeSet::new(),
+            overrides: BTreeMap::from([(
+                OsString::from("API_TOKEN"),
+                OsString::from("must-not-leak"),
+            )]),
+        };
+
+        let Err(error) = process_environment_dependency_digest(&command, &Blake3Hasher) else {
+            return Err("secret-like environment unexpectedly fingerprinted".into());
+        };
+        assert_eq!(error.kind(), ProcessErrorKind::InvalidEnvironment);
+        assert!(!error.to_string().contains("API_TOKEN"));
+        assert!(!error.to_string().contains("must-not-leak"));
         Ok(())
     }
 
