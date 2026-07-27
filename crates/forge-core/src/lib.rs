@@ -49,4 +49,7 @@ pub use policy::{
     EffectivePolicyContent, EvidenceRequirements, PathPattern, PolicyError, RiskLevel, RiskRule,
 };
 pub use risk::{RiskAssessment, RiskMatch, assess_risk, built_in_policy};
-pub use wire::{ProjectModelWireError, project_model_to_wire};
+pub use wire::{
+    ProjectModelWireError, command_detail_v2_to_wire, coverage_dimension_name, intent_to_wire,
+    project_model_to_wire,
+};

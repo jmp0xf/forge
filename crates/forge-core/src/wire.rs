@@ -7,11 +7,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use forge_schema::{
     AdapterData, AdapterDetailData, AdapterDriftData, AssetData, AssetDetailData, AssumptionData,
-    AssumptionDetailData, CommandData, CommandDetailData, CommandEnforcementData, CommandId,
-    CommandResolutionData, CommandSetData, CommandSourceData, ConfidenceData,
-    DerivationEvidenceData, IntentData, MutabilityData, NativeStringData, NativeStringEncodingData,
-    NetworkIntentData, ProjectModelData, ProjectUnitData, ProjectUnitDetailData, ProvenanceData,
-    SuccessPredicateData, TextRangeData, UnitDependencyDetailData, WirePath,
+    AssumptionDetailData, CommandData, CommandDetailData, CommandDetailV2Data,
+    CommandEnforcementData, CommandId, CommandResolutionData, CommandSetData, CommandSourceData,
+    ConfidenceData, DerivationEvidenceData, IntentData, MutabilityData, NativeStringData,
+    NativeStringEncodingData, NetworkIntentData, ProjectModelData, ProjectUnitData,
+    ProjectUnitDetailData, ProvenanceData, SuccessPredicateData, TextRangeData,
+    UnitDependencyDetailData, WirePath,
 };
 use thiserror::Error;
 
@@ -188,6 +189,25 @@ fn project_command_detail(
     })
 }
 
+/// Projects one authoritative command observation into the complete v2 wire representation.
+///
+/// This reuses the same lossless native-value and strict legacy-field checks as ProjectModel so a
+/// Receipt cannot silently describe a command differently from the command that was resolved.
+pub fn command_detail_v2_to_wire(
+    command: &CommandSpec,
+) -> Result<CommandDetailV2Data, ProjectModelWireError> {
+    let detail = project_command_detail(command)?;
+    Ok(CommandDetailV2Data {
+        command: detail.command,
+        native_program: detail.native_program,
+        native_args: detail.native_args,
+        native_environment_names: detail.native_environment_names,
+        source_detail: detail.source_detail,
+        enforcement: detail.enforcement,
+        success: detail.success,
+    })
+}
+
 fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWireError> {
     let program =
         command
@@ -233,7 +253,7 @@ fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWir
 
     Ok(CommandData {
         id: command.id.clone(),
-        intent: intent(command.intent),
+        intent: intent_to_wire(command.intent),
         program: program.to_owned(),
         args,
         cwd: WirePath::from_path(command.cwd.as_path()),
@@ -243,7 +263,11 @@ fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWir
         network: network(command.network),
         source: command_source_name(&command.source).to_owned(),
         confidence: confidence(command.confidence),
-        coverage: command.coverage.iter().map(coverage_name).collect(),
+        coverage: command
+            .coverage
+            .iter()
+            .map(coverage_dimension_name)
+            .collect(),
     })
 }
 
@@ -425,7 +449,7 @@ const fn intent_name(value: Intent) -> &'static str {
     }
 }
 
-const fn intent(value: Intent) -> IntentData {
+pub const fn intent_to_wire(value: Intent) -> IntentData {
     match value {
         Intent::Setup => IntentData::Setup,
         Intent::FormatCheck => IntentData::FormatCheck,
@@ -539,7 +563,7 @@ fn success_predicate(value: &SuccessPredicate) -> SuccessPredicateData {
     }
 }
 
-fn coverage_name(value: &CoverageDimension) -> String {
+pub fn coverage_dimension_name(value: &CoverageDimension) -> String {
     match value {
         CoverageDimension::Format => "format".to_owned(),
         CoverageDimension::Compile => "compile".to_owned(),
@@ -573,7 +597,9 @@ mod tests {
     };
     use crate::path::RepoRelativePath;
 
-    use super::{ProjectModelWireError, native_string_data, project_model_to_wire};
+    use super::{
+        ProjectModelWireError, command_detail_v2_to_wire, native_string_data, project_model_to_wire,
+    };
 
     fn provenance(rule_id: impl Into<String>) -> Provenance {
         let rule_id = rule_id.into();
@@ -739,6 +765,32 @@ mod tests {
         assert_eq!(sets["verify"].resolution, CommandResolutionData::Unknown);
         assert_eq!(sets["test"].candidates.len(), 1);
         assert_eq!(sets["verify"].candidates.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_command_projection_keeps_complete_execution_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = command("verify", Intent::Verify).with_args(["test", "--workspace"]);
+        command.env.insert("SAFE_FLAG".into(), "enabled".into());
+        command.timeout = Duration::from_secs(42);
+        command.mutability = Mutability::ReadOnly;
+        command.network = NetworkIntent::OfflineRequested;
+        command.enforcement = CommandEnforcement::Advisory;
+        command.success = SuccessPredicate::All(vec![
+            SuccessPredicate::ExitZero,
+            SuccessPredicate::ExitZeroAndStdoutEmpty,
+        ]);
+        command.coverage = BTreeSet::from([CoverageDimension::UnitTest]);
+
+        let wire = command_detail_v2_to_wire(&command)?;
+
+        assert_eq!(wire.command.id.as_str(), "verify");
+        assert_eq!(wire.command.timeout_seconds, 42);
+        assert_eq!(wire.native_args.len(), 2);
+        assert_eq!(wire.native_environment_names.len(), 1);
+        assert_eq!(wire.enforcement, CommandEnforcementData::Advisory);
+        assert_eq!(wire.command.coverage, ["unit-test"]);
         Ok(())
     }
 
