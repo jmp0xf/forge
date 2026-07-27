@@ -42,7 +42,7 @@ const WORKTREE_COMPARISON_PROTOCOL_VERSION: &str = "forge.worktree-comparison/v1
 const SCOPE_ACQUISITION_PROTOCOL_VERSION: &str = "forge.scope-acquisition/v1";
 const SCOPE_DIGEST_INPUT_VERSION: &str = "forge.scope-digest-input/v1";
 const SCOPE_DIGEST_DOMAIN: &[u8] = b"forge.scope-digest/v1";
-const ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION: &str = "forge.environment-fingerprint/v1";
+pub const ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION: &str = "forge.environment-fingerprint/v1";
 const EFFECTIVE_POLICY_DIGEST_DOMAIN: &[u8] = b"forge.effective-policy-digest/v1";
 const PROCESS_OUTPUT_DIGEST_DOMAIN: &[u8] = b"forge.process-output/v1\0";
 const COVERAGE_AGGREGATION_PROTOCOL_VERSION: &str = "forge.coverage-aggregation/v1";
@@ -192,11 +192,23 @@ pub fn toolchain_dependency_digest<H: Hasher + ?Sized>(
     hasher: &H,
     unit: &ProjectUnit,
 ) -> Result<DependencyValue<Digest>, FingerprintError> {
+    toolchain_info_dependency_digest(hasher, &unit.toolchain)
+}
+
+/// Digests authoritative toolchain facts independent of a project-unit container.
+///
+/// This is used by the execution boundary after it probes the exact command/toolchain binaries.
+/// Project-unit detection continues to call [`toolchain_dependency_digest`], which delegates here
+/// and therefore shares the same protocol and fail-closed rules.
+pub fn toolchain_info_dependency_digest<H: Hasher + ?Sized>(
+    hasher: &H,
+    toolchain: &ToolchainInfo,
+) -> Result<DependencyValue<Digest>, FingerprintError> {
     let ToolchainInfo {
         values,
         provenance,
         confidence,
-    } = &unit.toolchain;
+    } = toolchain;
     if *confidence == Confidence::Unknown
         || values.is_empty()
         || values
@@ -229,6 +241,35 @@ pub fn toolchain_dependency_digest<H: Hasher + ?Sized>(
     Ok(DependencyValue::Known(
         hasher.digest(&[TOOLCHAIN_DIGEST_DOMAIN, &encoder.finish()]),
     ))
+}
+
+/// Digests the exact sanitized environment supplied to one project command.
+///
+/// The caller must pass the post-allowlist, post-override map actually used by the process
+/// boundary. Native names and values are encoded losslessly and never returned. Secret-like or
+/// unclassifiable names fail closed so a low-entropy credential cannot leak through a reusable
+/// Receipt digest. A known empty environment remains a valid, distinct dependency.
+pub fn environment_dependency_digest<H: Hasher + ?Sized>(
+    hasher: &H,
+    environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<DependencyValue<Digest>, FingerprintError> {
+    validate_environment_privacy(environment)?;
+    let mut encoder = CanonicalEncoder::new("environment");
+    encoder.text("protocol-version", ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION);
+    let entries: Vec<_> = environment
+        .iter()
+        .map(|(name, value)| {
+            let mut entry = CanonicalEncoder::new("environment-entry");
+            entry.bytes("name", &canonical_native_os_bytes(name));
+            entry.bytes("value", &canonical_native_os_bytes(value));
+            entry.finish()
+        })
+        .collect();
+    encoder.sequence("entries", entries, |entry| entry);
+    Ok(DependencyValue::Known(hasher.digest(&[
+        b"forge.environment-digest/v1",
+        &encoder.finish(),
+    ])))
 }
 
 /// Aggregates the three execution dependency dimensions in command execution order.
@@ -1241,6 +1282,45 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn effective_environment_digest_is_known_empty_and_sensitive_to_names_and_values()
+    -> Result<(), Box<dyn Error>> {
+        let empty = environment_dependency_digest(&FixtureHasher, &BTreeMap::new())?;
+        let first = environment_dependency_digest(
+            &FixtureHasher,
+            &BTreeMap::from([(OsString::from("PATH"), OsString::from("/one"))]),
+        )?;
+        let second = environment_dependency_digest(
+            &FixtureHasher,
+            &BTreeMap::from([(OsString::from("PATH"), OsString::from("/two"))]),
+        )?;
+        let renamed = environment_dependency_digest(
+            &FixtureHasher,
+            &BTreeMap::from([(OsString::from("HOME"), OsString::from("/one"))]),
+        )?;
+
+        assert!(matches!(empty, DependencyValue::Known(_)));
+        assert_ne!(empty, first);
+        assert_ne!(first, second);
+        assert_ne!(first, renamed);
+        Ok(())
+    }
+
+    #[test]
+    fn effective_environment_digest_rejects_secret_like_names_before_hashing() {
+        let hasher = SpyHasher::default();
+        let environment = BTreeMap::from([(
+            OsString::from("API_TOKEN"),
+            OsString::from("must-not-be-digested"),
+        )]);
+
+        assert_eq!(
+            environment_dependency_digest(&hasher, &environment),
+            Err(FingerprintError::SecretLikeEnvironment)
+        );
+        assert_eq!(hasher.calls.get(), 0);
     }
 
     #[cfg(unix)]
