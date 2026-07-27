@@ -24,7 +24,9 @@ use forge_core::fingerprint::{
 };
 use forge_core::navigation::{NavigationIssue, ReceiptObservation};
 use forge_core::ports::{Clock, ExecSpec};
-use forge_core::scope::{PreparedScope, ScopeHead, scope_dependency_digest};
+use forge_core::scope::{
+    PreparedScope, ScopeHead, prepared_scope_dependency_digest, scope_dependency_digest,
+};
 use forge_core::{
     AppError, CommandSpec, Confidence, ExitCode, GitErrorKind, Intent, Mutability,
     OperationControl, OperationControlError, ProjectModel, RiskAssessment, RiskLevel, WorkState,
@@ -163,7 +165,6 @@ struct ReceiptAggregate {
 }
 
 struct RetainedReceiptEvaluation {
-    scope: PreparedScope,
     scope_digest: DependencyValue<forge_schema::Digest>,
     policy_base: DependencyValue<forge_schema::Digest>,
     layout: GitStateLayout,
@@ -204,14 +205,16 @@ fn execute_with_clock_controlled<C: Clock + ?Sized>(
     require_compatible_work_state(detected.model.repository.work_state)?;
 
     let git = configured_git_controlled(control);
-    let RetainedReceiptEvaluation {
+    let (
         scope,
-        scope_digest,
-        policy_base,
-        layout,
-        receipt_facts,
-        aggregate,
-    } = evaluate_retained_receipts_controlled(&detected, &git, control)?;
+        RetainedReceiptEvaluation {
+            scope_digest,
+            policy_base,
+            layout,
+            receipt_facts,
+            aggregate,
+        },
+    ) = evaluate_retained_receipts_controlled(&detected, &git, control)?;
     let hasher = Blake3Hasher;
     let codec = JsonEvidenceStateCodec;
 
@@ -405,7 +408,7 @@ pub(crate) fn navigation_receipts_controlled(
     }
 
     let git = configured_git_controlled(control);
-    let (retained, confirmed_scope) = if let Some(seed) = detected.navigation.scope_seed.as_ref() {
+    let retained = if let Some(seed) = detected.navigation.scope_seed.as_ref() {
         let candidate = prepare_repository_scope_candidate_controlled(
             &detected.model.repository.root,
             &seed.status,
@@ -415,31 +418,37 @@ pub(crate) fn navigation_receipts_controlled(
         .map_err(map_scope_error)?;
         let retained = evaluate_retained_receipts_with_scope_controlled(
             detected,
-            candidate.prepared_scope().clone(),
+            candidate.prepared_scope(),
             control,
         )?;
+        // Receipt evaluation above may read mutable private state and run toolchain probes. Keep
+        // this confirmation after every dependent read. A successful confirmation returns the
+        // exact scope already digested by the evaluator, so recomputing or comparing it is
+        // redundant.
         let confirmed_scope = candidate
             .confirm_controlled(&git, control)
             .map_err(map_scope_confirmation_error)?;
-        (retained, confirmed_scope)
+        require_same_detection_baseline(&detected.model, &confirmed_scope)?;
+        retained
     } else {
-        let retained = evaluate_retained_receipts_controlled(detected, &git, control)?;
+        let (retained_scope, retained) =
+            evaluate_retained_receipts_controlled(detected, &git, control)?;
         let confirmed_scope =
             acquire_repository_scope_controlled(&git, &detected.model.repository.root, control)
                 .map_err(map_scope_confirmation_error)?;
-        (retained, confirmed_scope)
+        require_same_detection_baseline(&detected.model, &confirmed_scope)?;
+        let confirmed_scope_digest = DependencyValue::Known(prepared_scope_dependency_digest(
+            &Blake3Hasher,
+            &confirmed_scope,
+        ));
+        require_stable_scope(
+            &retained_scope,
+            &retained.scope_digest,
+            &confirmed_scope,
+            &confirmed_scope_digest,
+        )?;
+        retained
     };
-    require_same_detection_baseline(&detected.model, &confirmed_scope)?;
-    let confirmed_scope_digest = scope_dependency_digest(
-        &Blake3Hasher,
-        &DependencyValue::Known(confirmed_scope.clone()),
-    );
-    require_stable_scope(
-        &retained.scope,
-        &retained.scope_digest,
-        &confirmed_scope,
-        &confirmed_scope_digest,
-    )?;
     let observation = ReceiptObservation::current(
         requirements_are_complete(
             detected,
@@ -473,21 +482,22 @@ fn evaluate_retained_receipts_controlled(
     detected: &explain::DetectedProject,
     git: &GitCli,
     control: &OperationBudget,
-) -> Result<RetainedReceiptEvaluation, AppError> {
+) -> Result<(PreparedScope, RetainedReceiptEvaluation), AppError> {
     let scope = acquire_repository_scope_controlled(git, &detected.model.repository.root, control)
         .map_err(map_scope_error)?;
-    evaluate_retained_receipts_with_scope_controlled(detected, scope, control)
+    let retained = evaluate_retained_receipts_with_scope_controlled(detected, &scope, control)?;
+    Ok((scope, retained))
 }
 
 fn evaluate_retained_receipts_with_scope_controlled(
     detected: &explain::DetectedProject,
-    scope: PreparedScope,
+    scope: &PreparedScope,
     control: &OperationBudget,
 ) -> Result<RetainedReceiptEvaluation, AppError> {
-    require_same_detection_baseline(&detected.model, &scope)?;
+    require_same_detection_baseline(&detected.model, scope)?;
 
     let hasher = Blake3Hasher;
-    let scope_digest = scope_dependency_digest(&hasher, &DependencyValue::Known(scope.clone()));
+    let scope_digest = DependencyValue::Known(prepared_scope_dependency_digest(&hasher, scope));
     let policy = policy_dependency(
         &detected.model,
         detected.navigation.policy_base_completeness,
@@ -530,7 +540,6 @@ fn evaluate_retained_receipts_with_scope_controlled(
     )
     .map_err(map_state_error)?;
     Ok(RetainedReceiptEvaluation {
-        scope,
         scope_digest,
         policy_base,
         layout: evidence_layout(detected),

@@ -94,7 +94,7 @@ fn retained_scope_candidate_matches_fresh_acquisition() -> Result<(), Box<dyn st
 }
 
 #[test]
-fn retained_scope_candidate_rejects_later_repository_or_dirty_content_changes()
+fn retained_scope_candidate_rejects_repository_or_same_status_dirty_content_changes()
 -> Result<(), Box<dyn std::error::Error>> {
     let repository = repository()?;
     let git_cli = GitCli::new();
@@ -112,6 +112,16 @@ fn retained_scope_candidate_rejects_later_repository_or_dirty_content_changes()
     let dirty_index = git_cli.index_entries(&root)?;
     let dirty_candidate = prepare_repository_scope_candidate(&root, &dirty_status, &dirty_index)?;
     fs::write(root.join("tracked.txt"), b"second dirty value\n")?;
+    assert_eq!(
+        git_cli.status(&root)?,
+        dirty_status,
+        "changing one already-dirty file must preserve porcelain status"
+    );
+    assert_eq!(
+        git_cli.index_entries(&root)?,
+        dirty_index,
+        "changing only worktree bytes must preserve the index"
+    );
     assert!(matches!(
         dirty_candidate.confirm(&git_cli),
         Err(ScopeAcquisitionError::WorktreePathChanged { .. })

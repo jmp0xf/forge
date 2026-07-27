@@ -307,6 +307,22 @@ pub enum ScopeDigestError {
     ObjectFormatMismatch,
 }
 
+/// Computes the canonical digest of one complete prepared scope without taking ownership.
+///
+/// A [`PreparedScope`] can be large. Callers that already proved acquisition completeness can use
+/// this borrowed form to bind the scope into multiple checks without cloning its entries.
+#[must_use]
+pub fn prepared_scope_dependency_digest<H: Hasher + ?Sized>(
+    hasher: &H,
+    scope: &PreparedScope,
+) -> Digest {
+    let mut encoder = CanonicalEncoder::new("scope");
+    encoder.text("format-version", SCOPE_DIGEST_INPUT_VERSION);
+    encoder.bytes("head", &encode_head(&scope.head));
+    encoder.sequence("entries", &scope.entries, encode_entry);
+    hasher.digest(&[SCOPE_DIGEST_DOMAIN, &encoder.finish()])
+}
+
 /// Computes the canonical dependency digest only for a complete prepared scope.
 ///
 /// `Unknown` is returned without invoking `Hasher`, making it impossible for an I/O caller to
@@ -320,11 +336,7 @@ pub fn scope_dependency_digest<H: Hasher + ?Sized>(
         return DependencyValue::Unknown;
     };
 
-    let mut encoder = CanonicalEncoder::new("scope");
-    encoder.text("format-version", SCOPE_DIGEST_INPUT_VERSION);
-    encoder.bytes("head", &encode_head(&scope.head));
-    encoder.sequence("entries", &scope.entries, encode_entry);
-    DependencyValue::Known(hasher.digest(&[SCOPE_DIGEST_DOMAIN, &encoder.finish()]))
+    DependencyValue::Known(prepared_scope_dependency_digest(hasher, scope))
 }
 
 fn encode_head(head: &ScopeHead) -> Vec<u8> {
@@ -458,7 +470,8 @@ mod tests {
 
     use super::{
         GitlinkDirtyState, PreparedScope, PreparedScopeEntry, ScopeContentIdentity,
-        ScopeDigestError, ScopeHead, ScopeMode, ScopeObjectId, scope_dependency_digest,
+        ScopeDigestError, ScopeHead, ScopeMode, ScopeObjectId, prepared_scope_dependency_digest,
+        scope_dependency_digest,
     };
     use crate::evidence::DependencyValue;
     use crate::git::GitObjectFormat;
@@ -688,10 +701,16 @@ mod tests {
                 )?,
             ],
         )?;
+        let DependencyValue::Known(scope) = &prepared else {
+            unreachable!("the fixture constructs a complete prepared scope")
+        };
+        let expected = Digest::from("fixture-fnv1a64:87f0bec6599c3a7f");
+        let borrowed = prepared_scope_dependency_digest(&VectorHasher, scope);
 
+        assert_eq!(borrowed, expected);
         assert_eq!(
             scope_dependency_digest(&VectorHasher, &prepared),
-            DependencyValue::Known(Digest::from("fixture-fnv1a64:87f0bec6599c3a7f"))
+            DependencyValue::Known(borrowed)
         );
         Ok(())
     }
