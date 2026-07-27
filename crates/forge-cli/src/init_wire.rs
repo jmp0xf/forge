@@ -175,6 +175,7 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use forge_core::{Assumption, Confidence, Digest, Provenance, RepoId, RepoRelativePath};
+    use forge_render::managed_block::LineEnding;
     use forge_render::{
         AdapterTarget, ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, FileEditReason,
         ManagedBlockKind, RollbackPlan, SkippedChange, SkippedReason,
@@ -197,6 +198,7 @@ mod tests {
                 replacement_edit(claude_path.clone(), claude_content.clone()),
                 create_edit(agents_path.clone(), agents_content.clone()),
             ],
+            gaps: Vec::new(),
             assumptions: vec![
                 assumption("z assumption", "rule.z", Confidence::Low),
                 assumption("a assumption", "rule.a", Confidence::High),
@@ -320,6 +322,7 @@ mod tests {
         FileEdit {
             kind: FileEditKind::Create,
             reason: FileEditReason::MissingFile,
+            fallback_line_ending: LineEnding::Lf,
             path,
             desired: DesiredManagedBlock {
                 kind: ManagedBlockKind::ProjectIndex,
@@ -336,6 +339,7 @@ mod tests {
         FileEdit {
             kind: FileEditKind::ReplaceManagedBlock,
             reason: FileEditReason::AssetChanged,
+            fallback_line_ending: LineEnding::Lf,
             path,
             desired: DesiredManagedBlock {
                 kind: ManagedBlockKind::ClaudePointer,
@@ -354,6 +358,7 @@ mod tests {
             repository: RepoId::new("repo/example"),
             model_digest: Digest::new("blake3:model"),
             edits: vec![edit],
+            gaps: Vec::new(),
             assumptions: Vec::new(),
             skipped: Vec::new(),
             rollback: RollbackPlan::default(),

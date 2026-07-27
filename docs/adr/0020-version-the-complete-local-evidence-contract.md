@@ -68,6 +68,15 @@ Receipt validity and coverage aggregation
 Receipt/Evidence canonical serialization
 ```
 
+落实 ADR-0019 的 `HEAD` comparison 后，普通仓库的 base/task dependency 由 comparison protocol、
+`HEAD` object format 与 object ID，以及 v0 的 `task acceptance = not-applicable` 共同派生；unborn
+仓库仍为 `not-applicable`。该派生使用独立的
+`forge.worktree-base-task-dependency/v1` digest domain，并参与 Receipt 的当前依赖重算与比较。因此，
+完整 behavior composition 从 `forge.evidence-behavior/v1` 升为
+`forge.evidence-behavior/v2`，同时纳入 `worktree-base-task-dependency-domain`。这次演进没有改变
+Receipt/Evidence 的 schema、字段类型或字段语义；既有文档仍按原 schema 读取，并由已记录的 Forge
+behavior dependency 与当前 dependency 的比较区分。
+
 任一子协议发生不兼容变化时必须改变 behavior composition，旧 Receipt 自动 stale。
 
 ## Consequences

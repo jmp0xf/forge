@@ -6,11 +6,13 @@ use std::process::{Command, Output};
 
 use forge_core::ports::GitPort as _;
 use forge_core::{
-    BranchHead, BranchOid, GitErrorKind, GitObjectFormat, RepoRelativePath, StatusEntry,
+    BranchHead, BranchOid, Digest, GitErrorKind, GitObjectFormat, RepoRelativePath, StatusEntry,
 };
 use forge_runtime::git::GitCli;
 use forge_runtime::inventory::{InventoryOptions, build_git_inventory};
-use forge_runtime::state::{AtomicStateStore, GitStateLayout};
+use forge_runtime::state::{
+    AtomicStateStore, GitStateLayout, SharedCacheKind, SharedCacheStore, SharedCacheWrite,
+};
 
 #[derive(Debug)]
 struct GitFixture {
@@ -148,7 +150,19 @@ impl GitFixture {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self.git_output(args)?;
+        self.run_git_at(&self.repository, args)
+    }
+
+    fn run_git_at<I, S>(&self, worktree: &Path, args: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = self
+            .git_command()
+            .current_dir(worktree)
+            .args(args)
+            .output()?;
         if output.status.success() {
             return Ok(());
         }
@@ -214,9 +228,9 @@ fn linked_worktrees_isolate_mutable_state_and_share_cache_layout()
         linked_layout.shared_cache_dir()
     );
 
-    let repository_store = AtomicStateStore::new(repository_layout)?;
-    let linked_store = AtomicStateStore::new(linked_layout)?;
-    let state_key = "receipts/current.json";
+    let repository_store = AtomicStateStore::new(repository_layout.clone())?;
+    let linked_store = AtomicStateStore::new(linked_layout.clone())?;
+    let state_key = "mutable/current.json";
     let repository_value = br#"{"worktree":"repository"}"#;
     let linked_value = br#"{"worktree":"linked"}"#;
 
@@ -229,8 +243,123 @@ fn linked_worktrees_isolate_mutable_state_and_share_cache_layout()
     );
     assert_eq!(linked_store.load(state_key)?, Some(linked_value.to_vec()));
 
+    let repository_cache = SharedCacheStore::new(&repository_layout)?;
+    let linked_cache = SharedCacheStore::new(&linked_layout)?;
+    assert_eq!(repository_cache.root(), linked_cache.root());
+    let cache_key = Digest::new(format!("blake3:{}", "a".repeat(64)));
+    assert_eq!(
+        repository_cache.store_immutable(
+            SharedCacheKind::Inventory,
+            &cache_key,
+            b"shared immutable inventory",
+        )?,
+        SharedCacheWrite::Created
+    );
+    assert_eq!(
+        linked_cache.load(SharedCacheKind::Inventory, &cache_key, 1024)?,
+        Some(b"shared immutable inventory".to_vec())
+    );
+    assert_eq!(
+        linked_cache.store_immutable(
+            SharedCacheKind::Inventory,
+            &cache_key,
+            b"shared immutable inventory",
+        )?,
+        SharedCacheWrite::AlreadyPresent
+    );
+
     assert!(git.status(&fixture.repository)?.branch.oid.is_some());
     assert!(git.status(&linked)?.branch.oid.is_some());
+
+    let repository_index_before = git.index_snapshot_bytes(&fixture.repository, 1024 * 1024)?;
+    let linked_index_before = git.index_snapshot_bytes(&linked, 1024 * 1024)?;
+    fs::write(linked.join("tracked.txt"), b"linked index change\n")?;
+    fixture.run_git_at(&linked, ["add", "--", "tracked.txt"])?;
+    assert_eq!(
+        git.index_snapshot_bytes(&fixture.repository, 1024 * 1024)?,
+        repository_index_before
+    );
+    assert_ne!(
+        git.index_snapshot_bytes(&linked, 1024 * 1024)?,
+        linked_index_before
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_index_snapshot_is_exact_bounded_and_changes_after_git_add()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = GitFixture::init(GitObjectFormat::Sha1)?;
+    fs::write(fixture.repository.join("tracked.txt"), b"first\n")?;
+    fixture.run_git(["add", "--", "tracked.txt"])?;
+
+    let git = GitCli::new();
+    let first = git.index_snapshot_bytes(&fixture.repository, 1024 * 1024)?;
+    assert!(first.starts_with(b"DIRC"));
+    assert_eq!(
+        git.index_snapshot_bytes(&fixture.repository, first.len())?,
+        first
+    );
+    assert_eq!(
+        git.index_snapshot_bytes(&fixture.repository, first.len().saturating_sub(1))
+            .err()
+            .map(|error| error.kind()),
+        Some(GitErrorKind::OutputLimit)
+    );
+
+    fs::write(fixture.repository.join("tracked.txt"), b"second\n")?;
+    fixture.run_git(["add", "--", "tracked.txt"])?;
+    let second = git.index_snapshot_bytes(&fixture.repository, 1024 * 1024)?;
+    assert!(second.starts_with(b"DIRC"));
+    assert_ne!(second, first);
+
+    fs::write(fixture.repository.join(".git").join("index.lock"), b"")?;
+    let locked = git
+        .index_snapshot_bytes(&fixture.repository, 1024 * 1024)
+        .err()
+        .ok_or("locked index unexpectedly produced a raw snapshot")?;
+    assert_eq!(locked.kind(), GitErrorKind::InvalidData);
+    assert_eq!(locked.operation(), "index-snapshot");
+    assert!(locked.detail().contains("index.lock"));
+    Ok(())
+}
+
+#[test]
+fn raw_index_snapshot_fails_closed_for_a_split_index() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = GitFixture::init(GitObjectFormat::Sha1)?;
+    fs::write(fixture.repository.join("tracked.txt"), b"tracked\n")?;
+    fixture.run_git(["add", "--", "tracked.txt"])?;
+    fixture.run_git(["update-index", "--split-index"])?;
+
+    let error = GitCli::new()
+        .index_snapshot_bytes(&fixture.repository, 1024 * 1024)
+        .err()
+        .ok_or("split index unexpectedly produced a single-file raw snapshot")?;
+    assert_eq!(error.kind(), GitErrorKind::InvalidData);
+    assert_eq!(error.operation(), "index-snapshot");
+    assert!(error.detail().contains("split indexes"));
+    Ok(())
+}
+
+#[test]
+fn raw_index_snapshot_rejects_a_non_regular_index() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = GitFixture::init(GitObjectFormat::Sha1)?;
+    fs::write(fixture.repository.join("tracked.txt"), b"tracked\n")?;
+    fixture.run_git(["add", "--", "tracked.txt"])?;
+    let index_path = fixture.repository.join(".git").join("index");
+    fs::rename(
+        &index_path,
+        fixture.repository.join(".git").join("index.real"),
+    )?;
+    fs::create_dir(&index_path)?;
+
+    let error = GitCli::new()
+        .index_snapshot_bytes(&fixture.repository, 1024 * 1024)
+        .err()
+        .ok_or("directory index unexpectedly produced a raw snapshot")?;
+    assert_eq!(error.kind(), GitErrorKind::CorruptRepository);
+    assert_eq!(error.operation(), "index-path");
+    assert!(error.detail().contains("unable to map index file"));
     Ok(())
 }
 

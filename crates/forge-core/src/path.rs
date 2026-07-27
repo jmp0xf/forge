@@ -18,15 +18,16 @@ impl RepoRelativePath {
 
     pub fn new(path: impl AsRef<Path>) -> Result<Self, RelativePathError> {
         let path = path.as_ref();
-        if contains_nul(path.as_os_str()) {
-            return Err(RelativePathError::Nul);
-        }
+        Self::validate(path)?;
 
         let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
                 Component::CurDir => {}
                 Component::Normal(value) => normalized.push(value),
+                // Keep construction defensive even though `validate` just checked the same
+                // components. A future validation refactor must not turn malformed input into a
+                // production panic.
                 Component::ParentDir => return Err(RelativePathError::ParentTraversal),
                 Component::RootDir | Component::Prefix(_) => {
                     return Err(RelativePathError::Absolute);
@@ -37,6 +38,28 @@ impl RepoRelativePath {
             normalized.push(".");
         }
         Ok(Self(normalized))
+    }
+
+    /// Validates the repository-relative lexical contract without allocating a normalized path.
+    ///
+    /// Inventory classifiers use this when most paths will not be retained as typed values.
+    pub fn validate(path: impl AsRef<Path>) -> Result<(), RelativePathError> {
+        let path = path.as_ref();
+        if contains_nul(path.as_os_str()) {
+            return Err(RelativePathError::Nul);
+        }
+
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(_) => {}
+                Component::ParentDir => return Err(RelativePathError::ParentTraversal),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(RelativePathError::Absolute);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[must_use]

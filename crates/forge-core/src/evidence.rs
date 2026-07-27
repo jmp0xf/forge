@@ -360,14 +360,13 @@ const fn combine_predicate_outcomes(
     accumulated: EvidenceOutcome,
     next: EvidenceOutcome,
 ) -> EvidenceOutcome {
-    use EvidenceOutcome::{Inconclusive, Pass, ProductFailure, Unknown};
+    use EvidenceOutcome::{Pass, ProductFailure, Unknown};
 
     match (accumulated, next) {
         (ProductFailure, _) | (_, ProductFailure) => ProductFailure,
-        (Unknown, _) | (_, Unknown) => Unknown,
-        (Inconclusive, _) | (_, Inconclusive) => Inconclusive,
         (Pass, Pass) => Pass,
-        // Process-boundary outcomes are handled before predicate recursion.
+        // Process-boundary outcomes return before predicate recursion. Of the remaining predicate
+        // outcomes, every pair not handled above contains `Unknown` and is therefore non-proving.
         _ => Unknown,
     }
 }
@@ -1875,6 +1874,27 @@ mod tests {
         assert_eq!(incomplete.not_verified(), ["risk-classification"]);
         assert_eq!(inconclusive.state(), LocalEvidenceState::Unknown);
         assert_eq!(inconclusive.not_verified(), ["check"]);
+    }
+
+    #[test]
+    fn passing_receipt_applicability_distinguishes_unknown_from_non_proving() {
+        let unknown = BTreeMap::from([(
+            Intent::Check,
+            validity(EvidenceOutcome::Pass, Mutability::Unknown),
+        )]);
+        let non_proving = BTreeMap::from([(
+            Intent::Check,
+            validity(EvidenceOutcome::Pass, Mutability::WorkingTreeWrite),
+        )]);
+
+        let unknown = evaluate_local_evidence(true, [String::from("check")], Vec::new(), &unknown);
+        let non_proving =
+            evaluate_local_evidence(true, [String::from("check")], Vec::new(), &non_proving);
+
+        assert_eq!(unknown.state(), LocalEvidenceState::Unknown);
+        assert_eq!(unknown.not_verified(), ["check"]);
+        assert_eq!(non_proving.state(), LocalEvidenceState::Insufficient);
+        assert_eq!(non_proving.not_verified(), ["check"]);
     }
 
     #[test]

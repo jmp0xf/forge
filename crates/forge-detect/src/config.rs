@@ -9,11 +9,13 @@ use std::path::Path;
 
 use forge_core::branding::CONFIG_FILE;
 use forge_core::domain::CommandEnforcement;
+use forge_core::fingerprint::validate_argv_privacy;
 use forge_core::inventory::DEFAULT_MAX_TEXT_FILE_BYTES;
 use forge_core::ports::FileSystemPort;
 use forge_core::{
-    CoverageDimension, GitErrorKind, Intent, InventoryError, Mutability, NetworkIntent, PathKind,
-    RepoRelativePath, SuccessPredicate,
+    CoverageDimension, GitErrorKind, Intent, InventoryError, Mutability, NetworkIntent,
+    OperationControl, PathKind, PathPattern, RepoRelativePath, SuccessPredicate,
+    UnlimitedOperationControl,
 };
 use serde::Deserialize;
 
@@ -38,8 +40,8 @@ pub struct ForgeConfig {
 /// Optional project-boundary overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectConfig {
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
+    pub include: Vec<PathPattern>,
+    pub exclude: Vec<PathPattern>,
 }
 
 /// Optional host-adapter overrides. `None` preserves automatic detection.
@@ -208,10 +210,22 @@ pub fn load_default_forge_config<F>(
 where
     F: FileSystemPort + ?Sized,
 {
+    load_default_forge_config_controlled(filesystem, repository_root, &UnlimitedOperationControl)
+}
+
+/// Loads the optional root configuration with cooperative operation checkpoints.
+pub fn load_default_forge_config_controlled<F>(
+    filesystem: &F,
+    repository_root: &Path,
+    control: &dyn OperationControl,
+) -> Result<Option<ForgeConfig>, ConfigError>
+where
+    F: FileSystemPort + ?Sized,
+{
     let path = RepoRelativePath::new(CONFIG_FILE).map_err(|_| ConfigError::Load {
         reason: ConfigLoadError::InvalidDefaultPath,
     })?;
-    load_optional_forge_config_at(filesystem, repository_root, &path)
+    load_optional_forge_config_at(filesystem, repository_root, &path, control)
 }
 
 /// Loads a caller-selected, repository-relative configuration through the same bounded boundary.
@@ -225,7 +239,25 @@ pub fn load_forge_config_at<F>(
 where
     F: FileSystemPort + ?Sized,
 {
-    match load_optional_forge_config_at(filesystem, repository_root, path)? {
+    load_forge_config_at_controlled(
+        filesystem,
+        repository_root,
+        path,
+        &UnlimitedOperationControl,
+    )
+}
+
+/// Loads one selected configuration with cooperative operation checkpoints.
+pub fn load_forge_config_at_controlled<F>(
+    filesystem: &F,
+    repository_root: &Path,
+    path: &RepoRelativePath,
+    control: &dyn OperationControl,
+) -> Result<ForgeConfig, ConfigError>
+where
+    F: FileSystemPort + ?Sized,
+{
+    match load_optional_forge_config_at(filesystem, repository_root, path, control)? {
         Some(config) => Ok(config),
         None => Err(ConfigError::Load {
             reason: ConfigLoadError::ExpectedRegularFile {
@@ -239,10 +271,14 @@ fn load_optional_forge_config_at<F>(
     filesystem: &F,
     repository_root: &Path,
     path: &RepoRelativePath,
+    control: &dyn OperationControl,
 ) -> Result<Option<ForgeConfig>, ConfigError>
 where
     F: FileSystemPort + ?Sized,
 {
+    control
+        .checkpoint()
+        .map_err(|error| map_config_read_error(InventoryError::Control(error)))?;
     let kind = filesystem
         .path_kind(repository_root, path)
         .map_err(|error| ConfigError::Load {
@@ -259,7 +295,12 @@ where
     }
 
     let text = filesystem
-        .read_bounded_text(repository_root, path, DEFAULT_MAX_CONFIG_FILE_BYTES)
+        .read_bounded_text_controlled(
+            repository_root,
+            path,
+            DEFAULT_MAX_CONFIG_FILE_BYTES,
+            control,
+        )
         .map_err(map_config_read_error)?;
     if text.truncated {
         return Err(ConfigError::Load {
@@ -273,6 +314,12 @@ where
 
 fn map_config_read_error(error: InventoryError) -> ConfigError {
     let kind = match error {
+        InventoryError::Control(forge_core::OperationControlError::TimedOut) => {
+            io::ErrorKind::TimedOut
+        }
+        InventoryError::Control(forge_core::OperationControlError::Interrupted) => {
+            io::ErrorKind::Interrupted
+        }
         InventoryError::InvalidRoot(_) => io::ErrorKind::NotADirectory,
         InventoryError::Io { source, .. } => source.kind(),
         InventoryError::Symlink(_) => io::ErrorKind::PermissionDenied,
@@ -350,10 +397,8 @@ impl RawForgeConfig {
             return Err(ConfigError::UnsupportedSchema { found: self.schema });
         }
 
-        validate_nonempty_values("project.include", &self.project.include)?;
-        validate_nonempty_values("project.exclude", &self.project.exclude)?;
-        validate_no_nul_values("project.include", &self.project.include)?;
-        validate_no_nul_values("project.exclude", &self.project.exclude)?;
+        let project_include = parse_path_patterns("project.include", self.project.include)?;
+        let project_exclude = parse_path_patterns("project.exclude", self.project.exclude)?;
         let commands = self.commands.validate()?;
         let evidence = self.evidence.validate()?;
         let mut risk_ids = BTreeSet::new();
@@ -372,8 +417,8 @@ impl RawForgeConfig {
         Ok(ForgeConfig {
             schema: self.schema,
             project: ProjectConfig {
-                include: self.project.include,
-                exclude: self.project.exclude,
+                include: project_include,
+                exclude: project_exclude,
             },
             adapters: AdapterConfig {
                 agents: self.adapters.agents,
@@ -389,6 +434,15 @@ impl RawForgeConfig {
             risks,
         })
     }
+}
+
+fn parse_path_patterns(field: &str, values: Vec<String>) -> Result<Vec<PathPattern>, ConfigError> {
+    values
+        .into_iter()
+        .map(|value| {
+            PathPattern::new(value).map_err(|error| invalid_value(field, error.to_string()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -473,8 +527,19 @@ impl RawConfiguredCommand {
         validate_nonempty(&format!("{prefix}.program"), &self.program)?;
         validate_no_nul(&format!("{prefix}.program"), &self.program)?;
         validate_no_nul_values(&format!("{prefix}.args"), &self.args)?;
+        validate_argv_privacy(
+            std::iter::once(self.program.as_str()).chain(self.args.iter().map(String::as_str)),
+        )
+        .map_err(|_| {
+            invalid_value(
+                format!("{prefix}.args"),
+                "must not contain credential-like literal arguments",
+            )
+        })?;
         validate_nonempty_values(&format!("{prefix}.inputs"), &self.inputs)?;
         validate_no_nul_values(&format!("{prefix}.inputs"), &self.inputs)?;
+        let _validated_inputs =
+            parse_path_patterns(&format!("{prefix}.inputs"), self.inputs.clone())?;
         let mutability =
             parse_command_mutability(&format!("{prefix}.mutability"), self.mutability.as_deref())?;
         let network = parse_command_network(&format!("{prefix}.network"), self.network.as_deref())?;
@@ -541,10 +606,13 @@ fn parse_command_success(
     match value {
         None | Some("exit-zero") => Ok(SuccessPredicate::ExitZero),
         Some("exit-zero-and-stdout-empty") => Ok(SuccessPredicate::ExitZeroAndStdoutEmpty),
-        Some("json-has-no-errors") => Ok(SuccessPredicate::JsonHasNoErrors),
+        Some("json-has-no-errors") => Err(invalid_value(
+            field,
+            "`json-has-no-errors` requires a command-specific complete-output parser, which explicit v1 commands cannot declare; use `exit-zero` or `exit-zero-and-stdout-empty`",
+        )),
         Some(_) => Err(invalid_value(
             field,
-            "must be one of `exit-zero`, `exit-zero-and-stdout-empty`, or `json-has-no-errors`",
+            "must be one of `exit-zero` or `exit-zero-and-stdout-empty`",
         )),
     }
 }
@@ -734,6 +802,7 @@ fn invalid_value(field: impl Into<String>, reason: impl Into<String>) -> ConfigE
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::error::Error;
     use std::io;
     use std::path::{Path, PathBuf};
 
@@ -742,8 +811,8 @@ mod tests {
     use forge_core::ports::FileSystemPort;
     use forge_core::{
         BoundedText, CoverageDimension, GitError, GitErrorKind, GitFileSet, Intent, Inventory,
-        InventoryError, InventoryOptions, Mutability, NetworkIntent, PathKind, RepoRelativePath,
-        SuccessPredicate,
+        InventoryError, InventoryOptions, Mutability, NetworkIntent, PathKind, PathPattern,
+        RepoRelativePath, SuccessPredicate,
     };
 
     use super::{
@@ -1130,6 +1199,24 @@ external = ["owner-review", "protected-ci"]
         assert_eq!(config.schema, CONFIG_SCHEMA_V1);
         assert_eq!(config.adapters.agents, Some(true));
         assert_eq!(config.adapters.claude, Some(false));
+        assert_eq!(
+            config
+                .project
+                .include
+                .iter()
+                .map(PathPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["crates/**"]
+        );
+        assert_eq!(
+            config
+                .project
+                .exclude
+                .iter()
+                .map(PathPattern::as_str)
+                .collect::<Vec<_>>(),
+            ["target/**"]
+        );
         assert_eq!(config.policy.default_timeout_seconds, Some(300));
         let verify =
             config
@@ -1159,6 +1246,71 @@ external = ["owner-review", "protected-ci"]
         assert_eq!(verify.enforcement, CommandEnforcement::Advisory);
         assert!(config.commands.contains_key(&Intent::FormatCheck));
         assert_eq!(config.risks[0].level, RiskLevel::Critical);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_argv_rejects_credential_literals_without_echoing_them()
+    -> Result<(), Box<dyn Error>> {
+        for (args, literal) in [
+            ("['--api-token=literal-inline']", "literal-inline"),
+            ("['--password', 'literal-following']", "literal-following"),
+            (
+                "['-H', 'Authorization: Bearer literal-header']",
+                "literal-header",
+            ),
+            (
+                "['https://user:literal-uri@example.invalid/path']",
+                "literal-uri",
+            ),
+            ("['SESSION_ID=literal-assignment']", "literal-assignment"),
+        ] {
+            let input = format!("schema = 1\n[commands.test]\nprogram = 'tool'\nargs = {args}\n");
+            let error = match parse_forge_config(&input) {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err(
+                        io::Error::other("credential-like configured argv was accepted").into(),
+                    );
+                }
+            };
+            assert_eq!(
+                error,
+                ConfigError::InvalidValue {
+                    field: String::from("commands.test.args"),
+                    reason: String::from("must not contain credential-like literal arguments"),
+                }
+            );
+            assert!(!error.to_string().contains(literal));
+            assert!(!format!("{error:?}").contains(literal));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_argv_does_not_guess_that_ordinary_short_options_are_secrets()
+    -> Result<(), ConfigError> {
+        let config = parse_forge_config(
+            "schema = 1\n[commands.test]\nprogram = 'tool'\nargs = ['-p', 'ordinary-value']\n",
+        )?;
+
+        assert_eq!(
+            config.commands[&Intent::Test].args,
+            ["-p", "ordinary-value"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_overrides_preserve_omitted_true_and_false_states() -> Result<(), ConfigError> {
+        let omitted = parse_forge_config("schema = 1\n")?;
+        assert_eq!(omitted.adapters.agents, None);
+        assert_eq!(omitted.adapters.claude, None);
+
+        let explicit =
+            parse_forge_config("schema = 1\n[adapters]\nagents = false\nclaude = true\n")?;
+        assert_eq!(explicit.adapters.agents, Some(false));
+        assert_eq!(explicit.adapters.claude, Some(true));
         Ok(())
     }
 
@@ -1197,12 +1349,7 @@ external = ["owner-review", "protected-ci"]
             ),
             (
                 "success",
-                [
-                    "exit-zero",
-                    "exit-zero-and-stdout-empty",
-                    "json-has-no-errors",
-                ]
-                .as_slice(),
+                ["exit-zero", "exit-zero-and-stdout-empty"].as_slice(),
             ),
             ("enforcement", ["required", "advisory"].as_slice()),
         ];
@@ -1226,12 +1373,29 @@ coverage = ["format", "compile", "lint", "unit-test", "integration-test", "build
     }
 
     #[test]
+    fn explicit_json_success_is_rejected_without_an_authoritative_parser_contract() {
+        let error = parse_forge_config(
+            "schema = 1\n[commands.check]\nprogram = 'tool'\nsuccess = 'json-has-no-errors'\n",
+        );
+        assert_eq!(
+            error,
+            Err(ConfigError::InvalidValue {
+                field: String::from("commands.check.success"),
+                reason: String::from(
+                    "`json-has-no-errors` requires a command-specific complete-output parser, which explicit v1 commands cannot declare; use `exit-zero` or `exit-zero-and-stdout-empty`"
+                ),
+            })
+        );
+    }
+
+    #[test]
     fn unknown_or_unsafe_command_evidence_values_are_rejected() {
         for input in [
             "schema = 1\n[commands.check]\nprogram = 'cargo'\nmutability = 'sometimes'\n",
             "schema = 1\n[commands.check]\nprogram = 'cargo'\nnetwork = 'maybe'\n",
             "schema = 1\n[commands.check]\nprogram = 'cargo'\nsuccess = 'ignore-exit'\n",
             "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = ['unknown']\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\ninputs = ['src/**.rs']\n",
             "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = ['custom:']\n",
             "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = [\"custom:api\\tcontract\"]\n",
             "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = ['compile', 'compile']\n",
@@ -1262,6 +1426,23 @@ coverage = ["format", "compile", "lint", "unit-test", "integration-test", "build
             parse_forge_config("schema = 2\n"),
             Err(ConfigError::UnsupportedSchema { found: 2 })
         );
+    }
+
+    #[test]
+    fn project_boundaries_use_the_shared_repository_path_grammar() {
+        for input in [
+            "schema = 1\n[project]\ninclude = ['/absolute/**']\n",
+            "schema = 1\n[project]\nexclude = ['fixtures/**.toml']\n",
+            "schema = 1\n[project]\nexclude = ['fixtures\\\\**']\n",
+        ] {
+            assert!(
+                matches!(
+                    parse_forge_config(input),
+                    Err(ConfigError::InvalidValue { .. })
+                ),
+                "invalid project boundary unexpectedly parsed: {input}"
+            );
+        }
     }
 
     #[test]

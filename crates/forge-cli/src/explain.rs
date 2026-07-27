@@ -1,25 +1,36 @@
 //! Read-only CLI composition for generic project-model detection and explanation.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use forge_core::branding::{CLI_NAME, CONFIG_FILE};
+use forge_core::fingerprint::validate_command_privacy;
 use forge_core::ports::{GitPort as _, ProcessError};
 use forge_core::{
-    AppError, ExitCode, GitError, GitErrorKind, InventoryError, ProjectModel,
-    ProjectModelWireError, RepoRelativePath, project_model_to_wire,
+    AppError, ExitCode, GitError, GitErrorKind, InventoryError, OperationControl as _,
+    OperationControlError, ProjectModel, ProjectModelWireError, RepoRelativePath,
+    project_model_to_wire,
+};
+use forge_detect::config::{ConfigError, ConfigLoadError};
+use forge_detect::inventory_cache::{
+    InventoryCachePublication, InventoryCacheReadPort, InventoryCacheWritePort,
+    MAX_INVENTORY_CACHE_BYTES, publish_cached_inventory,
 };
 use forge_detect::model::{
-    ModelDetectionCompletion, ModelDetectionError, ModelDetectionOptions, NavigationSnapshot,
-    detect_project_model,
+    InventoryCacheStatus, ModelDetectionCompletion, ModelDetectionError, ModelDetectionExecution,
+    ModelDetectionOptions, NavigationSnapshot, detect_project_model_with_cache_controlled,
 };
+use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::git::GitCli;
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::process::SynchronousProcessRunner;
+use forge_runtime::state::{
+    GitStateLayout, SharedCacheKind, SharedCacheStore, SharedCacheWrite, StateError,
+};
 use forge_schema::{
     CommandResolutionData, ConfidenceData, Diagnostic, ProjectModelData, ProvenanceData,
     SchemaKind, Severity,
@@ -27,20 +38,84 @@ use forge_schema::{
 
 use crate::args::Cli;
 
-/// One repository scan retained in both its domain and public wire forms.
+/// One repository scan retained as the domain-model source of truth for command-specific views.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetectedProject {
     pub(crate) model: ProjectModel,
-    pub(crate) wire: ProjectModelData,
     pub(crate) completion: ModelDetectionCompletion,
+    pub(crate) inventory_cache_status: InventoryCacheStatus,
     pub(crate) navigation: NavigationSnapshot,
+    inventory_cache_publication: Option<InventoryCachePublication>,
 }
 
-/// Detects and projects the model used by both human and JSON explain output.
-pub(crate) fn detect(
+#[cfg(test)]
+impl DetectedProject {
+    /// Builds the smallest complete detection snapshot needed by CLI unit tests that verify
+    /// cross-scan stability. Production detections continue to come only from [`detect`].
+    pub(crate) fn test_fixture(model: ProjectModel) -> Result<Self, Box<dyn std::error::Error>> {
+        let effective_policy = forge_core::EffectivePolicyContent::new(
+            Vec::<forge_core::RiskRule>::new(),
+            forge_core::EvidenceRequirements::default(),
+        )?;
+        Ok(Self {
+            model,
+            completion: ModelDetectionCompletion::Complete,
+            inventory_cache_status: InventoryCacheStatus::Disabled,
+            navigation: NavigationSnapshot {
+                status: None,
+                inventory: forge_core::Inventory::default(),
+                config: None,
+                config_path: RepoRelativePath::new(CONFIG_FILE)?,
+                effective_policy,
+                policy_base_completeness: forge_detect::policy::PolicyBaseCompleteness::Complete,
+                policy_base_digest: None,
+                policy_base_origin: forge_detect::model::PolicyBaseOrigin::Unborn,
+                scope_seed: None,
+            },
+            inventory_cache_publication: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SharedInventoryCache {
+    store: SharedCacheStore,
+}
+
+impl InventoryCacheReadPort for SharedInventoryCache {
+    fn load(&self, key: &forge_core::Digest, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+        self.store
+            .load(
+                SharedCacheKind::Inventory,
+                key,
+                max_bytes.min(MAX_INVENTORY_CACHE_BYTES),
+            )
+            .map_err(state_error_as_io)
+    }
+}
+
+impl InventoryCacheWritePort for SharedInventoryCache {
+    fn store_new(&self, key: &forge_core::Digest, bytes: &[u8]) -> io::Result<()> {
+        match self
+            .store
+            .store_immutable(SharedCacheKind::Inventory, key, bytes)
+            .map_err(state_error_as_io)?
+        {
+            SharedCacheWrite::Created | SharedCacheWrite::AlreadyPresent => Ok(()),
+        }
+    }
+}
+
+fn state_error_as_io(error: StateError) -> io::Error {
+    io::Error::new(error.io_kind(), error.to_string())
+}
+
+/// Detects using the single command-wide budget constructed by the CLI dispatcher.
+pub(crate) fn detect_controlled(
     cli: &Cli,
-    cancellation: Arc<AtomicBool>,
+    control: &OperationBudget,
 ) -> Result<DetectedProject, AppError> {
+    checkpoint(control, "project detection")?;
     let start = cli.dir.as_deref().unwrap_or_else(|| Path::new("."));
     let config_path = cli
         .config
@@ -56,21 +131,35 @@ pub(crate) fn detect(
                 "pass a path inside the repository without an absolute prefix or `..`",
             )
         })?;
-    let timeout = cli.timeout.as_deref().map(parse_duration).transpose()?;
-    let git = timeout
-        .map_or_else(GitCli::new, |timeout| GitCli::new().with_timeout(timeout))
-        .with_cancellation_flag(Arc::clone(&cancellation));
+    let git = GitCli::new().with_operation_budget(control.clone());
     let repository_root = git.repository_root(start).map_err(|error| {
         let detail = error.to_string();
         map_git_error(&error, "repository root", detail)
     })?;
     let process = SynchronousProcessRunner::new(&repository_root)
         .map_err(map_process_setup_error)?
-        .with_cancellation_flag(cancellation);
+        .with_cancellation_flag(control.cancellation_flag());
     let filesystem = NativeFileSystem;
     let hasher = Blake3Hasher;
+    checkpoint(control, "inventory cache discovery")?;
+    let inventory_cache = if cli.no_cache {
+        None
+    } else {
+        git.git_dir(&repository_root)
+            .ok()
+            .zip(git.git_common_dir(&repository_root).ok())
+            .and_then(|(git_dir, common_dir)| {
+                SharedCacheStore::new(&GitStateLayout::new(git_dir, common_dir)).ok()
+            })
+            .map(|store| SharedInventoryCache { store })
+    };
+    checkpoint(control, "inventory cache discovery")?;
     let default_options = ModelDetectionOptions::default();
-    let outcome = detect_project_model(
+    let execution = ModelDetectionExecution::new(control);
+    let execution = inventory_cache.as_ref().map_or(execution, |cache| {
+        execution.with_inventory_cache(cache as &dyn InventoryCacheReadPort)
+    });
+    let outcome = detect_project_model_with_cache_controlled(
         &repository_root,
         &git,
         &filesystem,
@@ -78,19 +167,73 @@ pub(crate) fn detect(
         &hasher,
         &ModelDetectionOptions {
             config_path,
-            metadata_timeout: timeout.unwrap_or(default_options.metadata_timeout),
             ..default_options
         },
+        execution,
     )
     .map_err(map_detection_error)?;
-    let wire = project_model_to_wire(&outcome.model).map_err(map_projection_error)?;
-
     Ok(DetectedProject {
         model: outcome.model,
-        wire,
         completion: outcome.completion,
+        inventory_cache_status: outcome.inventory_cache_status,
         navigation: outcome.navigation,
+        inventory_cache_publication: outcome.inventory_cache_publication,
     })
+}
+
+fn checkpoint(control: &OperationBudget, location: &str) -> Result<(), AppError> {
+    control
+        .checkpoint()
+        .map(|_| ())
+        .map_err(|error| map_operation_control_error(error, location))
+}
+
+/// Publishes a retained cache candidate only after the caller's authoritative write succeeded.
+///
+/// The shared cache is an optimization, so an unavailable or colliding entry does not change the
+/// already-completed operation's result.
+pub(crate) fn publish_inventory_cache_after_state_write(detected: &DetectedProject) {
+    let Some(publication) = detected.inventory_cache_publication.as_ref() else {
+        return;
+    };
+    let layout = GitStateLayout::new(
+        &detected.model.repository.git_dir,
+        &detected.model.repository.git_common_dir,
+    );
+    let Ok(store) = SharedCacheStore::new(&layout) else {
+        return;
+    };
+    let cache = SharedInventoryCache { store };
+    let _ignored = publish_cached_inventory(&cache, publication);
+}
+
+/// Validates every command that `forge explain` exposes, then performs the full model projection.
+pub(crate) fn project_for_output(model: &ProjectModel) -> Result<ProjectModelData, AppError> {
+    for command_set in model.commands.values() {
+        for command in command_set.commands() {
+            validate_command_privacy(command).map_err(|_| command_privacy_error())?;
+        }
+    }
+    project_model_to_wire(model).map_err(map_projection_error)
+}
+
+pub(crate) fn command_privacy_error() -> AppError {
+    AppError::data(
+        "FGE1103",
+        "project command metadata cannot be displayed safely",
+        "project command",
+        "a project command contains credential-like metadata",
+        "remove credentials from project command metadata and provide them through an approved runtime secret mechanism",
+    )
+}
+
+pub(crate) const fn inventory_cache_status_name(status: InventoryCacheStatus) -> &'static str {
+    match status {
+        InventoryCacheStatus::Disabled => "disabled",
+        InventoryCacheStatus::Ineligible => "ineligible",
+        InventoryCacheStatus::Miss => "miss",
+        InventoryCacheStatus::Hit => "hit",
+    }
 }
 
 fn parse_duration(value: &str) -> Result<Duration, AppError> {
@@ -117,6 +260,10 @@ fn parse_duration(value: &str) -> Result<Duration, AppError> {
     Ok(Duration::from_millis(amount))
 }
 
+pub(crate) fn operation_timeout(cli: &Cli) -> Result<Option<Duration>, AppError> {
+    cli.timeout.as_deref().map(parse_duration).transpose()
+}
+
 fn invalid_duration(value: &str) -> AppError {
     AppError::usage(
         "FGE1002",
@@ -129,6 +276,9 @@ fn invalid_duration(value: &str) -> AppError {
 
 fn map_detection_error(error: ModelDetectionError) -> AppError {
     match error {
+        ModelDetectionError::Control(error) => {
+            map_operation_control_error(error, "project detection")
+        }
         ModelDetectionError::Repository(error) => map_git_error(
             error.source_error(),
             "repository detection",
@@ -141,6 +291,9 @@ fn map_detection_error(error: ModelDetectionError) -> AppError {
         ModelDetectionError::Inventory(InventoryError::Git(error)) => {
             let detail = error.to_string();
             map_git_error(&error, "repository inventory", detail)
+        }
+        ModelDetectionError::Inventory(InventoryError::Control(error)) => {
+            map_operation_control_error(error, "repository inventory")
         }
         ModelDetectionError::Inventory(InventoryError::EntryLimit {
             max_entries,
@@ -169,6 +322,23 @@ fn map_detection_error(error: ModelDetectionError) -> AppError {
                 "fix the repository path, permissions, or symlink boundary, then rerun `{CLI_NAME} explain`"
             ),
         ),
+        ModelDetectionError::Config(ConfigError::Load {
+            reason:
+                ConfigLoadError::ReadFailed {
+                    kind: io::ErrorKind::TimedOut,
+                },
+        }) => {
+            map_operation_control_error(OperationControlError::TimedOut, "repository configuration")
+        }
+        ModelDetectionError::Config(ConfigError::Load {
+            reason:
+                ConfigLoadError::ReadFailed {
+                    kind: io::ErrorKind::Interrupted,
+                },
+        }) => map_operation_control_error(
+            OperationControlError::Interrupted,
+            "repository configuration",
+        ),
         ModelDetectionError::Config(error) => AppError::data(
             "FGE1101",
             format!("{CLI_NAME} configuration is invalid or unreadable"),
@@ -195,6 +365,36 @@ fn map_detection_error(error: ModelDetectionError) -> AppError {
             internal_detection_error(error.to_string())
         }
         ModelDetectionError::InvalidModel(error) => internal_detection_error(error.to_string()),
+    }
+}
+
+pub(crate) fn map_operation_control_error(
+    error: OperationControlError,
+    location: &str,
+) -> AppError {
+    match error {
+        OperationControlError::TimedOut => AppError::new(
+            ExitCode::Timeout,
+            Diagnostic::new(
+                "FGE2004",
+                Severity::Error,
+                "Forge operation timed out",
+                location,
+                error.to_string(),
+                "increase `--timeout` or reduce the requested operation scope, then retry",
+            ),
+        ),
+        OperationControlError::Interrupted => AppError::new(
+            ExitCode::Interrupted,
+            Diagnostic::new(
+                "FGE2005",
+                Severity::Error,
+                "Forge operation was interrupted",
+                location,
+                error.to_string(),
+                "rerun the command when ready",
+            ),
+        ),
     }
 }
 
@@ -277,7 +477,7 @@ fn internal_detection_error(detail: String) -> AppError {
     )
 }
 
-fn map_projection_error(error: ProjectModelWireError) -> AppError {
+pub(crate) fn map_projection_error(error: ProjectModelWireError) -> AppError {
     match error {
         ProjectModelWireError::InvalidModel(error) => internal_detection_error(error.to_string()),
         error => AppError::data(
@@ -360,13 +560,26 @@ pub(crate) fn render_human(model: &ProjectModelData) -> String {
             .as_ref()
             .map_or("unknown", |digest| digest.as_str()),
     );
-    for assumption in &model.assumptions {
+    let assumptions = model
+        .assumptions
+        .iter()
+        .map(|assumption| {
+            (
+                confidence_name(assumption.confidence),
+                assumption.statement.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if assumptions.len() != model.assumptions.len() {
         let _ = writeln!(
             output,
-            "assumption [{}]: {}",
-            confidence_name(assumption.confidence),
-            assumption.statement
+            "assumptions: {} distinct ({} source observations)",
+            assumptions.len(),
+            model.assumptions.len(),
         );
+    }
+    for (confidence, statement) in assumptions {
+        let _ = writeln!(output, "assumption [{}]: {}", confidence, statement);
     }
     for diagnostic in &model.diagnostics {
         let _ = writeln!(output, "\n{diagnostic}");
@@ -402,11 +615,80 @@ const fn resolution_name(resolution: CommandResolutionData) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    use forge_core::{AppError, ExitCode};
+    use forge_core::{
+        AdapterInventory, AppError, AssetInventory, CommandSource, CommandSpec, Confidence,
+        EffectivePolicy, ExitCode, Intent, ProjectModel, ProjectModelInputs, Provenance, RepoFacts,
+        RepoRelativePath, ResolvedCommandSet, WorkState, project_model_to_wire,
+    };
+    use forge_schema::RepoId;
 
-    use super::parse_duration;
+    use super::{parse_duration, project_for_output};
+
+    fn provenance(rule_id: &str) -> Provenance {
+        Provenance {
+            rule_id: rule_id.to_owned(),
+            source_path: None,
+            source_range: None,
+            detail: String::from("test evidence"),
+        }
+    }
+
+    fn model_with_check_command(
+        command: CommandSpec,
+    ) -> Result<ProjectModel, Box<dyn std::error::Error>> {
+        let evidence = || vec![provenance("test.fixture")];
+        let mut model = ProjectModel::new(ProjectModelInputs {
+            repository: RepoFacts {
+                id: RepoId::from("local:blake3:explain-privacy-test"),
+                root: PathBuf::from("/repo"),
+                git_dir: PathBuf::from("/repo/.git"),
+                git_common_dir: PathBuf::from("/repo/.git"),
+                is_linked_worktree: false,
+                head: None,
+                branch: None,
+                upstream: None,
+                work_state: WorkState::Clean,
+            },
+            repository_provenance: evidence(),
+            repository_confidence: Confidence::High,
+            unit_inventory_provenance: evidence(),
+            unit_inventory_confidence: Confidence::High,
+            assets: AssetInventory::new(Vec::new(), evidence(), Confidence::High),
+            adapters: AdapterInventory::new(Vec::new(), evidence(), Confidence::High),
+            policy: EffectivePolicy::new(None, evidence(), Confidence::High),
+        });
+        for intent in Intent::ALL {
+            model.commands.insert(
+                intent,
+                ResolvedCommandSet::absent(evidence(), Confidence::High),
+            );
+        }
+        model.commands.insert(
+            Intent::Check,
+            ResolvedCommandSet::resolved(
+                vec![command],
+                evidence(),
+                Confidence::High,
+                Confidence::High,
+            )?,
+        );
+        Ok(model)
+    }
+
+    fn check_command() -> CommandSpec {
+        CommandSpec::new(
+            "check",
+            Intent::Check,
+            "cargo",
+            RepoRelativePath::root(),
+            CommandSource::ExplicitConfig,
+        )
+        .with_args(["check"])
+    }
 
     #[test]
     fn duration_parser_accepts_explicit_positive_units() -> Result<(), Box<dyn std::error::Error>> {
@@ -427,5 +709,65 @@ mod tests {
                 Some(ExitCode::Usage)
             );
         }
+    }
+
+    #[test]
+    fn explain_preserves_safe_projection_bytes_and_benign_environment_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = check_command();
+        command
+            .env
+            .insert(OsString::from("AUTHOR"), OsString::from("Ada"));
+        command
+            .env
+            .insert(OsString::from("BUILD_REGION"), OsString::from("us-east-1"));
+        let model = model_with_check_command(command)?;
+
+        let expected = project_model_to_wire(&model)?;
+        let projected = project_for_output(&model)?;
+
+        assert_eq!(
+            serde_json::to_vec(&projected)?,
+            serde_json::to_vec(&expected)?
+        );
+        assert_eq!(
+            projected.commands["check"][0].environment_names,
+            ["AUTHOR", "BUILD_REGION"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explain_rejects_unsafe_commands_without_rendering_secret_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "explain-secret-sentinel";
+        let argument_command = check_command().with_args(["check", "--token", secret]);
+        let mut environment_command = check_command();
+        environment_command
+            .env
+            .insert(OsString::from("API_TOKEN"), OsString::from(secret));
+
+        for (command, forbidden) in [
+            (argument_command, vec![secret, "--token"]),
+            (environment_command, vec![secret, "API_TOKEN"]),
+        ] {
+            let error = project_for_output(&model_with_check_command(command)?)
+                .err()
+                .ok_or_else(|| {
+                    std::io::Error::other("unsafe explain command did not fail closed")
+                })?;
+            assert_eq!(error.diagnostic().code.as_str(), "FGE1103");
+            let rendered = [
+                error.to_string(),
+                serde_json::to_string(error.diagnostic())?,
+                format!("{error:?}"),
+            ];
+            for output in rendered {
+                for value in &forbidden {
+                    assert!(!output.contains(value), "leaked {value:?}: {output}");
+                }
+            }
+        }
+        Ok(())
     }
 }

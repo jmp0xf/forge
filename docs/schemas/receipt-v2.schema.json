@@ -246,6 +246,17 @@
         "interrupted": {
           "type": "boolean"
         },
+        "json_error_status": {
+          "description": "Result of the command provider's typed JSON error contract, when applicable.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonErrorStatusV2Data"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "log_refs": {
           "type": "array",
           "items": {
@@ -256,7 +267,19 @@
           "$ref": "#/$defs/OutcomeData"
         },
         "output_truncated": {
+          "description": "Compatibility projection equal to `stdout_truncated || stderr_truncated` for current v2.",
           "type": "boolean"
+        },
+        "process_error_kind": {
+          "description": "Present when the process boundary failed before a complete termination observation existed.\n\nOptionality is same-major read compatibility for early v2 writers. Current writers always\npopulate this field for `infrastructure-failure` observations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessErrorKindV2Data"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "raw_exit_code": {
           "type": [
@@ -275,8 +298,31 @@
         "stderr_digest": {
           "$ref": "#/$defs/Digest"
         },
+        "stderr_truncated": {
+          "description": "Whether the bounded in-memory stderr preview omitted bytes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "stdout_digest": {
           "$ref": "#/$defs/Digest"
+        },
+        "stdout_total_bytes": {
+          "description": "Complete stdout byte count before any bounded retention or display truncation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stdout_truncated": {
+          "description": "Whether the bounded in-memory stdout preview omitted bytes.\n\nThis is optional only for same-major read compatibility with early v2 writers. A current\nReceipt must carry both per-stream flags so consumers never have to infer which stream the\nlegacy combined flag described.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "timed_out": {
           "type": "boolean"
@@ -610,6 +656,16 @@
         "unknown"
       ]
     },
+    "JsonErrorStatusV2Data": {
+      "description": "Typed result of applying a command's JSON error contract to complete stdout.\n\nUnknown values map to a non-proving state in v2 Receipt consumers.",
+      "type": "string",
+      "enum": [
+        "no-errors",
+        "has-errors",
+        "invalid",
+        "unknown"
+      ]
+    },
     "MutabilityData": {
       "description": "Declared command mutability.",
       "type": "string",
@@ -701,6 +757,23 @@
         }
       ]
     },
+    "ProcessErrorKindV2Data": {
+      "description": "Typed process-boundary failure recorded when no termination observation is available.\n\nUnknown values remain readable but can never satisfy current Evidence.",
+      "type": "string",
+      "enum": [
+        "invalid-repository-root",
+        "invalid-working-directory",
+        "invalid-environment",
+        "unsupported-program",
+        "executable-unavailable",
+        "permission-denied",
+        "spawn",
+        "process-tree",
+        "output",
+        "wait",
+        "unknown"
+      ]
+    },
     "ReceiptDependenciesV2Data": {
       "description": "Every dependency whose equality is required before a v2 receipt may be reused.",
       "type": "object",
@@ -762,6 +835,17 @@
             "type": "string"
           }
         },
+        "coverage_confidence": {
+          "description": "Confidence that the resolved command set covers the selected intent completely enough for\nlocal evidence.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConfidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "dependencies": {
           "$ref": "#/$defs/ReceiptDependenciesV2Data"
         },
@@ -790,6 +874,17 @@
         },
         "outcome": {
           "$ref": "#/$defs/OutcomeData"
+        },
+        "resolution_confidence": {
+          "description": "Confidence that this exact command set implements the selected intent.\n\nOptionality is read compatibility only. Current writers always populate both command-set\nconfidence fields; older v2 objects without them remain historical and non-proving.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConfidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "started_at": {
           "description": "Execution start in UTC RFC 3339 form.",

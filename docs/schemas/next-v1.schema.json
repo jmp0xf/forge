@@ -171,8 +171,26 @@
     "ContextPathData": {
       "type": "object",
       "properties": {
+        "confidence": {
+          "description": "Present in current Forge output; optional on input for additive v1 compatibility.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConfidenceData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "$ref": "#/$defs/WirePath"
+        },
+        "provenance": {
+          "description": "Stable rule identifiers supporting this context pointer.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "why": {
           "type": "string"

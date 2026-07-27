@@ -865,6 +865,7 @@ mod tests {
             repository: repository('a'),
             model_digest: digest('b'),
             edits: Vec::new(),
+            gaps: Vec::new(),
             assumptions: Vec::new(),
             skipped,
             rollback: RollbackPlan::default(),

@@ -6,6 +6,7 @@
 
 pub mod branding;
 pub mod context;
+pub mod control;
 pub mod doctor;
 pub mod domain;
 pub mod error;
@@ -21,6 +22,10 @@ pub mod risk;
 pub mod scope;
 pub mod wire;
 
+pub use control::{
+    OPERATION_CONTROL_PROTOCOL_VERSION, OperationControl, OperationControlError, OperationPermit,
+    UnlimitedOperationControl,
+};
 pub use domain::{
     AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, Assumption, CommandResolution,
     CommandSource, CommandSpec, CommitId, Confidence, CoverageDimension, EffectivePolicy, Intent,
@@ -37,12 +42,13 @@ pub use git::{
     GitObjectId, GitPathListReadError, GitRefName, OrdinaryEntry, PorcelainV2ParseError,
     PorcelainV2ParseErrorKind, PorcelainV2ReadError, PorcelainV2Status, RenameOrCopy,
     RenamedOrCopiedEntry, StatusEntry, SubmoduleState, UnmergedEntry, XyStatus,
-    parse_git_index_reader, parse_git_path_list_reader, parse_status_porcelain_v2,
-    parse_status_porcelain_v2_reader,
+    parse_git_index_reader, parse_git_index_reader_controlled, parse_git_path_list_reader,
+    parse_git_path_list_reader_controlled, parse_status_porcelain_v2,
+    parse_status_porcelain_v2_reader, parse_status_porcelain_v2_reader_controlled,
 };
 pub use inventory::{
     BoundedText, Inventory, InventoryEntry, InventoryError, InventoryKind, InventoryOptions,
-    InventorySkip, PathKind,
+    InventorySkip, PathKind, PathMetadata,
 };
 pub use path::{RelativePathError, RepoRelativePath};
 pub use policy::{
@@ -50,8 +56,8 @@ pub use policy::{
 };
 pub use risk::{RiskAssessment, RiskMatch, assess_risk, built_in_policy};
 pub use wire::{
-    ProjectModelWireError, command_detail_v2_to_wire, comparison_basis_v2_to_wire,
-    coverage_dimension_name, evidence_outcome_to_wire, intent_to_wire,
+    ProjectModelWireError, assumption_to_wire, command_detail_v2_to_wire,
+    comparison_basis_v2_to_wire, coverage_dimension_name, evidence_outcome_to_wire, intent_to_wire,
     local_evidence_state_to_wire, non_satisfying_receipt_validity_v2_to_wire,
-    project_model_to_wire, receipt_dependencies_v2_to_wire,
+    process_error_kind_to_wire, project_model_to_wire, receipt_dependencies_v2_to_wire,
 };

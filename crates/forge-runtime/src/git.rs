@@ -2,26 +2,31 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufReader, Seek as _, SeekFrom, Write as _};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
+use forge_core::UnlimitedOperationControl;
 use forge_core::domain::{
     CommandSource, CommandSpec, Confidence, Intent, Mutability, NetworkIntent,
 };
-use forge_core::git::{GitIndexEntry, GitIndexReadError, parse_git_index_reader};
+use forge_core::git::{GitIndexEntry, GitIndexReadError, parse_git_index_reader_controlled};
 use forge_core::ports::{
     ExecSpec, GitPort, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation,
     ProcessPort as _,
 };
 use forge_core::{
     GitError, GitErrorKind, GitFileSet, GitObjectFormat, GitObjectId, GitPathListReadError,
-    PorcelainV2ReadError, PorcelainV2Status, RepoRelativePath, parse_git_path_list_reader,
-    parse_status_porcelain_v2_reader,
+    OperationControl as _, OperationControlError, PorcelainV2ReadError, PorcelainV2Status,
+    RepoRelativePath, parse_git_path_list_reader_controlled,
+    parse_status_porcelain_v2_reader_controlled,
 };
 
+use crate::control::OperationBudget;
 use crate::process::{
     DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES, SpooledProcessObservation, SynchronousProcessRunner,
 };
@@ -48,16 +53,19 @@ pub struct GitCli {
     status_record_limit_bytes: usize,
     status_entry_limit: usize,
     cancellation: Arc<AtomicBool>,
+    operation_budget: OperationBudget,
 }
 
 impl Default for GitCli {
     fn default() -> Self {
+        let cancellation = Arc::new(AtomicBool::new(false));
         Self {
             timeout: DEFAULT_GIT_TIMEOUT,
             status_spool_limit_bytes: DEFAULT_GIT_STATUS_SPOOL_LIMIT_BYTES,
             status_record_limit_bytes: DEFAULT_GIT_STATUS_RECORD_LIMIT_BYTES,
             status_entry_limit: DEFAULT_GIT_STATUS_ENTRY_LIMIT,
-            cancellation: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::clone(&cancellation),
+            operation_budget: OperationBudget::unlimited(cancellation),
         }
     }
 }
@@ -90,6 +98,15 @@ pub const GIT_DIR_ARGS: &[&str] = &["rev-parse", "--path-format=absolute", "--gi
 /// Resolve the shared Git directory as an absolute native path.
 pub const GIT_COMMON_DIR_ARGS: &[&str] =
     &["rev-parse", "--path-format=absolute", "--git-common-dir"];
+
+/// Resolve the exact worktree-specific index and report any split-index dependency.
+pub const INDEX_PATH_ARGS: &[&str] = &[
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "index",
+    "--shared-index-path",
+];
 
 /// Resolve the object format used by Git command output.
 pub const OBJECT_FORMAT_ARGS: &[&str] = &["rev-parse", "--show-object-format=output"];
@@ -159,7 +176,16 @@ impl GitCli {
     /// performed by this value or any of its clones until the caller resets it.
     #[must_use]
     pub fn with_cancellation_flag(mut self, cancellation: Arc<AtomicBool>) -> Self {
-        self.cancellation = cancellation;
+        self.cancellation = Arc::clone(&cancellation);
+        self.operation_budget = self.operation_budget.with_cancellation_flag(cancellation);
+        self
+    }
+
+    /// Shares one command-wide absolute deadline and cancellation source with every Git child.
+    #[must_use]
+    pub fn with_operation_budget(mut self, operation_budget: OperationBudget) -> Self {
+        self.cancellation = operation_budget.cancellation_flag();
+        self.operation_budget = operation_budget;
         self
     }
 
@@ -208,7 +234,11 @@ impl GitCli {
             },
         )
         .with_args(hardened_args);
-        spec.timeout = self.timeout;
+        spec.timeout = self
+            .operation_budget
+            .checkpoint()
+            .map_err(|error| operation_control_git_error(operation, error))?
+            .cap(self.timeout);
         spec.mutability = Mutability::ReadOnly;
         // These commands are local-only, but NetworkIntent has no `None` variant. Do not claim
         // ecosystem offline flags were requested when Git has no such flag for these operations.
@@ -339,10 +369,11 @@ impl GitCli {
     ) -> Result<Vec<RepoRelativePath>, GitError> {
         let mut spooled = self.run_spooled(root, operation)?;
         check_spooled_observation(operation, &mut spooled, self.status_spool_limit_bytes)?;
-        parse_git_path_list_reader(
+        parse_git_path_list_reader_controlled(
             BufReader::new(spooled.stdout_file),
             self.status_record_limit_bytes,
             max_paths,
+            &self.operation_budget,
         )
         .map_err(|error| map_path_list_read_error(operation, error))
     }
@@ -356,14 +387,29 @@ impl GitCli {
             &mut spooled,
             self.status_spool_limit_bytes,
         )?;
-        parse_git_index_reader(
+        parse_git_index_reader_controlled(
             BufReader::new(spooled.stdout_file),
             object_format,
             self.status_record_limit_bytes,
             self.status_entry_limit,
+            &self.operation_budget,
         )
         .map_err(|error| map_index_read_error(GitOperation::IndexEntries, error))
     }
+
+    /// Reads the exact raw index through one bounded, no-follow file descriptor.
+    pub fn index_snapshot_bytes(&self, root: &Path, max_bytes: usize) -> Result<Vec<u8>, GitError> {
+        let index_path = parse_index_snapshot_path(self.run(root, GitOperation::IndexPath)?)?;
+        read_index_snapshot_file_controlled(&index_path, max_bytes, &self.operation_budget)
+    }
+}
+
+fn operation_control_git_error(operation: GitOperation, error: OperationControlError) -> GitError {
+    let kind = match error {
+        OperationControlError::TimedOut => GitErrorKind::TimedOut,
+        OperationControlError::Interrupted => GitErrorKind::Interrupted,
+    };
+    GitError::new(kind, operation.name(), error.to_string())
 }
 
 fn hardened_git_environment<I>(ambient: I) -> io::Result<BTreeMap<OsString, OsString>>
@@ -445,11 +491,12 @@ impl GitPort for GitCli {
             &mut spooled,
             self.status_spool_limit_bytes,
         )?;
-        let status = parse_status_porcelain_v2_reader(
+        let status = parse_status_porcelain_v2_reader_controlled(
             BufReader::new(spooled.stdout_file),
             object_format,
             self.status_record_limit_bytes,
             self.status_entry_limit,
+            &self.operation_budget,
         )
         .map_err(|error| map_status_read_error(GitOperation::Status, error))?;
         if status.branch.oid.is_none() || status.branch.head.is_none() {
@@ -468,6 +515,14 @@ impl GitPort for GitCli {
         let remaining = self.status_entry_limit.saturating_sub(tracked.len());
         let untracked = self.spooled_paths(root, GitOperation::UntrackedFiles, remaining)?;
         Ok(GitFileSet::new(tracked, untracked))
+    }
+
+    fn index_snapshot_bytes(&self, root: &Path, max_bytes: usize) -> Result<Vec<u8>, GitError> {
+        GitCli::index_snapshot_bytes(self, root, max_bytes)
+    }
+
+    fn index_entries(&self, root: &Path) -> Result<Vec<GitIndexEntry>, GitError> {
+        GitCli::index_entries(self, root)
     }
 
     fn read_commit_file_bounded(
@@ -548,6 +603,8 @@ enum GitOperation {
     RepositoryRoot,
     GitDir,
     GitCommonDir,
+    IndexPath,
+    IndexSnapshot,
     ObjectFormat,
     Status,
     IndexEntries,
@@ -564,6 +621,8 @@ impl GitOperation {
             Self::RepositoryRoot => "repository-root",
             Self::GitDir => "git-dir",
             Self::GitCommonDir => "git-common-dir",
+            Self::IndexPath => "index-path",
+            Self::IndexSnapshot => "index-snapshot",
             Self::ObjectFormat => "object-format",
             Self::Status => "status",
             Self::IndexEntries => "index-entries",
@@ -580,6 +639,8 @@ impl GitOperation {
             Self::RepositoryRoot => "runtime.git.repository-root",
             Self::GitDir => "runtime.git.git-dir",
             Self::GitCommonDir => "runtime.git.git-common-dir",
+            Self::IndexPath => "runtime.git.index-path",
+            Self::IndexSnapshot => "runtime.git.index-snapshot",
             Self::ObjectFormat => "runtime.git.object-format",
             Self::Status => "runtime.git.status",
             Self::IndexEntries => "runtime.git.index-entries",
@@ -596,12 +657,15 @@ impl GitOperation {
             Self::RepositoryRoot => REPOSITORY_ROOT_ARGS,
             Self::GitDir => GIT_DIR_ARGS,
             Self::GitCommonDir => GIT_COMMON_DIR_ARGS,
+            Self::IndexPath => INDEX_PATH_ARGS,
             Self::ObjectFormat => OBJECT_FORMAT_ARGS,
             Self::Status => STATUS_PORCELAIN_V2_ARGS,
             Self::IndexEntries => INDEX_ENTRIES_ARGS,
             Self::TrackedFiles => TRACKED_FILES_ARGS,
             Self::UntrackedFiles => UNTRACKED_FILES_ARGS,
-            Self::CommitTreeEntry | Self::BlobSize | Self::BlobContents => return None,
+            Self::IndexSnapshot | Self::CommitTreeEntry | Self::BlobSize | Self::BlobContents => {
+                return None;
+            }
         })
     }
 
@@ -699,6 +763,7 @@ fn check_observation(
 
 fn map_status_read_error(operation: GitOperation, error: PorcelainV2ReadError) -> GitError {
     match error {
+        PorcelainV2ReadError::Control(error) => operation_control_git_error(operation, error),
         PorcelainV2ReadError::Input {
             offset,
             record,
@@ -720,6 +785,7 @@ fn map_status_read_error(operation: GitOperation, error: PorcelainV2ReadError) -
 
 fn map_path_list_read_error(operation: GitOperation, error: GitPathListReadError) -> GitError {
     match error {
+        GitPathListReadError::Control(error) => operation_control_git_error(operation, error),
         GitPathListReadError::Input { source, .. } => GitError::new(
             GitErrorKind::Io,
             operation.name(),
@@ -735,6 +801,7 @@ fn map_path_list_read_error(operation: GitOperation, error: GitPathListReadError
 
 fn map_index_read_error(operation: GitOperation, error: GitIndexReadError) -> GitError {
     match error {
+        GitIndexReadError::Control(error) => operation_control_git_error(operation, error),
         GitIndexReadError::Input { source, .. } => GitError::new(
             GitErrorKind::Io,
             operation.name(),
@@ -746,6 +813,295 @@ fn map_index_read_error(operation: GitOperation, error: GitIndexReadError) -> Gi
             format!("Git returned malformed index entries: {error}"),
         ),
     }
+}
+
+#[cfg(test)]
+fn read_index_snapshot_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, GitError> {
+    read_index_snapshot_file_controlled(path, max_bytes, &UnlimitedOperationControl)
+}
+
+fn read_index_snapshot_file_controlled(
+    path: &Path,
+    max_bytes: usize,
+    control: &dyn forge_core::OperationControl,
+) -> Result<Vec<u8>, GitError> {
+    read_index_snapshot_file_after_inspection_controlled(path, max_bytes, control, || Ok(()))
+}
+
+#[cfg(test)]
+fn read_index_snapshot_file_after_inspection<F>(
+    path: &Path,
+    max_bytes: usize,
+    after_path_inspection: F,
+) -> Result<Vec<u8>, GitError>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    read_index_snapshot_file_after_inspection_controlled(
+        path,
+        max_bytes,
+        &UnlimitedOperationControl,
+        after_path_inspection,
+    )
+}
+
+fn read_index_snapshot_file_after_inspection_controlled<F>(
+    path: &Path,
+    max_bytes: usize,
+    control: &dyn forge_core::OperationControl,
+    after_path_inspection: F,
+) -> Result<Vec<u8>, GitError>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    control
+        .checkpoint()
+        .map_err(|error| operation_control_git_error(GitOperation::IndexSnapshot, error))?;
+    let lock_path = index_lock_path(path)?;
+    ensure_index_lock_absent(&lock_path, "before reading the index")?;
+
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        map_io_error(
+            GitOperation::IndexSnapshot,
+            "inspect resolved index path without following links",
+            error,
+        )
+    })?;
+    validate_index_snapshot_metadata(&path_metadata, "resolved index path")?;
+    after_path_inspection().map_err(|error| {
+        map_io_error(
+            GitOperation::IndexSnapshot,
+            "complete the index inspection boundary",
+            error,
+        )
+    })?;
+
+    let mut file = open_index_file_no_follow(path).map_err(|error| {
+        if no_follow_open_rejected_link(&error) {
+            invalid_index_snapshot("resolved index path became a symbolic link before it opened")
+        } else {
+            map_io_error(
+                GitOperation::IndexSnapshot,
+                "open resolved index path without following links",
+                error,
+            )
+        }
+    })?;
+    let initial_metadata = file.metadata().map_err(|error| {
+        map_io_error(
+            GitOperation::IndexSnapshot,
+            "inspect opened index file",
+            error,
+        )
+    })?;
+    validate_index_snapshot_metadata(&initial_metadata, "opened index file")?;
+
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if initial_metadata.len() > max_bytes_u64 {
+        return Err(index_snapshot_too_large(initial_metadata.len(), max_bytes));
+    }
+
+    let capacity = usize::try_from(initial_metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut bounded = std::io::Read::by_ref(&mut file).take(max_bytes_u64.saturating_add(1));
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        control
+            .checkpoint()
+            .map_err(|error| operation_control_git_error(GitOperation::IndexSnapshot, error))?;
+        let read = bounded.read(&mut chunk).map_err(|error| {
+            map_io_error(
+                GitOperation::IndexSnapshot,
+                "read opened index file within its byte bound",
+                error,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if bytes.len() > max_bytes {
+        return Err(index_snapshot_too_large(bytes.len() as u64, max_bytes));
+    }
+
+    control
+        .checkpoint()
+        .map_err(|error| operation_control_git_error(GitOperation::IndexSnapshot, error))?;
+
+    let final_metadata = file.metadata().map_err(|error| {
+        map_io_error(
+            GitOperation::IndexSnapshot,
+            "reinspect opened index file after reading",
+            error,
+        )
+    })?;
+    validate_index_snapshot_metadata(&final_metadata, "reinspected index file")?;
+    let observed_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if initial_metadata.len() != final_metadata.len()
+        || observed_length != final_metadata.len()
+        || metadata_modified_changed(&initial_metadata, &final_metadata)
+    {
+        return Err(invalid_index_snapshot(
+            "index file changed while its bounded snapshot was being read",
+        ));
+    }
+    ensure_index_lock_absent(&lock_path, "after reading the index")?;
+
+    Ok(bytes)
+}
+
+fn parse_index_snapshot_path(mut bytes: Vec<u8>) -> Result<PathBuf, GitError> {
+    trim_one_line_ending(&mut bytes);
+    if bytes.contains(&b'\n') {
+        return Err(invalid_index_snapshot(
+            "split indexes are not a complete single-file snapshot",
+        ));
+    }
+    parse_absolute_git_path(bytes, GitOperation::IndexPath.name()).map_err(|error| {
+        GitError::new(
+            GitErrorKind::InvalidData,
+            GitOperation::IndexPath.name(),
+            error.to_string(),
+        )
+    })
+}
+
+fn index_lock_path(index_path: &Path) -> Result<PathBuf, GitError> {
+    let Some(file_name) = index_path.file_name() else {
+        return Err(invalid_index_snapshot(
+            "resolved index path does not name a file",
+        ));
+    };
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(index_path.with_file_name(lock_name))
+}
+
+fn ensure_index_lock_absent(lock_path: &Path, phase: &str) -> Result<(), GitError> {
+    match fs::symlink_metadata(lock_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(invalid_index_snapshot(format!(
+            "index.lock exists {phase}; the index may be changing"
+        ))),
+        Err(error) => Err(map_io_error(
+            GitOperation::IndexSnapshot,
+            "inspect index.lock without following links",
+            error,
+        )),
+    }
+}
+
+fn validate_index_snapshot_metadata(
+    metadata: &fs::Metadata,
+    subject: &str,
+) -> Result<(), GitError> {
+    if metadata_is_link_or_reparse(metadata) {
+        return Err(invalid_index_snapshot(format!(
+            "{subject} is a symbolic link or reparse point"
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(invalid_index_snapshot(format!(
+            "{subject} is not a regular file"
+        )));
+    }
+    Ok(())
+}
+
+fn index_snapshot_too_large(observed_bytes: u64, max_bytes: usize) -> GitError {
+    GitError::new(
+        GitErrorKind::OutputLimit,
+        GitOperation::IndexSnapshot.name(),
+        format!(
+            "raw index size {observed_bytes} bytes exceeds the configured bound of {max_bytes} bytes"
+        ),
+    )
+}
+
+fn invalid_index_snapshot(detail: impl Into<String>) -> GitError {
+    GitError::new(
+        GitErrorKind::InvalidData,
+        GitOperation::IndexSnapshot.name(),
+        detail,
+    )
+}
+
+fn metadata_modified_changed(initial: &fs::Metadata, final_metadata: &fs::Metadata) -> bool {
+    modification_times_differ_or_are_unobservable(initial.modified(), final_metadata.modified())
+}
+
+fn modification_times_differ_or_are_unobservable(
+    initial: io::Result<std::time::SystemTime>,
+    final_time: io::Result<std::time::SystemTime>,
+) -> bool {
+    match (initial, final_time) {
+        (Ok(initial), Ok(final_metadata)) => initial != final_metadata,
+        // Snapshot stability is a proof obligation. If either timestamp cannot be observed, the
+        // reader cannot establish that the file stayed unchanged and must fail closed.
+        _ => true,
+    }
+}
+
+#[cfg(unix)]
+fn open_index_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        // A path can become a FIFO after the no-follow metadata probe. Nonblocking open lets the
+        // descriptor metadata check reject it instead of waiting forever for an attacker-supplied
+        // writer. O_NONBLOCK has no effect on ordinary index files.
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_index_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_index_file_no_follow(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bounded raw-index snapshots require a no-follow file-open primitive",
+    ))
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn no_follow_open_rejected_link(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(nix::libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn no_follow_open_rejected_link(_error: &io::Error) -> bool {
+    false
 }
 
 fn map_io_error(operation: GitOperation, action: &str, error: io::Error) -> GitError {
@@ -774,6 +1130,7 @@ fn classify_command_failure(stderr: &[u8]) -> GitErrorKind {
         "bad signature",
         "invalid object",
         "index file smaller than expected",
+        "unable to map index file",
     ]
     .iter()
     .any(|marker| stderr.contains(marker))
@@ -956,22 +1313,28 @@ fn path_buf_from_git_bytes(bytes: Vec<u8>) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
+    #[cfg(unix)]
+    use std::fs;
     use std::io;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use forge_core::ports::{
         GitPort as _, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation, StdinPolicy,
     };
     use forge_core::{BranchOid, Digest, GitErrorKind, GitObjectFormat, RepoRelativePath};
 
+    use crate::control::OperationBudget;
+
     use super::{
         GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, INDEX_ENTRIES_ARGS,
-        OBJECT_FORMAT_ARGS, STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS,
-        checked_stdout, classify_command_failure, hardened_git_environment, indexed_git_config_key,
-        parse_absolute_git_path, parse_blob_size, parse_exact_tree_blob, parse_object_format,
+        INDEX_PATH_ARGS, OBJECT_FORMAT_ARGS, STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS,
+        UNTRACKED_FILES_ARGS, checked_stdout, classify_command_failure, hardened_git_environment,
+        indexed_git_config_key, modification_times_differ_or_are_unobservable,
+        parse_absolute_git_path, parse_blob_size, parse_exact_tree_blob, parse_index_snapshot_path,
+        parse_object_format, read_index_snapshot_file, read_index_snapshot_file_after_inspection,
     };
 
     #[test]
@@ -997,6 +1360,21 @@ mod tests {
             Some(&OsString::from("0"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn expired_command_budget_prevents_git_from_starting() {
+        let git = GitCli::new().with_operation_budget(OperationBudget::until(
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let result = git.exec_spec(GitOperation::RepositoryRoot);
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == GitErrorKind::TimedOut
+        ));
     }
 
     #[test]
@@ -1029,6 +1407,16 @@ mod tests {
         assert_eq!(
             OBJECT_FORMAT_ARGS,
             ["rev-parse", "--show-object-format=output"]
+        );
+        assert_eq!(
+            INDEX_PATH_ARGS,
+            [
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
+                "--shared-index-path"
+            ]
         );
         assert_eq!(TRACKED_FILES_ARGS, ["ls-files", "--cached", "-z", "--"]);
         assert_eq!(
@@ -1154,6 +1542,94 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn raw_index_path_parser_rejects_split_index_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            parse_index_snapshot_path(b"/repo/.git/index\n".to_vec())?,
+            Path::new("/repo/.git/index")
+        );
+        let error = parse_index_snapshot_path(
+            b"/repo/.git/index\n/repo/.git/sharedindex.0123456789abcdef\n".to_vec(),
+        )
+        .err()
+        .ok_or("split index paths unexpectedly produced a single-file snapshot path")?;
+        assert_eq!(error.kind(), GitErrorKind::InvalidData);
+        assert_eq!(error.operation(), "index-snapshot");
+        assert!(error.detail().contains("split indexes"));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_index_timestamp_observation_fails_closed() {
+        let now = std::time::SystemTime::now();
+        assert!(!modification_times_differ_or_are_unobservable(
+            Ok(now),
+            Ok(now)
+        ));
+        assert!(modification_times_differ_or_are_unobservable(
+            Ok(now),
+            Err(io::Error::other("final timestamp unavailable"))
+        ));
+        assert!(modification_times_differ_or_are_unobservable(
+            Err(io::Error::other("initial timestamp unavailable")),
+            Ok(now)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_index_file_reader_does_not_follow_a_symbolic_link()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let real_index = directory.path().join("index.real");
+        let linked_index = directory.path().join("index");
+        fs::write(&real_index, b"DIRCopaque-index-bytes")?;
+        symlink("index.real", &linked_index)?;
+
+        let error = read_index_snapshot_file(&linked_index, 1024)
+            .err()
+            .ok_or("symbolic-link index unexpectedly produced a raw snapshot")?;
+        assert_eq!(error.kind(), GitErrorKind::InvalidData);
+        assert_eq!(error.operation(), "index-snapshot");
+        assert!(error.detail().contains("symbolic link"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_index_file_reader_does_not_block_when_the_path_becomes_a_fifo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let index = directory.path().join("index");
+        let original = directory.path().join("index.original");
+        let fifo = directory.path().join("index.fifo");
+        fs::write(&index, b"DIRCopaque-index-bytes")?;
+        let created = std::process::Command::new("mkfifo").arg(&fifo).output()?;
+        if !created.status.success() {
+            return Err(io::Error::other(format!(
+                "mkfifo failed: {}",
+                String::from_utf8_lossy(&created.stderr)
+            ))
+            .into());
+        }
+
+        let error = read_index_snapshot_file_after_inspection(&index, 1024, || {
+            fs::rename(&index, &original)?;
+            fs::rename(&fifo, &index)
+        })
+        .err()
+        .ok_or("FIFO replacement unexpectedly produced a raw snapshot")?;
+
+        assert_eq!(error.kind(), GitErrorKind::InvalidData);
+        assert_eq!(error.operation(), "index-snapshot");
+        assert!(error.detail().contains("not a regular file"));
+        Ok(())
+    }
+
     #[test]
     fn git_port_dogfoods_the_current_worktree() -> Result<(), Box<dyn std::error::Error>> {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1165,6 +1641,7 @@ mod tests {
         let git_common_dir = git.git_common_dir(&root)?;
         let status = git.status(&root)?;
         let file_set = git.file_set(&root)?;
+        let index_snapshot = git.index_snapshot_bytes(&root, 64 * 1024 * 1024)?;
         let index_entries = git.index_entries(&root)?;
 
         assert_eq!(root, expected_root);
@@ -1185,6 +1662,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path.as_path() == Path::new("Cargo.toml") && entry.stage == 0)
         );
+        assert!(index_snapshot.starts_with(b"DIRC"));
         let head = match status.branch.oid {
             Some(BranchOid::Commit(head)) => head,
             _ => return Err("dogfood repository did not have a commit".into()),

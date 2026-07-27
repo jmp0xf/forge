@@ -20,8 +20,13 @@ forge-detect = { path = "../forge-detect" }
 forge-render = { path = "../forge-render" }
 forge-runtime = { path = "../forge-runtime" }
 forge-schema = { path = "../forge-schema" }
+ignore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -9,7 +9,9 @@ use forge_core::ports::{Hasher, RepositoryFilePort};
 use forge_core::{Digest, RepoRelativePath};
 
 use crate::inspection::{ADAPTER_FILE_MAX_BYTES, FileEditReason};
-use crate::managed_block::{ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block};
+use crate::managed_block::{
+    ManagedBlock, ManagedBlockError, MergeAction, merge_managed_block_with_line_ending,
+};
 use crate::plan::{ChangePlan, FileEdit, FileEditKind};
 use crate::repository_file_digest;
 
@@ -430,7 +432,14 @@ where
         id: edit.desired.kind.id(),
         body: &edit.desired.body,
     };
-    let ordinary = merge_markdown_block(existing.as_deref(), &block, hasher, false);
+    let ordinary = merge_managed_block_with_line_ending(
+        existing.as_deref(),
+        &block,
+        edit.desired.kind.syntax(),
+        edit.fallback_line_ending,
+        hasher,
+        false,
+    );
     let (observed_reason, merged) = match ordinary {
         Ok(merged) => {
             let observed_reason = match (merged.action, existing.is_some()) {
@@ -461,9 +470,17 @@ where
                     report.clone(),
                 ));
             }
-            let merged = merge_markdown_block(existing.as_deref(), &block, hasher, true).map_err(
-                |source| ApplyError::managed_block(edit.path.clone(), source, report.clone()),
-            )?;
+            let merged = merge_managed_block_with_line_ending(
+                existing.as_deref(),
+                &block,
+                edit.desired.kind.syntax(),
+                edit.fallback_line_ending,
+                hasher,
+                true,
+            )
+            .map_err(|source| {
+                ApplyError::managed_block(edit.path.clone(), source, report.clone())
+            })?;
             if merged.action != MergeAction::Replace {
                 return Err(ApplyError::plain(
                     ApplyErrorKind::UnexpectedMergeAction,
@@ -544,7 +561,8 @@ mod tests {
 
     use crate::inspection::FileEditReason;
     use crate::managed_block::{
-        ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block,
+        LineEnding, ManagedBlock, ManagedBlockError, ManagedBlockSyntax, MergeAction,
+        merge_managed_block_with_line_ending, merge_markdown_block,
     };
     use crate::plan::{
         ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, ManagedBlockKind, RollbackPlan,
@@ -748,6 +766,7 @@ mod tests {
                 FileEditKind::Create
             },
             reason,
+            fallback_line_ending: LineEnding::Lf,
             path: RepoRelativePath::new(path)?,
             desired,
             expected_preimage: existing
@@ -764,6 +783,7 @@ mod tests {
             repository: RepoId::from("local:apply-fixture"),
             model_digest: Digest::from("fixture:model"),
             edits,
+            gaps: Vec::new(),
             assumptions: Vec::new(),
             skipped: Vec::new(),
             rollback: RollbackPlan::default(),
@@ -951,6 +971,55 @@ mod tests {
         assert_eq!(files.content("AGENTS.md"), Some(recomputed));
         assert!(report.unwritten.is_empty());
         assert_eq!(report.written.len(), 1);
+        assert!(report.written[0].verified);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_recomputes_a_reviewed_crlf_create_without_using_preview_as_authority()
+    -> Result<(), Box<dyn Error>> {
+        let desired = DesiredManagedBlock {
+            kind: ManagedBlockKind::ProjectIndex,
+            body: String::from("first\nsecond"),
+        };
+        let merged = merge_managed_block_with_line_ending(
+            None,
+            &ManagedBlock {
+                id: desired.kind.id(),
+                body: &desired.body,
+            },
+            ManagedBlockSyntax::Markdown,
+            LineEnding::CrLf,
+            &FixtureHasher,
+            false,
+        )?;
+        let target = FileEdit {
+            kind: FileEditKind::Create,
+            reason: FileEditReason::MissingFile,
+            fallback_line_ending: LineEnding::CrLf,
+            path: RepoRelativePath::new("AGENTS.md")?,
+            desired,
+            expected_preimage: None,
+            preview_postimage: b"review projection is not write authority".to_vec(),
+            expected_postimage: repository_file_digest(&FixtureHasher, &merged.content),
+            force: false,
+        };
+        let files = ScriptedFiles::default();
+
+        let report = apply_change_plan(
+            Path::new("/repo"),
+            &plan(vec![target]),
+            &files,
+            &FixtureHasher,
+        )?;
+        let written = files.content("AGENTS.md").ok_or("missing written file")?;
+
+        assert_eq!(written, merged.content);
+        for (index, byte) in written.iter().enumerate() {
+            if *byte == b'\n' {
+                assert!(index > 0 && written[index - 1] == b'\r');
+            }
+        }
         assert!(report.written[0].verified);
         Ok(())
     }
@@ -1224,6 +1293,7 @@ mod tests {
         let target = FileEdit {
             kind: FileEditKind::ReplaceManagedBlock,
             reason: FileEditReason::AssetChanged,
+            fallback_line_ending: LineEnding::Lf,
             path: RepoRelativePath::new("AGENTS.md")?,
             desired: created.desired,
             expected_preimage: Some(repository_file_digest(&FixtureHasher, &existing)),

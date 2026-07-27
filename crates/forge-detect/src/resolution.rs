@@ -1,6 +1,6 @@
 //! Deterministic command-intent resolution across explicit, project, and language layers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -169,6 +169,7 @@ pub fn compose_ordered_language_plans(
 pub struct CommandLayer {
     kind: CommandLayerKind,
     completeness: CommandLayerCompleteness,
+    unknown_intents: BTreeSet<Intent>,
     candidates: Vec<CommandPlanCandidate>,
     provenance: Vec<Provenance>,
     confidence: Confidence,
@@ -182,13 +183,7 @@ impl CommandLayer {
         provenance: Vec<Provenance>,
         confidence: Confidence,
     ) -> Self {
-        Self::new(
-            kind,
-            CommandLayerCompleteness::Complete,
-            candidates,
-            provenance,
-            confidence,
-        )
+        Self::new(kind, BTreeSet::new(), candidates, provenance, confidence)
     }
 
     #[must_use]
@@ -199,20 +194,40 @@ impl CommandLayer {
     ) -> Self {
         Self::new(
             kind,
-            CommandLayerCompleteness::Unknown,
+            Intent::ALL.into_iter().collect(),
             candidates,
             provenance,
             Confidence::Unknown,
         )
     }
 
+    /// Creates a layer whose discovery is complete except for the named intents.
+    ///
+    /// This keeps a malformed exact `verify` entrypoint from suppressing independently proven
+    /// `check` or `test` commands while still preventing an unsafe fallback for `verify` itself.
+    #[must_use]
+    pub fn partially_unknown(
+        kind: CommandLayerKind,
+        candidates: Vec<CommandPlanCandidate>,
+        provenance: Vec<Provenance>,
+        confidence: Confidence,
+        unknown_intents: BTreeSet<Intent>,
+    ) -> Self {
+        Self::new(kind, unknown_intents, candidates, provenance, confidence)
+    }
+
     fn new(
         kind: CommandLayerKind,
-        completeness: CommandLayerCompleteness,
+        unknown_intents: BTreeSet<Intent>,
         mut candidates: Vec<CommandPlanCandidate>,
         mut provenance: Vec<Provenance>,
         confidence: Confidence,
     ) -> Self {
+        let completeness = if unknown_intents.is_empty() {
+            CommandLayerCompleteness::Complete
+        } else {
+            CommandLayerCompleteness::Unknown
+        };
         candidates.sort_by(|left, right| left.commands.cmp(&right.commands));
         provenance.push(layer_provenance(kind, completeness));
         provenance.sort();
@@ -220,6 +235,7 @@ impl CommandLayer {
         Self {
             kind,
             completeness,
+            unknown_intents,
             candidates,
             provenance,
             confidence,
@@ -234,6 +250,11 @@ impl CommandLayer {
     #[must_use]
     pub const fn completeness(&self) -> CommandLayerCompleteness {
         self.completeness
+    }
+
+    #[must_use]
+    pub fn intent_is_unknown(&self, intent: Intent) -> bool {
+        self.unknown_intents.contains(&intent)
     }
 
     #[must_use]
@@ -292,7 +313,7 @@ fn resolve_intent(
         inspected_provenance.extend(layer.provenance.iter().cloned());
         let candidates = candidates_for_intent(layer, intent);
 
-        if layer.completeness == CommandLayerCompleteness::Unknown {
+        if layer.intent_is_unknown(intent) {
             let mut retained = candidates;
             let mut provenance = inspected_provenance;
             for lower in &ordered[index + 1..] {
@@ -397,6 +418,8 @@ fn layer_provenance(kind: CommandLayerKind, completeness: CommandLayerCompletene
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use forge_core::{
         CommandResolution, CommandSource, CommandSpec, Confidence, Intent, Provenance,
         RepoRelativePath,
@@ -624,6 +647,85 @@ mod tests {
         assert_eq!(test.commands().len(), 1);
         assert_eq!(test.executable_commands(), None);
         assert_eq!(test.resolution_confidence, Confidence::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_unknown_blocks_only_the_affected_intent() -> Result<(), Box<dyn std::error::Error>> {
+        let mut layers = empty_layers();
+        layers.existing_project = CommandLayer::partially_unknown(
+            CommandLayerKind::ExistingProject,
+            Vec::new(),
+            vec![provenance("script/verify-unknown")],
+            Confidence::Medium,
+            BTreeSet::from([Intent::Verify]),
+        );
+        layers.language_default = complete(
+            CommandLayerKind::LanguageDefault,
+            vec![
+                candidate(
+                    command("rust.check", Intent::Check, "cargo", Confidence::High),
+                    "rust/check",
+                ),
+                candidate(
+                    command("rust.verify", Intent::Verify, "cargo", Confidence::High),
+                    "rust/verify",
+                ),
+            ],
+            Confidence::High,
+        );
+
+        let commands = resolve_command_intents(&layers)?;
+
+        assert_eq!(
+            commands[&Intent::Check].resolution(),
+            CommandResolution::Resolved
+        );
+        assert_eq!(commands[&Intent::Check].commands()[0].program, "cargo");
+        assert_eq!(
+            commands[&Intent::Verify].resolution(),
+            CommandResolution::Unknown
+        );
+        assert_eq!(commands[&Intent::Verify].executable_commands(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_command_precedes_partial_unknown_for_the_same_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut layers = empty_layers();
+        layers.explicit_config = complete(
+            CommandLayerKind::ExplicitConfig,
+            vec![candidate(
+                command(
+                    "config.verify",
+                    Intent::Verify,
+                    "configured",
+                    Confidence::High,
+                ),
+                "config/verify",
+            )],
+            Confidence::High,
+        );
+        layers.existing_project = CommandLayer::partially_unknown(
+            CommandLayerKind::ExistingProject,
+            Vec::new(),
+            vec![provenance("script/verify-unknown")],
+            Confidence::Medium,
+            BTreeSet::from([Intent::Verify]),
+        );
+
+        let commands = resolve_command_intents(&layers)?;
+        let verify = &commands[&Intent::Verify];
+
+        assert_eq!(verify.resolution(), CommandResolution::Resolved);
+        assert_eq!(verify.commands()[0].program, "configured");
+        assert!(
+            verify
+                .provenance
+                .iter()
+                .all(|item| item.rule_id != "script/verify-unknown")
+        );
         Ok(())
     }
 

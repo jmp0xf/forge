@@ -28,6 +28,73 @@ pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = DEFAULT_CAPTURE_LIMIT_BYTES;
 /// an unexpectedly large child cannot consume unbounded local disk space.
 pub const DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Process-tree isolation backend compiled for the current target.
+///
+/// This is a build-time capability fact, not evidence that any particular command completed or
+/// that an external CI host preserves the same runtime boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTreeCapability {
+    /// A dedicated Unix process group plus a non-reaping exit observer are available.
+    UnixProcessGroup,
+    /// A Windows Job Object is assigned before user code is resumed.
+    WindowsJobObject,
+    /// The current target has no complete process-tree isolation backend.
+    Unsupported,
+}
+
+/// Conservative result of resolving one command executable without running repository code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableAvailability {
+    /// The current platform lookup rules found an executable regular file.
+    Available,
+    /// Every safely inspected lookup candidate was absent or non-executable.
+    Unavailable,
+    /// The lookup could not be reproduced safely or completely on this platform.
+    Unknown,
+}
+
+/// Returns the process-tree isolation backend compiled for the current target.
+#[must_use]
+pub const fn process_tree_capability() -> ProcessTreeCapability {
+    #[cfg(windows)]
+    {
+        ProcessTreeCapability::WindowsJobObject
+    }
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            all(target_os = "linux", not(target_env = "uclibc")),
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )
+    ))]
+    {
+        ProcessTreeCapability::UnixProcessGroup
+    }
+    #[cfg(not(any(
+        windows,
+        all(
+            unix,
+            any(
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "uclibc")),
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            )
+        )
+    )))]
+    {
+        ProcessTreeCapability::Unsupported
+    }
+}
+
 /// Fingerprints the exact sanitized environment that the runner would supply to `spec`.
 ///
 /// Raw values never leave this boundary. Privacy-unsafe names and invalid process environment
@@ -127,6 +194,37 @@ impl SynchronousProcessRunner {
     #[must_use]
     pub fn repository_root(&self) -> &Path {
         &self.repository_root
+    }
+
+    /// Resolves the executable selected by `spec` without starting it.
+    ///
+    /// Unix PATH lookup is reproduced conservatively. Other targets return `Unknown` until their
+    /// native search order can be matched without executing untrusted project code.
+    pub fn executable_availability(
+        &self,
+        spec: &ExecSpec,
+    ) -> Result<ExecutableAvailability, ProcessError> {
+        let cwd = self.resolve_cwd(spec.cwd.as_path())?;
+        let environment =
+            sanitized_environment(std::env::vars_os(), &spec.env).map_err(|error| {
+                ProcessError::new(
+                    ProcessErrorKind::InvalidEnvironment,
+                    "build executable lookup environment",
+                    error,
+                )
+            })?;
+        reject_implicit_shell_program(&spec.program).map_err(|error| {
+            ProcessError::new(
+                ProcessErrorKind::UnsupportedProgram,
+                "validate executable lookup program",
+                error,
+            )
+        })?;
+        Ok(platform_executable_availability(
+            &spec.program,
+            &cwd,
+            &environment,
+        ))
     }
 
     /// Runs one command with stdout retained in a private anonymous temporary file.
@@ -367,6 +465,76 @@ fn private_anonymous_tempfile() -> io::Result<File> {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn platform_executable_availability(
+    program: &OsStr,
+    cwd: &Path,
+    environment: &BTreeMap<OsString, OsString>,
+) -> ExecutableAvailability {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn candidate_availability(path: &Path) -> io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    if program.as_bytes().contains(&b'/') {
+        let path = Path::new(program);
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        return match candidate_availability(&candidate) {
+            Ok(true) => ExecutableAvailability::Available,
+            Ok(false) => ExecutableAvailability::Unavailable,
+            Err(_) => ExecutableAvailability::Unknown,
+        };
+    }
+
+    let Some(path) = environment.get(OsStr::new("PATH")) else {
+        return ExecutableAvailability::Unknown;
+    };
+    let mut incomplete = false;
+    for directory in std::env::split_paths(path) {
+        let directory = if directory.as_os_str().is_empty() {
+            cwd.to_path_buf()
+        } else {
+            directory
+        };
+        match candidate_availability(&directory.join(program)) {
+            Ok(true) => return ExecutableAvailability::Available,
+            Ok(false) => {}
+            Err(_) => incomplete = true,
+        }
+    }
+    if incomplete {
+        ExecutableAvailability::Unknown
+    } else {
+        ExecutableAvailability::Unavailable
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_executable_availability(
+    _program: &OsStr,
+    _cwd: &Path,
+    _environment: &BTreeMap<OsString, OsString>,
+) -> ExecutableAvailability {
+    ExecutableAvailability::Unknown
 }
 
 #[cfg(windows)]
@@ -693,6 +861,17 @@ fn finish_output_digest(hasher: blake3::Hasher) -> Digest {
     Digest::new(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
+/// Returns normal empty-stream digests for a command that was deliberately not spawned.
+///
+/// These are complete observations of zero bytes, not infrastructure-unavailable sentinels.
+#[must_use]
+pub fn empty_process_output_digests() -> (Digest, Digest) {
+    (
+        OutputStream::Stdout.empty_digest(),
+        OutputStream::Stderr.empty_digest(),
+    )
+}
+
 fn spawn_reader<R, W>(
     name: &'static str,
     stream: OutputStream,
@@ -985,7 +1164,12 @@ mod platform {
 
     #[cfg(target_vendor = "apple")]
     fn signal_tree(tree: &ChildTree, signal: Signal) -> io::Result<()> {
-        match killpg(tree.process_group, signal) {
+        signal_process_group(tree.process_group, signal)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn signal_process_group(process_group: Pid, signal: Signal) -> io::Result<()> {
+        match killpg(process_group, signal) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(Errno::EPERM) => {
                 // XNU's killpg implementation filters zombies from the process-group walk and
@@ -994,7 +1178,7 @@ mod platform {
                 // permitted across credential changes within a session: success proves a live
                 // member remains and the original signal failure must be reported; EPERM/ESRCH
                 // means the group contains only exited members and is already terminated.
-                match killpg(tree.process_group, Signal::SIGCONT) {
+                match killpg(process_group, Signal::SIGCONT) {
                     Ok(()) => Err(Errno::EPERM.into()),
                     Err(Errno::EPERM | Errno::ESRCH) => Ok(()),
                     Err(error) => {
@@ -1017,6 +1201,7 @@ mod platform {
         signal_process_group(tree.process_group, signal)
     }
 
+    #[cfg(not(target_vendor = "apple"))]
     fn signal_process_group(process_group: Pid, signal: Signal) -> io::Result<()> {
         match killpg(process_group, signal) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
@@ -1105,15 +1290,36 @@ mod platform {
                 0,
             );
             let mut events = [change];
-            let count = queue.kevent(
+            // XNU can report ESRCH either as the `kevent` error or through an EV_ERROR event when
+            // this freshly spawned child reaches exit before registration. This runtime
+            // exclusively owns the `Child` and does not reap via a SIGCHLD handler, so the child
+            // remains a zombie that pins the same PID/PGID. Retaining the exited state lets the
+            // caller kill that still-pinned process group before reaping instead of turning a
+            // successful short command into a setup failure.
+            let count = match queue.kevent(
                 &[change],
                 &mut events,
                 Some(nix::libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 0,
                 }),
-            )?;
-            let exited = first_event_reports_exit(&events, count)?;
+            ) {
+                Ok(count) => count,
+                #[cfg(target_vendor = "apple")]
+                Err(Errno::ESRCH) => {
+                    return Ok(Self {
+                        queue,
+                        exited: true,
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let exited = match first_event_reports_exit(&events, count) {
+                Ok(exited) => exited,
+                #[cfg(target_vendor = "apple")]
+                Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => true,
+                Err(error) => return Err(error),
+            };
             Ok(Self { queue, exited })
         }
 
@@ -1514,9 +1720,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SynchronousProcessRunner, TerminationMode,
-        drain_bounded, is_windows_batch_program, platform, private_anonymous_tempfile,
-        process_environment_dependency_digest, sanitized_environment,
+        DEFAULT_OUTPUT_LIMIT_BYTES, ExecutableAvailability, OutputStream, SynchronousProcessRunner,
+        TerminationMode, drain_bounded, is_windows_batch_program, platform,
+        private_anonymous_tempfile, process_environment_dependency_digest, sanitized_environment,
     };
     use crate::hash::Blake3Hasher;
 
@@ -1539,6 +1745,40 @@ mod tests {
             )
             .with_args(args),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_lookup_checks_path_without_running_repository_code() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempdir()?;
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin)?;
+        let executable = bin.join("forge-availability-fixture");
+        fs::write(&executable, b"this must never be executed\n")?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let mut available = spec("forge-availability-fixture", &[]);
+        available.env = EnvPolicy::minimal_with_overrides(BTreeMap::from([(
+            OsString::from("PATH"),
+            bin.as_os_str().to_owned(),
+        )]));
+
+        assert_eq!(
+            runner.executable_availability(&available)?,
+            ExecutableAvailability::Available
+        );
+        assert_eq!(fs::read(&executable)?, b"this must never be executed\n");
+
+        let mut unavailable = spec("forge-missing-availability-fixture", &[]);
+        unavailable.env = available.env;
+        assert_eq!(
+            runner.executable_availability(&unavailable)?,
+            ExecutableAvailability::Unavailable
+        );
+        Ok(())
     }
 
     #[test]
@@ -2053,6 +2293,71 @@ mod tests {
         terminate_result?;
         kill_result?;
         assert!(status_result?.success());
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn darwin_attach_accepts_a_child_that_exited_before_registration() -> Result<(), Box<dyn Error>>
+    {
+        let mut command = ProcessCommand::new("/usr/bin/true");
+        let prepared_tree = platform::PreparedTree::prepare(&mut command)?;
+        let mut child = command.spawn()?;
+
+        // Force the same ordering as a heavily loaded caller: the direct child exits before the
+        // parent reaches EVFILT_PROC registration, but remains unreaped and therefore still owns
+        // its PID/PGID identity.
+        thread::sleep(Duration::from_millis(100));
+        let mut tree = match prepared_tree.attach(&child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                super::reap_direct_child(&mut child);
+                return Err(error.into());
+            }
+        };
+
+        assert!(platform::wait_for_exit(&mut tree, Duration::ZERO)?);
+        assert!(super::kill_tree_and_reap(&mut child, &tree)?.success());
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn darwin_parallel_quick_exits_remain_observable() -> Result<(), Box<dyn Error>> {
+        const THREADS: usize = 8;
+        const RUNS_PER_THREAD: usize = 128;
+
+        let root = tempdir()?;
+        let runner = Arc::new(SynchronousProcessRunner::new(root.path())?);
+        let workers = (0..THREADS)
+            .map(|_| {
+                let runner = Arc::clone(&runner);
+                thread::spawn(move || -> Result<(), String> {
+                    for run in 0..RUNS_PER_THREAD {
+                        let observation = runner
+                            .run(&spec("/usr/bin/true", &[]))
+                            .map_err(|error| format!("quick-exit run {run} failed: {error}"))?;
+                        if observation.exit_code != Some(0)
+                            || observation.signal.is_some()
+                            || observation.timed_out
+                            || observation.interrupted
+                        {
+                            return Err(format!(
+                                "quick-exit run {run} returned an invalid observation: {observation:?}"
+                            ));
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("quick-exit worker panicked"))?
+                .map_err(io::Error::other)?;
+        }
         Ok(())
     }
 

@@ -40,6 +40,8 @@ pub struct AdapterSpec {
     pub selection: AdapterSelection,
     pub renderer: Option<AdapterRenderer>,
     pub equivalent_unmanaged: Option<&'static str>,
+    /// Canonical projection that must be selected before this projection can be generated.
+    pub requires: Option<AdapterTarget>,
     /// Explicit requests for the canonical host are reported as reuse of its standard entry.
     pub report_requested_reuse: bool,
 }
@@ -57,10 +59,19 @@ impl AdapterSpec {
             && path.as_path() == Path::new(self.path)
     }
 
-    pub(crate) fn selected(self, model: &ProjectModel, requested: bool) -> bool {
+    pub(crate) fn selected(
+        self,
+        model: &ProjectModel,
+        explicitly_requested: bool,
+        adopted: bool,
+        automatic_override: Option<bool>,
+    ) -> bool {
         match self.selection {
-            AdapterSelection::Always => true,
-            AdapterSelection::ExplicitOrDetected => requested || detected(model, self.host),
+            AdapterSelection::Always => explicitly_requested || automatic_override.unwrap_or(true),
+            AdapterSelection::ExplicitOrDetected => {
+                explicitly_requested
+                    || automatic_override.unwrap_or(adopted || detected(model, self.host))
+            }
             AdapterSelection::ExplicitReuse { .. } => false,
         }
     }
@@ -94,6 +105,7 @@ static ADAPTER_SPECS: [AdapterSpec; 3] = [
         selection: AdapterSelection::Always,
         renderer: Some(AdapterRenderer::ProjectIndex),
         equivalent_unmanaged: None,
+        requires: None,
         report_requested_reuse: true,
     },
     AdapterSpec {
@@ -106,6 +118,7 @@ static ADAPTER_SPECS: [AdapterSpec; 3] = [
         },
         renderer: None,
         equivalent_unmanaged: None,
+        requires: Some(AdapterTarget::Codex),
         report_requested_reuse: false,
     },
     AdapterSpec {
@@ -116,6 +129,7 @@ static ADAPTER_SPECS: [AdapterSpec; 3] = [
         selection: AdapterSelection::ExplicitOrDetected,
         renderer: Some(AdapterRenderer::Literal(CLAUDE_POINTER)),
         equivalent_unmanaged: Some(CLAUDE_POINTER),
+        requires: Some(AdapterTarget::Codex),
         report_requested_reuse: false,
     },
 ];

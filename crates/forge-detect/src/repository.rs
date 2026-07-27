@@ -7,9 +7,10 @@ use std::path::Path;
 
 use forge_core::ports::{FileSystemPort, GitPort, Hasher};
 use forge_core::{
-    BranchHead, BranchOid, CommitId, Confidence, Diagnostic, GitError, GitErrorKind, PathKind,
-    PorcelainV2Status, Provenance, RepoFacts, RepoId, RepoRelativePath, Severity, StatusEntry,
-    UpstreamState, WorkState,
+    BranchHead, BranchOid, CommitId, Confidence, Diagnostic, GitError, GitErrorKind,
+    OperationControl, OperationControlError, PathKind, PorcelainV2Status, Provenance, RepoFacts,
+    RepoId, RepoRelativePath, Severity, StatusEntry, UnlimitedOperationControl, UpstreamState,
+    WorkState,
 };
 
 const REPOSITORY_ID_DOMAIN: &[u8] = b"forge.repository-id/v1";
@@ -95,8 +96,27 @@ where
     F: FileSystemPort + ?Sized,
     H: Hasher + ?Sized,
 {
+    detect_repository_controlled(start, git, filesystem, hasher, &UnlimitedOperationControl)
+}
+
+/// Detects repository facts under one caller-owned operation deadline.
+pub fn detect_repository_controlled<G, F, H>(
+    start: &Path,
+    git: &G,
+    filesystem: &F,
+    hasher: &H,
+    control: &dyn OperationControl,
+) -> Result<RepositoryDetection, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+    F: FileSystemPort + ?Sized,
+    H: Hasher + ?Sized,
+{
+    control_step("repository root", control)?;
     let root = required_git_step("repository root", git.repository_root(start))?;
+    control_step("worktree Git directory", control)?;
     let git_dir = required_git_step("worktree Git directory", git.git_dir(&root))?;
+    control_step("common Git directory", control)?;
     let git_common_dir = required_git_step("common Git directory", git.git_common_dir(&root))?;
     if !git_common_dir.is_absolute() {
         return Err(RepositoryDetectionError {
@@ -131,6 +151,7 @@ where
     ];
     let mut diagnostics = Vec::new();
 
+    control_step("Git status", control)?;
     let (status, status_failure_state) = match git.status(&root) {
         Ok(status) => (Some(status), None),
         Err(error) if error.kind() == GitErrorKind::CorruptRepository => {
@@ -153,6 +174,8 @@ where
             });
         }
     };
+
+    control_step("repository fact assembly", control)?;
 
     let (head, branch, upstream, work_state, status_confidence) =
         if let Some(status) = status.as_ref() {
@@ -197,6 +220,27 @@ where
         confidence: status_confidence,
         diagnostics,
     })
+}
+
+fn control_step(
+    step: &'static str,
+    control: &dyn OperationControl,
+) -> Result<(), RepositoryDetectionError> {
+    control
+        .checkpoint()
+        .map(|_| ())
+        .map_err(|error| RepositoryDetectionError {
+            step,
+            source: operation_control_git_error(step, error),
+        })
+}
+
+fn operation_control_git_error(step: &'static str, error: OperationControlError) -> GitError {
+    let kind = match error {
+        OperationControlError::TimedOut => GitErrorKind::TimedOut,
+        OperationControlError::Interrupted => GitErrorKind::Interrupted,
+    };
+    GitError::new(kind, step, error.to_string())
 }
 
 #[cfg(unix)]

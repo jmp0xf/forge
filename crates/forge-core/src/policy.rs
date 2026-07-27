@@ -593,6 +593,15 @@ mod tests {
     }
 
     #[test]
+    fn path_patterns_reject_non_normalized_candidate_paths() -> Result<(), PolicyError> {
+        let broad = pattern("**")?;
+        for path in ["", "/src/lib.rs", "src//lib.rs", "src/"] {
+            assert!(!broad.matches(path), "non-normalized candidate {path:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn invalid_pattern_forms_are_rejected() {
         for value in [
             "",
@@ -602,6 +611,9 @@ mod tests {
             "../**",
             "src/**.rs",
             "src/[ab]",
+            "src/[ab.rs",
+            "src/ab].rs",
+            r"src\lib.rs",
         ] {
             assert!(PathPattern::new(value).is_err(), "{value}");
         }
@@ -712,6 +724,83 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["verify"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn every_independent_rule_tightening_retains_candidate_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = EffectivePolicyContent::new(
+            [rule(
+                "risk/x",
+                RiskLevel::Medium,
+                &["src/**"],
+                &["check"],
+                &["owner-review"],
+                "base",
+            )?],
+            EvidenceRequirements::default(),
+        )?;
+        let candidates = [
+            (
+                "level",
+                rule(
+                    "risk/x",
+                    RiskLevel::High,
+                    &["src/**"],
+                    &["check"],
+                    &["owner-review"],
+                    "candidate",
+                )?,
+            ),
+            (
+                "path",
+                rule(
+                    "risk/x",
+                    RiskLevel::Medium,
+                    &["src/**", "tests/**"],
+                    &["check"],
+                    &["owner-review"],
+                    "candidate",
+                )?,
+            ),
+            (
+                "evidence",
+                rule(
+                    "risk/x",
+                    RiskLevel::Medium,
+                    &["src/**"],
+                    &["check", "test"],
+                    &["owner-review"],
+                    "candidate",
+                )?,
+            ),
+            (
+                "external",
+                rule(
+                    "risk/x",
+                    RiskLevel::Medium,
+                    &["src/**"],
+                    &["check"],
+                    &["owner-review", "security-review"],
+                    "candidate",
+                )?,
+            ),
+        ];
+
+        for (dimension, candidate_rule) in candidates {
+            let candidate =
+                EffectivePolicyContent::new([candidate_rule], EvidenceRequirements::default())?;
+            let effective = EffectivePolicyContent::merge_candidate(&base, &candidate);
+            let provenance = effective
+                .rule("risk/x")
+                .ok_or_else(|| std::io::Error::other("the base rule was not retained"))?
+                .provenance
+                .iter()
+                .map(|source| source.rule_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(provenance, ["base", "candidate"], "{dimension}");
+        }
         Ok(())
     }
 

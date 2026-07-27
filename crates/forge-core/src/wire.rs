@@ -124,7 +124,7 @@ pub fn project_model_to_wire(
             &model.policy.provenance,
             model.policy.confidence,
         )),
-        assumptions: model.assumptions.iter().map(project_assumption).collect(),
+        assumptions: model.assumptions.iter().map(assumption_to_wire).collect(),
         assumption_details: Some(
             model
                 .assumptions
@@ -315,6 +315,30 @@ pub const fn evidence_outcome_to_wire(outcome: EvidenceOutcome) -> OutcomeData {
         EvidenceOutcome::TimedOut => OutcomeData::TimedOut,
         EvidenceOutcome::Interrupted => OutcomeData::Interrupted,
         EvidenceOutcome::Unknown => OutcomeData::Unknown,
+    }
+}
+
+/// Projects a process-boundary failure into its stable v2 Receipt spelling.
+#[must_use]
+pub const fn process_error_kind_to_wire(
+    kind: crate::ports::ProcessErrorKind,
+) -> forge_schema::ProcessErrorKindV2Data {
+    use crate::ports::ProcessErrorKind;
+    use forge_schema::ProcessErrorKindV2Data;
+
+    match kind {
+        ProcessErrorKind::InvalidRepositoryRoot => ProcessErrorKindV2Data::InvalidRepositoryRoot,
+        ProcessErrorKind::InvalidWorkingDirectory => {
+            ProcessErrorKindV2Data::InvalidWorkingDirectory
+        }
+        ProcessErrorKind::InvalidEnvironment => ProcessErrorKindV2Data::InvalidEnvironment,
+        ProcessErrorKind::UnsupportedProgram => ProcessErrorKindV2Data::UnsupportedProgram,
+        ProcessErrorKind::ExecutableUnavailable => ProcessErrorKindV2Data::ExecutableUnavailable,
+        ProcessErrorKind::PermissionDenied => ProcessErrorKindV2Data::PermissionDenied,
+        ProcessErrorKind::Spawn => ProcessErrorKindV2Data::Spawn,
+        ProcessErrorKind::ProcessTree => ProcessErrorKindV2Data::ProcessTree,
+        ProcessErrorKind::Output => ProcessErrorKindV2Data::Output,
+        ProcessErrorKind::Wait => ProcessErrorKindV2Data::Wait,
     }
 }
 
@@ -544,7 +568,12 @@ fn project_adapter_detail(adapter: &crate::domain::AdapterInfo) -> AdapterDetail
     }
 }
 
-fn project_assumption(assumption: &crate::domain::Assumption) -> AssumptionData {
+/// Projects one domain assumption using the same legacy representation as the project model.
+///
+/// Consumers that project only a command-relevant slice of a model can reuse this function
+/// without first projecting every command in the model.
+#[must_use]
+pub fn assumption_to_wire(assumption: &crate::domain::Assumption) -> AssumptionData {
     AssumptionData {
         statement: assumption.statement.clone(),
         provenance: legacy_provenance(&assumption.provenance),

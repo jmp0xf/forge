@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 
 pub mod clock;
+pub mod control;
 pub mod fs;
 pub mod git;
 pub mod hash;

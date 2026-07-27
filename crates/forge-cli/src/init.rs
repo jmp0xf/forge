@@ -4,17 +4,20 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Write as _};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use forge_core::branding::CLI_NAME;
-use forge_core::{AppError, ExitCode, WorkState};
+use forge_core::{
+    AppError, ExitCode, Intent, OperationControl as _, ProjectModel, Provenance, WorkState,
+};
+use forge_detect::config::ForgeConfig;
 use forge_detect::model::ModelDetectionCompletion;
 use forge_render::managed_block::ManagedBlockError;
 use forge_render::{
-    AdapterTarget, ApplyError, ApplyErrorKind, ApplyReport, ChangePlan, FileEditKind,
-    InitPlanOptions, ManagedBlockKind, PlanError, SkippedReason, apply_change_plan, plan_init,
+    AdapterSelectionOverrides, AdapterTarget, ApplyError, ApplyErrorKind, ApplyReport, ChangePlan,
+    FileEditKind, GapKind, InitPlanOptions, ManagedBlockKind, PlanError, RunnerRenderError,
+    RunnerTarget, SkippedReason, apply_change_plan, plan_init,
 };
+use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError};
@@ -25,14 +28,15 @@ use crate::adapter_manifest::{
     manifest_from_converged_plan, store_adapter_manifest,
 };
 use crate::args::{AdapterChoice, CiChoice, Cli, InitArgs, RunnerChoice};
-use crate::explain;
 use crate::init_wire::{InitPlanWireError, project_init_plan_to_wire};
+use crate::{doctor, explain};
 
 /// A completed init request. The plan remains the pre-apply artifact that the user reviewed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InitOutcome {
     pub(crate) plan: ChangePlan,
     pub(crate) wire: InitPlanData,
+    pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) applied: bool,
     pub(crate) apply_report: Option<ApplyReport>,
     pub(crate) completion: ModelDetectionCompletion,
@@ -68,30 +72,37 @@ impl InitFailure {
     }
 
     fn after_apply(app_error: AppError, apply_report: ApplyReport) -> Self {
-        let diagnostic = app_error.diagnostic();
-        let app_error = AppError::new(
-            app_error.exit_code(),
-            Diagnostic::new(
-                diagnostic.code.clone(),
-                diagnostic.severity,
-                diagnostic.what.clone(),
-                diagnostic.location.clone(),
-                format!(
-                    "{}; {}",
-                    diagnostic.why,
-                    apply_report_summary(&apply_report)
-                ),
-                format!(
-                    "{}; treat the reported write progress as authoritative when reviewing or rolling back",
-                    diagnostic.next
-                ),
-            ),
-        );
+        let app_error = with_apply_report(app_error, Some(&apply_report));
         Self {
             app_error,
             apply_report: Some(apply_report),
         }
     }
+}
+
+/// Adds authoritative write progress to a terminal error observed after init returned.
+pub(crate) fn with_apply_report(
+    app_error: AppError,
+    apply_report: Option<&ApplyReport>,
+) -> AppError {
+    let Some(apply_report) = apply_report else {
+        return app_error;
+    };
+    let diagnostic = app_error.diagnostic();
+    AppError::new(
+        app_error.exit_code(),
+        Diagnostic::new(
+            diagnostic.code.clone(),
+            diagnostic.severity,
+            diagnostic.what.clone(),
+            diagnostic.location.clone(),
+            format!("{}; {}", diagnostic.why, apply_report_summary(apply_report)),
+            format!(
+                "{}; treat the reported write progress as authoritative when reviewing or rolling back",
+                diagnostic.next
+            ),
+        ),
+    )
 }
 
 impl fmt::Display for InitFailure {
@@ -112,29 +123,29 @@ impl From<AppError> for InitFailure {
     }
 }
 
-/// Detects and plans init, and writes only when the caller explicitly selected `--apply`.
-pub(crate) fn execute(
+pub(crate) fn execute_controlled(
     cli: &Cli,
     args: &InitArgs,
-    cancellation: Arc<AtomicBool>,
+    control: &OperationBudget,
 ) -> Result<InitOutcome, InitFailure> {
-    execute_with_manifest_precondition(
+    execute_with_manifest_precondition_controlled(
         cli,
         args,
-        cancellation,
+        control,
         AdapterManifestPrecondition::Unchecked,
     )
 }
 
-pub(crate) fn execute_with_manifest_precondition(
+pub(crate) fn execute_with_manifest_precondition_controlled(
     cli: &Cli,
     args: &InitArgs,
-    cancellation: Arc<AtomicBool>,
+    control: &OperationBudget,
     manifest_precondition: AdapterManifestPrecondition,
 ) -> Result<InitOutcome, InitFailure> {
     validate_request(args)?;
-    let options = init_plan_options(args)?;
-    let detected = explain::detect(cli, Arc::clone(&cancellation))?;
+    let detected = explain::detect_controlled(cli, control)?;
+    checkpoint(control, "init plan")?;
+    let options = init_plan_options(args, detected.navigation.config.as_ref())?;
 
     if args.apply {
         ensure_detection_can_apply(detected.completion)?;
@@ -148,11 +159,13 @@ pub(crate) fn execute_with_manifest_precondition(
         plan_init(&detected.model, &filesystem, &hasher, &options).map_err(map_plan_error)?;
     let wire =
         project_init_plan_to_wire(&plan, &repository_root).map_err(map_wire_projection_error)?;
+    let diagnostics = project_gap_diagnostics(&plan, &detected.model);
 
     if !args.apply {
         return Ok(InitOutcome {
             plan,
             wire,
+            diagnostics,
             applied: false,
             apply_report: None,
             completion: detected.completion,
@@ -165,7 +178,8 @@ pub(crate) fn execute_with_manifest_precondition(
     // Re-detect every input that authorized the reviewed plan immediately before writing. Target
     // preimages protect managed files; this second model also closes races in manifests, runners,
     // work state, and other inputs that can change the generated bytes without touching a target.
-    let preapply = explain::detect(cli, Arc::clone(&cancellation))?;
+    checkpoint(control, "init pre-apply detection")?;
+    let preapply = explain::detect_controlled(cli, control)?;
     ensure_detection_can_apply(preapply.completion)?;
     ensure_work_state_can_apply(preapply.model.repository.work_state, args.allow_dirty)?;
     if preapply.model.repository.id != plan.repository
@@ -183,9 +197,11 @@ pub(crate) fn execute_with_manifest_precondition(
             ),
         )));
     }
-    let current_plan = plan_init(&preapply.model, &filesystem, &hasher, &options)
+    let current_options = init_plan_options(args, preapply.navigation.config.as_ref())?;
+    checkpoint(control, "init pre-apply plan")?;
+    let current_plan = plan_init(&preapply.model, &filesystem, &hasher, &current_options)
         .map_err(|error| InitFailure::plain(map_plan_error_app(error, "init pre-apply check")))?;
-    if current_plan != plan {
+    if current_options != options || current_plan != plan {
         return Err(InitFailure::plain(AppError::new(
             ExitCode::Temporary,
             Diagnostic::new(
@@ -199,6 +215,7 @@ pub(crate) fn execute_with_manifest_precondition(
         )));
     }
 
+    checkpoint(control, "init apply state")?;
     let state_store = AtomicStateStore::new(GitStateLayout::new(
         &preapply.model.repository.git_dir,
         &preapply.model.repository.git_common_dir,
@@ -227,9 +244,11 @@ pub(crate) fn execute_with_manifest_precondition(
             )));
         }
     }
+    checkpoint(control, "init apply")?;
     let report = apply_change_plan(&repository_root, &plan, &filesystem, &hasher)
         .map_err(map_apply_error)?;
-    let postcheck = explain::detect(cli, cancellation)
+    checkpoint_after_apply(control, "init post-check", &report)?;
+    let postcheck = explain::detect_controlled(cli, control)
         .map_err(|error| InitFailure::after_apply(error, report.clone()))?;
     ensure_postcheck_completed(postcheck.completion, &report)?;
     if postcheck.model.repository.id != plan.repository
@@ -254,8 +273,30 @@ pub(crate) fn execute_with_manifest_precondition(
             report,
         ));
     }
+    let post_options =
+        init_plan_options(args, postcheck.navigation.config.as_ref()).map_err(|failure| {
+            let (error, _) = failure.into_parts();
+            InitFailure::after_apply(error, report.clone())
+        })?;
+    if post_options != options {
+        return Err(InitFailure::after_apply(
+            AppError::new(
+                ExitCode::Temporary,
+                Diagnostic::new(
+                    "FGE2231",
+                    Severity::Error,
+                    "adapter selection changed during init post-check",
+                    "init post-check",
+                    "forge.toml no longer selects the adapters authorized by the reviewed plan",
+                    "review the written paths and rerun a fresh dry-run before applying again",
+                ),
+            ),
+            report,
+        ));
+    }
+    checkpoint_after_apply(control, "init post-check plan", &report)?;
     let post_plan =
-        plan_init(&postcheck.model, &filesystem, &hasher, &options).map_err(|error| {
+        plan_init(&postcheck.model, &filesystem, &hasher, &post_options).map_err(|error| {
             InitFailure::after_apply(map_plan_error_app(error, "init post-check"), report.clone())
         })?;
     if !post_plan.edits.is_empty() {
@@ -276,6 +317,7 @@ pub(crate) fn execute_with_manifest_precondition(
             report,
         ));
     }
+    checkpoint_after_apply(control, "init adapter manifest", &report)?;
     let manifest = manifest_from_converged_plan(&post_plan, &repository_root, &filesystem, &hasher)
         .map_err(|error| {
             InitFailure::after_apply(
@@ -289,10 +331,19 @@ pub(crate) fn execute_with_manifest_precondition(
             report.clone(),
         )
     })?;
+    drop(_state_lock);
+    checkpoint_after_apply(control, "init post-apply doctor", &report)?;
+    let postdoctor = doctor::execute_postcheck_controlled(cli, &postcheck, control)
+        .map_err(|error| InitFailure::after_apply(error, report.clone()))?;
+    ensure_generated_state_postdoctor(&postdoctor, &report)?;
+    if control.checkpoint().is_ok() {
+        explain::publish_inventory_cache_after_state_write(&preapply);
+    }
 
     Ok(InitOutcome {
         plan,
         wire,
+        diagnostics,
         applied: true,
         apply_report: Some(report),
         completion: detected.completion,
@@ -302,13 +353,160 @@ pub(crate) fn execute_with_manifest_precondition(
     })
 }
 
+fn checkpoint(control: &OperationBudget, location: &str) -> Result<(), InitFailure> {
+    control
+        .checkpoint()
+        .map(|_| ())
+        .map_err(|error| InitFailure::plain(explain::map_operation_control_error(error, location)))
+}
+
+fn checkpoint_after_apply(
+    control: &OperationBudget,
+    location: &str,
+    report: &ApplyReport,
+) -> Result<(), InitFailure> {
+    control.checkpoint().map(|_| ()).map_err(|error| {
+        InitFailure::after_apply(
+            explain::map_operation_control_error(error, location),
+            report.clone(),
+        )
+    })
+}
+
+/// Projects diagnostic-only command gaps through the envelope channel shared by human and JSON
+/// output. The versioned `InitPlanData` payload deliberately remains unchanged.
+fn project_gap_diagnostics(plan: &ChangePlan, model: &ProjectModel) -> Vec<Diagnostic> {
+    Intent::ALL
+        .into_iter()
+        .filter_map(|intent| {
+            let gap = plan.gaps.iter().find(|gap| {
+                gap.intent == Some(intent)
+                    && matches!(
+                        gap.kind,
+                        GapKind::MissingProjectCommand | GapKind::AmbiguousCommand
+                    )
+            })?;
+            let commands = model.commands.get(&intent)?;
+            let intent_label = intent_name(intent);
+            let evidence = provenance_summary(&commands.provenance);
+            match gap.kind {
+                GapKind::MissingProjectCommand => Some(Diagnostic::new(
+                    "FGE2232",
+                    Severity::Warning,
+                    format!("project command `{intent_label}` is absent"),
+                    format!("project command `{intent_label}`"),
+                    format!(
+                        "command resolution completed without a project-owned candidate; {evidence}"
+                    ),
+                    format!(
+                        "add a project-owned `{intent_label}` entry point or define `[commands.{intent_label}]` in forge.toml, then rerun forge init"
+                    ),
+                )),
+                GapKind::AmbiguousCommand => Some(Diagnostic::new(
+                    "FGE2233",
+                    Severity::Warning,
+                    format!("project command `{intent_label}` is ambiguous"),
+                    format!("project command `{intent_label}`"),
+                    format!(
+                        "command resolution retained {} equally authoritative candidates and will not choose one arbitrarily; {evidence}",
+                        commands.commands().len()
+                    ),
+                    format!(
+                        "select one authoritative `{intent_label}` interface or define `[commands.{intent_label}]` in forge.toml, then rerun forge init"
+                    ),
+                )),
+                GapKind::MissingHostIndex
+                | GapKind::MissingHostPointer
+                | GapKind::AdapterDrift
+                | GapKind::OptionalRunner
+                | GapKind::OptionalCiDraft
+                | GapKind::ConfigurationRequired => None,
+            }
+        })
+        .collect()
+}
+
+fn provenance_summary(provenance: &[Provenance]) -> String {
+    const DISPLAY_LIMIT: usize = 4;
+
+    if provenance.is_empty() {
+        return String::from("no resolution provenance was retained");
+    }
+    let mut sources = provenance
+        .iter()
+        .take(DISPLAY_LIMIT)
+        .map(|source| {
+            let rule = sanitize_text(&source.rule_id);
+            source.source_path.as_ref().map_or(rule.clone(), |path| {
+                format!("{rule}@{}", sanitize_text(&path.display))
+            })
+        })
+        .collect::<Vec<_>>();
+    if provenance.len() > DISPLAY_LIMIT {
+        sources.push(format!(
+            "{} additional source(s)",
+            provenance.len() - DISPLAY_LIMIT
+        ));
+    }
+    format!("resolution provenance: {}", sources.join(", "))
+}
+
+const fn intent_name(intent: Intent) -> &'static str {
+    match intent {
+        Intent::Setup => "setup",
+        Intent::FormatCheck => "format-check",
+        Intent::Format => "format",
+        Intent::Check => "check",
+        Intent::Fix => "fix",
+        Intent::Test => "test",
+        Intent::Verify => "verify",
+        Intent::Build => "build",
+    }
+}
+
+fn ensure_generated_state_postdoctor(
+    outcome: &doctor::DoctorOutcome,
+    report: &ApplyReport,
+) -> Result<(), InitFailure> {
+    let failed = outcome
+        .wire
+        .checks
+        .iter()
+        .filter(|check| {
+            matches!(
+                check.id.as_str(),
+                "state.layout" | "adapters.drift" | "path.safety"
+            ) && check.status == forge_schema::CheckStatusData::Fail
+        })
+        .map(|check| check.id.as_str())
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(InitFailure::after_apply(
+        AppError::internal(
+            "FGE0215",
+            "generated repository integration failed its post-doctor checks",
+            "init post-doctor",
+            format!("failed checks: {}", failed.join(", ")),
+            "inspect the generated state and reported write set before retrying or rolling back",
+        ),
+        report.clone(),
+    ))
+}
+
 fn map_state_error(error: StateError, location: &str) -> AppError {
-    AppError::environment_unmet(
-        "FGE2217",
-        "Forge private state is unavailable for adapter persistence",
-        location,
-        sanitize_text(&error.to_string()),
-        "fix the Git private-state path, permissions, or competing Forge process, then rerun init --apply",
+    let exit_code = crate::state_diagnostic::state_error_exit_code(&error);
+    AppError::new(
+        exit_code,
+        Diagnostic::new(
+            "FGE2217",
+            Severity::Error,
+            "Forge private state is unavailable for adapter persistence",
+            location,
+            sanitize_text(&error.to_string()),
+            "fix the Git private-state path, permissions, or competing Forge process, then rerun init --apply",
+        ),
     )
 }
 
@@ -385,29 +583,10 @@ fn validate_request(args: &InitArgs) -> Result<(), InitFailure> {
             "select at most one mode; omitting both is a dry-run",
         )));
     }
-    if let Some(runner) = args.with_runner {
-        return Err(InitFailure::plain(unavailable_runner_error(runner)));
-    }
     if let Some(provider) = args.with_ci {
         return Err(InitFailure::plain(unavailable_ci_error(provider)));
     }
     Ok(())
-}
-
-fn unavailable_runner_error(runner: RunnerChoice) -> AppError {
-    AppError::environment_unmet(
-        "FGE2201",
-        format!(
-            "explicit `{}` runner generation is not available in this build",
-            runner_name(runner)
-        ),
-        "--with-runner",
-        "Forge cannot yet render and verify this opt-in asset, so it will not silently ignore the request",
-        format!(
-            "remove `--with-runner {}` and use detected native commands, or use a Forge build that implements explicit runner generation",
-            runner_name(runner)
-        ),
-    )
 }
 
 fn unavailable_ci_error(provider: CiChoice) -> AppError {
@@ -426,21 +605,16 @@ fn unavailable_ci_error(provider: CiChoice) -> AppError {
     )
 }
 
-const fn runner_name(runner: RunnerChoice) -> &'static str {
-    match runner {
-        RunnerChoice::Make => "make",
-        RunnerChoice::Just => "just",
-        RunnerChoice::Task => "task",
-    }
-}
-
 const fn ci_name(provider: CiChoice) -> &'static str {
     match provider {
         CiChoice::Github => "github",
     }
 }
 
-fn init_plan_options(args: &InitArgs) -> Result<InitPlanOptions, InitFailure> {
+fn init_plan_options(
+    args: &InitArgs,
+    config: Option<&ForgeConfig>,
+) -> Result<InitPlanOptions, InitFailure> {
     let adapters = args
         .adapter
         .iter()
@@ -453,7 +627,25 @@ fn init_plan_options(args: &InitArgs) -> Result<InitPlanOptions, InitFailure> {
     let force_blocks = parse_force_blocks(&args.force_block)?;
     Ok(InitPlanOptions {
         adapters,
+        adopted_adapters: Vec::new(),
+        adapter_selection: adapter_selection_overrides(config),
         force_blocks,
+        runner: args.with_runner.map(|runner| match runner {
+            RunnerChoice::Make => RunnerTarget::Make,
+            RunnerChoice::Just => RunnerTarget::Just,
+            RunnerChoice::Task => RunnerTarget::Task,
+        }),
+    })
+}
+
+pub(crate) fn adapter_selection_overrides(
+    config: Option<&ForgeConfig>,
+) -> AdapterSelectionOverrides {
+    config.map_or_else(AdapterSelectionOverrides::default, |config| {
+        AdapterSelectionOverrides {
+            agents: config.adapters.agents,
+            claude: config.adapters.claude,
+        }
     })
 }
 
@@ -464,13 +656,16 @@ fn parse_force_blocks(values: &[String]) -> Result<Vec<ManagedBlockKind>, InitFa
         let block = match value.as_str() {
             "project-index" => ManagedBlockKind::ProjectIndex,
             "claude-pointer" => ManagedBlockKind::ClaudePointer,
+            "runner-make-verify" => ManagedBlockKind::RunnerMakeVerify,
+            "runner-just-verify" => ManagedBlockKind::RunnerJustVerify,
+            "runner-task-verify" => ManagedBlockKind::RunnerTaskVerify,
             _ => {
                 return Err(InitFailure::plain(AppError::usage(
                     "FGE1202",
                     "unknown managed block selected for replacement",
                     "--force-block",
                     format!("`{value}` is not one of the managed blocks owned by this Forge build"),
-                    "use `--force-block project-index` or `--force-block claude-pointer`",
+                    "use one block id printed by the init preview",
                 )));
             }
         };
@@ -609,6 +804,17 @@ pub(crate) fn map_plan_error_app(error: PlanError, location: &str) -> AppError {
             format!("adapter `{}` occurs more than once", adapter_name(adapter)),
             "remove the duplicate adapter option",
         ),
+        PlanError::AdapterDependencyConflict { adapter, required } => AppError::data(
+            "FGE1215",
+            "adapter configuration cannot be satisfied safely",
+            "forge.toml [adapters]",
+            format!(
+                "adapter `{}` requires `{}`, but the required projection is disabled",
+                adapter_name(adapter),
+                adapter_name(required)
+            ),
+            "enable the required adapter, disable the dependent adapter, or request the dependent adapter explicitly for this init",
+        ),
         PlanError::DuplicateForceBlock(block) => AppError::usage(
             "FGE1203",
             "the same managed block was selected more than once",
@@ -651,6 +857,40 @@ pub(crate) fn map_plan_error_app(error: PlanError, location: &str) -> AppError {
                 ),
             ),
             "reduce or split the user-owned file before asking Forge to append a managed block",
+        ),
+        PlanError::AttributesFileLimit { path, max_bytes } => AppError::environment_unmet(
+            "FGE2226",
+            "the root attributes file is too large for bounded init planning",
+            display_repository_path(path.as_path()),
+            format!("the complete file exceeds the {max_bytes}-byte review limit"),
+            "reduce or split the root .gitattributes file, then rerun the dry-run",
+        ),
+        PlanError::RunnerRender { path, source } => {
+            let (what, next) = if matches!(&source, RunnerRenderError::UnsupportedPlatform { .. }) {
+                (
+                    "the explicit runner is not supported on this platform",
+                    "select --with-runner task on Windows, or keep using the reported project-native commands",
+                )
+            } else {
+                (
+                    "the explicit runner cannot preserve the resolved project command contract",
+                    "keep using the reported project-native commands, or make their argv, cwd, and environment portable before retrying --with-runner",
+                )
+            };
+            AppError::environment_unmet(
+                "FGE2229",
+                what,
+                display_repository_path(path.as_path()),
+                sanitize_text(&source.to_string()),
+                next,
+            )
+        }
+        PlanError::RunnerConflict { path, detail } => AppError::environment_unmet(
+            "FGE2230",
+            "the explicit runner would conflict with an existing project interface",
+            display_repository_path(path.as_path()),
+            sanitize_text(&detail),
+            "keep the existing runner or verify command; remove the competing interface explicitly before selecting a different runner",
         ),
         PlanError::InvalidTarget(_)
         | PlanError::DuplicateTarget(_)
@@ -855,9 +1095,37 @@ pub(crate) fn render_human(outcome: &InitOutcome) -> String {
         );
         render_postimage(&mut output, &edit.preview_postimage);
     }
-    let _ = writeln!(output, "assumptions: {}", outcome.plan.assumptions.len());
-    for assumption in &outcome.plan.assumptions {
-        let _ = writeln!(output, "  - {}", sanitize_text(&assumption.statement));
+    let assumptions = outcome
+        .plan
+        .assumptions
+        .iter()
+        .map(|assumption| sanitize_text(&assumption.statement))
+        .collect::<BTreeSet<_>>();
+    if assumptions.len() == outcome.plan.assumptions.len() {
+        let _ = writeln!(output, "assumptions: {}", assumptions.len());
+    } else {
+        let _ = writeln!(
+            output,
+            "assumptions: {} distinct ({} source observations)",
+            assumptions.len(),
+            outcome.plan.assumptions.len(),
+        );
+    }
+    for assumption in assumptions {
+        let _ = writeln!(output, "  - {assumption}");
+    }
+    let _ = writeln!(output, "warnings: {}", outcome.diagnostics.len());
+    for diagnostic in &outcome.diagnostics {
+        let _ = writeln!(
+            output,
+            "  - {}[{}]: {}",
+            diagnostic.severity,
+            diagnostic.code,
+            sanitize_text(&diagnostic.what),
+        );
+        let _ = writeln!(output, "    where: {}", sanitize_text(&diagnostic.location));
+        let _ = writeln!(output, "    why: {}", sanitize_text(&diagnostic.why));
+        let _ = writeln!(output, "    next: {}", sanitize_text(&diagnostic.next));
     }
     let _ = writeln!(output, "skipped: {}", outcome.plan.skipped.len());
     for skipped in &outcome.plan.skipped {
@@ -926,14 +1194,43 @@ pub(crate) fn sanitize_text(value: &str) -> String {
 mod tests {
     use std::error::Error;
 
-    use forge_core::{ExitCode, WorkState};
-    use forge_render::ManagedBlockKind;
+    use forge_core::{AppError, ExitCode, RepoRelativePath, WorkState};
+    use forge_render::{ApplyReport, ManagedBlockKind, PlanError, RunnerRenderError, RunnerTarget};
+    use forge_schema::{Diagnostic, Severity};
 
     use super::{
-        display_repository_path, ensure_work_state_can_apply, parse_force_blocks, render_postimage,
-        sanitize_text, validate_request,
+        display_repository_path, ensure_work_state_can_apply, map_plan_error_app,
+        parse_force_blocks, render_postimage, sanitize_text, validate_request, with_apply_report,
     };
     use crate::args::{CiChoice, InitArgs, RunnerChoice};
+
+    #[test]
+    fn post_apply_terminal_error_retains_typed_exit_and_apply_report() -> Result<(), Box<dyn Error>>
+    {
+        let report = ApplyReport {
+            written: Vec::new(),
+            unwritten: vec![RepoRelativePath::new("AGENTS.md")?],
+        };
+        let error = AppError::new(
+            ExitCode::Interrupted,
+            Diagnostic::new(
+                "FGE2005",
+                Severity::Error,
+                "fixture interruption",
+                "init result",
+                "fixture reason",
+                "retry",
+            ),
+        );
+
+        let error = with_apply_report(error, Some(&report));
+
+        assert_eq!(error.exit_code(), ExitCode::Interrupted);
+        assert_eq!(error.diagnostic().code.as_str(), "FGE2005");
+        assert!(error.diagnostic().why.contains("apply report:"));
+        assert!(error.diagnostic().why.contains("unwritten=[AGENTS.md]"));
+        Ok(())
+    }
 
     #[test]
     fn force_blocks_accept_only_owned_ids_and_reject_duplicates() -> Result<(), Box<dyn Error>> {
@@ -996,17 +1293,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_unavailable_generators_are_not_ignored() -> Result<(), Box<dyn Error>> {
+    fn runner_is_available_while_unavailable_ci_is_not_ignored() -> Result<(), Box<dyn Error>> {
         let mut args = init_args();
         args.with_runner = Some(RunnerChoice::Just);
-        match validate_request(&args) {
-            Ok(()) => return Err("unavailable runner generation was ignored".into()),
-            Err(error) => {
-                assert_eq!(error.into_parts().0.exit_code(), ExitCode::EnvironmentUnmet);
-            }
-        }
+        validate_request(&args)?;
 
-        args.with_runner = None;
         args.with_ci = Some(CiChoice::Github);
         match validate_request(&args) {
             Ok(()) => return Err("unavailable CI generation was ignored".into()),
@@ -1014,6 +1305,37 @@ mod tests {
                 assert_eq!(error.into_parts().0.exit_code(), ExitCode::EnvironmentUnmet);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_runner_has_an_actionable_platform_diagnostic() -> Result<(), Box<dyn Error>> {
+        let error = map_plan_error_app(
+            PlanError::RunnerRender {
+                path: RepoRelativePath::new("Makefile")?,
+                source: RunnerRenderError::UnsupportedPlatform {
+                    runner: RunnerTarget::Make,
+                },
+            },
+            "init plan",
+        );
+        let diagnostic = error.diagnostic();
+
+        assert_eq!(error.exit_code(), ExitCode::EnvironmentUnmet);
+        assert_eq!(diagnostic.code.as_str(), "FGE2229");
+        assert_eq!(
+            diagnostic.what,
+            "the explicit runner is not supported on this platform"
+        );
+        assert_eq!(diagnostic.location, "Makefile");
+        assert_eq!(
+            diagnostic.why,
+            "the explicit `make` runner recipe is not portable on this platform"
+        );
+        assert_eq!(
+            diagnostic.next,
+            "select --with-runner task on Windows, or keep using the reported project-native commands"
+        );
         Ok(())
     }
 

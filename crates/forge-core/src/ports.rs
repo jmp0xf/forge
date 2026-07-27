@@ -7,9 +7,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::control::OperationControl;
 use crate::domain::{CommandSpec, Mutability, NetworkIntent};
-use crate::git::{GitError, GitErrorKind, GitFileSet, GitObjectId, PorcelainV2Status};
-use crate::inventory::{BoundedText, Inventory, InventoryError, InventoryOptions, PathKind};
+use crate::git::{
+    GitError, GitErrorKind, GitFileSet, GitIndexEntry, GitObjectId, PorcelainV2Status,
+};
+use crate::inventory::{
+    BoundedText, Inventory, InventoryError, InventoryOptions, PathKind, PathMetadata,
+};
 use crate::path::RepoRelativePath;
 use forge_schema::Digest;
 
@@ -191,6 +196,25 @@ pub enum ProcessErrorKind {
     Wait,
 }
 
+impl ProcessErrorKind {
+    /// Stable machine spelling used by typed Receipt projections and process-boundary markers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRepositoryRoot => "invalid-repository-root",
+            Self::InvalidWorkingDirectory => "invalid-working-directory",
+            Self::InvalidEnvironment => "invalid-environment",
+            Self::UnsupportedProgram => "unsupported-program",
+            Self::ExecutableUnavailable => "executable-unavailable",
+            Self::PermissionDenied => "permission-denied",
+            Self::Spawn => "spawn",
+            Self::ProcessTree => "process-tree",
+            Self::Output => "output",
+            Self::Wait => "wait",
+        }
+    }
+}
+
 /// A typed process-boundary failure with its original operating-system error retained.
 #[derive(Debug)]
 pub struct ProcessError {
@@ -250,6 +274,20 @@ pub trait FileSystemPort {
         file_set: Option<&GitFileSet>,
         options: InventoryOptions,
     ) -> Result<Inventory, InventoryError>;
+    /// Inventories with one operation-wide deadline and cancellation source.
+    ///
+    /// Alternate ports retain source compatibility through this fail-safe default. Native runtime
+    /// implementations override it to checkpoint every retained or skipped entry.
+    fn inventory_controlled(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+        control: &dyn OperationControl,
+    ) -> Result<Inventory, InventoryError> {
+        control.checkpoint()?;
+        self.inventory(root, file_set, options)
+    }
     /// Reads a repository-relative text candidate up to the configured byte bound.
     fn read_bounded_text(
         &self,
@@ -257,10 +295,31 @@ pub trait FileSystemPort {
         path: &RepoRelativePath,
         max_text_file_bytes: u64,
     ) -> Result<BoundedText, InventoryError>;
+    /// Reads bounded text with cooperative checkpoints.
+    fn read_bounded_text_controlled(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+        control: &dyn OperationControl,
+    ) -> Result<BoundedText, InventoryError> {
+        control.checkpoint()?;
+        self.read_bounded_text(root, path, max_text_file_bytes)
+    }
     /// Inspects one repository-relative path without following symbolic links.
     ///
     /// Missing paths are represented explicitly; permission and other I/O failures remain errors.
     fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind>;
+    /// Atomically observes path kind and size without following symbolic links.
+    ///
+    /// The default fails closed: a port that cannot provide both facts from one metadata snapshot
+    /// must not silently make a shared-cache entry appear reusable.
+    fn path_metadata(&self, _root: &Path, _path: &RepoRelativePath) -> io::Result<PathMetadata> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the filesystem port does not implement atomic path metadata observations",
+        ))
+    }
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
     fn exists(&self, path: &Path) -> bool;
 }
@@ -307,6 +366,35 @@ pub trait GitPort {
     fn status(&self, root: &Path) -> Result<PorcelainV2Status, GitError>;
     fn file_set(&self, root: &Path) -> Result<GitFileSet, GitError>;
 
+    /// Reads the exact raw Git index file through one bounded, no-follow file snapshot.
+    ///
+    /// The bytes are opaque input for a cryptographic cache identity; callers must not interpret
+    /// them as a Git object ID or rely on Git's SHA-1/SHA-256 object format. Implementations must
+    /// reject symbolic links, non-regular files, files larger than `max_bytes`, split indexes whose
+    /// shared dependency is not included, and any present sibling `index.lock`.
+    ///
+    /// The default fails closed so alternate ports cannot silently build a reusable cache identity
+    /// from an incomplete or path-derived approximation of the index.
+    fn index_snapshot_bytes(&self, _root: &Path, _max_bytes: usize) -> Result<Vec<u8>, GitError> {
+        Err(GitError::new(
+            GitErrorKind::InvalidData,
+            "index-snapshot",
+            "the Git port does not implement bounded raw-index snapshot reads",
+        ))
+    }
+
+    /// Reads the complete bounded index representation used by reusable cache identities.
+    ///
+    /// The default fails closed so alternate ports cannot claim a complete index basis from only
+    /// a path list.
+    fn index_entries(&self, _root: &Path) -> Result<Vec<GitIndexEntry>, GitError> {
+        Err(GitError::new(
+            GitErrorKind::InvalidData,
+            "index-entries",
+            "the Git port does not implement complete index entry reads",
+        ))
+    }
+
     /// Reads one regular file from an exact immutable commit object.
     ///
     /// `Ok(None)` means that the path is absent from that commit. Implementations must not follow
@@ -352,12 +440,49 @@ pub trait Hasher {
 mod tests {
     use std::error::Error;
     use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use crate::domain::{CommandSource, CommandSpec, Intent, Mutability, NetworkIntent};
+    use crate::{GitError, GitErrorKind, GitFileSet, PorcelainV2Status};
 
-    use super::{DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, OutputPolicy, StdinPolicy};
+    use super::{
+        DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, GitPort, OutputPolicy, StdinPolicy,
+    };
     use crate::path::RepoRelativePath;
+
+    #[derive(Debug)]
+    struct GitPortWithoutIndexSnapshot;
+
+    impl GitPort for GitPortWithoutIndexSnapshot {
+        fn repository_root(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            unavailable_git_operation()
+        }
+
+        fn git_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            unavailable_git_operation()
+        }
+
+        fn git_common_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            unavailable_git_operation()
+        }
+
+        fn status(&self, _root: &Path) -> Result<PorcelainV2Status, GitError> {
+            unavailable_git_operation()
+        }
+
+        fn file_set(&self, _root: &Path) -> Result<GitFileSet, GitError> {
+            unavailable_git_operation()
+        }
+    }
+
+    fn unavailable_git_operation<T>() -> Result<T, GitError> {
+        Err(GitError::new(
+            GitErrorKind::InvalidData,
+            "test",
+            "operation is intentionally unavailable",
+        ))
+    }
 
     #[test]
     fn project_command_adapter_preserves_every_executable_field() -> Result<(), Box<dyn Error>> {
@@ -436,5 +561,21 @@ mod tests {
     #[test]
     fn discarded_output_has_a_zero_retention_bound() {
         assert_eq!(OutputPolicy::Discard.retention_limit(), 0);
+    }
+
+    #[test]
+    fn raw_index_snapshot_defaults_to_fail_closed() {
+        let error = GitPortWithoutIndexSnapshot
+            .index_snapshot_bytes(Path::new("."), 1024)
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(GitError::kind),
+            Some(GitErrorKind::InvalidData)
+        );
+        assert_eq!(
+            error.as_ref().map(GitError::operation),
+            Some("index-snapshot")
+        );
     }
 }

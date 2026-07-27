@@ -9,6 +9,9 @@ use std::process::ExitCode;
 
 use forge_schema::{SchemaKind, schema_json};
 
+mod compat;
+mod fixtures;
+
 const EXIT_OK: u8 = 0;
 const EXIT_NEGATIVE: u8 = 1;
 const EXIT_ENV_UNMET: u8 = 2;
@@ -28,14 +31,84 @@ fn main() -> ExitCode {
         }
         [command] if command == "schema-export" => run_schema_export(),
         [command] if command == "check-schemas" => run_check_schemas(),
-        [command] if command == "generate-fixtures" || command == "diff-plans" => {
-            eprintln!("xtask `{command}` is specified but not implemented yet");
-            ExitCode::from(EXIT_ENV_UNMET)
-        }
+        [command] if command == "generate-fixtures" => run_generate_fixtures(),
+        [command, rest @ ..] if command == "diff-plans" => run_diff_plans(rest),
         _ => {
             eprintln!("invalid xtask arguments; run `cargo run -p xtask -- help`");
             ExitCode::from(EXIT_USAGE)
         }
+    }
+}
+
+fn run_diff_plans(arguments: &[String]) -> ExitCode {
+    if matches!(arguments, [argument] if argument == "--help") {
+        print_diff_plans_help();
+        return ExitCode::from(EXIT_OK);
+    }
+    let request = match compat::DiffPlansRequest::parse(arguments) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("error: {error}");
+            eprintln!("usage: xtask diff-plans --baseline <BIN> --candidate <BIN>");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let paths = match fixtures::FixturePaths::repository_default() {
+        Ok(paths) => paths,
+        Err(error) => return report_error(EXIT_INTERNAL, &error),
+    };
+    match compat::compare(&request, &paths.generated) {
+        Ok(report) if report.differences.is_empty() => {
+            println!(
+                "public compatibility self-check passed: {} fixtures, {} shared schemas",
+                report.fixture_count, report.shared_schema_count
+            );
+            println!(
+                "baseline schemas: {}; candidate schemas: {}",
+                report.baseline_schema_count, report.candidate_schema_count
+            );
+            println!(
+                "this candidate-repository check is public self-test evidence, not external authority"
+            );
+            ExitCode::from(EXIT_OK)
+        }
+        Ok(report) => {
+            eprintln!(
+                "public compatibility differences detected ({}):",
+                report.differences.len()
+            );
+            for difference in report.differences {
+                eprintln!("  {}: {}", difference.subject, difference.detail);
+            }
+            eprintln!(
+                "review each difference as a compatible addition, versioned contract change, or declared breaking change"
+            );
+            eprintln!(
+                "this candidate-repository check is public self-test evidence, not external authority"
+            );
+            ExitCode::from(EXIT_NEGATIVE)
+        }
+        Err(error) => report_error(error.exit_code(), &error.to_string()),
+    }
+}
+
+fn run_generate_fixtures() -> ExitCode {
+    let paths = match fixtures::FixturePaths::repository_default() {
+        Ok(paths) => paths,
+        Err(error) => return report_error(EXIT_INTERNAL, &error),
+    };
+    match fixtures::generate(&paths, fixtures::REQUIRED_FIXTURE_IDS) {
+        Ok(report) => {
+            println!(
+                "materialized {} fixtures under {} ({} written, {} unchanged)",
+                report.fixture_count,
+                paths.generated.display(),
+                report.written,
+                report.unchanged
+            );
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => report_error(EXIT_ENV_UNMET, &error),
     }
 }
 
@@ -151,8 +224,20 @@ fn print_help() {
         "xtask commands:\n\
          schema-export     export checked-in JSON Schemas\n\
          check-schemas     detect unreviewed Schema drift\n\
-         generate-fixtures build deterministic fixture repositories (planned)\n\
-         diff-plans        compare N-1 and candidate init plans (planned)"
+         generate-fixtures build deterministic fixture repositories\n\
+         diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate"
+    );
+}
+
+fn print_diff_plans_help() {
+    println!(
+        "usage: xtask diff-plans --baseline <BIN> --candidate <BIN>\n\n\
+         Compares default JSON init dry-runs for every checked-in public fixture, supported\n\
+         schema sets, and shared schema documents. JSON comparison ignores only the root\n\
+         envelope's tool_version string value. Exit 0 means equal, 1 means behavior differs, 2 means\n\
+         the environment could not run the harness, 64 means invalid arguments, and 70 means\n\
+         a harness invariant failed. Subject execution currently requires Unix process-group\n\
+         containment and fails closed elsewhere. This repository-local self-check is not external authority."
     );
 }
 

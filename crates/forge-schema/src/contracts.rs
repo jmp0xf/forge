@@ -507,10 +507,25 @@ pub enum CheckStatusData {
     Unknown,
 }
 
+/// Typed reason why a registered doctor check was not evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum DoctorSkipReasonData {
+    UserFlag,
+    PlatformLimitation,
+    Budget,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DoctorCheckData {
     pub id: String,
     pub status: CheckStatusData,
+    /// Present exactly when `status` is `skipped` in current Forge output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<DoctorSkipReasonData>,
     pub detail: String,
     pub next: String,
 }
@@ -581,6 +596,12 @@ pub struct RiskAssessmentData {
 pub struct ContextPathData {
     pub path: WirePath,
     pub why: String,
+    /// Stable rule identifiers supporting this context pointer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
+    /// Present in current Forge output; optional on input for additive v1 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<ConfidenceData>,
 }
 
 /// Root data for `forge next`.
@@ -722,6 +743,41 @@ pub enum OutcomeData {
     Unknown,
 }
 
+/// Typed result of applying a command's JSON error contract to complete stdout.
+///
+/// Unknown values map to a non-proving state in v2 Receipt consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum JsonErrorStatusV2Data {
+    NoErrors,
+    HasErrors,
+    Invalid,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed process-boundary failure recorded when no termination observation is available.
+///
+/// Unknown values remain readable but can never satisfy current Evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ProcessErrorKindV2Data {
+    InvalidRepositoryRoot,
+    InvalidWorkingDirectory,
+    InvalidEnvironment,
+    UnsupportedProgram,
+    ExecutableUnavailable,
+    PermissionDenied,
+    Spawn,
+    ProcessTree,
+    Output,
+    Wait,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandObservationData {
     pub command: CommandData,
@@ -759,8 +815,31 @@ pub struct CommandObservationV2Data {
     pub duration_ms: u64,
     pub timed_out: bool,
     pub interrupted: bool,
+    /// Present when the process boundary failed before a complete termination observation existed.
+    ///
+    /// Optionality is same-major read compatibility for early v2 writers. Current writers always
+    /// populate this field for `infrastructure-failure` observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_error_kind: Option<ProcessErrorKindV2Data>,
     pub stdout_digest: Digest,
+    /// Complete stdout byte count before any bounded retention or display truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_total_bytes: Option<u64>,
+    /// Result of the command provider's typed JSON error contract, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_error_status: Option<JsonErrorStatusV2Data>,
     pub stderr_digest: Digest,
+    /// Whether the bounded in-memory stdout preview omitted bytes.
+    ///
+    /// This is optional only for same-major read compatibility with early v2 writers. A current
+    /// Receipt must carry both per-stream flags so consumers never have to infer which stream the
+    /// legacy combined flag described.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_truncated: Option<bool>,
+    /// Whether the bounded in-memory stderr preview omitted bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated: Option<bool>,
+    /// Compatibility projection equal to `stdout_truncated || stderr_truncated` for current v2.
     pub output_truncated: bool,
     pub log_refs: Vec<WirePath>,
 }
@@ -1077,6 +1156,16 @@ pub struct ReceiptDependenciesV2Data {
 pub struct ReceiptV2Data {
     pub id: ReceiptId,
     pub intent: IntentData,
+    /// Confidence that this exact command set implements the selected intent.
+    ///
+    /// Optionality is read compatibility only. Current writers always populate both command-set
+    /// confidence fields; older v2 objects without them remain historical and non-proving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_confidence: Option<ConfidenceData>,
+    /// Confidence that the resolved command set covers the selected intent completely enough for
+    /// local evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_confidence: Option<ConfidenceData>,
     pub observations: Vec<CommandObservationV2Data>,
     pub comparison_basis: ComparisonBasisV2Data,
     pub dependencies: ReceiptDependenciesV2Data,
@@ -1470,10 +1559,11 @@ mod tests {
 
     use super::{
         BaseTaskDependencyV2Data, CheckStatusData, CommandDetailData, CommandEnforcementData,
-        CommandResolutionData, CommandSourceData, ComparisonProtocolV2Data, ConfidenceData,
-        DigestDependencyV2Data, Envelope, EvidenceDependencyV2Data, EvidenceV2Data,
-        GitObjectIdV2Data, GitSha1ObjectIdV2Data, GitSha256ObjectIdV2Data,
-        NativeStringEncodingData, ProjectModelData, ProjectUnitDetailData,
+        CommandObservationV2Data, CommandResolutionData, CommandSourceData,
+        ComparisonProtocolV2Data, ConfidenceData, DigestDependencyV2Data, Envelope,
+        EvidenceDependencyV2Data, EvidenceV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
+        GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
+        ProcessErrorKindV2Data, ProjectModelData, ProjectUnitDetailData,
         ReceiptValidityReasonV2Data, SchemaIndexData, SchemaKind, SchemaVersion,
         StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData, schema_json,
     };
@@ -2106,6 +2196,145 @@ mod tests {
         let encoded = serde_json::to_string(&predicate)?;
         let decoded: SuccessPredicateData = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, predicate);
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_v2_observation_facts_are_optional_typed_and_schema_visible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = serde_json::json!({
+            "command": {
+                "command": {
+                    "id": "rust.test",
+                    "intent": "test",
+                    "program": "cargo",
+                    "args": ["test"],
+                    "cwd": {"display": "", "encoding": "utf8"},
+                    "environment_names": [],
+                    "timeout_seconds": 300,
+                    "mutability": "read-only",
+                    "network": "inherit",
+                    "source": "language-default",
+                    "confidence": "high",
+                    "coverage": ["unit-test"]
+                },
+                "native_program": {"display": "cargo", "encoding": "utf8"},
+                "native_args": [{"display": "test", "encoding": "utf8"}],
+                "native_environment_names": [],
+                "source_detail": {
+                    "kind": "language-default",
+                    "provider": "rust",
+                    "rule": "cargo-test"
+                },
+                "enforcement": "required",
+                "success": {"kind": "exit-zero"}
+            },
+            "raw_exit_code": 0,
+            "signal": null,
+            "outcome": "pass",
+            "duration_ms": 10,
+            "timed_out": false,
+            "interrupted": false,
+            "stdout_digest": "blake3:stdout",
+            "stderr_digest": "blake3:stderr",
+            "output_truncated": false,
+            "log_refs": []
+        });
+        let legacy_observation: CommandObservationV2Data = serde_json::from_value(legacy.clone())?;
+        assert_eq!(legacy_observation.process_error_kind, None);
+        assert_eq!(legacy_observation.stdout_total_bytes, None);
+        assert_eq!(legacy_observation.json_error_status, None);
+        assert_eq!(legacy_observation.stdout_truncated, None);
+        assert_eq!(legacy_observation.stderr_truncated, None);
+        assert_eq!(serde_json::to_value(&legacy_observation)?, legacy);
+
+        let mut current = legacy;
+        current["stdout_total_bytes"] = serde_json::json!(0);
+        current["process_error_kind"] = serde_json::json!("executable-unavailable");
+        current["json_error_status"] = serde_json::json!("no-errors");
+        current["stdout_truncated"] = serde_json::json!(false);
+        current["stderr_truncated"] = serde_json::json!(true);
+        let current: CommandObservationV2Data = serde_json::from_value(current)?;
+        assert_eq!(
+            current.process_error_kind,
+            Some(ProcessErrorKindV2Data::ExecutableUnavailable)
+        );
+        assert_eq!(current.stdout_total_bytes, Some(0));
+        assert_eq!(
+            current.json_error_status,
+            Some(JsonErrorStatusV2Data::NoErrors)
+        );
+        assert_eq!(current.stdout_truncated, Some(false));
+        assert_eq!(current.stderr_truncated, Some(true));
+
+        let future_status: JsonErrorStatusV2Data = serde_json::from_str(r#""future-status""#)?;
+        assert_eq!(future_status, JsonErrorStatusV2Data::Unknown);
+        let future_process_kind: ProcessErrorKindV2Data =
+            serde_json::from_str(r#""future-process-kind""#)?;
+        assert_eq!(future_process_kind, ProcessErrorKindV2Data::Unknown);
+        assert_eq!(
+            serde_json::to_value(JsonErrorStatusV2Data::HasErrors)?,
+            serde_json::json!("has-errors")
+        );
+
+        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::Receipt)?)?;
+        let observation = schema
+            .pointer("/$defs/CommandObservationV2Data")
+            .ok_or_else(|| std::io::Error::other("v2 observation schema is missing"))?;
+        let properties = observation["properties"]
+            .as_object()
+            .ok_or_else(|| std::io::Error::other("v2 observation properties are missing"))?;
+        let required = observation["required"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("v2 observation required list is missing"))?;
+        for optional in [
+            "stdout_total_bytes",
+            "process_error_kind",
+            "json_error_status",
+            "stdout_truncated",
+            "stderr_truncated",
+        ] {
+            assert!(properties.contains_key(optional));
+            assert!(required.iter().all(|field| field != optional));
+        }
+        let receipt = schema
+            .pointer("/$defs/ReceiptV2Data")
+            .ok_or_else(|| std::io::Error::other("v2 receipt schema is missing"))?;
+        let receipt_properties = receipt["properties"]
+            .as_object()
+            .ok_or_else(|| std::io::Error::other("v2 receipt properties are missing"))?;
+        let receipt_required = receipt["required"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("v2 receipt required list is missing"))?;
+        for optional in ["resolution_confidence", "coverage_confidence"] {
+            assert!(receipt_properties.contains_key(optional));
+            assert!(receipt_required.iter().all(|field| field != optional));
+        }
+        assert_eq!(
+            schema.pointer("/$defs/JsonErrorStatusV2Data/enum"),
+            Some(&serde_json::json!([
+                "no-errors",
+                "has-errors",
+                "invalid",
+                "unknown"
+            ]))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/ProcessErrorKindV2Data/enum"),
+            Some(&serde_json::json!([
+                "invalid-repository-root",
+                "invalid-working-directory",
+                "invalid-environment",
+                "unsupported-program",
+                "executable-unavailable",
+                "permission-denied",
+                "spawn",
+                "process-tree",
+                "output",
+                "wait",
+                "unknown"
+            ]))
+        );
         Ok(())
     }
 

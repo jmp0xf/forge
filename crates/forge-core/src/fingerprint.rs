@@ -13,16 +13,19 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use forge_schema::{Digest, PathEncoding, WirePath};
 
+use crate::control::OPERATION_CONTROL_PROTOCOL_VERSION;
 use crate::domain::{
     CommandEnforcement, CommandSource, CommandSpec, Confidence, CoverageDimension, Intent,
     Mutability, NetworkIntent, ProjectUnit, Provenance, SuccessPredicate, ToolchainInfo,
     validate_provenance,
 };
 use crate::evidence::{
-    DependencyValue, ExecutionDependencyFingerprint, RECEIPT_VALIDITY_PROTOCOL_VERSION,
-    SUCCESS_NORMALIZATION_PROTOCOL_VERSION,
+    BaseTaskDependency, DependencyValue, ExecutionDependencyFingerprint,
+    RECEIPT_VALIDITY_PROTOCOL_VERSION, SUCCESS_NORMALIZATION_PROTOCOL_VERSION,
 };
+use crate::git::GitObjectFormat;
 use crate::ports::Hasher;
+use crate::scope::ScopeHead;
 
 /// Internal protocol version for only the command and toolchain projections in this module.
 pub const COMMAND_TOOLCHAIN_FINGERPRINT_PROTOCOL_VERSION: &str =
@@ -32,8 +35,14 @@ pub const COMMAND_TOOLCHAIN_FINGERPRINT_PROTOCOL_VERSION: &str =
 pub const ORDERED_EXECUTION_DEPENDENCY_PROTOCOL_VERSION: &str =
     "forge.ordered-execution-dependencies/v1";
 
+/// Command-set confidence binding layered over the ordered command dependency.
+pub const COMMAND_SET_DEPENDENCY_PROTOCOL_VERSION: &str = "forge.command-set-dependency/v1";
+
+/// Marker protocol for process failures that cannot provide stream observations.
+pub const PROCESS_OUTPUT_UNAVAILABLE_PROTOCOL_VERSION: &str = "forge.process-output-unavailable/v1";
+
 /// Complete local-evidence behavior composition frozen by ADR-0020.
-pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v1";
+pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v6";
 
 // Existing behavior identifiers are repeated here as composition inputs because their defining
 // modules deliberately keep implementation domains private. A change to any implementation must
@@ -45,22 +54,27 @@ const SCOPE_DIGEST_DOMAIN: &[u8] = b"forge.scope-digest/v1";
 pub const ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION: &str = "forge.environment-fingerprint/v1";
 const EFFECTIVE_POLICY_DIGEST_DOMAIN: &[u8] = b"forge.effective-policy-digest/v1";
 const PROCESS_OUTPUT_DIGEST_DOMAIN: &[u8] = b"forge.process-output/v1\0";
-const COVERAGE_AGGREGATION_PROTOCOL_VERSION: &str = "forge.coverage-aggregation/v1";
-const RECEIPT_CANONICAL_SERIALIZATION_PROTOCOL_VERSION: &str = "forge.receipt-canonical-json/v2";
-const EVIDENCE_CANONICAL_SERIALIZATION_PROTOCOL_VERSION: &str = "forge.evidence-canonical-json/v2";
+const PROCESS_OUTPUT_UNAVAILABLE_DIGEST_DOMAIN: &[u8] = b"forge.process-output-unavailable/v1\0";
+const COVERAGE_AGGREGATION_PROTOCOL_VERSION: &str = "forge.coverage-aggregation/v2";
+const RECEIPT_CANONICAL_SERIALIZATION_PROTOCOL_VERSION: &str = "forge.receipt-canonical-json/v3";
+const EVIDENCE_CANONICAL_SERIALIZATION_PROTOCOL_VERSION: &str = "forge.evidence-canonical-json/v3";
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"forge.command-digest/v1";
 const TOOLCHAIN_DIGEST_DOMAIN: &[u8] = b"forge.toolchain-digest/v1";
 const ORDERED_COMMAND_DEPENDENCY_DOMAIN: &[u8] = b"forge.ordered-command-dependency/v1";
 const ORDERED_TOOLCHAIN_DEPENDENCY_DOMAIN: &[u8] = b"forge.ordered-toolchain-dependency/v1";
 const ORDERED_ENVIRONMENT_DEPENDENCY_DOMAIN: &[u8] = b"forge.ordered-environment-dependency/v1";
+const COMMAND_SET_DEPENDENCY_DOMAIN: &[u8] = b"forge.command-set-dependency/v1";
 const EVIDENCE_BEHAVIOR_DIGEST_DOMAIN: &[u8] = b"forge.evidence-behavior-digest/v1";
+const WORKTREE_BASE_TASK_DEPENDENCY_DOMAIN: &[u8] = b"forge.worktree-base-task-dependency/v1";
 
 /// A content-safe reason why a dependency cannot be fingerprinted safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerprintError {
     /// The explicit environment contains a name conventionally used for secrets.
     SecretLikeEnvironment,
+    /// The command argv contains a literal conventionally used to carry credentials.
+    SecretLikeArgument,
     /// A native environment name cannot be classified with the frozen ASCII rule set.
     UnclassifiableEnvironmentName,
     /// A source path explicitly reports an unknown encoding.
@@ -78,6 +92,9 @@ impl fmt::Display for FingerprintError {
         match self {
             Self::SecretLikeEnvironment => formatter.write_str(
                 "command environment contains secret-like data that cannot enter a fingerprint",
+            ),
+            Self::SecretLikeArgument => formatter.write_str(
+                "command arguments contain secret-like data that cannot enter a fingerprint",
             ),
             Self::UnclassifiableEnvironmentName => formatter
                 .write_str("command environment contains a name that cannot be classified safely"),
@@ -126,7 +143,7 @@ pub fn command_dependency_digest<H: Hasher + ?Sized>(
         confidence,
         coverage,
     } = command;
-    validate_environment_privacy(env)?;
+    validate_command_privacy(command)?;
     if program.is_empty()
         || *mutability == Mutability::Unknown
         || *network == NetworkIntent::Unknown
@@ -308,6 +325,93 @@ pub fn aggregate_ordered_execution_dependencies<H: Hasher + ?Sized>(
     )
 }
 
+/// Returns non-output sentinels for a process boundary that produced no complete stream facts.
+///
+/// These digests deliberately do not claim that either stream was empty. Stream identity is part
+/// of the preimage, and the separate domain prevents collision with normal process-output digests.
+#[must_use]
+pub fn process_output_unavailable_digests<H: Hasher + ?Sized>(hasher: &H) -> (Digest, Digest) {
+    (
+        hasher.digest(&[PROCESS_OUTPUT_UNAVAILABLE_DIGEST_DOMAIN, b"stdout"]),
+        hasher.digest(&[PROCESS_OUTPUT_UNAVAILABLE_DIGEST_DOMAIN, b"stderr"]),
+    )
+}
+
+/// Binds command-set resolution and coverage confidence to an ordered execution dependency.
+///
+/// `High` and `Medium` are explicit, comparable evidence inputs and produce distinct digests.
+/// `Low` and `Unknown` are useful discovery observations but cannot support reusable local
+/// evidence, so only the command axis becomes unknown. Toolchain and environment axes are
+/// preserved to retain accurate stale diagnostics without upgrading the command decision.
+#[must_use]
+pub fn bind_command_set_confidence<H: Hasher + ?Sized>(
+    hasher: &H,
+    execution: &ExecutionDependencyFingerprint,
+    resolution_confidence: Confidence,
+    coverage_confidence: Confidence,
+) -> ExecutionDependencyFingerprint {
+    let command = match (
+        execution.command(),
+        resolution_confidence,
+        coverage_confidence,
+    ) {
+        (
+            DependencyValue::Known(command),
+            Confidence::Medium | Confidence::High,
+            Confidence::Medium | Confidence::High,
+        ) if !command.as_str().is_empty() => {
+            let mut encoder = CanonicalEncoder::new("command-set-dependency");
+            encoder.text("protocol-version", COMMAND_SET_DEPENDENCY_PROTOCOL_VERSION);
+            encoder.text("ordered-command-digest", command.as_str());
+            encoder.text(
+                "resolution-confidence",
+                confidence_name(resolution_confidence),
+            );
+            encoder.text("coverage-confidence", confidence_name(coverage_confidence));
+            DependencyValue::Known(
+                hasher.digest(&[COMMAND_SET_DEPENDENCY_DOMAIN, &encoder.finish()]),
+            )
+        }
+        _ => DependencyValue::Unknown,
+    };
+    ExecutionDependencyFingerprint::new(
+        command,
+        execution.toolchain().clone(),
+        execution.environment().clone(),
+    )
+}
+
+/// Derives the v0 comparison/base-task dependency from the canonical starting `HEAD`.
+///
+/// A normal repository has an applicable baseline even though v0 task acceptance itself is not
+/// applicable. Only an unborn repository has neither input and therefore returns
+/// [`BaseTaskDependency::NotApplicable`]. Policy-base identity is deliberately excluded because it
+/// is recorded and compared on the independent policy dependency axis.
+#[must_use]
+pub fn worktree_base_task_dependency<H: Hasher + ?Sized>(
+    hasher: &H,
+    head: &ScopeHead,
+) -> BaseTaskDependency {
+    let ScopeHead::Commit(object_id) = head else {
+        return BaseTaskDependency::NotApplicable;
+    };
+    let mut encoder = CanonicalEncoder::new("worktree-base-task-dependency");
+    encoder.text("comparison-protocol", WORKTREE_COMPARISON_PROTOCOL_VERSION);
+    encoder.text("baseline", "head");
+    encoder.text(
+        "object-format",
+        match object_id.object_format() {
+            GitObjectFormat::Sha1 => "sha1",
+            GitObjectFormat::Sha256 => "sha256",
+        },
+    );
+    encoder.bytes("object-id", object_id.lowercase_hex());
+    encoder.text("task-acceptance", "not-applicable");
+    BaseTaskDependency::Known(
+        hasher.digest(&[WORKTREE_BASE_TASK_DEPENDENCY_DOMAIN, &encoder.finish()]),
+    )
+}
+
 fn aggregate_digest_axis<'a, H: Hasher + ?Sized>(
     hasher: &H,
     axis: &str,
@@ -357,6 +461,14 @@ pub fn evidence_behavior_digest<H: Hasher + ?Sized>(hasher: &H) -> Digest {
                 WORKTREE_COMPARISON_PROTOCOL_VERSION.as_bytes(),
             ),
             behavior_component(
+                "operation-control",
+                OPERATION_CONTROL_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "worktree-base-task-dependency-domain",
+                WORKTREE_BASE_TASK_DEPENDENCY_DOMAIN,
+            ),
+            behavior_component(
                 "scope-acquisition",
                 SCOPE_ACQUISITION_PROTOCOL_VERSION.as_bytes(),
             ),
@@ -371,6 +483,14 @@ pub fn evidence_behavior_digest<H: Hasher + ?Sized>(hasher: &H) -> Digest {
             behavior_component(
                 "ordered-execution-dependencies",
                 ORDERED_EXECUTION_DEPENDENCY_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "command-set-dependency",
+                COMMAND_SET_DEPENDENCY_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "command-set-dependency-domain",
+                COMMAND_SET_DEPENDENCY_DOMAIN,
             ),
             behavior_component(
                 "ordered-command-dependency-domain",
@@ -390,6 +510,14 @@ pub fn evidence_behavior_digest<H: Hasher + ?Sized>(hasher: &H) -> Digest {
             ),
             behavior_component("policy-digest-domain", EFFECTIVE_POLICY_DIGEST_DOMAIN),
             behavior_component("process-output-digest-domain", PROCESS_OUTPUT_DIGEST_DOMAIN),
+            behavior_component(
+                "process-output-unavailable",
+                PROCESS_OUTPUT_UNAVAILABLE_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "process-output-unavailable-digest-domain",
+                PROCESS_OUTPUT_UNAVAILABLE_DIGEST_DOMAIN,
+            ),
             behavior_component(
                 "success-normalization",
                 SUCCESS_NORMALIZATION_PROTOCOL_VERSION.as_bytes(),
@@ -448,6 +576,231 @@ pub(crate) fn command_toolchain_fingerprint_protocol_digest<H: Hasher + ?Sized>(
     hasher.digest(&[DIGEST_DOMAIN, &encoder.finish()])
 }
 
+/// Rejects explicit command environment names that cannot safely enter previews, Receipts, or
+/// dependency fingerprints.
+///
+/// The error deliberately carries no offending name or value. Callers must run this check before
+/// projecting or displaying a command because the wire contract preserves environment names.
+pub fn validate_command_environment_privacy(command: &CommandSpec) -> Result<(), FingerprintError> {
+    validate_environment_privacy(&command.env)
+}
+
+/// Returns whether a portable name conventionally denotes secret-bearing data.
+///
+/// This one classifier is shared by fingerprints and every generated command surface so their
+/// privacy decisions cannot drift. The conservative substring and cloud-prefix rules are the
+/// minimum accepted-design boundary; false positives fail closed instead of allowing a value that
+/// may be a credential to enter a Receipt, preview, or persisted runner.
+#[must_use]
+pub fn is_secret_like_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if ["TOKEN", "SECRET", "PASSWORD", "PRIVATE", "KEY"]
+        .iter()
+        .any(|pattern| upper.contains(pattern))
+        || ["AWS_", "GOOGLE_", "AZURE_"]
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+    {
+        return true;
+    }
+
+    let tokens = secret_name_tokens(name);
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "TOKEN"
+                | "TOKENS"
+                | "SECRET"
+                | "SECRETS"
+                | "PASSWORD"
+                | "PASSWD"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "AUTH"
+                | "OAUTH"
+                | "AUTHN"
+                | "AUTHZ"
+                | "AUTHORIZATION"
+                | "AUTHENTICATION"
+                | "COOKIE"
+                | "COOKIES"
+                | "SESSION"
+        )
+    }) {
+        return true;
+    }
+    false
+}
+
+fn secret_name_tokens(name: &str) -> Vec<String> {
+    let characters = name.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for &character in &characters {
+        if character.is_ascii_alphanumeric() {
+            current.push(character.to_ascii_uppercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(std::mem::take(&mut current));
+    }
+    for (index, &character) in characters.iter().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index + 1);
+        let starts_word = !current.is_empty()
+            && character.is_ascii_uppercase()
+            && (previous.is_some_and(char::is_ascii_lowercase)
+                || previous.is_some_and(char::is_ascii_uppercase)
+                    && next.is_some_and(char::is_ascii_lowercase));
+        if starts_word {
+            tokens.push(std::mem::take(&mut current));
+        }
+        current.push(character.to_ascii_uppercase());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Rejects credential-like literals before a complete command can be fingerprinted or persisted.
+pub fn validate_command_privacy(command: &CommandSpec) -> Result<(), FingerprintError> {
+    validate_command_environment_privacy(command)?;
+    validate_argv_privacy(std::iter::once(&command.program).chain(command.args.iter()))
+}
+
+/// Rejects obvious credential literals in one native argv sequence without formatting its values.
+///
+/// Ordinary short options are intentionally opaque. A secret-like long option is rejected only
+/// when it contains an inline value or is followed by an obvious non-option value.
+pub fn validate_argv_privacy<I, S>(argv: I) -> Result<(), FingerprintError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut secret_long_option_awaiting_value = false;
+    for argument in argv {
+        let bytes = argument.as_ref().as_encoded_bytes();
+        if secret_long_option_awaiting_value && is_obvious_following_value(bytes) {
+            return Err(FingerprintError::SecretLikeArgument);
+        }
+        secret_long_option_awaiting_value = false;
+
+        if has_authorization_header_literal(bytes)
+            || has_uri_userinfo(bytes)
+            || has_secret_like_assignment(bytes)
+        {
+            return Err(FingerprintError::SecretLikeArgument);
+        }
+        match secret_like_long_option(bytes) {
+            SecretLongOption::None => {}
+            SecretLongOption::AwaitingValue => secret_long_option_awaiting_value = true,
+            SecretLongOption::InlineLiteral => {
+                return Err(FingerprintError::SecretLikeArgument);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretLongOption {
+    None,
+    AwaitingValue,
+    InlineLiteral,
+}
+
+fn secret_like_long_option(argument: &[u8]) -> SecretLongOption {
+    let Some(body) = argument.strip_prefix(b"--") else {
+        return SecretLongOption::None;
+    };
+    if body.is_empty() {
+        return SecretLongOption::None;
+    }
+    let (name, value) = body
+        .iter()
+        .position(|byte| matches!(byte, b'=' | b':'))
+        .map_or((body, None), |separator| {
+            (&body[..separator], Some(&body[separator + 1..]))
+        });
+    let Some(name) = std::str::from_utf8(name).ok() else {
+        return SecretLongOption::None;
+    };
+    if !is_secret_like_name(name) {
+        return SecretLongOption::None;
+    }
+    match value {
+        Some(value) if !value.is_empty() => SecretLongOption::InlineLiteral,
+        Some(_) => SecretLongOption::None,
+        None => SecretLongOption::AwaitingValue,
+    }
+}
+
+fn is_obvious_following_value(argument: &[u8]) -> bool {
+    !(argument.is_empty() || argument.len() > 1 && argument.starts_with(b"-"))
+}
+
+fn has_secret_like_assignment(argument: &[u8]) -> bool {
+    let Some(separator) = argument.iter().position(|byte| *byte == b'=') else {
+        return false;
+    };
+    if separator == 0 || separator + 1 == argument.len() {
+        return false;
+    }
+    std::str::from_utf8(&argument[..separator]).is_ok_and(is_secret_like_name)
+}
+
+fn has_authorization_header_literal(argument: &[u8]) -> bool {
+    let argument = trim_ascii(argument);
+    let candidate = if argument.len() > 2 && argument[..2].eq_ignore_ascii_case(b"-h") {
+        &argument[2..]
+    } else if let Some(separator) = argument.iter().position(|byte| *byte == b'=') {
+        &argument[separator + 1..]
+    } else {
+        argument
+    };
+    let candidate = trim_ascii(candidate);
+    let header = b"authorization";
+    candidate.len() > header.len()
+        && candidate[..header.len()].eq_ignore_ascii_case(header)
+        && candidate[header.len()] == b':'
+        && !trim_ascii(&candidate[header.len() + 1..]).is_empty()
+}
+
+fn has_uri_userinfo(argument: &[u8]) -> bool {
+    let Some(scheme_end) = argument.windows(3).position(|window| window == b"://") else {
+        return false;
+    };
+    let authority = &argument[scheme_end + 3..];
+    let authority_end = authority
+        .iter()
+        .position(|byte| matches!(byte, b'/' | b'?' | b'#'))
+        .unwrap_or(authority.len());
+    let authority = &authority[..authority_end];
+    let Some(at) = authority.iter().rposition(|byte| *byte == b'@') else {
+        return false;
+    };
+    at > 0
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
 fn validate_environment_privacy(
     environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
 ) -> Result<(), FingerprintError> {
@@ -455,14 +808,7 @@ fn validate_environment_privacy(
         let name = name
             .to_str()
             .ok_or(FingerprintError::UnclassifiableEnvironmentName)?;
-        let canonical = name.to_ascii_uppercase();
-        if ["TOKEN", "SECRET", "PASSWORD", "PRIVATE", "KEY"]
-            .iter()
-            .any(|marker| canonical.contains(marker))
-            || ["AWS_", "GOOGLE_", "AZURE_"]
-                .iter()
-                .any(|prefix| canonical.starts_with(prefix))
-        {
+        if is_secret_like_name(name) {
             return Err(FingerprintError::SecretLikeEnvironment);
         }
     }
@@ -1253,11 +1599,17 @@ mod tests {
             "api_token",
             "ClientSecret",
             "db_PaSsWoRd",
-            "private_material",
-            "monKEY",
-            "aws_region",
-            "GoOgLe_Project",
-            "azure_tenant",
+            "legacy_passwd",
+            "service_credential",
+            "oauth_client",
+            "browser_cookie",
+            "user_session",
+            "signing_private_key",
+            "cloud_access_key",
+            "access-key",
+            "aws_access_key_id",
+            "GoOgLe_Client_Secret",
+            "azure_auth_token",
             "github_token",
         ] {
             let mut command = command()?;
@@ -1265,6 +1617,10 @@ mod tests {
                 OsString::from(name),
                 OsString::from("SENSITIVE_SAMPLE_VALUE"),
             )]);
+            assert_eq!(
+                validate_command_environment_privacy(&command),
+                Err(FingerprintError::SecretLikeEnvironment)
+            );
             let hasher = SpyHasher::default();
             let error = match command_dependency_digest(&hasher, &command, &[]) {
                 Err(error) => error,
@@ -1282,6 +1638,107 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn shared_secret_name_classifier_has_one_conservative_vocabulary() {
+        for name in [
+            "API_TOKEN",
+            "clientSecret",
+            "DB_PASSWORD",
+            "legacy_passwd",
+            "service_credential",
+            "oauth_client",
+            "browser_cookie",
+            "user_session",
+            "signing_private_key",
+            "PRIVATE_MATERIAL",
+            "cloud_access_key",
+            "access-key",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_REGION",
+            "google_client_secret",
+            "GOOGLE_PROJECT",
+            "Azure_Auth_Token",
+            "AZURE_TENANT",
+            "SSH_AUTH_SOCK",
+            "OAuthToken",
+            "Authorization",
+            "MONKEY",
+        ] {
+            assert!(
+                is_secret_like_name(name),
+                "expected `{name}` to be secret-like"
+            );
+        }
+        for name in [
+            "PATH",
+            "PROFILE",
+            "AUTHOR",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_DATE",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "GOMODCACHE",
+        ] {
+            assert!(
+                !is_secret_like_name(name),
+                "expected `{name}` to remain ordinary"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_literals_in_argv_fail_before_hashing_without_content_leakage()
+    -> Result<(), Box<dyn Error>> {
+        for (args, literal) in [
+            (vec!["--api-token=literal-inline"], "literal-inline"),
+            (vec!["--cookie:literal-colon"], "literal-colon"),
+            (vec!["--password", "literal-following"], "literal-following"),
+            (
+                vec!["-H", "Authorization: Bearer literal-header"],
+                "literal-header",
+            ),
+            (
+                vec!["https://user:literal-uri@example.invalid/path"],
+                "literal-uri",
+            ),
+            (
+                vec!["https://literal-userinfo@example.invalid/path"],
+                "literal-userinfo",
+            ),
+            (vec!["SESSION_ID=literal-assignment"], "literal-assignment"),
+        ] {
+            let mut command = command()?;
+            command.args = args.iter().map(OsString::from).collect();
+            assert_eq!(
+                validate_command_privacy(&command),
+                Err(FingerprintError::SecretLikeArgument)
+            );
+            let hasher = SpyHasher::default();
+            let error = match command_dependency_digest(&hasher, &command, &[]) {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err(io::Error::other("credential-like argv was accepted").into());
+                }
+            };
+            assert_eq!(error, FingerprintError::SecretLikeArgument);
+            assert_eq!(hasher.calls.get(), 0);
+            assert!(!error.to_string().contains(literal));
+            assert!(!format!("{error:?}").contains(literal));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_short_options_remain_allowed() {
+        for argv in [
+            vec!["tool", "-p", "ordinary-value"],
+            vec!["tool", "--verbose", "ordinary-value"],
+            vec!["tool", "--token", "--verbose"],
+        ] {
+            assert_eq!(validate_argv_privacy(argv), Ok(()));
+        }
     }
 
     #[test]
@@ -1473,14 +1930,111 @@ mod tests {
     }
 
     #[test]
-    fn evidence_behavior_digest_is_pinned_to_the_complete_v1_composition() {
+    fn command_set_confidence_is_bound_and_low_confidence_fails_only_command_closed() {
+        let execution = execution_dependencies("command:a", "toolchain:a", "environment:a");
+        let high = bind_command_set_confidence(
+            &FixtureHasher,
+            &execution,
+            Confidence::High,
+            Confidence::High,
+        );
+        let medium_resolution = bind_command_set_confidence(
+            &FixtureHasher,
+            &execution,
+            Confidence::Medium,
+            Confidence::High,
+        );
+        let medium_coverage = bind_command_set_confidence(
+            &FixtureHasher,
+            &execution,
+            Confidence::High,
+            Confidence::Medium,
+        );
+        assert!(matches!(high.command(), DependencyValue::Known(_)));
+        assert_ne!(high.command(), medium_resolution.command());
+        assert_ne!(high.command(), medium_coverage.command());
+        assert_ne!(medium_resolution.command(), medium_coverage.command());
+
+        for confidence in [Confidence::Low, Confidence::Unknown] {
+            let bound = bind_command_set_confidence(
+                &FixtureHasher,
+                &execution,
+                confidence,
+                Confidence::High,
+            );
+            assert_eq!(bound.command(), &DependencyValue::Unknown);
+            assert_eq!(bound.toolchain(), execution.toolchain());
+            assert_eq!(bound.environment(), execution.environment());
+        }
+    }
+
+    #[test]
+    fn command_set_confidence_does_not_hash_an_unknown_ordered_command() {
+        let hasher = SpyHasher::default();
+        let execution = ExecutionDependencyFingerprint::new(
+            DependencyValue::Unknown,
+            DependencyValue::Known(Digest::from("toolchain:a")),
+            DependencyValue::Known(Digest::from("environment:a")),
+        );
+        let bound =
+            bind_command_set_confidence(&hasher, &execution, Confidence::High, Confidence::High);
+        assert_eq!(bound.command(), &DependencyValue::Unknown);
+        assert_eq!(hasher.calls.get(), 0);
+    }
+
+    #[test]
+    fn worktree_base_task_dependency_is_known_for_head_and_not_applicable_when_unborn()
+    -> Result<(), Box<dyn Error>> {
+        let first = ScopeHead::Commit(crate::scope::ScopeObjectId::new(
+            GitObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111",
+        )?);
+        let second = ScopeHead::Commit(crate::scope::ScopeObjectId::new(
+            GitObjectFormat::Sha1,
+            b"2222222222222222222222222222222222222222",
+        )?);
+
+        let first_dependency = worktree_base_task_dependency(&FixtureHasher, &first);
+        assert!(matches!(first_dependency, BaseTaskDependency::Known(_)));
+        assert_ne!(
+            first_dependency,
+            worktree_base_task_dependency(&FixtureHasher, &second)
+        );
+
+        let hasher = SpyHasher::default();
+        assert_eq!(
+            worktree_base_task_dependency(&hasher, &ScopeHead::Unborn(GitObjectFormat::Sha256)),
+            BaseTaskDependency::NotApplicable
+        );
+        assert_eq!(hasher.calls.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn process_output_unavailable_markers_are_stream_separated_fixed_vectors() {
+        let (stdout, stderr) = process_output_unavailable_digests(&FixtureHasher);
+        assert_eq!(stdout.as_str(), "fixture:38e9dcd2487583e9");
+        assert_eq!(stderr.as_str(), "fixture:02b8f6d229228cda");
+        assert_ne!(stdout, stderr);
+    }
+
+    #[test]
+    fn evidence_behavior_digest_is_pinned_to_operation_control_and_coverage_v2() {
         assert_eq!(
             EVIDENCE_BEHAVIOR_PROTOCOL_VERSION,
-            "forge.evidence-behavior/v1"
+            "forge.evidence-behavior/v6"
+        );
+        assert_eq!(
+            OPERATION_CONTROL_PROTOCOL_VERSION,
+            "forge.operation-control/v1"
+        );
+        assert_eq!(
+            COVERAGE_AGGREGATION_PROTOCOL_VERSION,
+            "forge.coverage-aggregation/v2"
         );
         assert_eq!(
             evidence_behavior_digest(&FixtureHasher).as_str(),
-            "fixture:34a240ce25e94d2a"
+            "fixture:2ff6f5d16b92507f"
         );
     }
 

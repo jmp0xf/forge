@@ -251,6 +251,30 @@ mod tests {
     }
 
     #[test]
+    fn policy_resolution_errors_preserve_actionable_context() {
+        for (error, expected) in [
+            (
+                PolicyResolutionError::BuiltInInvariant,
+                "the built-in policy registry is internally invalid",
+            ),
+            (
+                PolicyResolutionError::InvalidCandidateEvidence,
+                "the validated configuration could not form typed evidence policy",
+            ),
+            (
+                PolicyResolutionError::InvalidCandidatePattern,
+                "the validated configuration contains an unsupported risk path pattern",
+            ),
+            (
+                PolicyResolutionError::InvalidCandidateRule,
+                "the validated configuration could not form a typed risk rule",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn absent_config_keeps_builtins_and_requested_base_completeness() -> Result<(), Box<dyn Error>>
     {
         for (completeness, confidence) in [

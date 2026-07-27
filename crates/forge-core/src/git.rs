@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::RepoRelativePath;
+use crate::{OperationControl, OperationControlError, RepoRelativePath, UnlimitedOperationControl};
 
 /// Object format selected by the repository for Git command output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +342,8 @@ pub struct GitIndexEntry {
 /// A bounded streaming failure while parsing `git ls-files --stage -v -z` output.
 #[derive(Debug, Error)]
 pub enum GitIndexReadError {
+    #[error(transparent)]
+    Control(#[from] OperationControlError),
     #[error("failed to read Git index at byte {offset}, record {record}: {source}")]
     Input {
         offset: usize,
@@ -386,10 +388,33 @@ pub enum GitIndexReadError {
 /// requested by Forge. It preserves unmerged stages and native path bytes, rejects duplicate
 /// `(path, stage)` entries, and never returns a partial typed result.
 pub fn parse_git_index_reader<R>(
+    reader: R,
+    object_format: GitObjectFormat,
+    max_record_bytes: usize,
+    max_entries: usize,
+) -> Result<Vec<GitIndexEntry>, GitIndexReadError>
+where
+    R: BufRead,
+{
+    parse_git_index_reader_controlled(
+        reader,
+        object_format,
+        max_record_bytes,
+        max_entries,
+        &UnlimitedOperationControl,
+    )
+}
+
+/// Incrementally parses bounded index entries under one operation-wide control.
+///
+/// A checkpoint precedes every record read and surrounds ordered post-processing. Once control
+/// stops, no partial entry set is returned and no later record is consumed.
+pub fn parse_git_index_reader_controlled<R>(
     mut reader: R,
     object_format: GitObjectFormat,
     max_record_bytes: usize,
     max_entries: usize,
+    control: &dyn OperationControl,
 ) -> Result<Vec<GitIndexEntry>, GitIndexReadError>
 where
     R: BufRead,
@@ -400,6 +425,7 @@ where
     let mut record_number = 0_usize;
 
     loop {
+        control.checkpoint()?;
         record.clear();
         let record_start = offset;
         let read_bound = u64::try_from(max_record_bytes)
@@ -513,11 +539,13 @@ where
         });
     }
 
+    control.checkpoint()?;
     entries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
             .then_with(|| left.stage.cmp(&right.stage))
     });
+    control.checkpoint()?;
     if let Some(pair) = entries
         .windows(2)
         .find(|pair| pair[0].path == pair[1].path && pair[0].stage == pair[1].stage)
@@ -563,6 +591,8 @@ fn parse_index_oid(field: &[u8], object_format: GitObjectFormat) -> Option<GitOb
 /// A bounded streaming failure while parsing `git ls-files -z` output.
 #[derive(Debug, Error)]
 pub enum GitPathListReadError {
+    #[error(transparent)]
+    Control(#[from] OperationControlError),
     #[error("failed to read Git path list at byte {offset}, record {record}: {source}")]
     Input {
         offset: usize,
@@ -593,9 +623,30 @@ pub enum GitPathListReadError {
 /// At most `max_path_bytes + 1` bytes are buffered for one path, and `max_paths` bounds typed
 /// allocation. Clean empty output is valid; every non-empty record must have a NUL terminator.
 pub fn parse_git_path_list_reader<R>(
+    reader: R,
+    max_path_bytes: usize,
+    max_paths: usize,
+) -> Result<Vec<RepoRelativePath>, GitPathListReadError>
+where
+    R: BufRead,
+{
+    parse_git_path_list_reader_controlled(
+        reader,
+        max_path_bytes,
+        max_paths,
+        &UnlimitedOperationControl,
+    )
+}
+
+/// Incrementally parses bounded paths under one operation-wide control.
+///
+/// A checkpoint precedes every record read and surrounds ordered post-processing. Once control
+/// stops, no partial path set is returned and no later record is consumed.
+pub fn parse_git_path_list_reader_controlled<R>(
     mut reader: R,
     max_path_bytes: usize,
     max_paths: usize,
+    control: &dyn OperationControl,
 ) -> Result<Vec<RepoRelativePath>, GitPathListReadError>
 where
     R: BufRead,
@@ -606,6 +657,7 @@ where
     let mut record_number = 0_usize;
 
     loop {
+        control.checkpoint()?;
         record.clear();
         let record_start = offset;
         let read_bound = u64::try_from(max_path_bytes)
@@ -658,8 +710,10 @@ where
         paths.push(path);
     }
 
+    control.checkpoint()?;
     paths.sort();
     paths.dedup();
+    control.checkpoint()?;
     Ok(paths)
 }
 
@@ -706,6 +760,8 @@ pub struct PorcelainV2ParseError {
 /// A bounded streaming parse failure, preserving parser locations separately from input I/O.
 #[derive(Debug, Error)]
 pub enum PorcelainV2ReadError {
+    #[error(transparent)]
+    Control(#[from] OperationControlError),
     #[error("failed to read Git porcelain v2 at byte {offset}, record {record}: {source}")]
     Input {
         offset: usize,
@@ -746,6 +802,16 @@ pub fn parse_status_porcelain_v2(
                 kind: source.kind(),
             },
         }),
+        Err(PorcelainV2ReadError::Control(_)) => Err(PorcelainV2ParseError {
+            offset: 0,
+            record: 0,
+            // The compatibility wrapper uses `UnlimitedOperationControl`, so this branch cannot
+            // be produced by its control. Keep the wrapper total without a panic if that invariant
+            // ever changes.
+            kind: PorcelainV2ParseErrorKind::InputReadFailure {
+                kind: io::ErrorKind::Interrupted,
+            },
+        }),
     }
 }
 
@@ -757,10 +823,33 @@ pub fn parse_status_porcelain_v2(
 /// Neither bound causes an unbounded read: the implementation only uses [`BufRead::fill_buf`] and
 /// [`BufRead::consume`].
 pub fn parse_status_porcelain_v2_reader<R>(
+    reader: R,
+    object_format: GitObjectFormat,
+    max_record_bytes: usize,
+    max_entries: usize,
+) -> Result<PorcelainV2Status, PorcelainV2ReadError>
+where
+    R: BufRead,
+{
+    parse_status_porcelain_v2_reader_controlled(
+        reader,
+        object_format,
+        max_record_bytes,
+        max_entries,
+        &UnlimitedOperationControl,
+    )
+}
+
+/// Incrementally parses bounded porcelain v2 records under one operation-wide control.
+///
+/// Type-2's paired paths remain one logical record and therefore share one checkpoint. Once
+/// control stops, no partial status is returned and the next logical record is not consumed.
+pub fn parse_status_porcelain_v2_reader_controlled<R>(
     mut reader: R,
     object_format: GitObjectFormat,
     max_record_bytes: usize,
     max_entries: usize,
+    control: &dyn OperationControl,
 ) -> Result<PorcelainV2Status, PorcelainV2ReadError>
 where
     R: BufRead,
@@ -775,6 +864,7 @@ where
     let mut record = Vec::with_capacity(max_record_bytes.min(8 * 1024));
 
     loop {
+        control.checkpoint()?;
         let next_record_number = record_number + 1;
         let record_start = offset;
         if !read_nul_record(
@@ -882,6 +972,7 @@ where
         }
     }
 
+    control.checkpoint()?;
     Ok(parsed)
 }
 
@@ -1583,19 +1674,150 @@ impl<'a> Fields<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufReader, Cursor};
+    use std::cell::Cell;
+    use std::io::{self, BufRead, BufReader, Cursor, Read};
     use std::path::Path;
+    use std::rc::Rc;
 
     use super::{
         AheadBehind, BranchHead, BranchOid, GitIndexReadError, GitObjectFormat,
         GitPathListReadError, PorcelainV2ParseErrorKind, PorcelainV2ReadError, RenameOrCopy,
-        StatusEntry, parse_git_index_reader, parse_git_path_list_reader, parse_status_porcelain_v2,
-        parse_status_porcelain_v2_reader,
+        StatusEntry, parse_git_index_reader, parse_git_index_reader_controlled,
+        parse_git_path_list_reader, parse_git_path_list_reader_controlled,
+        parse_status_porcelain_v2, parse_status_porcelain_v2_reader,
+        parse_status_porcelain_v2_reader_controlled,
     };
-    use crate::RepoRelativePath;
+    use crate::{OperationControl, OperationControlError, OperationPermit, RepoRelativePath};
 
     const OID_1: &[u8] = b"1111111111111111111111111111111111111111";
     const OID_2: &[u8] = b"2222222222222222222222222222222222222222";
+
+    #[derive(Debug)]
+    struct FailAtCheckpoint {
+        calls: Cell<usize>,
+        fail_at: usize,
+        error: OperationControlError,
+    }
+
+    impl FailAtCheckpoint {
+        const fn new(fail_at: usize, error: OperationControlError) -> Self {
+            Self {
+                calls: Cell::new(0),
+                fail_at,
+                error,
+            }
+        }
+    }
+
+    impl OperationControl for FailAtCheckpoint {
+        fn checkpoint(&self) -> Result<OperationPermit, OperationControlError> {
+            let call = self.calls.get().saturating_add(1);
+            self.calls.set(call);
+            if call >= self.fail_at {
+                Err(self.error)
+            } else {
+                Ok(OperationPermit::unlimited())
+            }
+        }
+    }
+
+    struct TrackedBuf<'a> {
+        bytes: &'a [u8],
+        offset: Rc<Cell<usize>>,
+    }
+
+    impl Read for TrackedBuf<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let count = buffer.len().min(available.len());
+            buffer[..count].copy_from_slice(&available[..count]);
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    impl BufRead for TrackedBuf<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&self.bytes[self.offset.get()..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.offset
+                .set((self.offset.get() + amount).min(self.bytes.len()));
+        }
+    }
+
+    fn tracked_reader(bytes: &[u8]) -> (TrackedBuf<'_>, Rc<Cell<usize>>) {
+        let offset = Rc::new(Cell::new(0));
+        (
+            TrackedBuf {
+                bytes,
+                offset: Rc::clone(&offset),
+            },
+            offset,
+        )
+    }
+
+    #[test]
+    fn controlled_readers_do_not_consume_the_record_after_control_stops() {
+        let path_input = b"first\0second\0";
+        let (reader, consumed) = tracked_reader(path_input);
+        let error = parse_git_path_list_reader_controlled(
+            reader,
+            32,
+            2,
+            &FailAtCheckpoint::new(2, OperationControlError::TimedOut),
+        )
+        .err();
+        assert!(matches!(
+            error,
+            Some(GitPathListReadError::Control(
+                OperationControlError::TimedOut
+            ))
+        ));
+        assert_eq!(consumed.get(), b"first\0".len());
+
+        let mut index_input = b"H 100644 ".to_vec();
+        index_input.extend_from_slice(OID_1);
+        index_input.extend_from_slice(b" 0\tfirst\0H 100644 ");
+        index_input.extend_from_slice(OID_2);
+        index_input.extend_from_slice(b" 0\tsecond\0");
+        let first_index_record = b"H 100644 ".len() + OID_1.len() + b" 0\tfirst\0".len();
+        let (reader, consumed) = tracked_reader(&index_input);
+        let error = parse_git_index_reader_controlled(
+            reader,
+            GitObjectFormat::Sha1,
+            128,
+            2,
+            &FailAtCheckpoint::new(2, OperationControlError::Interrupted),
+        )
+        .err();
+        assert!(matches!(
+            error,
+            Some(GitIndexReadError::Control(
+                OperationControlError::Interrupted
+            ))
+        ));
+        assert_eq!(consumed.get(), first_index_record);
+
+        let status_input = b"? first\0? second\0";
+        let (reader, consumed) = tracked_reader(status_input);
+        let error = parse_status_porcelain_v2_reader_controlled(
+            reader,
+            GitObjectFormat::Sha1,
+            32,
+            2,
+            &FailAtCheckpoint::new(2, OperationControlError::TimedOut),
+        )
+        .err();
+        assert!(matches!(
+            error,
+            Some(PorcelainV2ReadError::Control(
+                OperationControlError::TimedOut
+            ))
+        ));
+        assert_eq!(consumed.get(), b"? first\0".len());
+    }
 
     #[test]
     fn parses_branch_headers_and_all_entry_kinds_losslessly()

@@ -9,6 +9,7 @@ pub mod digest;
 pub mod inspection;
 pub mod managed_block;
 pub mod plan;
+pub mod runners;
 
 pub use adapter_registry::{
     AdapterRenderer, AdapterSelection, AdapterSpec, adapter_spec, adapter_specs,
@@ -23,8 +24,10 @@ pub use inspection::{
     InspectedFileEdit, inspect_adapter_targets,
 };
 pub use plan::{
-    AdapterFileLimitStage, AdapterTarget, ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind,
-    InitAdapterInspection, InitAdapterTargetInspection, InitPlanOptions, ManagedBlockKind,
-    PlanError, ReusedAdapter, RollbackPlan, SatisfiedManagedBlock, SkippedChange, SkippedReason,
+    AdapterFileLimitStage, AdapterSelectionOverrides, AdapterTarget, ChangePlan,
+    DesiredManagedBlock, FileEdit, FileEditKind, GapKind, InitAdapterInspection,
+    InitAdapterTargetInspection, InitGap, InitPlanOptions, ManagedBlockKind, PlanError,
+    ReusedAdapter, RollbackPlan, SatisfiedManagedBlock, SkippedChange, SkippedReason,
     inspect_init_targets, plan_init,
 };
+pub use runners::{RunnerRenderError, RunnerTarget};

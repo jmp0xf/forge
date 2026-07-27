@@ -4,7 +4,7 @@
 - Date: 2026-07-26
 - Deciders: Forge maintainers
 - Supersedes: None
-- Superseded by: None
+- Superseded by: ADR-0023（仅 JSON Schema 文档输出例外）
 
 ## Context
 

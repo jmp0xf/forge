@@ -6,15 +6,15 @@ use std::path::{Component, Path, PathBuf};
 
 use forge_core::ports::{FileSystemPort, RepositoryFilePort};
 use forge_core::{
-    BoundedText, GitFileSet, Inventory, InventoryError, InventoryOptions, PathKind,
-    RepoRelativePath,
+    BoundedText, GitFileSet, Inventory, InventoryError, InventoryOptions, OperationControl,
+    PathKind, PathMetadata, RepoRelativePath, UnlimitedOperationControl,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::inventory::{
-    build_inventory_from_git_file_set, build_non_git_filesystem_inventory,
-    read_bounded_text as read_repository_bounded_text,
+    build_inventory_from_git_file_set_controlled, build_non_git_filesystem_inventory_controlled,
+    read_bounded_text_controlled as read_repository_bounded_text_controlled,
 };
 
 /// The native implementation of [`FileSystemPort`].
@@ -41,9 +41,21 @@ impl NativeFileSystem {
         file_set: Option<&GitFileSet>,
         options: InventoryOptions,
     ) -> Result<Inventory, InventoryError> {
+        self.inventory_controlled(root, file_set, options, &UnlimitedOperationControl)
+    }
+
+    pub fn inventory_controlled(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+        control: &dyn OperationControl,
+    ) -> Result<Inventory, InventoryError> {
         match file_set {
-            Some(file_set) => build_inventory_from_git_file_set(root, file_set, options),
-            None => build_non_git_filesystem_inventory(root, options),
+            Some(file_set) => {
+                build_inventory_from_git_file_set_controlled(root, file_set, options, control)
+            }
+            None => build_non_git_filesystem_inventory_controlled(root, options, control),
         }
     }
 
@@ -53,12 +65,32 @@ impl NativeFileSystem {
         path: &RepoRelativePath,
         max_text_file_bytes: u64,
     ) -> Result<BoundedText, InventoryError> {
-        read_repository_bounded_text(root, path, max_text_file_bytes)
+        self.read_bounded_text_controlled(
+            root,
+            path,
+            max_text_file_bytes,
+            &UnlimitedOperationControl,
+        )
+    }
+
+    pub fn read_bounded_text_controlled(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+        control: &dyn OperationControl,
+    ) -> Result<BoundedText, InventoryError> {
+        read_repository_bounded_text_controlled(root, path, max_text_file_bytes, control)
     }
 
     /// Inspects one path without following the target or any symbolic-link ancestor.
     pub fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
-        path_kind(root, path)
+        self.path_metadata(root, path).map(|metadata| metadata.kind)
+    }
+
+    /// Atomically inspects one path's kind and size without following symbolic links.
+    pub fn path_metadata(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathMetadata> {
+        path_metadata(root, path)
     }
 
     /// Replaces one file through a temporary file in the target directory.
@@ -85,6 +117,16 @@ impl FileSystemPort for NativeFileSystem {
         NativeFileSystem::inventory(self, root, file_set, options)
     }
 
+    fn inventory_controlled(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+        control: &dyn OperationControl,
+    ) -> Result<Inventory, InventoryError> {
+        NativeFileSystem::inventory_controlled(self, root, file_set, options, control)
+    }
+
     fn read_bounded_text(
         &self,
         root: &Path,
@@ -94,8 +136,28 @@ impl FileSystemPort for NativeFileSystem {
         NativeFileSystem::read_bounded_text(self, root, path, max_text_file_bytes)
     }
 
+    fn read_bounded_text_controlled(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+        control: &dyn OperationControl,
+    ) -> Result<BoundedText, InventoryError> {
+        NativeFileSystem::read_bounded_text_controlled(
+            self,
+            root,
+            path,
+            max_text_file_bytes,
+            control,
+        )
+    }
+
     fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
         NativeFileSystem::path_kind(self, root, path)
+    }
+
+    fn path_metadata(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathMetadata> {
+        NativeFileSystem::path_metadata(self, root, path)
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -154,7 +216,7 @@ impl RepositoryFilePort for NativeFileSystem {
     }
 }
 
-fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
+fn path_metadata(root: &Path, relative: &RepoRelativePath) -> io::Result<PathMetadata> {
     let root_metadata = fs::symlink_metadata(root).map_err(|source| {
         FileSystemError::io("inspect repository root", root, source).into_io_error()
     })?;
@@ -181,7 +243,7 @@ fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(PathKind::Missing);
+                return Ok(PathMetadata::missing());
             }
             Err(source) => {
                 return Err(
@@ -193,7 +255,7 @@ fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
         let is_target = components.peek().is_none();
         if metadata.file_type().is_symlink() {
             if is_target {
-                return Ok(PathKind::Symlink);
+                return Ok(PathMetadata::present(PathKind::Symlink, metadata.len()));
             }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -213,11 +275,17 @@ fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
             ));
         }
         if is_target {
-            return Ok(metadata_path_kind(&metadata));
+            return Ok(PathMetadata::present(
+                metadata_path_kind(&metadata),
+                metadata.len(),
+            ));
         }
     }
 
-    Ok(PathKind::Directory)
+    Ok(PathMetadata::present(
+        PathKind::Directory,
+        root_metadata.len(),
+    ))
 }
 
 fn metadata_path_kind(metadata: &fs::Metadata) -> PathKind {
@@ -638,7 +706,13 @@ fn write_atomic_impl_with_recheck(
         )
     })?;
     let existing_permissions = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+        Ok(metadata) if metadata.is_file() => match new_file_mode {
+            NewFileMode::Default => Some(metadata.permissions()),
+            // Private replacements must be newly owner-private. Inheriting the target's mode
+            // would preserve a pre-existing disclosure boundary even though the bytes were
+            // written through a private API.
+            NewFileMode::Private => None,
+        },
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -720,7 +794,17 @@ fn new_atomic_temporary_file(parent: &Path, mode: NewFileMode) -> io::Result<Nam
         .tempfile_in(parent)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn new_atomic_temporary_file(parent: &Path, mode: NewFileMode) -> io::Result<NamedTempFile> {
+    match mode {
+        NewFileMode::Default => NamedTempFile::new_in(parent),
+        NewFileMode::Private => tempfile::Builder::new()
+            .prefix(".forge-private-")
+            .make_in(parent, crate::state::create_private_atomic_file),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn new_atomic_temporary_file(parent: &Path, _mode: NewFileMode) -> io::Result<NamedTempFile> {
     NamedTempFile::new_in(parent)
 }
@@ -743,7 +827,7 @@ mod tests {
     use std::path::Path;
 
     use forge_core::ports::{FileSystemPort, RepositoryFilePort};
-    use forge_core::{GitFileSet, InventoryOptions, PathKind, RepoRelativePath};
+    use forge_core::{GitFileSet, InventoryOptions, PathKind, PathMetadata, RepoRelativePath};
     use tempfile::tempdir;
 
     use super::{FileSystemError, NativeFileSystem, RepositoryWriter};
@@ -925,6 +1009,22 @@ mod tests {
             )?,
             PathKind::Directory
         );
+        assert_eq!(
+            FileSystemPort::path_metadata(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("missing")?,
+            )?,
+            PathMetadata::missing()
+        );
+        assert_eq!(
+            FileSystemPort::path_metadata(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("file")?,
+            )?,
+            PathMetadata::present(PathKind::File, 8)
+        );
 
         let invalid_ancestor = FileSystemPort::path_kind(
             &filesystem,
@@ -994,6 +1094,25 @@ mod tests {
 
         assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o750);
         assert_eq!(fs::read(&target)?, b"new");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_replace_does_not_inherit_permissive_permissions() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repository = tempdir()?;
+        let target = repository.path().join("state.json");
+        fs::write(&target, b"old")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        writer.write_atomic_private("state.json", b"new")?;
+
+        assert_eq!(fs::read(&target)?, b"new");
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o600);
         Ok(())
     }
 

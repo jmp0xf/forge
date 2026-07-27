@@ -11,8 +11,9 @@ use forge_core::domain::CommandEnforcement;
 use forge_core::ports::{ExecSpec, FileSystemPort, Hasher, ProcessPort};
 use forge_core::{
     CommandSource, CommandSpec, Confidence, CoverageDimension, GitFileSet, Intent, Inventory,
-    InventoryKind, Mutability, NetworkIntent, PathKind, ProjectKind, ProjectModel, ProjectUnit,
-    Provenance, RepoRelativePath, SuccessPredicate, ToolchainInfo,
+    InventoryKind, Mutability, NetworkIntent, OperationControl, OperationControlError, PathKind,
+    ProjectKind, ProjectModel, ProjectUnit, Provenance, RepoRelativePath, SuccessPredicate,
+    ToolchainInfo, UnlimitedOperationControl,
 };
 use serde::Deserialize;
 
@@ -81,6 +82,17 @@ pub enum GoProviderIssueKind {
     ImpactScopeBroadened,
 }
 
+impl GoProviderIssueKind {
+    /// Whether this observation prevents the provider from claiming a complete result.
+    ///
+    /// Conservative impact broadening is the safe v0 answer to an imprecise mapping: the full
+    /// validated module or workspace remains covered. The other variants mean some unit, command,
+    /// or mutation boundary could not be proven and therefore keep the provider incomplete.
+    const fn prevents_completion(self) -> bool {
+        !matches!(self, Self::ImpactScopeBroadened)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GoProviderIssue {
     pub kind: GoProviderIssueKind,
@@ -135,7 +147,16 @@ impl GoProvider {
         &self,
         context: GoProviderContext<'_>,
     ) -> Result<GoProviderResult, GoProviderError> {
-        analyze_go(context)
+        self.analyze_controlled(context, &UnlimitedOperationControl)
+    }
+
+    /// Detects Go units while sharing one operation-wide deadline with earlier providers.
+    pub fn analyze_controlled(
+        &self,
+        context: GoProviderContext<'_>,
+        control: &dyn OperationControl,
+    ) -> Result<GoProviderResult, GoProviderError> {
+        analyze_go(context, control)
     }
 }
 
@@ -186,7 +207,10 @@ struct CommandScope {
     changed_go_files: Vec<RepoRelativePath>,
 }
 
-fn analyze_go(context: GoProviderContext<'_>) -> Result<GoProviderResult, GoProviderError> {
+fn analyze_go(
+    context: GoProviderContext<'_>,
+    control: &dyn OperationControl,
+) -> Result<GoProviderResult, GoProviderError> {
     let mut issues = inventory_issues(context.inventory);
     let mut provenance = vec![Provenance {
         rule_id: String::from("go.inventory.v1"),
@@ -196,6 +220,13 @@ fn analyze_go(context: GoProviderContext<'_>) -> Result<GoProviderResult, GoProv
             "Go manifest candidates and formatting inputs come from the bounded repository inventory and Git file set",
         ),
     }];
+    let mut units = Vec::new();
+
+    if let Err(error) = control.checkpoint() {
+        return Ok(control_stopped_go_result(
+            units, provenance, issues, error, None,
+        ));
+    }
 
     if !context.repository_root.is_absolute() {
         issues.push(issue(
@@ -206,38 +237,110 @@ fn analyze_go(context: GoProviderContext<'_>) -> Result<GoProviderResult, GoProv
         return Ok(finalize_result(Vec::new(), Vec::new(), provenance, issues));
     }
 
-    let inventory_kinds = inventory_kind_map(context.inventory);
-    let (work_manifests, module_manifests) = manifest_candidates(context.inventory, &mut issues);
+    let inventory_kinds = match inventory_kind_map_controlled(context.inventory, control) {
+        Ok(kinds) => kinds,
+        Err(error) => {
+            return Ok(control_stopped_go_result(
+                units, provenance, issues, error, None,
+            ));
+        }
+    };
+    let (work_manifests, module_manifests) =
+        match manifest_candidates_controlled(context.inventory, &mut issues, control) {
+            Ok(manifests) => manifests,
+            Err(error) => {
+                return Ok(control_stopped_go_result(
+                    units, provenance, issues, error, None,
+                ));
+            }
+        };
     let mut workspaces = Vec::new();
     for manifest in work_manifests {
-        workspaces.push(inspect_workspace(
+        if let Err(error) = control.checkpoint() {
+            return Ok(control_stopped_go_result(
+                units,
+                provenance,
+                issues,
+                error,
+                Some(manifest),
+            ));
+        }
+        let workspace = match inspect_workspace(
             &context,
             &inventory_kinds,
-            manifest,
+            manifest.clone(),
             &mut issues,
             &mut provenance,
-        ));
+            control,
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return Ok(control_stopped_go_result(
+                    units,
+                    provenance,
+                    issues,
+                    error,
+                    Some(manifest),
+                ));
+            }
+        };
+        workspaces.push(workspace);
     }
 
     mark_ambiguous_workspaces(&mut workspaces, &mut issues);
-    let covered_modules = workspaces
-        .iter()
-        .flat_map(|workspace| workspace.modules.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    if let Err(error) = control.checkpoint() {
+        return Ok(control_stopped_go_result(
+            units, provenance, issues, error, None,
+        ));
+    }
+    let mut covered_modules = BTreeSet::new();
+    for workspace in &workspaces {
+        for module in &workspace.modules {
+            if let Err(error) = control.checkpoint() {
+                return Ok(control_stopped_go_result(
+                    units,
+                    provenance,
+                    issues,
+                    error,
+                    Some(workspace.manifest.clone()),
+                ));
+            }
+            covered_modules.insert(module.clone());
+        }
+    }
     let blocked_roots = workspaces
         .iter()
         .filter(|workspace| !workspace.valid)
         .map(|workspace| workspace.root.clone())
         .collect::<Vec<_>>();
 
-    let all_module_roots = module_manifests
-        .iter()
-        .filter_map(parent_path)
-        .collect::<BTreeSet<_>>();
-    let mut units = Vec::new();
+    let mut all_module_roots = BTreeSet::new();
+    for manifest in &module_manifests {
+        if let Err(error) = control.checkpoint() {
+            return Ok(control_stopped_go_result(
+                units,
+                provenance,
+                issues,
+                error,
+                Some(manifest.clone()),
+            ));
+        }
+        if let Some(root) = parent_path(manifest) {
+            all_module_roots.insert(root);
+        }
+    }
     let mut scopes = Vec::new();
 
     for workspace in workspaces {
+        if let Err(error) = control.checkpoint() {
+            return Ok(control_stopped_go_result(
+                units,
+                provenance,
+                issues,
+                error,
+                Some(workspace.manifest),
+            ));
+        }
         let workspace_identity = unit_identity(context.hasher, "workspace", &workspace.manifest);
         let unit_provenance = vec![manifest_provenance(
             "go.workspace.metadata.v1",
@@ -277,6 +380,15 @@ fn analyze_go(context: GoProviderContext<'_>) -> Result<GoProviderResult, GoProv
         });
         if workspace.valid {
             for module in &workspace.modules {
+                if let Err(error) = control.checkpoint() {
+                    return Ok(control_stopped_go_result(
+                        units,
+                        provenance,
+                        issues,
+                        error,
+                        Some(module.clone()),
+                    ));
+                }
                 let Some(module_root) = parent_path(module) else {
                     continue;
                 };
@@ -315,6 +427,15 @@ fn analyze_go(context: GoProviderContext<'_>) -> Result<GoProviderResult, GoProv
     }
 
     for manifest in module_manifests {
+        if let Err(error) = control.checkpoint() {
+            return Ok(control_stopped_go_result(
+                units,
+                provenance,
+                issues,
+                error,
+                Some(manifest),
+            ));
+        }
         if covered_modules.contains(&manifest)
             || blocked_roots
                 .iter()
@@ -366,40 +487,90 @@ fn analyze_go(context: GoProviderContext<'_>) -> Result<GoProviderResult, GoProv
 
     units.sort_by(|left, right| left.manifest.cmp(&right.manifest));
     scopes.sort_by(|left, right| left.manifest.cmp(&right.manifest));
-    assign_tracked_go_files(
+    if let Err(error) = control.checkpoint() {
+        return Ok(control_stopped_go_result(
+            units, provenance, issues, error, None,
+        ));
+    }
+    if let Err(error) = assign_tracked_go_files(
         &mut scopes,
         context.git_files,
         &inventory_kinds,
         &all_module_roots,
-    );
-    let mutation_scope_complete = assign_changed_go_files(
+        control,
+    ) {
+        return Ok(control_stopped_go_result(
+            units, provenance, issues, error, None,
+        ));
+    }
+    let mutation_scope_complete = match assign_changed_go_files(
         &context,
         &mut scopes,
         &inventory_kinds,
         &all_module_roots,
         &mut issues,
-    );
-    record_conservative_impact(&context, &scopes, &mut issues);
+        control,
+    ) {
+        Ok(complete) => complete,
+        Err(error) => {
+            return Ok(control_stopped_go_result(
+                units, provenance, issues, error, None,
+            ));
+        }
+    };
+    if let Err(error) = record_conservative_impact(&context, &scopes, &mut issues, control) {
+        return Ok(control_stopped_go_result(
+            units, provenance, issues, error, None,
+        ));
+    }
 
-    let plans = build_plans(
+    let complete = issues.iter().all(|issue| !issue.kind.prevents_completion());
+    let plans = match build_plans(
         context.repository_root,
         &scopes,
         mutation_scope_complete,
-        if issues.is_empty() {
+        if complete {
             Confidence::High
         } else {
             Confidence::Unknown
         },
-    )?;
-    provenance.extend(scopes.iter().map(|scope| {
-        manifest_provenance(
+        control,
+    ) {
+        Ok(plans) => plans,
+        Err(GoPlanBuildError::Control(error)) => {
+            return Ok(control_stopped_go_result(
+                units, provenance, issues, error, None,
+            ));
+        }
+        Err(GoPlanBuildError::Invalid(error)) => {
+            return Err(GoProviderError::InvalidCommandPlan(error));
+        }
+    };
+    for scope in &scopes {
+        if let Err(error) = control.checkpoint() {
+            return Ok(control_stopped_go_result(
+                units,
+                provenance,
+                issues,
+                error,
+                Some(scope.manifest.clone()),
+            ));
+        }
+        provenance.push(manifest_provenance(
             "go.command-scope.v1",
             &scope.manifest,
             "Go commands use the full validated module scope; unknown impact is widened rather than excluded",
-        )
-    }));
+        ));
+    }
 
-    Ok(finalize_result(units, plans, provenance, issues))
+    let mut result = finalize_result(units, plans, provenance, issues);
+    if let Err(error) = control.checkpoint() {
+        result.plans.clear();
+        result.issues.push(control_issue(error, None));
+        result.confidence = Confidence::Unknown;
+        result.complete = false;
+    }
+    Ok(result)
 }
 
 fn finalize_result(
@@ -412,7 +583,7 @@ fn finalize_result(
     provenance.dedup();
     issues.sort();
     issues.dedup();
-    let complete = issues.is_empty();
+    let complete = issues.iter().all(|issue| !issue.kind.prevents_completion());
     GoProviderResult {
         units,
         plans,
@@ -424,6 +595,24 @@ fn finalize_result(
             Confidence::Unknown
         },
         complete,
+    }
+}
+
+fn control_stopped_go_result(
+    units: Vec<ProjectUnit>,
+    provenance: Vec<Provenance>,
+    mut issues: Vec<GoProviderIssue>,
+    error: OperationControlError,
+    path: Option<RepoRelativePath>,
+) -> GoProviderResult {
+    issues.push(control_issue(error, path));
+    GoProviderResult {
+        units,
+        plans: Vec::new(),
+        provenance,
+        issues,
+        confidence: Confidence::Unknown,
+        complete: false,
     }
 }
 
@@ -445,25 +634,29 @@ fn inventory_issues(inventory: &Inventory) -> Vec<GoProviderIssue> {
         .collect()
 }
 
-fn inventory_kind_map(inventory: &Inventory) -> BTreeMap<RepoRelativePath, InventoryKind> {
-    inventory
-        .entries
-        .iter()
-        .filter_map(|entry| {
-            RepoRelativePath::new(&entry.path)
-                .ok()
-                .map(|path| (path, entry.kind))
-        })
-        .collect()
+fn inventory_kind_map_controlled(
+    inventory: &Inventory,
+    control: &dyn OperationControl,
+) -> Result<BTreeMap<RepoRelativePath, InventoryKind>, OperationControlError> {
+    let mut kinds = BTreeMap::new();
+    for entry in &inventory.entries {
+        control.checkpoint()?;
+        if let Ok(path) = RepoRelativePath::new(&entry.path) {
+            kinds.insert(path, entry.kind);
+        }
+    }
+    Ok(kinds)
 }
 
-fn manifest_candidates(
+fn manifest_candidates_controlled(
     inventory: &Inventory,
     issues: &mut Vec<GoProviderIssue>,
-) -> (Vec<RepoRelativePath>, Vec<RepoRelativePath>) {
+    control: &dyn OperationControl,
+) -> Result<(Vec<RepoRelativePath>, Vec<RepoRelativePath>), OperationControlError> {
     let mut work = BTreeSet::new();
     let mut modules = BTreeSet::new();
     for entry in &inventory.entries {
+        control.checkpoint()?;
         let Some(file_name) = entry.path.file_name() else {
             continue;
         };
@@ -486,7 +679,8 @@ fn manifest_candidates(
             )),
         }
     }
-    (work.into_iter().collect(), modules.into_iter().collect())
+    control.checkpoint()?;
+    Ok((work.into_iter().collect(), modules.into_iter().collect()))
 }
 
 fn inspect_workspace(
@@ -495,29 +689,34 @@ fn inspect_workspace(
     manifest: RepoRelativePath,
     issues: &mut Vec<GoProviderIssue>,
     provenance: &mut Vec<Provenance>,
-) -> WorkspaceCandidate {
+    control: &dyn OperationControl,
+) -> Result<WorkspaceCandidate, OperationControlError> {
+    control.checkpoint()?;
     let root = parent_path(&manifest).unwrap_or_else(RepoRelativePath::root);
     if !manifest_is_regular(context, inventory_kinds, &manifest, issues) {
-        return WorkspaceCandidate {
+        return Ok(WorkspaceCandidate {
             manifest,
             root,
             modules: Vec::new(),
             valid: false,
-        };
+        });
     }
-    let Some(metadata) = read_workspace_metadata(context, &manifest, &root, issues) else {
-        return WorkspaceCandidate {
+    let Some(metadata) = read_workspace_metadata(context, &manifest, &root, issues, control) else {
+        control.checkpoint()?;
+        return Ok(WorkspaceCandidate {
             manifest,
             root,
             modules: Vec::new(),
             valid: false,
-        };
+        });
     };
+    control.checkpoint()?;
 
     let mut modules = Vec::new();
     let mut seen = BTreeSet::new();
     let mut valid = true;
     for use_entry in metadata.uses {
+        control.checkpoint()?;
         let module_root = match resolve_use_path(
             context.repository_root,
             &root,
@@ -597,6 +796,7 @@ fn inspect_workspace(
         }
         modules.push(module_manifest);
     }
+    control.checkpoint()?;
     modules.sort();
     if module_roots_overlap(&modules) {
         issues.push(issue(
@@ -611,12 +811,13 @@ fn inspect_workspace(
         &manifest,
         "bounded argv-only go work edit metadata was parsed with network and user Go configuration disabled",
     ));
-    WorkspaceCandidate {
+    control.checkpoint()?;
+    Ok(WorkspaceCandidate {
         manifest,
         root,
         modules,
         valid,
-    }
+    })
 }
 
 fn manifest_is_regular(
@@ -662,7 +863,15 @@ fn read_workspace_metadata(
     manifest: &RepoRelativePath,
     root: &RepoRelativePath,
     issues: &mut Vec<GoProviderIssue>,
+    control: &dyn OperationControl,
 ) -> Option<GoWorkMetadata> {
+    let permit = match control.checkpoint() {
+        Ok(permit) => permit,
+        Err(error) => {
+            issues.push(control_issue(error, Some(manifest.clone())));
+            return None;
+        }
+    };
     let file_name = manifest.as_path().file_name()?.to_os_string();
     let mut command = CommandSpec::new(
         format!(
@@ -683,7 +892,7 @@ fn read_workspace_metadata(
         OsString::from("-json"),
         file_name,
     ]);
-    command.timeout = context.metadata_timeout;
+    command.timeout = permit.cap(context.metadata_timeout);
     command.mutability = Mutability::ReadOnly;
     command.network = NetworkIntent::OfflineRequested;
     command.confidence = Confidence::High;
@@ -754,6 +963,17 @@ fn read_workspace_metadata(
     }
 }
 
+fn control_issue(error: OperationControlError, path: Option<RepoRelativePath>) -> GoProviderIssue {
+    issue(
+        match error {
+            OperationControlError::TimedOut => GoProviderIssueKind::MetadataTimedOut,
+            OperationControlError::Interrupted => GoProviderIssueKind::MetadataInterrupted,
+        },
+        path,
+        error.to_string(),
+    )
+}
+
 fn mark_ambiguous_workspaces(
     workspaces: &mut [WorkspaceCandidate],
     issues: &mut Vec<GoProviderIssue>,
@@ -802,30 +1022,34 @@ fn assign_tracked_go_files(
     git_files: &GitFileSet,
     inventory_kinds: &BTreeMap<RepoRelativePath, InventoryKind>,
     all_module_roots: &BTreeSet<RepoRelativePath>,
-) {
+    control: &dyn OperationControl,
+) -> Result<(), OperationControlError> {
     for scope in scopes {
-        scope.tracked_go_files = git_files
-            .tracked
-            .iter()
-            .filter(|path| is_go_source(path))
-            .filter(|path| inventory_kinds.get(*path) == Some(&InventoryKind::File))
-            .filter(|path| {
-                scope
+        control.checkpoint()?;
+        let mut tracked = Vec::new();
+        for path in &git_files.tracked {
+            control.checkpoint()?;
+            if is_go_source(path)
+                && inventory_kinds.get(path) == Some(&InventoryKind::File)
+                && scope
                     .module_roots
                     .iter()
                     .any(|module_root| belongs_to_module(path, module_root, all_module_roots))
-            })
-            .filter(|path| {
-                !scope.module_roots.iter().any(|root| {
+                && !scope.module_roots.iter().any(|root| {
                     relative_to(path, root)
                         .is_some_and(|relative| contains_component(&relative, OsStr::new("vendor")))
                 })
-            })
-            .cloned()
-            .collect();
-        scope.tracked_go_files.sort();
-        scope.tracked_go_files.dedup();
+            {
+                tracked.push(path.clone());
+            }
+        }
+        control.checkpoint()?;
+        tracked.sort();
+        tracked.dedup();
+        scope.tracked_go_files = tracked;
     }
+    control.checkpoint()?;
+    Ok(())
 }
 
 fn assign_changed_go_files(
@@ -834,7 +1058,9 @@ fn assign_changed_go_files(
     inventory_kinds: &BTreeMap<RepoRelativePath, InventoryKind>,
     all_module_roots: &BTreeSet<RepoRelativePath>,
     issues: &mut Vec<GoProviderIssue>,
-) -> bool {
+    control: &dyn OperationControl,
+) -> Result<bool, OperationControlError> {
+    control.checkpoint()?;
     let Some(changed_files) = context.changed_files else {
         if !scopes.is_empty() {
             issues.push(issue(
@@ -843,17 +1069,21 @@ fn assign_changed_go_files(
                 "typed Git status did not provide a complete changed-path set; mutating Go format plans were omitted",
             ));
         }
-        return false;
+        return Ok(false);
     };
-    let authoritative = context
+    let mut authoritative = BTreeSet::new();
+    for path in context
         .git_files
         .tracked
         .iter()
         .chain(&context.git_files.untracked)
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    {
+        control.checkpoint()?;
+        authoritative.insert(path.clone());
+    }
     let mut complete = true;
     for changed in changed_files {
+        control.checkpoint()?;
         if !authoritative.contains(changed) {
             issues.push(issue(
                 GoProviderIssueKind::ChangedPathUnknown,
@@ -883,7 +1113,6 @@ fn assign_changed_go_files(
             continue;
         };
         if inventory_kinds.get(changed) != Some(&InventoryKind::File) {
-            // A deleted path has nothing to format. Other inventory kinds remain visible below.
             if inventory_kinds.get(changed).is_none() {
                 continue;
             }
@@ -922,6 +1151,7 @@ fn assign_changed_go_files(
                 continue;
             }
         }
+        control.checkpoint()?;
         let text = match context.file_system.read_bounded_text(
             context.repository_root,
             changed,
@@ -947,41 +1177,62 @@ fn assign_changed_go_files(
                 continue;
             }
         };
+        control.checkpoint()?;
         if !has_standard_generated_marker(&text.bytes) {
             scope.changed_go_files.push(changed.clone());
         }
     }
     for scope in scopes {
+        control.checkpoint()?;
         scope.changed_go_files.sort();
         scope.changed_go_files.dedup();
     }
-    complete
+    control.checkpoint()?;
+    Ok(complete)
 }
 
 fn record_conservative_impact(
     context: &GoProviderContext<'_>,
     scopes: &[CommandScope],
     issues: &mut Vec<GoProviderIssue>,
-) {
+    control: &dyn OperationControl,
+) -> Result<(), OperationControlError> {
+    control.checkpoint()?;
     let Some(changed_files) = context.changed_files else {
-        return;
+        return Ok(());
     };
-    let changed_non_go = changed_files
-        .iter()
-        .filter(|path| !is_go_source(path))
-        .collect::<Vec<_>>();
-    if changed_non_go.is_empty() {
-        return;
+    let mut changed_non_go = Vec::new();
+    for path in changed_files {
+        control.checkpoint()?;
+        if !is_go_source(path) {
+            changed_non_go.push(path);
+        }
     }
-    let has_unmapped_change = changed_non_go.iter().any(|path| {
-        !scopes.iter().any(|scope| {
-            scope
+    if changed_non_go.is_empty() {
+        return Ok(());
+    }
+    let mut has_unmapped_change = false;
+    for path in &changed_non_go {
+        control.checkpoint()?;
+        let mut mapped = false;
+        for scope in scopes {
+            control.checkpoint()?;
+            if scope
                 .module_roots
                 .iter()
                 .any(|root| path_is_within(path, root))
-        })
-    });
+            {
+                mapped = true;
+                break;
+            }
+        }
+        if !mapped {
+            has_unmapped_change = true;
+            break;
+        }
+    }
     for scope in scopes {
+        control.checkpoint()?;
         let relevant_change = has_unmapped_change
             || changed_non_go.iter().any(|path| {
                 scope
@@ -992,13 +1243,19 @@ fn record_conservative_impact(
         if !relevant_change {
             continue;
         }
-        let embed_observed = scope.tracked_go_files.iter().any(|path| {
-            context
+        let mut embed_observed = false;
+        for path in &scope.tracked_go_files {
+            control.checkpoint()?;
+            if context
                 .file_system
                 .read_bounded_text(context.repository_root, path, MAX_GENERATED_SCAN_BYTES)
                 .ok()
                 .is_some_and(|text| bytes_contains(&text.bytes, b"//go:embed"))
-        });
+            {
+                embed_observed = true;
+                break;
+            }
+        }
         issues.push(issue(
             GoProviderIssueKind::ImpactScopeBroadened,
             Some(scope.manifest.clone()),
@@ -1009,6 +1266,26 @@ fn record_conservative_impact(
             },
         ));
     }
+    control.checkpoint()?;
+    Ok(())
+}
+
+#[derive(Debug)]
+enum GoPlanBuildError {
+    Control(OperationControlError),
+    Invalid(InvalidCommandPlanCandidate),
+}
+
+impl From<OperationControlError> for GoPlanBuildError {
+    fn from(error: OperationControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl From<InvalidCommandPlanCandidate> for GoPlanBuildError {
+    fn from(error: InvalidCommandPlanCandidate) -> Self {
+        Self::Invalid(error)
+    }
 }
 
 fn build_plans(
@@ -1016,10 +1293,12 @@ fn build_plans(
     scopes: &[CommandScope],
     mutation_scope_complete: bool,
     coverage_confidence: Confidence,
-) -> Result<Vec<CommandPlanCandidate>, GoProviderError> {
+    control: &dyn OperationControl,
+) -> Result<Vec<CommandPlanCandidate>, GoPlanBuildError> {
     let mut commands = BTreeMap::<Intent, Vec<CommandSpec>>::new();
     let mut plan_provenance = Vec::new();
     for scope in scopes {
+        control.checkpoint()?;
         plan_provenance.push(manifest_provenance(
             "go.default-command.v1",
             &scope.manifest,
@@ -1034,6 +1313,7 @@ fn build_plans(
             &scope.tracked_go_files,
             Mutability::ReadOnly,
         );
+        control.checkpoint()?;
         commands
             .entry(Intent::FormatCheck)
             .or_default()
@@ -1056,6 +1336,7 @@ fn build_plans(
             ));
 
         let tests = go_module_commands(repository_root, scope, Intent::Test, "test", false);
+        control.checkpoint()?;
         commands
             .entry(Intent::Test)
             .or_default()
@@ -1070,6 +1351,7 @@ fn build_plans(
             .extend(retarget_commands(&tests, Intent::Verify, "verify-test"));
 
         let vet = go_module_commands(repository_root, scope, Intent::Verify, "vet", true);
+        control.checkpoint()?;
         commands
             .entry(Intent::Check)
             .or_default()
@@ -1086,6 +1368,7 @@ fn build_plans(
                 &scope.changed_go_files,
                 Mutability::WorkingTreeWrite,
             );
+            control.checkpoint()?;
             commands
                 .entry(Intent::Format)
                 .or_default()
@@ -1099,6 +1382,7 @@ fn build_plans(
 
     let mut plans = Vec::new();
     for intent in Intent::ALL {
+        control.checkpoint()?;
         let Some(intent_commands) = commands.remove(&intent) else {
             continue;
         };
@@ -1111,6 +1395,7 @@ fn build_plans(
             coverage_confidence,
         )?);
     }
+    control.checkpoint()?;
     Ok(plans)
 }
 
@@ -1461,6 +1746,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::time::Duration;
 
     use forge_core::ports::{
@@ -1469,8 +1755,9 @@ mod tests {
     };
     use forge_core::{
         BoundedText, Confidence, Digest, GitFileSet, Intent, Inventory, InventoryEntry,
-        InventoryError, InventoryKind, InventoryOptions, InventorySkip, Mutability, PathKind,
-        ProjectKind, RepoRelativePath,
+        InventoryError, InventoryKind, InventoryOptions, InventorySkip, Mutability,
+        OperationControl, OperationControlError, OperationPermit, PathKind, ProjectKind,
+        RepoRelativePath,
     };
 
     use super::{
@@ -1587,6 +1874,7 @@ mod tests {
     struct FakeProcess {
         responses: RefCell<VecDeque<ProcessObservation>>,
         calls: RefCell<Vec<ExecSpec>>,
+        stop_after_run: Option<Rc<Cell<bool>>>,
     }
 
     impl FakeProcess {
@@ -1594,20 +1882,45 @@ mod tests {
             Self {
                 responses: RefCell::new(responses.into()),
                 calls: RefCell::new(Vec::new()),
+                stop_after_run: None,
             }
+        }
+
+        fn with_stop_after_run(mut self, stop: Rc<Cell<bool>>) -> Self {
+            self.stop_after_run = Some(stop);
+            self
         }
     }
 
     impl ProcessPort for FakeProcess {
         fn run(&self, spec: &ExecSpec) -> Result<ProcessObservation, ProcessError> {
             self.calls.borrow_mut().push(spec.clone());
-            self.responses.borrow_mut().pop_front().ok_or_else(|| {
+            let result = self.responses.borrow_mut().pop_front().ok_or_else(|| {
                 ProcessError::new(
                     ProcessErrorKind::Spawn,
                     "fixture process response",
                     io::Error::other("unexpected process execution"),
                 )
-            })
+            });
+            if let Some(stop) = &self.stop_after_run {
+                stop.set(true);
+            }
+            result
+        }
+    }
+
+    struct EventControl {
+        stop: Rc<Cell<bool>>,
+        error: OperationControlError,
+    }
+
+    impl OperationControl for EventControl {
+        fn checkpoint(&self) -> Result<OperationPermit, OperationControlError> {
+            if self.stop.get() {
+                Err(self.error)
+            } else {
+                Ok(OperationPermit::unlimited())
+            }
         }
     }
 
@@ -1636,7 +1949,7 @@ mod tests {
                 .map(|(path, kind)| InventoryEntry {
                     path: PathBuf::from(path),
                     kind: *kind,
-                    size_bytes: if *kind == InventoryKind::File { 1 } else { 0 },
+                    size_bytes: Some(if *kind == InventoryKind::File { 1 } else { 0 }),
                 })
                 .collect(),
             skipped: Vec::new(),
@@ -1696,6 +2009,54 @@ mod tests {
             .iter()
             .find(|plan| plan.intent() == intent)
             .ok_or_else(|| io::Error::other(format!("missing {intent:?} plan")).into())
+    }
+
+    #[test]
+    fn control_event_after_first_workspace_prevents_later_workspace_work()
+    -> Result<(), Box<dyn Error>> {
+        let repository = inventory(&[
+            ("a/go.work", InventoryKind::File),
+            ("b/go.work", InventoryKind::File),
+        ]);
+        let file_system = FakeFileSystem::new(repository.clone());
+        let git = git_files(&["a/go.work", "b/go.work"], &[])?;
+        let stop = Rc::new(Cell::new(false));
+        let process = FakeProcess::with_responses(vec![
+            observation(br#"{"Use":[]}"#),
+            observation(br#"{"Use":[]}"#),
+        ])
+        .with_stop_after_run(Rc::clone(&stop));
+        let control = EventControl {
+            stop,
+            error: OperationControlError::Interrupted,
+        };
+
+        let result = GoProvider.analyze_controlled(
+            GoProviderContext {
+                repository_root: Path::new("/repo"),
+                inventory: &repository,
+                git_files: &git,
+                changed_files: None,
+                file_system: &file_system,
+                process: &process,
+                hasher: &FakeHasher,
+                metadata_timeout: Duration::from_secs(2),
+            },
+            &control,
+        )?;
+
+        assert_eq!(process.calls.borrow().len(), 1);
+        assert!(result.units.is_empty());
+        assert!(result.plans.is_empty());
+        assert!(!result.complete);
+        assert!(result.issues.iter().any(|issue| {
+            issue.kind == GoProviderIssueKind::MetadataInterrupted
+                && issue
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.as_path() == Path::new("a/go.work"))
+        }));
+        Ok(())
     }
 
     #[test]
@@ -1808,6 +2169,8 @@ mod tests {
                 .iter()
                 .any(|issue| issue.kind == GoProviderIssueKind::ImpactScopeBroadened)
         );
+        assert!(result.complete);
+        assert_eq!(result.confidence, Confidence::High);
         Ok(())
     }
 

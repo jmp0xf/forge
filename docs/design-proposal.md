@@ -564,7 +564,7 @@ forge improve   # v0 不实现
 --color auto|always|never
 -q, --quiet
 -v, --verbose                可叠加
---timeout <DURATION>
+--timeout <DURATION>          整条 Forge 命令共享的 wall-clock 总预算
 --config <PATH>
 --no-cache
 ```
@@ -791,9 +791,12 @@ pub trait ProcessPort { /* argv run, timeout, cancel, kill tree */ }
 pub trait StateStore { /* load, save, lock, gc */ }
 pub trait Clock { fn now(&self) -> SystemTime; }
 pub trait Hasher { /* streaming digest */ }
+pub trait OperationControl { /* one fixed command deadline, remaining budget, cancellation */ }
 ```
 
 测试只替换这些外部端口，不 mock 风险、状态机和证据充分性等业务逻辑。
+`--timeout` 在命令入口只构造一次 `OperationControl`；后续 Git、inventory、Provider、scope、状态和
+子进程只能消费 remaining budget，不能用剩余 duration 创建新 deadline。
 
 ---
 
@@ -985,6 +988,16 @@ repository identity
 - 用户要求 `--fresh` / `--no-cache`；
 - 未能获得可靠作用域摘要的结果。
 
+v0 的 shared inventory cache 采用更窄的专用键：repository identity、HEAD、inventory
+边界、effective policy、平台、Forge behavior，加上当前普通 Git index 的语义投影
+`(mode, blob object id, native relative path)`。raw index bytes 只用于在 status/index 读取前后
+检测竞态，不进入跨 linked-worktree 的共享键，因为其中含 checkout 本地 stat 数据。缓存值只含
+有序普通文件路径，不含 worktree 本地 size；命中时必须用当前 stage-zero index 重新核对全部路径，
+并再次确认 raw index 未变化。split index、`index.lock`、symlink/reparse、非普通 index、
+Gitlink、unmerged、sparse/skip-worktree、assume-unchanged、untracked，或 bounded Git 读取所暴露的
+状态不在明确允许的普通 stage-zero 子集内，均回退到权威 inventory。只读命令的 miss 不发布；
+只有已成功的授权状态写入才能顺带发布不可变条目。
+
 ### 11.4 并发
 
 Forge v0 是同步单进程 CLI，不引入异步运行时。实现可以：
@@ -1086,6 +1099,27 @@ justfile
 Taskfile.yml / Taskfile.yaml
 项目已有标准脚本
 ```
+
+v0 对“标准脚本”采用可审计的窄边界，不按相似名称猜测：只识别仓库根
+`scripts/`、`tools/`、`hack/` 的直接子项；可选扩展名为
+`sh/bash/zsh/fish/py/rb/pl/js/ps1/cmd/bat`；文件 stem 到 intent 的映射为：
+
+| intent | 精确 stem |
+|---|---|
+| setup | `setup`、`bootstrap` |
+| format-check | `format-check`、`fmt-check` |
+| format | `format`、`fmt` |
+| check | `check`、`lint` |
+| fix | `fix` |
+| test | `test` |
+| verify | `verify`、`ci` |
+| build | `build` |
+
+名称只定位 intent，不决定解释器。v0 只有在文本首行精确为
+`#!/usr/bin/env <portable-program-name>` 时才把它规范化成等价的
+`<portable-program-name> <repo-relative-script-path>` argv；缺失、截断、二进制、控制参数、
+绝对解释器或其它不可移植 shebang 只令该脚本对应的 intent 为 unknown，不污染其它 intent，
+也不执行脚本。显式配置仍可覆盖同一 intent 的 unknown。
 
 v0 不解析任意 CI shell 以反推命令；CI 仅作为“项目是否已经使用某入口”的补充证据。
 
@@ -1264,6 +1298,16 @@ examples/benches (是否覆盖由实际命令决定)
 cross-target (默认 not-verified)
 performance (默认 not-verified)
 ```
+
+Evidence v2 保留上述通用维度，并用现有 custom 维度声明
+`rust-format`、`rust-compile`、`rust-lint`、`rust-unit-test`、
+`rust-integration-test-local`、`rust-build`、`rust-examples-compile`、
+`rust-benches-compile`、`rust-cross-target` 和 `rust-performance`。这样 mixed repository 中
+Go 的通用 coverage 不会遮蔽 Rust 缺口。`cargo check --all-targets` 只声明通用 compile 与
+`rust-compile`；Cargo 会跳过当前 feature set 未满足 `required-features` 的 target，因此默认命令不
+声明 examples/benches compile、performance 或 cross-target coverage。无 Receipt 或部分 Receipt 时，
+Provider expectation 中尚未出现在 verified/advisory/显式 not-verified 的维度进入 not-verified；
+四分优先级为 external-required > not-verified > advisory > verified。该展示不改变本地充分性。
 
 ---
 
@@ -2141,6 +2185,7 @@ pub struct ExecSpec {
 - stdout/stderr 分开流式读取；
 - 内存有界，完整日志按策略落盘；
 - 记录 wall time、raw exit、signal、timeout、cancel；
+- 子进程 timeout 取命令声明上限与 operation remaining budget 的较小值，不重置总预算；
 - 捕获 SIGINT 并终止整个进程树；
 - Unix 使用独立进程组；
 - Windows 使用 Job Object；
@@ -2905,8 +2950,8 @@ N-1 public compatibility harness skeleton
 | AGENTS 受管块上限 | 120 行 / 8 KiB | 观察删除率、上下文占用、漏指引与人工撤销 |
 | 单流内存输出 | 256 KiB | huge-output 和真实工具分布 |
 | 单日志文件 | 10 MiB | 排障需求与磁盘成本 |
-| doctor 元数据超时 | 30–60 s | p95 与超时原因 |
-| check/test 默认超时 | 5/15 min | 仓库实际耗时分布 |
+| doctor 元数据默认子阶段上限 | 30–60 s | p95、总预算余量与超时原因 |
+| check/test 默认子进程上限 | 5/15 min | 仓库实际耗时分布；不得重置命令总预算 |
 | Receipt GC | 最近 200 条或 14 天取宽 | Evidence 引用、磁盘占用、排障需要 |
 | context 预算 | 16 KiB 路径/摘要 | 任务完成率与默认上下文成本 |
 | 变更规模风险阈值 | 暂不硬编码或保守值 | 历史 PR 与人工风险标注 |
@@ -2942,6 +2987,15 @@ N-1 public compatibility harness skeleton
 | 0015 | worktree 状态隔离，只共享内容寻址缓存 |
 | 0016 | Evidence 按依赖变化失效 |
 | 0017 | 默认不生成 runner、CI 和组织文档 |
+| 0018 | 从 Git common-dir 派生本地仓库身份 |
+| 0019 | v0 使用 HEAD 作为工作树比较基线 |
+| 0020 | 版本化完整的本地 Evidence 契约 |
+| 0021 | Evidence 状态使用不可变对象和有界保留 |
+| 0022 | 不可变证据身份对 JSON 数字做无浮点精确规范化 |
+| 0023 | JSON Schema 文档不套 Forge 结果信封 |
+| 0024 | 进程边界失败写入类型化非证明 Receipt |
+| 0025 | 每条命令使用一个操作级总预算 |
+| 0026 | 声明 Provider 命名空间覆盖与缺口 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 
