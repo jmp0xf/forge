@@ -2,6 +2,8 @@
 
 /// CLI binary name.
 pub const CLI_NAME: &str = "forge";
+/// Human-readable product name.
+pub const DISPLAY_NAME: &str = "Forge";
 /// Optional repository-root configuration file.
 pub const CONFIG_FILE: &str = "forge.toml";
 /// Runtime state namespace below the per-worktree Git directory.

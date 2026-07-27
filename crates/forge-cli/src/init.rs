@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-use forge_core::branding::CLI_NAME;
+use forge_core::branding::{CLI_NAME, CONFIG_FILE, DISPLAY_NAME};
 use forge_core::{
     AppError, ExitCode, Intent, OperationControl as _, ProjectModel, Provenance, WorkState,
 };
@@ -431,7 +431,7 @@ fn project_gap_diagnostics(plan: &ChangePlan, model: &ProjectModel) -> Vec<Diagn
                     format!("project command `{intent_label}`"),
                     format!("command resolution remains unknown; {evidence}"),
                     format!(
-                        "choose the repository's authoritative `{intent_label}` argv, define it in `[commands.{intent_label}]` in forge.toml, then rerun forge init; Forge will not guess this decision"
+                        "choose the repository's authoritative `{intent_label}` argv, define it in `[commands.{intent_label}]` in {CONFIG_FILE}, then rerun {CLI_NAME} init; {DISPLAY_NAME} will not guess this decision"
                     ),
                 )),
                 GapKind::MissingHostIndex
