@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use forge_core::ports::GitPort as _;
-use forge_core::{BranchHead, BranchOid, GitErrorKind, GitObjectFormat, StatusEntry};
+use forge_core::{
+    BranchHead, BranchOid, GitErrorKind, GitObjectFormat, RepoRelativePath, StatusEntry,
+};
 use forge_runtime::git::GitCli;
 use forge_runtime::inventory::{InventoryOptions, build_git_inventory};
 use forge_runtime::state::{AtomicStateStore, GitStateLayout};
@@ -263,6 +265,71 @@ fn sha256_repository_status_uses_full_width_object_ids() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn commit_file_reads_are_immutable_literal_and_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    for object_format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+        let fixture = GitFixture::init(object_format)?;
+        let accepted = b"schema = 1\n# accepted baseline\n";
+        let literal_path_content = b"literal pathspec bytes\n";
+        fs::write(fixture.repository.join("forge.toml"), accepted)?;
+        fs::write(
+            fixture.repository.join("[policy].toml"),
+            literal_path_content,
+        )?;
+        fixture.run_git(["add", "--all"])?;
+        fixture.run_git(["commit", "-m", "policy baseline"])?;
+
+        let git = GitCli::new();
+        let status = git.status(&fixture.repository)?;
+        let head = match status.branch.oid {
+            Some(BranchOid::Commit(head)) => head,
+            _ => return Err("committed fixture did not report an immutable HEAD".into()),
+        };
+        fs::write(fixture.repository.join("forge.toml"), b"schema = 1\n")?;
+        let path = RepoRelativePath::new("forge.toml")?;
+
+        assert_eq!(
+            git.read_commit_file_bounded(
+                &fixture.repository,
+                &head,
+                &path,
+                accepted.len() as u64,
+            )?,
+            Some(accepted.to_vec())
+        );
+        assert_eq!(
+            git.read_commit_file_bounded(
+                &fixture.repository,
+                &head,
+                &RepoRelativePath::new("absent.toml")?,
+                1024,
+            )?,
+            None
+        );
+        assert_eq!(
+            git.read_commit_file_bounded(
+                &fixture.repository,
+                &head,
+                &RepoRelativePath::new("[policy].toml")?,
+                1024,
+            )?,
+            Some(literal_path_content.to_vec())
+        );
+        assert_eq!(
+            git.read_commit_file_bounded(
+                &fixture.repository,
+                &head,
+                &path,
+                accepted.len() as u64 - 1,
+            )
+            .err()
+            .map(|error| error.kind()),
+            Some(GitErrorKind::OutputLimit)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn unborn_repository_status_is_typed_without_a_commit() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = GitFixture::init(GitObjectFormat::Sha1)?;
     fs::write(fixture.repository.join("untracked.txt"), b"untracked\n")?;
@@ -387,6 +454,19 @@ fn status_preserves_a_non_utf8_worktree_path() -> Result<(), Box<dyn std::error:
             .entries
             .iter()
             .any(|entry| { entry.path.as_os_str().as_bytes() == filename.as_bytes() })
+    );
+
+    fixture.run_git(["add", "--all"])?;
+    fixture.run_git(["commit", "-m", "native path"])?;
+    let status = git.status(&fixture.repository)?;
+    let head = match status.branch.oid {
+        Some(BranchOid::Commit(head)) => head,
+        _ => return Err("native-path fixture did not report a commit".into()),
+    };
+    let native_path = RepoRelativePath::new(Path::new(&filename))?;
+    assert_eq!(
+        git.read_commit_file_bounded(&fixture.repository, &head, &native_path, 1024)?,
+        Some(b"untracked\n".to_vec())
     );
     Ok(())
 }

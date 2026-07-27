@@ -17,7 +17,7 @@ use forge_core::ports::{
     ProcessPort as _,
 };
 use forge_core::{
-    GitError, GitErrorKind, GitFileSet, GitObjectFormat, GitPathListReadError,
+    GitError, GitErrorKind, GitFileSet, GitObjectFormat, GitObjectId, GitPathListReadError,
     PorcelainV2ReadError, PorcelainV2Status, RepoRelativePath, parse_git_path_list_reader,
     parse_status_porcelain_v2_reader,
 };
@@ -98,6 +98,8 @@ pub const OBJECT_FORMAT_ARGS: &[&str] = &["rev-parse", "--show-object-format=out
 pub const HARDENED_GIT_GLOBAL_ARGS: &[&str] = &[
     "--no-pager",
     "--no-optional-locks",
+    "--no-replace-objects",
+    "--literal-pathspecs",
     "-c",
     "core.fsmonitor=false",
 ];
@@ -106,6 +108,7 @@ pub const HARDENED_GIT_GLOBAL_ARGS: &[&str] = &[
 pub const HARDENED_GIT_ENV: &[(&str, &str)] = &[
     ("GIT_TERMINAL_PROMPT", "0"),
     ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_NO_LAZY_FETCH", "1"),
     ("GCM_INTERACTIVE", "Never"),
     ("LC_ALL", "C"),
 ];
@@ -174,6 +177,26 @@ impl GitCli {
     }
 
     fn command_spec(&self, operation: GitOperation) -> Result<CommandSpec, GitError> {
+        let args = operation.static_args().ok_or_else(|| {
+            GitError::new(
+                GitErrorKind::InvalidData,
+                operation.name(),
+                "operation requires explicit bounded arguments",
+            )
+        })?;
+        self.command_spec_with_args(operation, args.iter().map(OsString::from).collect())
+    }
+
+    fn command_spec_with_args(
+        &self,
+        operation: GitOperation,
+        args: Vec<OsString>,
+    ) -> Result<CommandSpec, GitError> {
+        let mut hardened_args: Vec<OsString> = HARDENED_GIT_GLOBAL_ARGS
+            .iter()
+            .map(OsString::from)
+            .collect();
+        hardened_args.extend(args);
         let mut spec = CommandSpec::new(
             operation.command_id(),
             Intent::Check,
@@ -184,12 +207,7 @@ impl GitCli {
                 rule: "forge-runtime-inspection".into(),
             },
         )
-        .with_args(
-            HARDENED_GIT_GLOBAL_ARGS
-                .iter()
-                .chain(operation.args())
-                .copied(),
-        );
+        .with_args(hardened_args);
         spec.timeout = self.timeout;
         spec.mutability = Mutability::ReadOnly;
         // These commands are local-only, but NetworkIntent has no `None` variant. Do not claim
@@ -204,6 +222,27 @@ impl GitCli {
             )
         })?;
         Ok(spec)
+    }
+
+    fn run_with_args(
+        &self,
+        start: &Path,
+        operation: GitOperation,
+        args: Vec<OsString>,
+        stdout_limit: usize,
+    ) -> Result<ProcessObservation, GitError> {
+        self.fail_if_cancelled(operation)?;
+        let mut spec =
+            ExecSpec::from_project_command(&self.command_spec_with_args(operation, args)?);
+        spec.stdout = OutputPolicy::CaptureBounded {
+            max_bytes: stdout_limit,
+        };
+        let runner = SynchronousProcessRunner::new(start)
+            .map_err(|error| map_execution_error(operation, error))?
+            .with_cancellation_flag(Arc::clone(&self.cancellation));
+        runner
+            .run(&spec)
+            .map_err(|error| map_execution_error(operation, error))
     }
 
     fn exec_spec(&self, operation: GitOperation) -> Result<ExecSpec, GitError> {
@@ -430,6 +469,78 @@ impl GitPort for GitCli {
         let untracked = self.spooled_paths(root, GitOperation::UntrackedFiles, remaining)?;
         Ok(GitFileSet::new(tracked, untracked))
     }
+
+    fn read_commit_file_bounded(
+        &self,
+        root: &Path,
+        commit: &GitObjectId,
+        path: &RepoRelativePath,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        let object_id_width = commit.as_bytes().len();
+        let commit = object_id_argument(commit, GitOperation::CommitTreeEntry)?;
+        let tree_args = vec![
+            OsString::from("ls-tree"),
+            OsString::from("-z"),
+            OsString::from("--full-tree"),
+            commit,
+            OsString::from("--"),
+            path.as_path().as_os_str().to_os_string(),
+        ];
+        let tree = checked_stdout(
+            GitOperation::CommitTreeEntry,
+            self.run_with_args(
+                root,
+                GitOperation::CommitTreeEntry,
+                tree_args,
+                self.status_record_limit_bytes,
+            )?,
+        )?;
+        let Some(blob_oid) = parse_exact_tree_blob(&tree, path, object_id_width)? else {
+            return Ok(None);
+        };
+
+        let size_args = vec![
+            OsString::from("cat-file"),
+            OsString::from("-s"),
+            blob_oid.clone(),
+        ];
+        let size = checked_stdout(
+            GitOperation::BlobSize,
+            self.run_with_args(root, GitOperation::BlobSize, size_args, 128)?,
+        )?;
+        let size = parse_blob_size(size)?;
+        if size > max_bytes {
+            return Err(GitError::new(
+                GitErrorKind::OutputLimit,
+                GitOperation::BlobContents.name(),
+                format!("blob size {size} bytes exceeds the configured bound of {max_bytes} bytes"),
+            ));
+        }
+        let stdout_limit = usize::try_from(max_bytes).map_err(|_| {
+            GitError::new(
+                GitErrorKind::OutputLimit,
+                GitOperation::BlobContents.name(),
+                "the configured blob bound exceeds this platform's addressable memory",
+            )
+        })?;
+        let blob_args = vec![OsString::from("cat-file"), OsString::from("blob"), blob_oid];
+        let bytes = checked_stdout(
+            GitOperation::BlobContents,
+            self.run_with_args(root, GitOperation::BlobContents, blob_args, stdout_limit)?,
+        )?;
+        if bytes.len() as u64 != size {
+            return Err(GitError::new(
+                GitErrorKind::InvalidData,
+                GitOperation::BlobContents.name(),
+                format!(
+                    "Git returned {} blob bytes after reporting a size of {size}",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(Some(bytes))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -442,6 +553,9 @@ enum GitOperation {
     IndexEntries,
     TrackedFiles,
     UntrackedFiles,
+    CommitTreeEntry,
+    BlobSize,
+    BlobContents,
 }
 
 impl GitOperation {
@@ -455,6 +569,9 @@ impl GitOperation {
             Self::IndexEntries => "index-entries",
             Self::TrackedFiles => "tracked-files",
             Self::UntrackedFiles => "untracked-files",
+            Self::CommitTreeEntry => "commit-tree-entry",
+            Self::BlobSize => "blob-size",
+            Self::BlobContents => "blob-contents",
         }
     }
 
@@ -468,11 +585,14 @@ impl GitOperation {
             Self::IndexEntries => "runtime.git.index-entries",
             Self::TrackedFiles => "runtime.git.tracked-files",
             Self::UntrackedFiles => "runtime.git.untracked-files",
+            Self::CommitTreeEntry => "runtime.git.commit-tree-entry",
+            Self::BlobSize => "runtime.git.blob-size",
+            Self::BlobContents => "runtime.git.blob-contents",
         }
     }
 
-    fn args(self) -> &'static [&'static str] {
-        match self {
+    fn static_args(self) -> Option<&'static [&'static str]> {
+        Some(match self {
             Self::RepositoryRoot => REPOSITORY_ROOT_ARGS,
             Self::GitDir => GIT_DIR_ARGS,
             Self::GitCommonDir => GIT_COMMON_DIR_ARGS,
@@ -481,7 +601,8 @@ impl GitOperation {
             Self::IndexEntries => INDEX_ENTRIES_ARGS,
             Self::TrackedFiles => TRACKED_FILES_ARGS,
             Self::UntrackedFiles => UNTRACKED_FILES_ARGS,
-        }
+            Self::CommitTreeEntry | Self::BlobSize | Self::BlobContents => return None,
+        })
     }
 
     fn uses_spool(self) -> bool {
@@ -689,6 +810,97 @@ fn parse_object_format(mut bytes: Vec<u8>) -> io::Result<GitObjectFormat> {
     }
 }
 
+fn object_id_argument(
+    object_id: &GitObjectId,
+    operation: GitOperation,
+) -> Result<OsString, GitError> {
+    object_id_bytes_argument(object_id.as_bytes(), object_id.as_bytes().len())
+        .map_err(|detail| GitError::new(GitErrorKind::InvalidData, operation.name(), detail))
+}
+
+fn object_id_bytes_argument(bytes: &[u8], expected_width: usize) -> Result<OsString, &'static str> {
+    if !matches!(expected_width, 40 | 64)
+        || bytes.len() != expected_width
+        || !bytes.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err("Git returned an invalid full object ID");
+    }
+    let value = std::str::from_utf8(bytes).map_err(|_| "Git returned a non-ASCII object ID")?;
+    Ok(OsString::from(value))
+}
+
+fn parse_exact_tree_blob(
+    bytes: &[u8],
+    requested_path: &RepoRelativePath,
+    object_id_width: usize,
+) -> Result<Option<OsString>, GitError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let Some(record) = bytes.strip_suffix(&[0]) else {
+        return Err(invalid_tree_entry("tree entry was not NUL terminated"));
+    };
+    if record.contains(&0) {
+        return Err(invalid_tree_entry(
+            "an exact literal path query returned multiple tree entries",
+        ));
+    }
+    let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+        return Err(invalid_tree_entry("tree entry omitted the path delimiter"));
+    };
+    let metadata = &record[..tab];
+    let path = path_buf_from_git_bytes(record[tab + 1..].to_vec())
+        .map_err(|error| invalid_tree_entry(format!("tree entry path was invalid: {error}")))?;
+    if path != requested_path.as_path() {
+        return Err(invalid_tree_entry(
+            "literal path query returned a different repository path",
+        ));
+    }
+    let mut fields = metadata.split(|byte| *byte == b' ');
+    let (Some(mode), Some(kind), Some(object_id), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(invalid_tree_entry("tree entry metadata was malformed"));
+    };
+    if !matches!(mode, b"100644" | b"100755") || kind != b"blob" {
+        return Err(invalid_tree_entry(
+            "the selected commit path is not a regular file blob",
+        ));
+    }
+    object_id_bytes_argument(object_id, object_id_width)
+        .map(Some)
+        .map_err(invalid_tree_entry)
+}
+
+fn invalid_tree_entry(detail: impl Into<String>) -> GitError {
+    GitError::new(
+        GitErrorKind::InvalidData,
+        GitOperation::CommitTreeEntry.name(),
+        detail,
+    )
+}
+
+fn parse_blob_size(mut bytes: Vec<u8>) -> Result<u64, GitError> {
+    trim_one_line_ending(&mut bytes);
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(GitError::new(
+            GitErrorKind::InvalidData,
+            GitOperation::BlobSize.name(),
+            "Git returned a malformed blob size",
+        ));
+    }
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            GitError::new(
+                GitErrorKind::InvalidData,
+                GitOperation::BlobSize.name(),
+                "Git returned a blob size outside the supported range",
+            )
+        })
+}
+
 fn parse_absolute_git_path(mut bytes: Vec<u8>, operation: &str) -> io::Result<PathBuf> {
     trim_one_line_ending(&mut bytes);
     if bytes.is_empty() || bytes.contains(&0) {
@@ -753,13 +965,13 @@ mod tests {
     use forge_core::ports::{
         GitPort as _, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation, StdinPolicy,
     };
-    use forge_core::{Digest, GitErrorKind, GitObjectFormat};
+    use forge_core::{BranchOid, Digest, GitErrorKind, GitObjectFormat, RepoRelativePath};
 
     use super::{
         GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, INDEX_ENTRIES_ARGS,
         OBJECT_FORMAT_ARGS, STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS,
         checked_stdout, classify_command_failure, hardened_git_environment, indexed_git_config_key,
-        parse_absolute_git_path, parse_object_format,
+        parse_absolute_git_path, parse_blob_size, parse_exact_tree_blob, parse_object_format,
     };
 
     #[test]
@@ -805,6 +1017,8 @@ mod tests {
     fn hardened_status_is_argv_only_and_non_interactive() {
         assert!(HARDENED_GIT_GLOBAL_ARGS.contains(&"--no-pager"));
         assert!(HARDENED_GIT_GLOBAL_ARGS.contains(&"--no-optional-locks"));
+        assert!(HARDENED_GIT_GLOBAL_ARGS.contains(&"--no-replace-objects"));
+        assert!(HARDENED_GIT_GLOBAL_ARGS.contains(&"--literal-pathspecs"));
         assert!(
             HARDENED_GIT_GLOBAL_ARGS
                 .windows(2)
@@ -827,6 +1041,7 @@ mod tests {
         );
         assert!(HARDENED_GIT_ENV.contains(&("GIT_TERMINAL_PROMPT", "0")));
         assert!(HARDENED_GIT_ENV.contains(&("GIT_OPTIONAL_LOCKS", "0")));
+        assert!(HARDENED_GIT_ENV.contains(&("GIT_NO_LAZY_FETCH", "1")));
         assert!(HARDENED_GIT_ENV.contains(&("GCM_INTERACTIVE", "Never")));
         assert!(HARDENED_GIT_ENV.contains(&("LC_ALL", "C")));
     }
@@ -969,6 +1184,38 @@ mod tests {
             index_entries
                 .iter()
                 .any(|entry| entry.path.as_path() == Path::new("Cargo.toml") && entry.stage == 0)
+        );
+        let head = match status.branch.oid {
+            Some(BranchOid::Commit(head)) => head,
+            _ => return Err("dogfood repository did not have a commit".into()),
+        };
+        let committed_manifest = git
+            .read_commit_file_bounded(
+                &root,
+                &head,
+                &RepoRelativePath::new("Cargo.toml")?,
+                1024 * 1024,
+            )?
+            .ok_or("committed Cargo.toml was absent")?;
+        assert!(
+            committed_manifest
+                .windows(b"[workspace]".len())
+                .any(|window| window == b"[workspace]")
+        );
+        assert_eq!(
+            git.read_commit_file_bounded(
+                &root,
+                &head,
+                &RepoRelativePath::new("forge.toml")?,
+                1024 * 1024,
+            )?,
+            None
+        );
+        assert_eq!(
+            git.read_commit_file_bounded(&root, &head, &RepoRelativePath::new("Cargo.toml")?, 1,)
+                .err()
+                .map(|error| error.kind()),
+            Some(GitErrorKind::OutputLimit)
         );
         Ok(())
     }
@@ -1127,6 +1374,39 @@ mod tests {
             Some(GitObjectFormat::Sha256)
         );
         assert!(parse_object_format(b"sha1 sha256\n".to_vec()).is_err());
+    }
+
+    #[test]
+    fn exact_tree_blob_parser_rejects_ambiguous_or_non_regular_results()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = RepoRelativePath::new("forge.toml")?;
+        let oid = b"0123456789012345678901234567890123456789";
+        let mut regular = b"100644 blob ".to_vec();
+        regular.extend_from_slice(oid);
+        regular.extend_from_slice(b"\tforge.toml\0");
+        assert_eq!(
+            parse_exact_tree_blob(&regular, &path, 40)?,
+            Some(OsString::from(std::str::from_utf8(oid)?))
+        );
+        assert!(parse_exact_tree_blob(b"", &path, 40)?.is_none());
+
+        let mut symlink = b"120000 blob ".to_vec();
+        symlink.extend_from_slice(oid);
+        symlink.extend_from_slice(b"\tforge.toml\0");
+        assert_eq!(
+            parse_exact_tree_blob(&symlink, &path, 40)
+                .err()
+                .map(|error| error.kind()),
+            Some(GitErrorKind::InvalidData)
+        );
+
+        let mut multiple = regular.clone();
+        multiple.extend_from_slice(&regular);
+        assert!(parse_exact_tree_blob(&multiple, &path, 40).is_err());
+        assert!(parse_exact_tree_blob(&regular, &RepoRelativePath::new("other")?, 40).is_err());
+        assert_eq!(parse_blob_size(b"42\n".to_vec())?, 42);
+        assert!(parse_blob_size(b"-1\n".to_vec()).is_err());
+        Ok(())
     }
 
     #[cfg(unix)]

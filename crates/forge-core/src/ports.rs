@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::domain::{CommandSpec, Mutability, NetworkIntent};
-use crate::git::{GitError, GitFileSet, PorcelainV2Status};
+use crate::git::{GitError, GitErrorKind, GitFileSet, GitObjectId, PorcelainV2Status};
 use crate::inventory::{BoundedText, Inventory, InventoryError, InventoryOptions, PathKind};
 use crate::path::RepoRelativePath;
 use forge_schema::Digest;
@@ -306,6 +306,26 @@ pub trait GitPort {
     fn git_common_dir(&self, start: &Path) -> Result<PathBuf, GitError>;
     fn status(&self, root: &Path) -> Result<PorcelainV2Status, GitError>;
     fn file_set(&self, root: &Path) -> Result<GitFileSet, GitError>;
+
+    /// Reads one regular file from an exact immutable commit object.
+    ///
+    /// `Ok(None)` means that the path is absent from that commit. Implementations must not follow
+    /// worktree paths, invoke content filters, or resolve a symbolic ref in place of `commit`.
+    /// The default fails closed so a partial test or alternate port cannot silently claim that an
+    /// accepted policy file was absent.
+    fn read_commit_file_bounded(
+        &self,
+        _root: &Path,
+        _commit: &GitObjectId,
+        _path: &RepoRelativePath,
+        _max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        Err(GitError::new(
+            GitErrorKind::InvalidData,
+            "read-commit-file",
+            "the Git port does not implement bounded immutable commit-file reads",
+        ))
+    }
 }
 
 pub trait StateStore {
