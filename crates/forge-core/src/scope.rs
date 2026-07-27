@@ -1,15 +1,10 @@
 //! Canonical aggregation of already-prepared repository scope identities.
 //!
-//! This module deliberately performs no Git or filesystem access. A future acquisition layer must
+//! This module deliberately performs no Git or filesystem access. The acquisition layer must
 //! first determine the complete intent scope, read every dirty/untracked file or symlink target,
 //! and construct [`PreparedScope`] only when every input is known. An acquisition or read failure
 //! must be represented as [`DependencyValue::Unknown`]; it must never be replaced with an empty,
 //! partial, mtime-only, or size-only scope.
-
-#![allow(
-    dead_code,
-    reason = "the Git acquisition layer and authoritative receipt builder are not yet frozen"
-)]
 
 use forge_schema::Digest;
 use thiserror::Error;
@@ -25,14 +20,14 @@ const SCOPE_DIGEST_INPUT_VERSION: &str = "forge.scope-digest-input/v1";
 
 /// One validated Git object identity in the repository's configured object format.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScopeObjectId {
+pub struct ScopeObjectId {
     object_format: GitObjectFormat,
     lowercase_hex: Vec<u8>,
 }
 
 impl ScopeObjectId {
     /// Validates and canonicalizes an object ID supplied by the Git acquisition layer.
-    pub(crate) fn new(
+    pub fn new(
         object_format: GitObjectFormat,
         hexadecimal: &[u8],
     ) -> Result<Self, ScopeDigestError> {
@@ -54,7 +49,7 @@ impl ScopeObjectId {
     }
 
     #[must_use]
-    const fn object_format(&self) -> GitObjectFormat {
+    pub const fn object_format(&self) -> GitObjectFormat {
         self.object_format
     }
 }
@@ -64,14 +59,14 @@ impl ScopeObjectId {
 /// Object format remains explicit for an unborn repository because it governs any staged blob
 /// identities and separates otherwise-empty SHA-1 and SHA-256 repositories.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeHead {
+pub enum ScopeHead {
     Commit(ScopeObjectId),
     Unborn(GitObjectFormat),
 }
 
 impl ScopeHead {
     #[must_use]
-    const fn object_format(&self) -> GitObjectFormat {
+    pub const fn object_format(&self) -> GitObjectFormat {
         match self {
             Self::Commit(object_id) => object_id.object_format(),
             Self::Unborn(object_format) => *object_format,
@@ -81,7 +76,7 @@ impl ScopeHead {
 
 /// A canonical Git file mode that may appear in an input scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ScopeMode {
+pub enum ScopeMode {
     Regular,
     Executable,
     Symlink,
@@ -116,7 +111,7 @@ impl TryFrom<GitMode> for ScopeMode {
 
 /// Dirty-state bits retained for a Gitlink boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GitlinkDirtyState {
+pub struct GitlinkDirtyState {
     commit_changed: bool,
     tracked_changes: bool,
     untracked_changes: bool,
@@ -124,11 +119,7 @@ pub(crate) struct GitlinkDirtyState {
 
 impl GitlinkDirtyState {
     #[must_use]
-    pub(crate) const fn new(
-        commit_changed: bool,
-        tracked_changes: bool,
-        untracked_changes: bool,
-    ) -> Self {
+    pub const fn new(commit_changed: bool, tracked_changes: bool, untracked_changes: bool) -> Self {
         Self {
             commit_changed,
             tracked_changes,
@@ -144,7 +135,7 @@ impl GitlinkDirtyState {
 
 /// The complete, already-computed identity of one scope entry's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeContentIdentity {
+pub enum ScopeContentIdentity {
     /// An unchanged tracked file or symlink, identified by its index blob.
     IndexBlob(ScopeObjectId),
     /// Complete bytes of a dirty/untracked file, or the link content of a symlink.
@@ -164,7 +155,7 @@ impl ScopeContentIdentity {
     /// Parses a canonical `blake3:<64 lowercase hex>` complete-content digest.
     ///
     /// Computing the digest, including streaming every byte, belongs to the acquisition layer.
-    pub(crate) fn worktree_blake3(digest: &Digest) -> Result<Self, ScopeDigestError> {
+    pub fn worktree_blake3(digest: &Digest) -> Result<Self, ScopeDigestError> {
         let Some(hexadecimal) = digest.as_str().strip_prefix("blake3:") else {
             return Err(ScopeDigestError::InvalidWorktreeDigest);
         };
@@ -203,14 +194,14 @@ impl ScopeContentIdentity {
 
 /// One validated path/mode/content-identity tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedScopeEntry {
+pub struct PreparedScopeEntry {
     path: RepoRelativePath,
     mode: ScopeMode,
     content_identity: ScopeContentIdentity,
 }
 
 impl PreparedScopeEntry {
-    pub(crate) fn new(
+    pub fn new(
         path: RepoRelativePath,
         mode: ScopeMode,
         content_identity: ScopeContentIdentity,
@@ -247,13 +238,13 @@ impl PreparedScopeEntry {
 /// instead of silently choosing one identity. With that uniqueness invariant, sorting by path is
 /// equivalent to sorting the accepted `(path, mode, content_identity)` tuples.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedScope {
+pub struct PreparedScope {
     head: ScopeHead,
     entries: Vec<PreparedScopeEntry>,
 }
 
 impl PreparedScope {
-    pub(crate) fn new(
+    pub fn new(
         head: ScopeHead,
         mut entries: Vec<PreparedScopeEntry>,
     ) -> Result<Self, ScopeDigestError> {
@@ -277,11 +268,21 @@ impl PreparedScope {
 
         Ok(Self { head, entries })
     }
+
+    #[must_use]
+    pub const fn head(&self) -> &ScopeHead {
+        &self.head
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[PreparedScopeEntry] {
+        &self.entries
+    }
 }
 
 /// Content-safe failures that prevent construction of a canonical scope input.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScopeDigestError {
+pub enum ScopeDigestError {
     #[error("scope Git object ID is invalid for its object format")]
     InvalidObjectId,
     #[error("scope worktree content digest is not canonical BLAKE3")]
@@ -305,7 +306,7 @@ pub(crate) enum ScopeDigestError {
 /// `Unknown` is returned without invoking `Hasher`, making it impossible for an I/O caller to
 /// accidentally turn a failed or partial acquisition into a reusable digest.
 #[must_use]
-pub(crate) fn scope_dependency_digest<H: Hasher + ?Sized>(
+pub fn scope_dependency_digest<H: Hasher + ?Sized>(
     hasher: &H,
     scope: &DependencyValue<PreparedScope>,
 ) -> DependencyValue<Digest> {

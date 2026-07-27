@@ -303,6 +303,263 @@ impl GitFileSet {
     }
 }
 
+/// Classification prefix emitted by `git ls-files --stage -v -z`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitIndexTag {
+    Cached,
+    SkipWorktree,
+    Unmerged,
+    Removed,
+    Modified,
+    Killed,
+    Other,
+    /// `-v` lowercases any normal tag when the assume-unchanged bit is set.
+    AssumeUnchanged {
+        underlying: u8,
+    },
+}
+
+impl GitIndexTag {
+    #[must_use]
+    pub const fn is_ordinary_cached(self) -> bool {
+        matches!(self, Self::Cached)
+    }
+}
+
+/// One entry emitted by `git ls-files --stage -v -z`.
+///
+/// Multiple entries for the same path are retained when the index is unmerged; callers must
+/// inspect `stage` rather than silently choosing one side of a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIndexEntry {
+    pub tag: GitIndexTag,
+    pub mode: GitMode,
+    pub object_id: GitObjectId,
+    pub stage: u8,
+    pub path: RepoRelativePath,
+}
+
+/// A bounded streaming failure while parsing `git ls-files --stage -v -z` output.
+#[derive(Debug, Error)]
+pub enum GitIndexReadError {
+    #[error("failed to read Git index at byte {offset}, record {record}: {source}")]
+    Input {
+        offset: usize,
+        record: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Git index record {record} is not terminated by NUL at byte {offset}")]
+    MissingNulTerminator { offset: usize, record: usize },
+    #[error(
+        "Git index record {record} exceeds the configured {max_bytes}-byte bound at byte {offset}"
+    )]
+    RecordTooLong {
+        offset: usize,
+        record: usize,
+        max_bytes: usize,
+    },
+    #[error("Git index contains more than the configured {max_entries} entries")]
+    TooManyEntries { max_entries: usize },
+    #[error("Git index record {record} has malformed metadata at byte {offset}")]
+    InvalidMetadata { offset: usize, record: usize },
+    #[error("Git index record {record} has an invalid status tag at byte {offset}")]
+    InvalidTag { offset: usize, record: usize },
+    #[error("Git index record {record} has an invalid mode at byte {offset}")]
+    InvalidMode { offset: usize, record: usize },
+    #[error("Git index record {record} has an invalid object ID at byte {offset}")]
+    InvalidObjectId { offset: usize, record: usize },
+    #[error("Git index record {record} has an invalid stage at byte {offset}")]
+    InvalidStage { offset: usize, record: usize },
+    #[error("Git index record {record} contains an empty path at byte {offset}")]
+    EmptyPath { offset: usize, record: usize },
+    #[error("Git index record {record} contains an invalid repository path at byte {offset}")]
+    InvalidPath { offset: usize, record: usize },
+    #[error("Git index contains duplicate stage {stage} entries for one path")]
+    DuplicatePathStage { stage: u8 },
+}
+
+/// Incrementally parses bounded, NUL-delimited index entries.
+///
+/// The parser accepts only the fixed `tag SP mode SP object-id SP stage TAB path NUL`
+/// representation
+/// requested by Forge. It preserves unmerged stages and native path bytes, rejects duplicate
+/// `(path, stage)` entries, and never returns a partial typed result.
+pub fn parse_git_index_reader<R>(
+    mut reader: R,
+    object_format: GitObjectFormat,
+    max_record_bytes: usize,
+    max_entries: usize,
+) -> Result<Vec<GitIndexEntry>, GitIndexReadError>
+where
+    R: BufRead,
+{
+    let mut entries = Vec::new();
+    let mut record = Vec::with_capacity(max_record_bytes.min(8 * 1024));
+    let mut offset = 0_usize;
+    let mut record_number = 0_usize;
+
+    loop {
+        record.clear();
+        let record_start = offset;
+        let read_bound = u64::try_from(max_record_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let bytes_read = reader
+            .by_ref()
+            .take(read_bound)
+            .read_until(0, &mut record)
+            .map_err(|source| GitIndexReadError::Input {
+                offset: record_start,
+                record: record_number.saturating_add(1),
+                source,
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        record_number = record_number.saturating_add(1);
+        offset = offset.saturating_add(bytes_read);
+        if record.last().copied() != Some(0) {
+            if record.len() > max_record_bytes {
+                return Err(GitIndexReadError::RecordTooLong {
+                    offset: record_start.saturating_add(max_record_bytes),
+                    record: record_number,
+                    max_bytes: max_record_bytes,
+                });
+            }
+            return Err(GitIndexReadError::MissingNulTerminator {
+                offset,
+                record: record_number,
+            });
+        }
+        record.pop();
+        if record.len() > max_record_bytes {
+            return Err(GitIndexReadError::RecordTooLong {
+                offset: record_start.saturating_add(max_record_bytes),
+                record: record_number,
+                max_bytes: max_record_bytes,
+            });
+        }
+        if entries.len() >= max_entries {
+            return Err(GitIndexReadError::TooManyEntries { max_entries });
+        }
+
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(GitIndexReadError::InvalidMetadata {
+                offset: record_start,
+                record: record_number,
+            });
+        };
+        let metadata = &record[..tab];
+        let path_bytes = &record[tab + 1..];
+        if path_bytes.is_empty() {
+            return Err(GitIndexReadError::EmptyPath {
+                offset: record_start.saturating_add(tab + 1),
+                record: record_number,
+            });
+        }
+        let mut fields = metadata.split(|byte| *byte == b' ');
+        let (Some(tag), Some(mode), Some(object_id), Some(stage), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err(GitIndexReadError::InvalidMetadata {
+                offset: record_start,
+                record: record_number,
+            });
+        };
+        let tag = parse_index_tag(tag).ok_or(GitIndexReadError::InvalidTag {
+            offset: record_start,
+            record: record_number,
+        })?;
+        let mode_offset = record_start.saturating_add(2);
+        let object_id_offset = mode_offset.saturating_add(mode.len() + 1);
+        let stage_offset = object_id_offset.saturating_add(object_id.len() + 1);
+        let mode = parse_index_mode(mode).ok_or(GitIndexReadError::InvalidMode {
+            offset: mode_offset,
+            record: record_number,
+        })?;
+        let object_id = parse_index_oid(object_id, object_format).ok_or(
+            GitIndexReadError::InvalidObjectId {
+                offset: object_id_offset,
+                record: record_number,
+            },
+        )?;
+        let stage = match stage {
+            [value @ b'0'..=b'3'] => value - b'0',
+            _ => {
+                return Err(GitIndexReadError::InvalidStage {
+                    offset: stage_offset,
+                    record: record_number,
+                });
+            }
+        };
+        let path = native_path_from_git_bytes(path_bytes)
+            .and_then(|path| RepoRelativePath::new(path).ok())
+            .ok_or(GitIndexReadError::InvalidPath {
+                offset: record_start.saturating_add(tab + 1),
+                record: record_number,
+            })?;
+        entries.push(GitIndexEntry {
+            tag,
+            mode,
+            object_id,
+            stage,
+            path,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.stage.cmp(&right.stage))
+    });
+    if let Some(pair) = entries
+        .windows(2)
+        .find(|pair| pair[0].path == pair[1].path && pair[0].stage == pair[1].stage)
+    {
+        return Err(GitIndexReadError::DuplicatePathStage {
+            stage: pair[0].stage,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_index_tag(field: &[u8]) -> Option<GitIndexTag> {
+    match field {
+        b"H" => Some(GitIndexTag::Cached),
+        b"S" => Some(GitIndexTag::SkipWorktree),
+        b"M" => Some(GitIndexTag::Unmerged),
+        b"R" => Some(GitIndexTag::Removed),
+        b"C" => Some(GitIndexTag::Modified),
+        b"K" => Some(GitIndexTag::Killed),
+        b"?" => Some(GitIndexTag::Other),
+        [underlying] if underlying.is_ascii_lowercase() => Some(GitIndexTag::AssumeUnchanged {
+            underlying: underlying.to_ascii_uppercase(),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_index_mode(field: &[u8]) -> Option<GitMode> {
+    if field.len() != 6 || !field.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return None;
+    }
+    Some(GitMode(field.try_into().ok()?))
+}
+
+fn parse_index_oid(field: &[u8], object_format: GitObjectFormat) -> Option<GitObjectId> {
+    if field.len() != object_format.hexadecimal_width() || !field.iter().all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+    Some(GitObjectId(field.to_vec()))
+}
+
 /// A bounded streaming failure while parsing `git ls-files -z` output.
 #[derive(Debug, Error)]
 pub enum GitPathListReadError {
@@ -1330,9 +1587,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AheadBehind, BranchHead, BranchOid, GitObjectFormat, GitPathListReadError,
-        PorcelainV2ParseErrorKind, PorcelainV2ReadError, RenameOrCopy, StatusEntry,
-        parse_git_path_list_reader, parse_status_porcelain_v2, parse_status_porcelain_v2_reader,
+        AheadBehind, BranchHead, BranchOid, GitIndexReadError, GitObjectFormat,
+        GitPathListReadError, PorcelainV2ParseErrorKind, PorcelainV2ReadError, RenameOrCopy,
+        StatusEntry, parse_git_index_reader, parse_git_path_list_reader, parse_status_porcelain_v2,
+        parse_status_porcelain_v2_reader,
     };
     use crate::RepoRelativePath;
 
@@ -1563,6 +1821,106 @@ mod tests {
             parsed.entries.last(),
             Some(StatusEntry::Untracked(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn index_reader_preserves_modes_object_ids_stages_and_native_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut input = b"H 100644 ".to_vec();
+        input.extend_from_slice(OID_1);
+        input.extend_from_slice(b" 0\tordinary file\0");
+        input.extend_from_slice(b"H 100755 ");
+        input.extend_from_slice(OID_2);
+        input.extend_from_slice(b" 2\tconflicted\0");
+        input.extend_from_slice(b"H 100755 ");
+        input.extend_from_slice(OID_1);
+        input.extend_from_slice(b" 3\tconflicted\0");
+
+        let entries = parse_git_index_reader(
+            BufReader::with_capacity(5, Cursor::new(input)),
+            GitObjectFormat::Sha1,
+            256,
+            3,
+        )?;
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path.as_path(), Path::new("conflicted"));
+        assert_eq!(entries[0].stage, 2);
+        assert_eq!(entries[1].stage, 3);
+        assert_eq!(entries[2].path.as_path(), Path::new("ordinary file"));
+        assert!(entries[2].tag.is_ordinary_cached());
+        assert_eq!(entries[2].mode.as_bytes(), b"100644");
+        assert_eq!(entries[2].object_id.as_bytes(), OID_1);
+        Ok(())
+    }
+
+    #[test]
+    fn index_reader_rejects_partial_duplicate_and_wrong_format_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut duplicate = b"H 100644 ".to_vec();
+        duplicate.extend_from_slice(OID_1);
+        duplicate.extend_from_slice(b" 0\tsame\0");
+        duplicate.extend_from_slice(b"H 100755 ");
+        duplicate.extend_from_slice(OID_2);
+        duplicate.extend_from_slice(b" 0\tsame\0");
+        assert!(matches!(
+            parse_git_index_reader(
+                BufReader::new(Cursor::new(duplicate)),
+                GitObjectFormat::Sha1,
+                256,
+                2,
+            ),
+            Err(GitIndexReadError::DuplicatePathStage { stage: 0 })
+        ));
+
+        let mut wrong_format = b"H 100644 ".to_vec();
+        wrong_format.extend_from_slice(OID_1);
+        wrong_format.extend_from_slice(b" 0\tpath\0");
+        assert!(matches!(
+            parse_git_index_reader(
+                BufReader::new(Cursor::new(wrong_format)),
+                GitObjectFormat::Sha256,
+                256,
+                1,
+            ),
+            Err(GitIndexReadError::InvalidObjectId { .. })
+        ));
+
+        let mut unterminated = b"H 100644 ".to_vec();
+        unterminated.extend_from_slice(OID_1);
+        unterminated.extend_from_slice(b" 0\tpath");
+        assert!(matches!(
+            parse_git_index_reader(
+                BufReader::new(Cursor::new(unterminated)),
+                GitObjectFormat::Sha1,
+                256,
+                1,
+            ),
+            Err(GitIndexReadError::MissingNulTerminator { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_reader_preserves_non_utf8_paths() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut input = b"H 100644 ".to_vec();
+        input.extend_from_slice(OID_1);
+        input.extend_from_slice(b" 0\tnon-utf8-\xff\0");
+        let entries = parse_git_index_reader(
+            BufReader::new(Cursor::new(input)),
+            GitObjectFormat::Sha1,
+            256,
+            1,
+        )?;
+
+        assert_eq!(
+            entries[0].path.as_path().as_os_str().as_bytes(),
+            b"non-utf8-\xff"
+        );
         Ok(())
     }
 

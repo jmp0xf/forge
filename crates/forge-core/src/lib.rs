@@ -18,7 +18,7 @@ pub mod path;
 pub mod policy;
 pub mod ports;
 pub mod risk;
-pub(crate) mod scope;
+pub mod scope;
 pub mod wire;
 
 pub use domain::{
@@ -33,10 +33,11 @@ pub use error::{AppError, ExitCode};
 pub use forge_schema::{Diagnostic, Digest, RepoId, Severity};
 pub use git::{
     AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitError, GitErrorKind,
-    GitFileSet, GitMode, GitObjectFormat, GitObjectId, GitPathListReadError, GitRefName,
-    OrdinaryEntry, PorcelainV2ParseError, PorcelainV2ParseErrorKind, PorcelainV2ReadError,
-    PorcelainV2Status, RenameOrCopy, RenamedOrCopiedEntry, StatusEntry, SubmoduleState,
-    UnmergedEntry, XyStatus, parse_git_path_list_reader, parse_status_porcelain_v2,
+    GitFileSet, GitIndexEntry, GitIndexReadError, GitIndexTag, GitMode, GitObjectFormat,
+    GitObjectId, GitPathListReadError, GitRefName, OrdinaryEntry, PorcelainV2ParseError,
+    PorcelainV2ParseErrorKind, PorcelainV2ReadError, PorcelainV2Status, RenameOrCopy,
+    RenamedOrCopiedEntry, StatusEntry, SubmoduleState, UnmergedEntry, XyStatus,
+    parse_git_index_reader, parse_git_path_list_reader, parse_status_porcelain_v2,
     parse_status_porcelain_v2_reader,
 };
 pub use inventory::{

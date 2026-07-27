@@ -11,6 +11,7 @@ use std::time::Duration;
 use forge_core::domain::{
     CommandSource, CommandSpec, Confidence, Intent, Mutability, NetworkIntent,
 };
+use forge_core::git::{GitIndexEntry, GitIndexReadError, parse_git_index_reader};
 use forge_core::ports::{
     ExecSpec, GitPort, OutputPolicy, ProcessError, ProcessErrorKind, ProcessObservation,
     ProcessPort as _,
@@ -72,6 +73,9 @@ pub const STATUS_PORCELAIN_V2_ARGS: &[&str] = &[
 
 /// Enumerate every path represented by the index, including tracked paths ignored later.
 pub const TRACKED_FILES_ARGS: &[&str] = &["ls-files", "--cached", "-z", "--"];
+
+/// Enumerate the exact mode, object identity, stage, and native path represented by the index.
+pub const INDEX_ENTRIES_ARGS: &[&str] = &["ls-files", "--stage", "-v", "-z", "--"];
 
 /// Enumerate untracked paths using Git's repository, info, and global exclude semantics.
 pub const UNTRACKED_FILES_ARGS: &[&str] =
@@ -303,6 +307,24 @@ impl GitCli {
         )
         .map_err(|error| map_path_list_read_error(operation, error))
     }
+
+    /// Reads the complete bounded index representation required for scope acquisition.
+    pub fn index_entries(&self, root: &Path) -> Result<Vec<GitIndexEntry>, GitError> {
+        let object_format = self.object_format(root)?;
+        let mut spooled = self.run_spooled(root, GitOperation::IndexEntries)?;
+        check_spooled_observation(
+            GitOperation::IndexEntries,
+            &mut spooled,
+            self.status_spool_limit_bytes,
+        )?;
+        parse_git_index_reader(
+            BufReader::new(spooled.stdout_file),
+            object_format,
+            self.status_record_limit_bytes,
+            self.status_entry_limit,
+        )
+        .map_err(|error| map_index_read_error(GitOperation::IndexEntries, error))
+    }
 }
 
 fn hardened_git_environment<I>(ambient: I) -> io::Result<BTreeMap<OsString, OsString>>
@@ -417,6 +439,7 @@ enum GitOperation {
     GitCommonDir,
     ObjectFormat,
     Status,
+    IndexEntries,
     TrackedFiles,
     UntrackedFiles,
 }
@@ -429,6 +452,7 @@ impl GitOperation {
             Self::GitCommonDir => "git-common-dir",
             Self::ObjectFormat => "object-format",
             Self::Status => "status",
+            Self::IndexEntries => "index-entries",
             Self::TrackedFiles => "tracked-files",
             Self::UntrackedFiles => "untracked-files",
         }
@@ -441,6 +465,7 @@ impl GitOperation {
             Self::GitCommonDir => "runtime.git.git-common-dir",
             Self::ObjectFormat => "runtime.git.object-format",
             Self::Status => "runtime.git.status",
+            Self::IndexEntries => "runtime.git.index-entries",
             Self::TrackedFiles => "runtime.git.tracked-files",
             Self::UntrackedFiles => "runtime.git.untracked-files",
         }
@@ -453,6 +478,7 @@ impl GitOperation {
             Self::GitCommonDir => GIT_COMMON_DIR_ARGS,
             Self::ObjectFormat => OBJECT_FORMAT_ARGS,
             Self::Status => STATUS_PORCELAIN_V2_ARGS,
+            Self::IndexEntries => INDEX_ENTRIES_ARGS,
             Self::TrackedFiles => TRACKED_FILES_ARGS,
             Self::UntrackedFiles => UNTRACKED_FILES_ARGS,
         }
@@ -461,7 +487,7 @@ impl GitOperation {
     fn uses_spool(self) -> bool {
         matches!(
             self,
-            Self::Status | Self::TrackedFiles | Self::UntrackedFiles
+            Self::Status | Self::IndexEntries | Self::TrackedFiles | Self::UntrackedFiles
         )
     }
 }
@@ -582,6 +608,21 @@ fn map_path_list_read_error(operation: GitOperation, error: GitPathListReadError
             GitErrorKind::InvalidData,
             operation.name(),
             format!("Git returned a malformed path list: {error}"),
+        ),
+    }
+}
+
+fn map_index_read_error(operation: GitOperation, error: GitIndexReadError) -> GitError {
+    match error {
+        GitIndexReadError::Input { source, .. } => GitError::new(
+            GitErrorKind::Io,
+            operation.name(),
+            format!("failed to read Git index entries: {source}"),
+        ),
+        error => GitError::new(
+            GitErrorKind::InvalidData,
+            operation.name(),
+            format!("Git returned malformed index entries: {error}"),
         ),
     }
 }
@@ -715,9 +756,9 @@ mod tests {
     use forge_core::{Digest, GitErrorKind, GitObjectFormat};
 
     use super::{
-        GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, OBJECT_FORMAT_ARGS,
-        STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS, checked_stdout,
-        classify_command_failure, hardened_git_environment, indexed_git_config_key,
+        GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, INDEX_ENTRIES_ARGS,
+        OBJECT_FORMAT_ARGS, STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS, UNTRACKED_FILES_ARGS,
+        checked_stdout, classify_command_failure, hardened_git_environment, indexed_git_config_key,
         parse_absolute_git_path, parse_object_format,
     };
 
@@ -776,6 +817,10 @@ mod tests {
             ["rev-parse", "--show-object-format=output"]
         );
         assert_eq!(TRACKED_FILES_ARGS, ["ls-files", "--cached", "-z", "--"]);
+        assert_eq!(
+            INDEX_ENTRIES_ARGS,
+            ["ls-files", "--stage", "-v", "-z", "--"]
+        );
         assert_eq!(
             UNTRACKED_FILES_ARGS,
             ["ls-files", "--others", "--exclude-standard", "-z", "--"]
@@ -905,6 +950,7 @@ mod tests {
         let git_common_dir = git.git_common_dir(&root)?;
         let status = git.status(&root)?;
         let file_set = git.file_set(&root)?;
+        let index_entries = git.index_entries(&root)?;
 
         assert_eq!(root, expected_root);
         assert!(git_dir.is_absolute());
@@ -918,6 +964,11 @@ mod tests {
                 .tracked
                 .iter()
                 .any(|path| path.as_path() == Path::new("Cargo.toml"))
+        );
+        assert!(
+            index_entries
+                .iter()
+                .any(|entry| entry.path.as_path() == Path::new("Cargo.toml") && entry.stage == 0)
         );
         Ok(())
     }

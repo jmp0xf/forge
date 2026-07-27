@@ -14,6 +14,7 @@ pub mod hash;
 pub mod interrupt;
 pub mod inventory;
 pub mod process;
+pub mod scope;
 pub mod state;
 
 /// Production runtime composition marker.
