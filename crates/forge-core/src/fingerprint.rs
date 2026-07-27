@@ -18,15 +18,43 @@ use crate::domain::{
     Mutability, NetworkIntent, ProjectUnit, Provenance, SuccessPredicate, ToolchainInfo,
     validate_provenance,
 };
-use crate::evidence::DependencyValue;
+use crate::evidence::{
+    DependencyValue, ExecutionDependencyFingerprint, RECEIPT_VALIDITY_PROTOCOL_VERSION,
+    SUCCESS_NORMALIZATION_PROTOCOL_VERSION,
+};
 use crate::ports::Hasher;
 
 /// Internal protocol version for only the command and toolchain projections in this module.
-pub(crate) const COMMAND_TOOLCHAIN_FINGERPRINT_PROTOCOL_VERSION: &str =
+pub const COMMAND_TOOLCHAIN_FINGERPRINT_PROTOCOL_VERSION: &str =
     "forge.command-toolchain-fingerprint-protocol/v1";
+
+/// Ordered aggregation of per-command command, toolchain, and environment dependencies.
+pub const ORDERED_EXECUTION_DEPENDENCY_PROTOCOL_VERSION: &str =
+    "forge.ordered-execution-dependencies/v1";
+
+/// Complete local-evidence behavior composition frozen by ADR-0020.
+pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v1";
+
+// Existing behavior identifiers are repeated here as composition inputs because their defining
+// modules deliberately keep implementation domains private. A change to any implementation must
+// bump its identifier here and at its source in the same reviewed change.
+const WORKTREE_COMPARISON_PROTOCOL_VERSION: &str = "forge.worktree-comparison/v1";
+const SCOPE_ACQUISITION_PROTOCOL_VERSION: &str = "forge.scope-acquisition/v1";
+const SCOPE_DIGEST_INPUT_VERSION: &str = "forge.scope-digest-input/v1";
+const SCOPE_DIGEST_DOMAIN: &[u8] = b"forge.scope-digest/v1";
+const ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION: &str = "forge.environment-fingerprint/v1";
+const EFFECTIVE_POLICY_DIGEST_DOMAIN: &[u8] = b"forge.effective-policy-digest/v1";
+const PROCESS_OUTPUT_DIGEST_DOMAIN: &[u8] = b"forge.process-output/v1\0";
+const COVERAGE_AGGREGATION_PROTOCOL_VERSION: &str = "forge.coverage-aggregation/v1";
+const RECEIPT_CANONICAL_SERIALIZATION_PROTOCOL_VERSION: &str = "forge.receipt-canonical-json/v2";
+const EVIDENCE_CANONICAL_SERIALIZATION_PROTOCOL_VERSION: &str = "forge.evidence-canonical-json/v2";
 
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"forge.command-digest/v1";
 const TOOLCHAIN_DIGEST_DOMAIN: &[u8] = b"forge.toolchain-digest/v1";
+const ORDERED_COMMAND_DEPENDENCY_DOMAIN: &[u8] = b"forge.ordered-command-dependency/v1";
+const ORDERED_TOOLCHAIN_DEPENDENCY_DOMAIN: &[u8] = b"forge.ordered-toolchain-dependency/v1";
+const ORDERED_ENVIRONMENT_DEPENDENCY_DOMAIN: &[u8] = b"forge.ordered-environment-dependency/v1";
+const EVIDENCE_BEHAVIOR_DIGEST_DOMAIN: &[u8] = b"forge.evidence-behavior-digest/v1";
 
 /// A content-safe reason why a dependency cannot be fingerprinted safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +229,157 @@ pub fn toolchain_dependency_digest<H: Hasher + ?Sized>(
     Ok(DependencyValue::Known(
         hasher.digest(&[TOOLCHAIN_DIGEST_DOMAIN, &encoder.finish()]),
     ))
+}
+
+/// Aggregates the three execution dependency dimensions in command execution order.
+///
+/// Order and duplicate entries are significant. Each dimension fails closed independently: an
+/// empty sequence, an unknown member, or an empty known digest makes only that aggregate unknown
+/// and does not invoke the hasher for that dimension. Raw environment data is outside this API.
+#[must_use]
+pub fn aggregate_ordered_execution_dependencies<H: Hasher + ?Sized>(
+    hasher: &H,
+    commands: &[ExecutionDependencyFingerprint],
+) -> ExecutionDependencyFingerprint {
+    ExecutionDependencyFingerprint::new(
+        aggregate_digest_axis(
+            hasher,
+            "command",
+            ORDERED_COMMAND_DEPENDENCY_DOMAIN,
+            commands.iter().map(ExecutionDependencyFingerprint::command),
+        ),
+        aggregate_digest_axis(
+            hasher,
+            "toolchain",
+            ORDERED_TOOLCHAIN_DEPENDENCY_DOMAIN,
+            commands
+                .iter()
+                .map(ExecutionDependencyFingerprint::toolchain),
+        ),
+        aggregate_digest_axis(
+            hasher,
+            "environment",
+            ORDERED_ENVIRONMENT_DEPENDENCY_DOMAIN,
+            commands
+                .iter()
+                .map(ExecutionDependencyFingerprint::environment),
+        ),
+    )
+}
+
+fn aggregate_digest_axis<'a, H: Hasher + ?Sized>(
+    hasher: &H,
+    axis: &str,
+    digest_domain: &[u8],
+    values: impl Iterator<Item = &'a DependencyValue<Digest>>,
+) -> DependencyValue<Digest> {
+    let mut known = Vec::new();
+    for value in values {
+        match value {
+            DependencyValue::Known(digest) if !digest.as_str().is_empty() => known.push(digest),
+            DependencyValue::Known(_) | DependencyValue::Unknown => {
+                return DependencyValue::Unknown;
+            }
+        }
+    }
+    if known.is_empty() {
+        return DependencyValue::Unknown;
+    }
+
+    let mut encoder = CanonicalEncoder::new("ordered-execution-dependency");
+    encoder.text(
+        "protocol-version",
+        ORDERED_EXECUTION_DEPENDENCY_PROTOCOL_VERSION,
+    );
+    encoder.text("axis", axis);
+    encoder.sequence("digests", known, |digest| {
+        digest.as_str().as_bytes().to_vec()
+    });
+    DependencyValue::Known(hasher.digest(&[digest_domain, &encoder.finish()]))
+}
+
+/// Digests the complete Forge behavior composition required by ADR-0020.
+///
+/// This function binds protocol identifiers and digest domains only; it does not claim that a
+/// caller successfully acquired any corresponding dependency. The authoritative receipt builder
+/// must still return an explicit unknown when acquisition for any applicable dependency is
+/// incomplete.
+#[must_use]
+pub fn evidence_behavior_digest<H: Hasher + ?Sized>(hasher: &H) -> Digest {
+    let mut encoder = CanonicalEncoder::new("evidence-behavior");
+    encoder.text("protocol-version", EVIDENCE_BEHAVIOR_PROTOCOL_VERSION);
+    encoder.sequence(
+        "components",
+        [
+            behavior_component(
+                "comparison",
+                WORKTREE_COMPARISON_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "scope-acquisition",
+                SCOPE_ACQUISITION_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component("scope-input", SCOPE_DIGEST_INPUT_VERSION.as_bytes()),
+            behavior_component("scope-digest-domain", SCOPE_DIGEST_DOMAIN),
+            behavior_component(
+                "command-toolchain-fingerprint",
+                COMMAND_TOOLCHAIN_FINGERPRINT_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component("command-digest-domain", COMMAND_DIGEST_DOMAIN),
+            behavior_component("toolchain-digest-domain", TOOLCHAIN_DIGEST_DOMAIN),
+            behavior_component(
+                "ordered-execution-dependencies",
+                ORDERED_EXECUTION_DEPENDENCY_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "ordered-command-dependency-domain",
+                ORDERED_COMMAND_DEPENDENCY_DOMAIN,
+            ),
+            behavior_component(
+                "ordered-toolchain-dependency-domain",
+                ORDERED_TOOLCHAIN_DEPENDENCY_DOMAIN,
+            ),
+            behavior_component(
+                "ordered-environment-dependency-domain",
+                ORDERED_ENVIRONMENT_DEPENDENCY_DOMAIN,
+            ),
+            behavior_component(
+                "environment-fingerprint",
+                ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component("policy-digest-domain", EFFECTIVE_POLICY_DIGEST_DOMAIN),
+            behavior_component("process-output-digest-domain", PROCESS_OUTPUT_DIGEST_DOMAIN),
+            behavior_component(
+                "success-normalization",
+                SUCCESS_NORMALIZATION_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "receipt-validity",
+                RECEIPT_VALIDITY_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "coverage-aggregation",
+                COVERAGE_AGGREGATION_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "receipt-canonical-serialization",
+                RECEIPT_CANONICAL_SERIALIZATION_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "evidence-canonical-serialization",
+                EVIDENCE_CANONICAL_SERIALIZATION_PROTOCOL_VERSION.as_bytes(),
+            ),
+        ],
+        |component| component,
+    );
+    hasher.digest(&[EVIDENCE_BEHAVIOR_DIGEST_DOMAIN, &encoder.finish()])
+}
+
+fn behavior_component(name: &str, version: &[u8]) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new("evidence-behavior-component");
+    encoder.text("name", name);
+    encoder.bytes("version", version);
+    encoder.finish()
 }
 
 /// Digests only the command/toolchain fingerprint protocol frozen in this module.
@@ -667,6 +846,18 @@ mod tests {
                 Err(io::Error::other("authoritative fixture toolchain was unknown").into())
             }
         }
+    }
+
+    fn execution_dependencies(
+        command: &str,
+        toolchain: &str,
+        environment: &str,
+    ) -> ExecutionDependencyFingerprint {
+        ExecutionDependencyFingerprint::new(
+            DependencyValue::Known(Digest::from(command)),
+            DependencyValue::Known(Digest::from(toolchain)),
+            DependencyValue::Known(Digest::from(environment)),
+        )
     }
 
     #[test]
@@ -1137,6 +1328,80 @@ mod tests {
         changed_confidence.toolchain.confidence = Confidence::Medium;
         assert_ne!(known_toolchain_digest(&changed_confidence)?, expected);
         Ok(())
+    }
+
+    #[test]
+    fn ordered_execution_aggregation_preserves_order_duplicates_and_axes() {
+        let first = execution_dependencies("command:a", "toolchain:a", "environment:a");
+        let second = execution_dependencies("command:b", "toolchain:b", "environment:b");
+
+        let forward = aggregate_ordered_execution_dependencies(
+            &FixtureHasher,
+            &[first.clone(), second.clone()],
+        );
+        let reverse = aggregate_ordered_execution_dependencies(
+            &FixtureHasher,
+            &[second.clone(), first.clone()],
+        );
+        let duplicated =
+            aggregate_ordered_execution_dependencies(&FixtureHasher, &[first.clone(), first]);
+        let single = aggregate_ordered_execution_dependencies(&FixtureHasher, &[second]);
+
+        assert_ne!(forward.command(), reverse.command());
+        assert_ne!(forward.toolchain(), reverse.toolchain());
+        assert_ne!(forward.environment(), reverse.environment());
+        assert_ne!(duplicated.command(), single.command());
+        assert_ne!(forward.command(), forward.toolchain());
+        assert_ne!(forward.toolchain(), forward.environment());
+        assert_eq!(
+            forward.command(),
+            &DependencyValue::Known(Digest::from("fixture:67afb7e658ed6553"))
+        );
+        assert_eq!(
+            forward.toolchain(),
+            &DependencyValue::Known(Digest::from("fixture:018e6333e82ea759"))
+        );
+        assert_eq!(
+            forward.environment(),
+            &DependencyValue::Known(Digest::from("fixture:b2968def73b65637"))
+        );
+    }
+
+    #[test]
+    fn ordered_execution_aggregation_fails_each_incomplete_axis_closed() {
+        let complete = execution_dependencies("command:a", "toolchain:a", "environment:a");
+        let incomplete = ExecutionDependencyFingerprint::new(
+            DependencyValue::Unknown,
+            DependencyValue::Known(Digest::from("toolchain:b")),
+            DependencyValue::Known(Digest::from("")),
+        );
+        let hasher = SpyHasher::default();
+
+        let aggregate = aggregate_ordered_execution_dependencies(&hasher, &[complete, incomplete]);
+
+        assert_eq!(aggregate.command(), &DependencyValue::Unknown);
+        assert!(matches!(aggregate.toolchain(), DependencyValue::Known(_)));
+        assert_eq!(aggregate.environment(), &DependencyValue::Unknown);
+        assert_eq!(hasher.calls.get(), 1);
+
+        let empty_hasher = SpyHasher::default();
+        let empty = aggregate_ordered_execution_dependencies(&empty_hasher, &[]);
+        assert_eq!(empty.command(), &DependencyValue::Unknown);
+        assert_eq!(empty.toolchain(), &DependencyValue::Unknown);
+        assert_eq!(empty.environment(), &DependencyValue::Unknown);
+        assert_eq!(empty_hasher.calls.get(), 0);
+    }
+
+    #[test]
+    fn evidence_behavior_digest_is_pinned_to_the_complete_v1_composition() {
+        assert_eq!(
+            EVIDENCE_BEHAVIOR_PROTOCOL_VERSION,
+            "forge.evidence-behavior/v1"
+        );
+        assert_eq!(
+            evidence_behavior_digest(&FixtureHasher).as_str(),
+            "fixture:34a240ce25e94d2a"
+        );
     }
 
     #[test]

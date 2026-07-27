@@ -1,14 +1,19 @@
-//! Deterministic receipt-validity rules.
+//! Deterministic evidence normalization and receipt-validity rules.
 //!
-//! This module compares already-computed facts. It deliberately owns no hashing, filesystem,
-//! process, clock, network, persistence, or wire-format behavior.
-//!
-//! Construction is intentionally unavailable outside this module until M6 provides one
-//! authoritative builder for canonical dependency digests and receipt execution facts.
+//! This module transforms or compares already-computed facts. It deliberately owns no hashing,
+//! filesystem, process, clock, network, persistence, JSON parsing, or wire-format behavior.
 
 use forge_schema::{Digest, RepoId};
 
-use crate::Mutability;
+use crate::ports::{ProcessErrorKind, ProcessObservation};
+use crate::{Mutability, SuccessPredicate};
+
+/// Pure command-success normalization behavior bound into the Forge behavior dependency.
+pub const SUCCESS_NORMALIZATION_PROTOCOL_VERSION: &str = "forge.success-normalization/v1";
+
+/// Receipt dependency and applicability comparison behavior bound into the Forge behavior
+/// dependency.
+pub const RECEIPT_VALIDITY_PROTOCOL_VERSION: &str = "forge.receipt-validity/v1";
 
 /// A dependency value whose absence cannot be confused with a real identifier or digest.
 ///
@@ -71,8 +76,8 @@ impl EvidenceDependency {
 ///
 /// For a recorded receipt, `scope` is the after-execution scope digest. The corresponding
 /// before-execution digest lives on [`ReceiptValidityInput`] because it is an execution invariant,
-/// not a reusable dependency value. A future authoritative builder must establish that context;
-/// this evaluator only compares the supplied typed facts.
+/// not a reusable dependency value. The authoritative builder must establish that context; this
+/// evaluator only compares the supplied typed facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceDependencyFingerprint {
     repository: DependencyValue<RepoId>,
@@ -83,6 +88,114 @@ pub struct EvidenceDependencyFingerprint {
     policy: DependencyValue<Digest>,
     base_task: BaseTaskDependency,
     forge_behavior: DependencyValue<Digest>,
+}
+
+/// The three per-command dependency dimensions that must be aggregated in execution order.
+///
+/// Values are already privacy-safe digests or explicit unknowns. Raw command environment values
+/// must never be passed through this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionDependencyFingerprint {
+    command: DependencyValue<Digest>,
+    toolchain: DependencyValue<Digest>,
+    environment: DependencyValue<Digest>,
+}
+
+impl ExecutionDependencyFingerprint {
+    #[must_use]
+    pub fn new(
+        command: DependencyValue<Digest>,
+        toolchain: DependencyValue<Digest>,
+        environment: DependencyValue<Digest>,
+    ) -> Self {
+        Self {
+            command,
+            toolchain,
+            environment,
+        }
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &DependencyValue<Digest> {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn toolchain(&self) -> &DependencyValue<Digest> {
+        &self.toolchain
+    }
+
+    #[must_use]
+    pub const fn environment(&self) -> &DependencyValue<Digest> {
+        &self.environment
+    }
+}
+
+impl EvidenceDependencyFingerprint {
+    /// Constructs a complete dependency fingerprint from authoritative, already-computed facts.
+    ///
+    /// Unknown values remain explicit and make receipt reuse fail closed. The constructor does not
+    /// infer missing dependencies or permit `NotApplicable` on any axis except base/task.
+    #[must_use]
+    pub fn new(
+        repository: DependencyValue<RepoId>,
+        scope: DependencyValue<Digest>,
+        execution: ExecutionDependencyFingerprint,
+        policy: DependencyValue<Digest>,
+        base_task: BaseTaskDependency,
+        forge_behavior: DependencyValue<Digest>,
+    ) -> Self {
+        Self {
+            repository,
+            scope,
+            command: execution.command,
+            toolchain: execution.toolchain,
+            environment: execution.environment,
+            policy,
+            base_task,
+            forge_behavior,
+        }
+    }
+
+    #[must_use]
+    pub const fn repository(&self) -> &DependencyValue<RepoId> {
+        &self.repository
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &DependencyValue<Digest> {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &DependencyValue<Digest> {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn toolchain(&self) -> &DependencyValue<Digest> {
+        &self.toolchain
+    }
+
+    #[must_use]
+    pub const fn environment(&self) -> &DependencyValue<Digest> {
+        &self.environment
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> &DependencyValue<Digest> {
+        &self.policy
+    }
+
+    #[must_use]
+    pub const fn base_task(&self) -> &BaseTaskDependency {
+        &self.base_task
+    }
+
+    #[must_use]
+    pub const fn forge_behavior(&self) -> &DependencyValue<Digest> {
+        &self.forge_behavior
+    }
 }
 
 /// Normalized result recorded by a receipt.
@@ -100,16 +213,211 @@ pub enum EvidenceOutcome {
     Unknown,
 }
 
+/// Caller-provided result of applying the command-specific JSON error contract to complete stdout.
+///
+/// Forge core deliberately does not invent a JSON field path. The authoritative command provider
+/// owns that parsing contract and reports only this typed result. `Invalid` means the output did
+/// not satisfy the declared JSON contract and is therefore a product failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JsonErrorStatus {
+    NoErrors,
+    HasErrors,
+    Invalid,
+}
+
+/// Pure input for normalizing one process boundary result.
+///
+/// A process observation carries complete stdout byte count even when retained output is bounded.
+/// JSON status is optional because most predicates do not need it. A caller using
+/// [`SuccessPredicate::JsonHasNoErrors`] must provide a status derived from the complete output;
+/// absence fails closed as [`EvidenceOutcome::Unknown`].
+#[derive(Debug, Clone, Copy)]
+pub enum ProcessOutcomeInput<'a> {
+    Observation {
+        observation: &'a ProcessObservation,
+        json_errors: Option<JsonErrorStatus>,
+    },
+    InfrastructureFailure(ProcessErrorKind),
+}
+
+impl<'a> ProcessOutcomeInput<'a> {
+    #[must_use]
+    pub const fn observation(
+        observation: &'a ProcessObservation,
+        json_errors: Option<JsonErrorStatus>,
+    ) -> Self {
+        Self::Observation {
+            observation,
+            json_errors,
+        }
+    }
+
+    #[must_use]
+    pub const fn infrastructure_failure(kind: ProcessErrorKind) -> Self {
+        Self::InfrastructureFailure(kind)
+    }
+}
+
+/// Normalizes a process result according to one declared success predicate.
+///
+/// Timeout, interruption, and process-boundary failures take precedence over product predicates.
+/// Empty conjunctions, contradictory observations, absent JSON status, and incomplete process
+/// termination facts never become passes.
+#[must_use]
+pub fn normalize_evidence_outcome(
+    predicate: &SuccessPredicate,
+    input: ProcessOutcomeInput<'_>,
+) -> EvidenceOutcome {
+    let ProcessOutcomeInput::Observation {
+        observation,
+        json_errors,
+    } = input
+    else {
+        return EvidenceOutcome::InfrastructureFailure;
+    };
+
+    if observation.timed_out && observation.interrupted {
+        return EvidenceOutcome::Unknown;
+    }
+    if observation.timed_out {
+        return EvidenceOutcome::TimedOut;
+    }
+    if observation.interrupted {
+        return EvidenceOutcome::Interrupted;
+    }
+    let retained_stdout_bytes = u64::try_from(observation.stdout.len()).unwrap_or(u64::MAX);
+    if observation.exit_code.is_some() && observation.signal.is_some()
+        || retained_stdout_bytes > observation.stdout_total_bytes
+        || observation.stdout_total_bytes == 0 && observation.stdout_truncated
+    {
+        return EvidenceOutcome::Unknown;
+    }
+    if observation.exit_code.is_none() {
+        return if observation.signal.is_some() {
+            EvidenceOutcome::ProductFailure
+        } else {
+            EvidenceOutcome::Inconclusive
+        };
+    }
+
+    evaluate_success_predicate(predicate, observation, json_errors)
+}
+
+fn evaluate_success_predicate(
+    predicate: &SuccessPredicate,
+    observation: &ProcessObservation,
+    json_errors: Option<JsonErrorStatus>,
+) -> EvidenceOutcome {
+    let mut aggregate = EvidenceOutcome::Pass;
+    let mut pending = vec![predicate];
+    while let Some(predicate) = pending.pop() {
+        let outcome = match predicate {
+            SuccessPredicate::ExitZero => exit_zero_outcome(observation),
+            SuccessPredicate::ExitZeroAndStdoutEmpty => match exit_zero_outcome(observation) {
+                EvidenceOutcome::Pass if observation.stdout_total_bytes == 0 => {
+                    EvidenceOutcome::Pass
+                }
+                EvidenceOutcome::Pass | EvidenceOutcome::ProductFailure => {
+                    EvidenceOutcome::ProductFailure
+                }
+                outcome => outcome,
+            },
+            SuccessPredicate::JsonHasNoErrors => match json_errors {
+                Some(JsonErrorStatus::NoErrors) => EvidenceOutcome::Pass,
+                Some(JsonErrorStatus::HasErrors | JsonErrorStatus::Invalid) => {
+                    EvidenceOutcome::ProductFailure
+                }
+                None => EvidenceOutcome::Unknown,
+            },
+            SuccessPredicate::All(predicates) if predicates.is_empty() => {
+                EvidenceOutcome::ProductFailure
+            }
+            SuccessPredicate::All(predicates) => {
+                pending.extend(predicates.iter().rev());
+                continue;
+            }
+        };
+        aggregate = combine_predicate_outcomes(aggregate, outcome);
+        if matches!(aggregate, EvidenceOutcome::ProductFailure) {
+            return aggregate;
+        }
+    }
+    aggregate
+}
+
+const fn exit_zero_outcome(observation: &ProcessObservation) -> EvidenceOutcome {
+    match observation.exit_code {
+        Some(0) => EvidenceOutcome::Pass,
+        Some(_) => EvidenceOutcome::ProductFailure,
+        None => EvidenceOutcome::Inconclusive,
+    }
+}
+
+const fn combine_predicate_outcomes(
+    accumulated: EvidenceOutcome,
+    next: EvidenceOutcome,
+) -> EvidenceOutcome {
+    use EvidenceOutcome::{Inconclusive, Pass, ProductFailure, Unknown};
+
+    match (accumulated, next) {
+        (ProductFailure, _) | (_, ProductFailure) => ProductFailure,
+        (Unknown, _) | (_, Unknown) => Unknown,
+        (Inconclusive, _) | (_, Inconclusive) => Inconclusive,
+        (Pass, Pass) => Pass,
+        // Process-boundary outcomes are handled before predicate recursion.
+        _ => Unknown,
+    }
+}
+
 /// The receipt facts needed by the pure validity evaluator.
 ///
-/// Fields remain private until one authoritative builder owns after-scope and `NotApplicable`
-/// semantics. The evaluator does not infer either from ambient context.
+/// Fields remain private so callers use the complete constructor. The authoritative builder owns
+/// after-scope and `NotApplicable` semantics; the evaluator does not infer either from ambient
+/// context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptValidityInput {
     dependencies: EvidenceDependencyFingerprint,
     scope_before: DependencyValue<Digest>,
     mutability: Mutability,
     outcome: EvidenceOutcome,
+}
+
+impl ReceiptValidityInput {
+    /// Constructs the pure validity input from authoritative receipt facts.
+    #[must_use]
+    pub fn new(
+        dependencies: EvidenceDependencyFingerprint,
+        scope_before: DependencyValue<Digest>,
+        mutability: Mutability,
+        outcome: EvidenceOutcome,
+    ) -> Self {
+        Self {
+            dependencies,
+            scope_before,
+            mutability,
+            outcome,
+        }
+    }
+
+    #[must_use]
+    pub const fn dependencies(&self) -> &EvidenceDependencyFingerprint {
+        &self.dependencies
+    }
+
+    #[must_use]
+    pub const fn scope_before(&self) -> &DependencyValue<Digest> {
+        &self.scope_before
+    }
+
+    #[must_use]
+    pub const fn mutability(&self) -> Mutability {
+        self.mutability
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> EvidenceOutcome {
+        self.outcome
+    }
 }
 
 /// Stable typed reason for the dependency-validity axis.
@@ -404,12 +712,16 @@ fn push_unknown(dependency_reasons: &mut Vec<DependencyReason>, dependency: Evid
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         ApplicabilityReason, BaseTaskDependency, DependencyReason, DependencyValidity,
         DependencyValue, EvidenceDependency, EvidenceDependencyFingerprint, EvidenceOutcome,
-        ReceiptApplicability, ReceiptValidityInput, evaluate_receipt_validity,
+        ExecutionDependencyFingerprint, JsonErrorStatus, ProcessOutcomeInput, ReceiptApplicability,
+        ReceiptValidityInput, evaluate_receipt_validity, normalize_evidence_outcome,
     };
-    use crate::Mutability;
+    use crate::ports::{ProcessErrorKind, ProcessObservation};
+    use crate::{Mutability, SuccessPredicate};
     use forge_schema::{Digest, RepoId};
 
     type FingerprintMutation = fn(&mut EvidenceDependencyFingerprint);
@@ -427,16 +739,18 @@ mod tests {
     }
 
     fn fingerprint() -> EvidenceDependencyFingerprint {
-        EvidenceDependencyFingerprint {
-            repository: known_repository("repo:one"),
-            scope: known_digest("scope:one"),
-            command: known_digest("command:one"),
-            toolchain: known_digest("toolchain:one"),
-            environment: known_digest("environment:one"),
-            policy: known_digest("policy:one"),
-            base_task: BaseTaskDependency::Known(digest("base-task:one")),
-            forge_behavior: known_digest("forge-behavior:one"),
-        }
+        EvidenceDependencyFingerprint::new(
+            known_repository("repo:one"),
+            known_digest("scope:one"),
+            ExecutionDependencyFingerprint::new(
+                known_digest("command:one"),
+                known_digest("toolchain:one"),
+                known_digest("environment:one"),
+            ),
+            known_digest("policy:one"),
+            BaseTaskDependency::Known(digest("base-task:one")),
+            known_digest("forge-behavior:one"),
+        )
     }
 
     fn receipt(
@@ -444,12 +758,210 @@ mod tests {
         mutability: Mutability,
         outcome: EvidenceOutcome,
     ) -> ReceiptValidityInput {
-        ReceiptValidityInput {
-            scope_before: dependencies.scope.clone(),
-            dependencies,
-            mutability,
-            outcome,
+        let scope_before = dependencies.scope.clone();
+        ReceiptValidityInput::new(dependencies, scope_before, mutability, outcome)
+    }
+
+    fn process_observation(exit_code: Option<i32>, stdout_total_bytes: u64) -> ProcessObservation {
+        ProcessObservation {
+            exit_code,
+            signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_digest: digest("stdout"),
+            stderr_digest: digest("stderr"),
+            stdout_total_bytes,
+            stderr_total_bytes: 0,
+            stdout_truncated: stdout_total_bytes > 0,
+            stderr_truncated: false,
+            duration: Duration::from_millis(1),
+            timed_out: false,
+            interrupted: false,
         }
+    }
+
+    #[test]
+    fn exit_and_stdout_predicates_use_complete_process_facts() {
+        let success = process_observation(Some(0), 0);
+        let failed = process_observation(Some(2), 0);
+        let nonempty_but_not_retained = process_observation(Some(0), 12);
+
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&success, None),
+            ),
+            EvidenceOutcome::Pass
+        );
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&failed, None),
+            ),
+            EvidenceOutcome::ProductFailure
+        );
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZeroAndStdoutEmpty,
+                ProcessOutcomeInput::observation(&success, None),
+            ),
+            EvidenceOutcome::Pass
+        );
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZeroAndStdoutEmpty,
+                ProcessOutcomeInput::observation(&nonempty_but_not_retained, None),
+            ),
+            EvidenceOutcome::ProductFailure
+        );
+    }
+
+    #[test]
+    fn json_predicate_consumes_only_the_callers_typed_parse_result() {
+        let observation = process_observation(Some(0), 17);
+        for (status, expected) in [
+            (Some(JsonErrorStatus::NoErrors), EvidenceOutcome::Pass),
+            (
+                Some(JsonErrorStatus::HasErrors),
+                EvidenceOutcome::ProductFailure,
+            ),
+            (
+                Some(JsonErrorStatus::Invalid),
+                EvidenceOutcome::ProductFailure,
+            ),
+            (None, EvidenceOutcome::Unknown),
+        ] {
+            assert_eq!(
+                normalize_evidence_outcome(
+                    &SuccessPredicate::JsonHasNoErrors,
+                    ProcessOutcomeInput::observation(&observation, status),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn all_is_recursive_order_independent_and_never_vacuously_passes() {
+        let observation = process_observation(Some(0), 0);
+        let nested = SuccessPredicate::All(vec![
+            SuccessPredicate::ExitZero,
+            SuccessPredicate::All(vec![
+                SuccessPredicate::ExitZeroAndStdoutEmpty,
+                SuccessPredicate::JsonHasNoErrors,
+            ]),
+        ]);
+        assert_eq!(
+            normalize_evidence_outcome(
+                &nested,
+                ProcessOutcomeInput::observation(&observation, Some(JsonErrorStatus::NoErrors),),
+            ),
+            EvidenceOutcome::Pass
+        );
+
+        let failed_and_unknown = SuccessPredicate::All(vec![
+            SuccessPredicate::JsonHasNoErrors,
+            SuccessPredicate::ExitZeroAndStdoutEmpty,
+        ]);
+        let nonempty = process_observation(Some(0), 1);
+        assert_eq!(
+            normalize_evidence_outcome(
+                &failed_and_unknown,
+                ProcessOutcomeInput::observation(&nonempty, None),
+            ),
+            EvidenceOutcome::ProductFailure
+        );
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::All(Vec::new()),
+                ProcessOutcomeInput::observation(&observation, None),
+            ),
+            EvidenceOutcome::ProductFailure
+        );
+    }
+
+    #[test]
+    fn execution_boundary_states_take_precedence_and_fail_closed() {
+        let mut observation = process_observation(Some(0), 0);
+        observation.timed_out = true;
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&observation, None),
+            ),
+            EvidenceOutcome::TimedOut
+        );
+
+        observation.timed_out = false;
+        observation.interrupted = true;
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&observation, None),
+            ),
+            EvidenceOutcome::Interrupted
+        );
+
+        observation.timed_out = true;
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&observation, None),
+            ),
+            EvidenceOutcome::Unknown
+        );
+
+        for kind in [ProcessErrorKind::Spawn, ProcessErrorKind::Output] {
+            assert_eq!(
+                normalize_evidence_outcome(
+                    &SuccessPredicate::ExitZero,
+                    ProcessOutcomeInput::infrastructure_failure(kind),
+                ),
+                EvidenceOutcome::InfrastructureFailure
+            );
+        }
+    }
+
+    #[test]
+    fn abnormal_or_incomplete_termination_never_passes() {
+        let mut signalled = process_observation(None, 0);
+        signalled.signal = Some(9);
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&signalled, None),
+            ),
+            EvidenceOutcome::ProductFailure
+        );
+
+        let incomplete = process_observation(None, 0);
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&incomplete, None),
+            ),
+            EvidenceOutcome::Inconclusive
+        );
+
+        let mut contradictory = process_observation(Some(0), 0);
+        contradictory.signal = Some(9);
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZero,
+                ProcessOutcomeInput::observation(&contradictory, None),
+            ),
+            EvidenceOutcome::Unknown
+        );
+
+        let mut impossible_output = process_observation(Some(0), 0);
+        impossible_output.stdout_truncated = true;
+        assert_eq!(
+            normalize_evidence_outcome(
+                &SuccessPredicate::ExitZeroAndStdoutEmpty,
+                ProcessOutcomeInput::observation(&impossible_output, None),
+            ),
+            EvidenceOutcome::Unknown
+        );
     }
 
     fn unknown_cases() -> [(EvidenceDependency, FingerprintMutation); 8] {
