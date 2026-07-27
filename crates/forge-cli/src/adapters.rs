@@ -35,6 +35,12 @@ enum AdaptersMode {
     SyncApply,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectionDepth {
+    StatusOnly,
+    PlanAndPreview,
+}
+
 /// A deterministic adapter result plus the internal plan used for human preview output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdaptersOutcome {
@@ -185,7 +191,13 @@ pub(crate) fn observe_managed_from_validated_state(
             changed: false,
         });
     };
-    let inspected = inspect_adapter_state(model, Some(manifest), &[], config)?;
+    let inspected = inspect_adapter_state(
+        model,
+        Some(manifest),
+        &[],
+        config,
+        InspectionDepth::StatusOnly,
+    )?;
     Ok(AdapterObservation {
         managed: true,
         statuses: inspected.statuses,
@@ -235,6 +247,11 @@ pub(crate) fn execute_controlled(
         manifest.as_ref(),
         force_values,
         detected.navigation.config.as_ref(),
+        if mode == AdaptersMode::Check {
+            InspectionDepth::StatusOnly
+        } else {
+            InspectionDepth::PlanAndPreview
+        },
     )?;
     let InspectionOutcome {
         options,
@@ -337,35 +354,48 @@ fn inspect_adapter_state(
     manifest: Option<&AdapterManifest>,
     force_values: &[String],
     config: Option<&ForgeConfig>,
+    depth: InspectionDepth,
 ) -> Result<InspectionOutcome, AppError> {
     let options = plan_options(manifest, force_values, config)?;
     let filesystem = NativeFileSystem;
     let hasher = Blake3Hasher;
     let mut inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
         .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
-    let plan = match plan_init(model, &filesystem, &hasher, &options) {
-        Ok(plan) => Some(plan),
-        Err(PlanError::ManagedBlock {
-            source: ManagedBlockError::UserEdited { .. },
-            ..
-        }) => {
-            // Refresh the complete target set after the fail-closed planner observes a conflict.
-            // This avoids collapsing a multi-target check to only the first edited block.
-            inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
-                .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
-            None
+    let plan = match depth {
+        InspectionDepth::StatusOnly => None,
+        InspectionDepth::PlanAndPreview => {
+            match plan_init(model, &filesystem, &hasher, &options) {
+                Ok(plan) => Some(plan),
+                Err(PlanError::ManagedBlock {
+                    source: ManagedBlockError::UserEdited { .. },
+                    ..
+                }) => {
+                    // Refresh the complete target set after the fail-closed planner observes a
+                    // conflict. This avoids collapsing a multi-target preview to only the first
+                    // edited block.
+                    inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
+                        .map_err(|error| {
+                            init::map_plan_error_app(error, "adapter drift inspection")
+                        })?;
+                    None
+                }
+                Err(error) => return Err(init::map_plan_error_app(error, "adapter drift plan")),
+            }
         }
-        Err(error) => return Err(init::map_plan_error_app(error, "adapter drift plan")),
     };
     let statuses = classify_inspection(&inspection, manifest, &model.repository.root, &filesystem)?;
-    let previews = inspection_previews(&inspection, &options);
+    let previews = if depth == InspectionDepth::PlanAndPreview {
+        inspection_previews(&inspection, &options)
+    } else {
+        Vec::new()
+    };
     let changed = statuses
         .iter()
         .any(|status| status.drift != AdapterDriftData::NoDrift);
     let user_edited = statuses
         .iter()
         .any(|status| status.drift == AdapterDriftData::UserEdited);
-    if plan.is_none() && !user_edited {
+    if depth == InspectionDepth::PlanAndPreview && plan.is_none() && !user_edited {
         return Err(inspection_changed_error());
     }
 

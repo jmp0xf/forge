@@ -281,6 +281,12 @@ fn emit_next(
 ) -> Result<ExitCode, AppError> {
     let outcome = next::execute_controlled(cli, context.budget())?;
     context.checkpoint("next result")?;
+    if cli.verbose > 0 && !cli.quiet {
+        write_stderr(format_args!(
+            "inventory-cache: {}\n",
+            explain::inventory_cache_status_name(outcome.inventory_cache_status)
+        ))?;
+    }
     if json {
         let mut envelope = Envelope::success(SchemaKind::Next, TOOL_VERSION, outcome.wire.clone());
         envelope.truncated = outcome.truncated;

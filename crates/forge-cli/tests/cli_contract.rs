@@ -2276,6 +2276,31 @@ fn next_stops_at_external_authority_for_a_critical_policy_change()
 fn next_advances_from_check_to_test_and_then_local_verified_without_writing()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = TestWorkspace::clean_rust_repository("next-receipt-progression")?;
+    let warm_check = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
+    assert_eq!(
+        warm_check.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&warm_check.stdout),
+        String::from_utf8_lossy(&warm_check.stderr)
+    );
+    let state_after_warm_check = fixture.private_state_snapshot()?;
+    let worktree_after_warm_check = fixture.snapshot()?;
+
+    let warm = fixture.run_forge(&["-v", "next", "--json"])?;
+    assert_eq!(
+        warm.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(warm.stderr, b"inventory-cache: hit\n");
+    let warm_document: Value = serde_json::from_slice(&warm.stdout)?;
+    assert_eq!(warm_document["data"]["state"], "idle");
+    assert_eq!(fixture.private_state_snapshot()?, state_after_warm_check);
+    assert_eq!(fixture.snapshot()?, worktree_after_warm_check);
+
     fs::write(
         fixture.worktree.join("src/main.rs"),
         b"fn main() {\n    println!(\"{}\", forge_evidence_fixture::answer());\n}\n",

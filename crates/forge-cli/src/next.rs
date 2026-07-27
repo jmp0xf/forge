@@ -22,7 +22,7 @@ use forge_core::{
     ProjectModel, Provenance, RepoRelativePath, ResolvedCommandSet, RiskAssessment, RiskLevel,
     WorkState, assess_risk, assumption_to_wire, command_detail_v2_to_wire,
 };
-use forge_detect::model::{ModelDetectionCompletion, NavigationSnapshot};
+use forge_detect::model::{InventoryCacheStatus, ModelDetectionCompletion, NavigationSnapshot};
 use forge_detect::policy::PolicyBaseCompleteness;
 use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::NativeFileSystem;
@@ -45,6 +45,7 @@ pub(crate) struct NextOutcome {
     pub(crate) wire: NextData,
     pub(crate) exit_code: ExitCode,
     pub(crate) truncated: bool,
+    pub(crate) inventory_cache_status: InventoryCacheStatus,
 }
 
 /// Computes one next action from a single retained detection snapshot.
@@ -111,6 +112,7 @@ pub(crate) fn execute_controlled(
         }),
         wire,
         truncated: context.truncated,
+        inventory_cache_status: detected.inventory_cache_status,
     })
 }
 
@@ -1087,8 +1089,8 @@ mod tests {
     };
 
     use super::{
-        NextOutcome, action_to_wire, named_test_for, navigation_exit_code, path_is_within,
-        project_selected_commands, render_human, state_to_wire,
+        InventoryCacheStatus, NextOutcome, action_to_wire, named_test_for, navigation_exit_code,
+        path_is_within, project_selected_commands, render_human, state_to_wire,
     };
 
     fn provenance() -> Vec<Provenance> {
@@ -1252,6 +1254,7 @@ mod tests {
             },
             exit_code: ExitCode::Negative,
             truncated: false,
+            inventory_cache_status: InventoryCacheStatus::Disabled,
         };
         let outputs = [
             render_human(&outcome),

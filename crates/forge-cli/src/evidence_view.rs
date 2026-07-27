@@ -26,10 +26,10 @@ use forge_core::navigation::{NavigationIssue, ReceiptObservation};
 use forge_core::ports::{Clock, ExecSpec};
 use forge_core::scope::{PreparedScope, ScopeHead, scope_dependency_digest};
 use forge_core::{
-    AppError, CommandSpec, Confidence, ExitCode, Intent, Mutability, OperationControl,
-    OperationControlError, ProjectModel, RiskAssessment, RiskLevel, WorkState, assess_risk,
-    comparison_basis_v2_to_wire, coverage_dimension_name, local_evidence_state_to_wire,
-    non_satisfying_receipt_validity_v2_to_wire,
+    AppError, CommandSpec, Confidence, ExitCode, GitErrorKind, Intent, Mutability,
+    OperationControl, OperationControlError, ProjectModel, RiskAssessment, RiskLevel, WorkState,
+    assess_risk, comparison_basis_v2_to_wire, coverage_dimension_name,
+    local_evidence_state_to_wire, non_satisfying_receipt_validity_v2_to_wire,
 };
 use forge_detect::model::ModelDetectionCompletion;
 use forge_detect::policy::PolicyBaseCompleteness;
@@ -40,7 +40,10 @@ use forge_runtime::fs::FileSystemError;
 use forge_runtime::git::GitCli;
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::process::{SynchronousProcessRunner, process_environment_dependency_digest};
-use forge_runtime::scope::{ScopeAcquisitionError, acquire_repository_scope_controlled};
+use forge_runtime::scope::{
+    ScopeAcquisitionError, acquire_repository_scope_controlled,
+    prepare_repository_scope_candidate_controlled,
+};
 use forge_runtime::state::{
     AtomicStateStore, EvidenceStateDecodeError, EvidenceStateObjectKind, EvidenceStateVersion,
     GitStateLayout, StateError, format_utc_rfc3339,
@@ -252,7 +255,7 @@ fn execute_with_clock_controlled<C: Clock + ?Sized>(
     require_stable_detection(&detected, &confirmation)?;
     let confirmed_scope =
         acquire_repository_scope_controlled(&git, &confirmation.model.repository.root, control)
-            .map_err(map_scope_error)?;
+            .map_err(map_scope_confirmation_error)?;
     require_same_detection_baseline(&confirmation.model, &confirmed_scope)?;
     let confirmed_scope_digest =
         scope_dependency_digest(&hasher, &DependencyValue::Known(confirmed_scope.clone()));
@@ -402,10 +405,30 @@ pub(crate) fn navigation_receipts_controlled(
     }
 
     let git = configured_git_controlled(control);
-    let retained = evaluate_retained_receipts_controlled(detected, &git, control)?;
-    let confirmed_scope =
-        acquire_repository_scope_controlled(&git, &detected.model.repository.root, control)
-            .map_err(map_scope_error)?;
+    let (retained, confirmed_scope) = if let Some(seed) = detected.navigation.scope_seed.as_ref() {
+        let candidate = prepare_repository_scope_candidate_controlled(
+            &detected.model.repository.root,
+            &seed.status,
+            &seed.index_entries,
+            control,
+        )
+        .map_err(map_scope_error)?;
+        let retained = evaluate_retained_receipts_with_scope_controlled(
+            detected,
+            candidate.prepared_scope().clone(),
+            control,
+        )?;
+        let confirmed_scope = candidate
+            .confirm_controlled(&git, control)
+            .map_err(map_scope_confirmation_error)?;
+        (retained, confirmed_scope)
+    } else {
+        let retained = evaluate_retained_receipts_controlled(detected, &git, control)?;
+        let confirmed_scope =
+            acquire_repository_scope_controlled(&git, &detected.model.repository.root, control)
+                .map_err(map_scope_confirmation_error)?;
+        (retained, confirmed_scope)
+    };
     require_same_detection_baseline(&detected.model, &confirmed_scope)?;
     let confirmed_scope_digest = scope_dependency_digest(
         &Blake3Hasher,
@@ -453,6 +476,14 @@ fn evaluate_retained_receipts_controlled(
 ) -> Result<RetainedReceiptEvaluation, AppError> {
     let scope = acquire_repository_scope_controlled(git, &detected.model.repository.root, control)
         .map_err(map_scope_error)?;
+    evaluate_retained_receipts_with_scope_controlled(detected, scope, control)
+}
+
+fn evaluate_retained_receipts_with_scope_controlled(
+    detected: &explain::DetectedProject,
+    scope: PreparedScope,
+    control: &OperationBudget,
+) -> Result<RetainedReceiptEvaluation, AppError> {
     require_same_detection_baseline(&detected.model, &scope)?;
 
     let hasher = Blake3Hasher;
@@ -1157,22 +1188,65 @@ fn require_stable_scope(
     if retained == confirmation && retained_digest == confirmation_digest {
         return Ok(());
     }
-    Err(AppError::environment_unmet(
-        "FGE3313",
-        "repository scope changed while local Evidence was being evaluated",
-        "whole-repository Evidence scope",
+    Err(scope_drift_error(
         "the confirmation scope did not reproduce the retained HEAD and content identities",
-        "stop concurrent worktree or Git changes and rerun the Evidence command",
     ))
 }
 
 fn map_scope_error(error: ScopeAcquisitionError) -> AppError {
+    match error {
+        ScopeAcquisitionError::Control(error) => {
+            explain::map_operation_control_error(error, "whole-repository Evidence scope")
+        }
+        ScopeAcquisitionError::Git(error) => match error.kind() {
+            GitErrorKind::TimedOut => explain::map_operation_control_error(
+                OperationControlError::TimedOut,
+                "whole-repository Evidence scope",
+            ),
+            GitErrorKind::Interrupted => explain::map_operation_control_error(
+                OperationControlError::Interrupted,
+                "whole-repository Evidence scope",
+            ),
+            GitErrorKind::ExecutableUnavailable
+            | GitErrorKind::UnsafeEnvironment
+            | GitErrorKind::NotRepository
+            | GitErrorKind::CorruptRepository
+            | GitErrorKind::OutputLimit
+            | GitErrorKind::InvalidData
+            | GitErrorKind::CommandFailed
+            | GitErrorKind::Io => scope_acquisition_error(error.into()),
+        },
+        error => scope_acquisition_error(error),
+    }
+}
+
+fn map_scope_confirmation_error(error: ScopeAcquisitionError) -> AppError {
+    match error {
+        error @ (ScopeAcquisitionError::RepositoryChanged
+        | ScopeAcquisitionError::WorktreePathChanged { .. }) => {
+            scope_drift_error(error.to_string())
+        }
+        error => map_scope_error(error),
+    }
+}
+
+fn scope_acquisition_error(error: ScopeAcquisitionError) -> AppError {
     AppError::environment_unmet(
         "FGE3306",
         "the current repository scope could not be acquired completely",
         "whole-repository Evidence scope",
         error.to_string(),
         "repair the Git repository or unreadable worktree path, then retry",
+    )
+}
+
+fn scope_drift_error(detail: impl Into<String>) -> AppError {
+    AppError::environment_unmet(
+        "FGE3313",
+        "repository scope changed while local Evidence was being evaluated",
+        "whole-repository Evidence scope",
+        detail,
+        "stop concurrent worktree or Git changes and rerun the Evidence command",
     )
 }
 
@@ -1478,18 +1552,21 @@ mod tests {
     use forge_core::scope::{PreparedScope, ScopeHead, scope_dependency_digest};
     use forge_core::{
         AdapterInventory, AssetInventory, Assumption, Confidence, EffectivePolicy, ExitCode,
-        GitObjectFormat, InventorySkip, ProjectModel, ProjectModelInputs, Provenance, RepoFacts,
-        RiskAssessment, RiskLevel, WorkState,
+        GitError, GitErrorKind, GitObjectFormat, InventorySkip, OperationControlError,
+        ProjectModel, ProjectModelInputs, Provenance, RepoFacts, RepoRelativePath, RiskAssessment,
+        RiskLevel, WorkState,
     };
     use forge_detect::model::ModelDetectionCompletion;
     use forge_detect::policy::PolicyBaseCompleteness;
     use forge_runtime::hash::Blake3Hasher;
+    use forge_runtime::scope::ScopeAcquisitionError;
     use forge_schema::RepoId;
 
     use super::{
-        add_missing_coverage_expectations, partition_coverage, receipt_order_is_newer,
-        require_same_detection_baseline, require_stable_detection, require_stable_scope,
-        requirements_are_complete, selected_command_count, with_persisted_evidence,
+        add_missing_coverage_expectations, map_scope_confirmation_error, partition_coverage,
+        receipt_order_is_newer, require_same_detection_baseline, require_stable_detection,
+        require_stable_scope, requirements_are_complete, selected_command_count,
+        with_persisted_evidence,
     };
     use crate::explain::DetectedProject;
 
@@ -1721,6 +1798,63 @@ mod tests {
             };
         assert_eq!(error.exit_code(), ExitCode::EnvironmentUnmet);
         assert_eq!(error.diagnostic().code.as_str(), "FGE3313");
+        Ok(())
+    }
+
+    #[test]
+    fn scope_confirmation_preserves_terminal_drift_and_acquisition_error_classes()
+    -> Result<(), Box<dyn Error>> {
+        let terminal_cases = [
+            (
+                ScopeAcquisitionError::Control(OperationControlError::TimedOut),
+                ExitCode::Timeout,
+                "FGE2004",
+            ),
+            (
+                ScopeAcquisitionError::Control(OperationControlError::Interrupted),
+                ExitCode::Interrupted,
+                "FGE2005",
+            ),
+            (
+                ScopeAcquisitionError::Git(GitError::new(
+                    GitErrorKind::TimedOut,
+                    "status",
+                    "fixture timeout",
+                )),
+                ExitCode::Timeout,
+                "FGE2004",
+            ),
+            (
+                ScopeAcquisitionError::Git(GitError::new(
+                    GitErrorKind::Interrupted,
+                    "status",
+                    "fixture interruption",
+                )),
+                ExitCode::Interrupted,
+                "FGE2005",
+            ),
+        ];
+        for (source, exit_code, diagnostic_code) in terminal_cases {
+            let error = map_scope_confirmation_error(source);
+            assert_eq!(error.exit_code(), exit_code);
+            assert_eq!(error.diagnostic().code.as_str(), diagnostic_code);
+        }
+
+        let drift_cases = [
+            ScopeAcquisitionError::RepositoryChanged,
+            ScopeAcquisitionError::WorktreePathChanged {
+                path: RepoRelativePath::new("src/lib.rs")?,
+            },
+        ];
+        for source in drift_cases {
+            let error = map_scope_confirmation_error(source);
+            assert_eq!(error.exit_code(), ExitCode::EnvironmentUnmet);
+            assert_eq!(error.diagnostic().code.as_str(), "FGE3313");
+        }
+
+        let error = map_scope_confirmation_error(ScopeAcquisitionError::MissingHead);
+        assert_eq!(error.exit_code(), ExitCode::EnvironmentUnmet);
+        assert_eq!(error.diagnostic().code.as_str(), "FGE3306");
         Ok(())
     }
 
