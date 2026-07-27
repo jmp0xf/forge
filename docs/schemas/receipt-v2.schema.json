@@ -1,0 +1,983 @@
+{
+  "$id": "forge.receipt/v2",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge receipt v2",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/ReceiptV2Data"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.receipt/v2"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "BaseTaskDependencyV2Data": {
+      "description": "Canonical base/task dependency recorded by a v2 receipt.\n\nThis is the only dependency axis for which `not-applicable` is a valid state.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "known"
+            },
+            "value": {
+              "$ref": "#/$defs/Digest"
+            }
+          },
+          "required": [
+            "state",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "not-applicable"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "CommandData": {
+      "description": "A shell-free project command representation.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceData"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/WirePath"
+        },
+        "environment_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/CommandId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "mutability": {
+          "$ref": "#/$defs/MutabilityData"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkIntentData"
+        },
+        "program": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "program",
+        "args",
+        "cwd",
+        "environment_names",
+        "timeout_seconds",
+        "mutability",
+        "network",
+        "source",
+        "confidence",
+        "coverage"
+      ]
+    },
+    "CommandDetailV2Data": {
+      "description": "Complete command semantics recorded by a v2 observation.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/CommandData"
+        },
+        "enforcement": {
+          "$ref": "#/$defs/CommandEnforcementData"
+        },
+        "native_args": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativeStringData"
+          }
+        },
+        "native_environment_names": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NativeStringData"
+          }
+        },
+        "native_program": {
+          "$ref": "#/$defs/NativeStringData"
+        },
+        "source_detail": {
+          "$ref": "#/$defs/CommandSourceData"
+        },
+        "success": {
+          "$ref": "#/$defs/SuccessPredicateData"
+        }
+      },
+      "required": [
+        "command",
+        "native_program",
+        "native_args",
+        "native_environment_names",
+        "source_detail",
+        "enforcement",
+        "success"
+      ]
+    },
+    "CommandEnforcementData": {
+      "description": "Whether failure of a command blocks the enclosing verification decision.",
+      "type": "string",
+      "enum": [
+        "required",
+        "advisory",
+        "unknown"
+      ]
+    },
+    "CommandId": {
+      "description": "Stable project-command identity.",
+      "type": "string"
+    },
+    "CommandObservationV2Data": {
+      "description": "Complete v2 observation for one shell-free project command.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/CommandDetailV2Data"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "log_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeData"
+        },
+        "output_truncated": {
+          "type": "boolean"
+        },
+        "raw_exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "signal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "stderr_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "stdout_digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "timed_out": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "command",
+        "outcome",
+        "duration_ms",
+        "timed_out",
+        "interrupted",
+        "stdout_digest",
+        "stderr_digest",
+        "output_truncated",
+        "log_refs"
+      ]
+    },
+    "CommandSourceData": {
+      "description": "Stable classification of where a project command came from.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "explicit-config"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "existing-project-target"
+            },
+            "path": {
+              "$ref": "#/$defs/WirePath"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "language-default"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "rule": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "rule"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ComparisonBaselineV2Data": {
+      "description": "Resolved `HEAD` state used as the worktree comparison baseline.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "commit": {
+              "$ref": "#/$defs/GitObjectIdV2Data"
+            },
+            "state": {
+              "type": "string",
+              "const": "head"
+            }
+          },
+          "required": [
+            "state",
+            "commit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "$ref": "#/$defs/GitObjectFormatV2Data"
+            },
+            "state": {
+              "type": "string",
+              "const": "unborn"
+            }
+          },
+          "required": [
+            "state",
+            "object_format"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "ComparisonBasisV2Data": {
+      "description": "Stable inputs needed to identify and recompute the v0 `HEAD` comparison baseline.",
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/ComparisonBaselineV2Data"
+        },
+        "policy_base_digest": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ComparisonProtocolV2Data"
+        },
+        "task_acceptance": {
+          "$ref": "#/$defs/TaskAcceptanceV2Data"
+        }
+      },
+      "required": [
+        "protocol",
+        "baseline",
+        "task_acceptance",
+        "policy_base_digest"
+      ]
+    },
+    "ComparisonProtocolV2Data": {
+      "description": "The comparison protocol that produced a receipt or evidence bundle.",
+      "type": "string",
+      "enum": [
+        "forge.worktree-comparison/v1",
+        "unknown"
+      ]
+    },
+    "ConfidenceData": {
+      "description": "Confidence in a derived fact.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Versioned content or policy digest.",
+      "type": "string"
+    },
+    "DigestDependencyV2Data": {
+      "description": "A required digest dependency that is either known or explicitly unavailable.\n\nUnknown knowledge is a distinct wire state. Callers must not manufacture a digest sentinel.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "known"
+            },
+            "value": {
+              "$ref": "#/$defs/Digest"
+            }
+          },
+          "required": [
+            "state",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "GitObjectFormatV2Data": {
+      "description": "Git object format required to validate a recorded baseline object ID.",
+      "type": "string",
+      "enum": [
+        "sha1",
+        "sha256",
+        "unknown"
+      ]
+    },
+    "GitObjectIdV2Data": {
+      "description": "A validated object ID paired with its Git object format.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha1"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha1ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha256"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha256ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "object_format"
+          ]
+        }
+      ]
+    },
+    "GitSha1ObjectIdV2Data": {
+      "description": "A validated full SHA-1 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "GitSha256ObjectIdV2Data": {
+      "description": "A validated full SHA-256 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "IntentData": {
+      "description": "Project operation intent on the wire.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "format-check",
+        "format",
+        "check",
+        "fix",
+        "test",
+        "verify",
+        "build",
+        "unknown"
+      ]
+    },
+    "MutabilityData": {
+      "description": "Declared command mutability.",
+      "type": "string",
+      "enum": [
+        "read-only",
+        "working-tree-write",
+        "external-side-effect",
+        "unknown"
+      ]
+    },
+    "NativeStringData": {
+      "description": "A displayable and, when needed, lossless platform-native string.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/NativeStringEncodingData"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    },
+    "NativeStringEncodingData": {
+      "description": "Encoding used to preserve a platform-native string on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "NetworkIntentData": {
+      "description": "Declared network behavior; it is not a sandbox guarantee.",
+      "type": "string",
+      "enum": [
+        "inherit",
+        "offline-requested",
+        "required",
+        "unknown"
+      ]
+    },
+    "OutcomeData": {
+      "description": "Normalized command outcome. Unknown values cannot satisfy evidence.",
+      "type": "string",
+      "enum": [
+        "pass",
+        "product-failure",
+        "infrastructure-failure",
+        "inconclusive",
+        "timed-out",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "ReceiptDependenciesV2Data": {
+      "description": "Every dependency whose equality is required before a v2 receipt may be reused.",
+      "type": "object",
+      "properties": {
+        "base_task": {
+          "$ref": "#/$defs/BaseTaskDependencyV2Data"
+        },
+        "command": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "environment": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "forge_behavior": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "policy": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryDependencyV2Data"
+        },
+        "scope_after": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "scope_before": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "toolchain": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        }
+      },
+      "required": [
+        "repository",
+        "scope_before",
+        "scope_after",
+        "command",
+        "toolchain",
+        "environment",
+        "policy",
+        "base_task",
+        "forge_behavior"
+      ]
+    },
+    "ReceiptId": {
+      "description": "Stable local receipt identity.",
+      "type": "string"
+    },
+    "ReceiptV2Data": {
+      "description": "Root data for a current local receipt (`forge.receipt/v2`).",
+      "type": "object",
+      "properties": {
+        "comparison_basis": {
+          "$ref": "#/$defs/ComparisonBasisV2Data"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "$ref": "#/$defs/ReceiptDependenciesV2Data"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "$ref": "#/$defs/ReceiptId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "log_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandObservationV2Data"
+          }
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeData"
+        },
+        "started_at": {
+          "description": "Execution start in UTC RFC 3339 form.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "intent",
+        "observations",
+        "comparison_basis",
+        "dependencies",
+        "started_at",
+        "duration_ms",
+        "outcome",
+        "coverage",
+        "log_refs"
+      ]
+    },
+    "RepoId": {
+      "description": "Stable repository identity.",
+      "type": "string"
+    },
+    "RepositoryDependencyV2Data": {
+      "description": "A required repository-identity dependency that is known or explicitly unavailable.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "known"
+            },
+            "value": {
+              "$ref": "#/$defs/RepoId"
+            }
+          },
+          "required": [
+            "state",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "SuccessPredicateData": {
+      "description": "Predicate used to decide whether a command observation succeeded.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exit-zero"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exit-zero-and-stdout-empty"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "json-has-no-errors"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "all"
+            },
+            "predicates": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SuccessPredicateData"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "predicates"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "TaskAcceptanceV2Data": {
+      "description": "Task-acceptance input to the comparison.\n\nv0 has no task-acceptance input. Unknown is retained as a fail-closed read state rather than\ntreating missing or future semantics as not applicable.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "not-applicable"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}

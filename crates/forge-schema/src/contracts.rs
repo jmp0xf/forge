@@ -30,11 +30,11 @@ impl SchemaVersion {
 
     #[must_use]
     pub fn for_kind(kind: SchemaKind) -> Self {
-        Self::new(kind.domain(), 1)
+        Self::new(kind.domain(), kind.major())
     }
 }
 
-/// Public root contract kinds in deterministic presentation order.
+/// Public root contract documents in deterministic domain-major presentation order.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -47,7 +47,9 @@ pub enum SchemaKind {
     Doctor,
     Next,
     ProjectModel,
+    ReceiptV1,
     Receipt,
+    EvidenceV1,
     Evidence,
     Adapters,
     Diagnostic,
@@ -63,7 +65,9 @@ impl SchemaKind {
         Self::Doctor,
         Self::Next,
         Self::ProjectModel,
+        Self::ReceiptV1,
         Self::Receipt,
+        Self::EvidenceV1,
         Self::Evidence,
         Self::Adapters,
         Self::Diagnostic,
@@ -84,22 +88,41 @@ impl SchemaKind {
             Self::Doctor => "doctor",
             Self::Next => "next",
             Self::ProjectModel => "model",
-            Self::Receipt => "receipt",
-            Self::Evidence => "evidence",
+            Self::ReceiptV1 | Self::Receipt => "receipt",
+            Self::EvidenceV1 | Self::Evidence => "evidence",
             Self::Adapters => "adapters",
             Self::Diagnostic => "diagnostic",
             Self::Unknown => "unknown",
         }
     }
 
+    /// Returns the semantic contract major represented by this exact document.
+    #[must_use]
+    pub const fn major(self) -> u16 {
+        match self {
+            Self::Receipt | Self::Evidence => 2,
+            Self::Version
+            | Self::SchemaIndex
+            | Self::InitPlan
+            | Self::Doctor
+            | Self::Next
+            | Self::ProjectModel
+            | Self::ReceiptV1
+            | Self::EvidenceV1
+            | Self::Adapters
+            | Self::Diagnostic
+            | Self::Unknown => 1,
+        }
+    }
+
     #[must_use]
     pub fn id(self) -> String {
-        format!("forge.{}/v1", self.domain())
+        format!("forge.{}/v{}", self.domain(), self.major())
     }
 
     #[must_use]
     pub fn file_name(self) -> String {
-        format!("{}-v1.schema.json", self.domain())
+        format!("{}-v{}.schema.json", self.domain(), self.major())
     }
 }
 
@@ -107,22 +130,32 @@ impl FromStr for SchemaKind {
     type Err = UnknownSchemaKind;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let normalized = value
-            .strip_prefix("forge.")
-            .unwrap_or(value)
-            .strip_suffix("/v1")
-            .unwrap_or(value.strip_prefix("forge.").unwrap_or(value));
-        let kind = match normalized {
-            "version" => Self::Version,
-            "schema-index" | "schema" => Self::SchemaIndex,
-            "init-plan" | "init" => Self::InitPlan,
-            "doctor" => Self::Doctor,
-            "next" => Self::Next,
-            "model" | "project-model" => Self::ProjectModel,
-            "receipt" => Self::Receipt,
-            "evidence" => Self::Evidence,
-            "adapters" => Self::Adapters,
-            "diagnostic" => Self::Diagnostic,
+        let normalized = value.strip_prefix("forge.").unwrap_or(value);
+        let (domain, requested_major) = match normalized.rsplit_once("/v") {
+            Some((domain, major)) => {
+                let parsed_major = major
+                    .parse::<u16>()
+                    .map_err(|_| UnknownSchemaKind(value.to_owned()))?;
+                if parsed_major.to_string() != major {
+                    return Err(UnknownSchemaKind(value.to_owned()));
+                }
+                (domain, Some(parsed_major))
+            }
+            None => (normalized, None),
+        };
+        let kind = match (domain, requested_major) {
+            ("version", None | Some(1)) => Self::Version,
+            ("schema-index" | "schema", None | Some(1)) => Self::SchemaIndex,
+            ("init-plan" | "init", None | Some(1)) => Self::InitPlan,
+            ("doctor", None | Some(1)) => Self::Doctor,
+            ("next", None | Some(1)) => Self::Next,
+            ("model" | "project-model", None | Some(1)) => Self::ProjectModel,
+            ("receipt", Some(1)) => Self::ReceiptV1,
+            ("receipt", None | Some(2)) => Self::Receipt,
+            ("evidence", Some(1)) => Self::EvidenceV1,
+            ("evidence", None | Some(2)) => Self::Evidence,
+            ("adapters", None | Some(1)) => Self::Adapters,
+            ("diagnostic", None | Some(1)) => Self::Diagnostic,
             _ => return Err(UnknownSchemaKind(value.to_owned())),
         };
         Ok(kind)
@@ -704,6 +737,34 @@ pub struct CommandObservationData {
     pub log_refs: Vec<WirePath>,
 }
 
+/// Complete command semantics recorded by a v2 observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CommandDetailV2Data {
+    pub command: CommandData,
+    pub native_program: NativeStringData,
+    pub native_args: Vec<NativeStringData>,
+    pub native_environment_names: Vec<NativeStringData>,
+    pub source_detail: CommandSourceData,
+    pub enforcement: CommandEnforcementData,
+    pub success: SuccessPredicateData,
+}
+
+/// Complete v2 observation for one shell-free project command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CommandObservationV2Data {
+    pub command: CommandDetailV2Data,
+    pub raw_exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub outcome: OutcomeData,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    pub interrupted: bool,
+    pub stdout_digest: Digest,
+    pub stderr_digest: Digest,
+    pub output_truncated: bool,
+    pub log_refs: Vec<WirePath>,
+}
+
 /// Root data for a local receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReceiptData {
@@ -803,6 +864,507 @@ pub struct EvidenceData {
     pub external_attestations: Vec<ExternalAttestationData>,
 }
 
+/// A required digest dependency that is either known or explicitly unavailable.
+///
+/// Unknown knowledge is a distinct wire state. Callers must not manufacture a digest sentinel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", content = "value", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum DigestDependencyV2Data {
+    Known(Digest),
+    #[serde(other)]
+    Unknown,
+}
+
+/// A required repository-identity dependency that is known or explicitly unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", content = "value", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum RepositoryDependencyV2Data {
+    Known(RepoId),
+    #[serde(other)]
+    Unknown,
+}
+
+/// Canonical base/task dependency recorded by a v2 receipt.
+///
+/// This is the only dependency axis for which `not-applicable` is a valid state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", content = "value", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum BaseTaskDependencyV2Data {
+    Known(Digest),
+    NotApplicable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Git object format required to validate a recorded baseline object ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum GitObjectFormatV2Data {
+    Sha1,
+    Sha256,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A non-canonical or unsafe full Git object ID supplied to the v2 wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Git object ID must be full-width lowercase hexadecimal and non-zero")]
+pub struct InvalidGitObjectIdV2Data;
+
+/// A validated full SHA-1 Git object ID.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct GitSha1ObjectIdV2Data(#[schemars(regex(pattern = "^[0-9a-f]{40}$"))] String);
+
+impl GitSha1ObjectIdV2Data {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidGitObjectIdV2Data> {
+        let value = value.into();
+        validate_git_object_id(&value, 40)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for GitSha1ObjectIdV2Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated full SHA-256 Git object ID.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct GitSha256ObjectIdV2Data(#[schemars(regex(pattern = "^[0-9a-f]{64}$"))] String);
+
+impl GitSha256ObjectIdV2Data {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidGitObjectIdV2Data> {
+        let value = value.into();
+        validate_git_object_id(&value, 64)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for GitSha256ObjectIdV2Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_git_object_id(
+    value: &str,
+    hexadecimal_width: usize,
+) -> Result<(), InvalidGitObjectIdV2Data> {
+    if value.len() != hexadecimal_width
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || value.bytes().all(|byte| byte == b'0')
+    {
+        return Err(InvalidGitObjectIdV2Data);
+    }
+    Ok(())
+}
+
+/// A validated object ID paired with its Git object format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "object_format", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum GitObjectIdV2Data {
+    Sha1 {
+        oid: GitSha1ObjectIdV2Data,
+    },
+    Sha256 {
+        oid: GitSha256ObjectIdV2Data,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// The comparison protocol that produced a receipt or evidence bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ComparisonProtocolV2Data {
+    #[serde(rename = "forge.worktree-comparison/v1")]
+    WorktreeV1,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Resolved `HEAD` state used as the worktree comparison baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ComparisonBaselineV2Data {
+    Head {
+        commit: GitObjectIdV2Data,
+    },
+    Unborn {
+        object_format: GitObjectFormatV2Data,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Task-acceptance input to the comparison.
+///
+/// v0 has no task-acceptance input. Unknown is retained as a fail-closed read state rather than
+/// treating missing or future semantics as not applicable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum TaskAcceptanceV2Data {
+    NotApplicable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Stable inputs needed to identify and recompute the v0 `HEAD` comparison baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ComparisonBasisV2Data {
+    pub protocol: ComparisonProtocolV2Data,
+    pub baseline: ComparisonBaselineV2Data,
+    pub task_acceptance: TaskAcceptanceV2Data,
+    pub policy_base_digest: DigestDependencyV2Data,
+}
+
+/// Comparison basis plus the candidate scope observed when Evidence is aggregated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ComparisonContextV2Data {
+    pub basis: ComparisonBasisV2Data,
+    pub candidate_scope_digest: DigestDependencyV2Data,
+}
+
+/// Every dependency whose equality is required before a v2 receipt may be reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReceiptDependenciesV2Data {
+    pub repository: RepositoryDependencyV2Data,
+    pub scope_before: DigestDependencyV2Data,
+    pub scope_after: DigestDependencyV2Data,
+    pub command: DigestDependencyV2Data,
+    pub toolchain: DigestDependencyV2Data,
+    pub environment: DigestDependencyV2Data,
+    pub policy: DigestDependencyV2Data,
+    pub base_task: BaseTaskDependencyV2Data,
+    pub forge_behavior: DigestDependencyV2Data,
+}
+
+/// Root data for a current local receipt (`forge.receipt/v2`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReceiptV2Data {
+    pub id: ReceiptId,
+    pub intent: IntentData,
+    pub observations: Vec<CommandObservationV2Data>,
+    pub comparison_basis: ComparisonBasisV2Data,
+    pub dependencies: ReceiptDependenciesV2Data,
+    /// Execution start in UTC RFC 3339 form.
+    pub started_at: String,
+    pub duration_ms: u64,
+    pub outcome: OutcomeData,
+    pub coverage: Vec<String>,
+    pub log_refs: Vec<WirePath>,
+}
+
+/// One dependency dimension named by a stable validity reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum EvidenceDependencyV2Data {
+    Repository,
+    Scope,
+    Command,
+    Toolchain,
+    Environment,
+    Policy,
+    BaseTask,
+    ForgeBehavior,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether all receipt dependencies are known and current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum DependencyValidityV2Data {
+    Current,
+    Stale,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether a local command observation can directly support an evidence decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReceiptApplicabilityV2Data {
+    Eligible,
+    NonProving,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Stable machine-readable reason that a receipt cannot satisfy current evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "code", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReceiptValidityReasonV2Data {
+    HistoricalIncompatible,
+    DependencyChanged {
+        dependency: EvidenceDependencyV2Data,
+    },
+    DependencyUnknown {
+        dependency: EvidenceDependencyV2Data,
+    },
+    OutcomeNotPassing,
+    ReadOnlyScopeChangedDuringRun,
+    ExternalSideEffectScopeChangedDuringRun,
+    WorkingTreeWriteRequiresReadOnlyFollowUp,
+    MutabilityUnknown,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Complete typed validity result retained for a non-satisfying receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReceiptValidityV2Data {
+    pub dependency_validity: DependencyValidityV2Data,
+    pub applicability: ReceiptApplicabilityV2Data,
+    pub outcome: OutcomeData,
+    pub reasons: Vec<ReceiptValidityReasonV2Data>,
+}
+
+/// The only outcome that can contribute to satisfied local evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum PassingOutcomeV2Data {
+    Pass,
+}
+
+/// Exact receipt schema that may contribute to current v2 Evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum CurrentReceiptSchemaV2Data {
+    #[serde(rename = "forge.receipt/v2")]
+    ReceiptV2,
+}
+
+/// A current v2 receipt that contributes local evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ValidReceiptV2Data {
+    pub schema: CurrentReceiptSchemaV2Data,
+    pub id: ReceiptId,
+    pub intent: IntentData,
+    pub outcome: PassingOutcomeV2Data,
+    pub coverage: Vec<String>,
+}
+
+/// Fixed dependency validity of a historical v1 receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoricalDependencyValidityV2Data {
+    Unknown,
+}
+
+/// Fixed applicability of a historical v1 receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoricalReceiptApplicabilityV2Data {
+    Unknown,
+}
+
+/// Fixed reason why a v1 receipt can only be shown as history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoricalReceiptReasonV2Data {
+    HistoricalIncompatible,
+}
+
+/// A v2 validity result that is guaranteed not to satisfy current Evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct NonSatisfyingReceiptValidityV2Data(ReceiptValidityV2Data);
+
+impl NonSatisfyingReceiptValidityV2Data {
+    pub fn new(value: ReceiptValidityV2Data) -> Result<Self, InvalidReceiptValidityV2Data> {
+        validate_non_satisfying_receipt_validity(&value)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn as_inner(&self) -> &ReceiptValidityV2Data {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for NonSatisfyingReceiptValidityV2Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = ReceiptValidityV2Data::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Invalid or incomplete reasons for a non-satisfying v2 receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("receipt validity must be non-satisfying and explain every non-satisfying axis")]
+pub struct InvalidReceiptValidityV2Data;
+
+fn validate_non_satisfying_receipt_validity(
+    validity: &ReceiptValidityV2Data,
+) -> Result<(), InvalidReceiptValidityV2Data> {
+    let has_dependency_changed = validity.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReceiptValidityReasonV2Data::DependencyChanged { .. }
+        )
+    });
+    let has_dependency_unknown = validity.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReceiptValidityReasonV2Data::DependencyUnknown { .. }
+        )
+    });
+    let has_non_proving_reason = validity.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReceiptValidityReasonV2Data::ReadOnlyScopeChangedDuringRun
+                | ReceiptValidityReasonV2Data::ExternalSideEffectScopeChangedDuringRun
+                | ReceiptValidityReasonV2Data::WorkingTreeWriteRequiresReadOnlyFollowUp
+        )
+    });
+    let has_unknown_applicability_reason = validity.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReceiptValidityReasonV2Data::MutabilityUnknown
+                | ReceiptValidityReasonV2Data::DependencyUnknown {
+                    dependency: EvidenceDependencyV2Data::Scope
+                }
+        )
+    });
+    let has_outcome_reason = validity
+        .reasons
+        .contains(&ReceiptValidityReasonV2Data::OutcomeNotPassing);
+    let has_invalid_v2_reason = validity.reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            ReceiptValidityReasonV2Data::HistoricalIncompatible
+                | ReceiptValidityReasonV2Data::Unknown
+        )
+    });
+
+    let dependency_explained = match validity.dependency_validity {
+        DependencyValidityV2Data::Current => true,
+        DependencyValidityV2Data::Stale => has_dependency_changed,
+        DependencyValidityV2Data::Unknown => has_dependency_unknown,
+    };
+    let applicability_explained = match validity.applicability {
+        ReceiptApplicabilityV2Data::Eligible => true,
+        ReceiptApplicabilityV2Data::NonProving => has_non_proving_reason,
+        ReceiptApplicabilityV2Data::Unknown => has_unknown_applicability_reason,
+    };
+    let outcome_explained = match validity.outcome {
+        OutcomeData::Pass => true,
+        OutcomeData::ProductFailure
+        | OutcomeData::InfrastructureFailure
+        | OutcomeData::Inconclusive
+        | OutcomeData::TimedOut
+        | OutcomeData::Interrupted
+        | OutcomeData::Unknown => has_outcome_reason,
+    };
+    let satisfies = matches!(
+        (
+            validity.dependency_validity,
+            validity.applicability,
+            validity.outcome
+        ),
+        (
+            DependencyValidityV2Data::Current,
+            ReceiptApplicabilityV2Data::Eligible,
+            OutcomeData::Pass
+        )
+    );
+
+    if satisfies
+        || validity.reasons.is_empty()
+        || has_invalid_v2_reason
+        || !dependency_explained
+        || !applicability_explained
+        || !outcome_explained
+    {
+        return Err(InvalidReceiptValidityV2Data);
+    }
+    Ok(())
+}
+
+/// A historical, stale, unknown, failing, or otherwise non-proving receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "schema", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum StaleReceiptV2Data {
+    #[serde(rename = "forge.receipt/v1")]
+    ReceiptV1 {
+        id: ReceiptId,
+        intent: IntentData,
+        outcome: OutcomeData,
+        dependency_validity: HistoricalDependencyValidityV2Data,
+        applicability: HistoricalReceiptApplicabilityV2Data,
+        reason: HistoricalReceiptReasonV2Data,
+    },
+    #[serde(rename = "forge.receipt/v2")]
+    ReceiptV2 {
+        id: ReceiptId,
+        intent: IntentData,
+        validity: NonSatisfyingReceiptValidityV2Data,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Root data for a current local evidence bundle (`forge.evidence/v2`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceV2Data {
+    pub id: EvidenceId,
+    /// Evidence-object creation time in UTC RFC 3339 form; retention must parse this value.
+    pub created_at: String,
+    pub repository: RepoId,
+    pub comparison: ComparisonContextV2Data,
+    pub risk: RiskAssessmentData,
+    pub valid_receipts: Vec<ValidReceiptV2Data>,
+    pub stale_receipts: Vec<StaleReceiptV2Data>,
+    pub coverage_and_gaps: CoverageStatementData,
+    pub local_state: LocalEvidenceStateData,
+    pub external_requirements: Vec<ExternalRequirementData>,
+    pub external_attestations: Vec<ExternalAttestationData>,
+    /// State-relative references to immutable bounded logs retained by this Evidence object.
+    pub log_refs: Vec<WirePath>,
+}
+
 /// Adapter drift classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -853,8 +1415,10 @@ pub fn schema_for_kind(kind: SchemaKind) -> SchemaDocument {
         SchemaKind::Doctor => schema_for!(Envelope<DoctorData>),
         SchemaKind::Next => schema_for!(Envelope<NextData>),
         SchemaKind::ProjectModel => schema_for!(Envelope<ProjectModelData>),
-        SchemaKind::Receipt => schema_for!(Envelope<ReceiptData>),
-        SchemaKind::Evidence => schema_for!(Envelope<EvidenceData>),
+        SchemaKind::ReceiptV1 => schema_for!(Envelope<ReceiptData>),
+        SchemaKind::Receipt => schema_for!(Envelope<ReceiptV2Data>),
+        SchemaKind::EvidenceV1 => schema_for!(Envelope<EvidenceData>),
+        SchemaKind::Evidence => schema_for!(Envelope<EvidenceV2Data>),
         SchemaKind::Adapters => schema_for!(Envelope<AdaptersData>),
         SchemaKind::Diagnostic | SchemaKind::Unknown => {
             schema_for!(Envelope<DiagnosticData>)
@@ -865,7 +1429,7 @@ pub fn schema_for_kind(kind: SchemaKind) -> SchemaDocument {
     object.insert(String::from("$id"), Value::String(identifier.clone()));
     object.insert(
         String::from("title"),
-        Value::String(format!("Forge {} v1", kind.domain())),
+        Value::String(format!("Forge {} v{}", kind.domain(), kind.major())),
     );
     let schema_property = object
         .get_mut("properties")
@@ -905,11 +1469,15 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        CheckStatusData, CommandDetailData, CommandEnforcementData, CommandResolutionData,
-        CommandSourceData, ConfidenceData, Envelope, NativeStringEncodingData, ProjectModelData,
-        ProjectUnitDetailData, SchemaIndexData, SchemaKind, SuccessPredicateData, VersionData,
-        schema_json,
+        BaseTaskDependencyV2Data, CheckStatusData, CommandDetailData, CommandEnforcementData,
+        CommandResolutionData, CommandSourceData, ComparisonProtocolV2Data, ConfidenceData,
+        DigestDependencyV2Data, Envelope, EvidenceDependencyV2Data, EvidenceV2Data,
+        GitObjectIdV2Data, GitSha1ObjectIdV2Data, GitSha256ObjectIdV2Data,
+        NativeStringEncodingData, ProjectModelData, ProjectUnitDetailData,
+        ReceiptValidityReasonV2Data, SchemaIndexData, SchemaKind, SchemaVersion,
+        StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData, schema_json,
     };
+    use crate::Digest;
 
     #[test]
     fn schema_ids_are_unique_namespaced_and_versioned() {
@@ -920,7 +1488,14 @@ mod tests {
 
         assert_eq!(ids.len(), original_len);
         assert!(ids.iter().all(|id| id.starts_with("forge.")));
-        assert!(ids.iter().all(|id| id.ends_with("/v1")));
+        assert!(
+            ids.iter()
+                .all(|id| id.ends_with("/v1") || id.ends_with("/v2"))
+        );
+        assert!(ids.contains(&String::from("forge.receipt/v1")));
+        assert!(ids.contains(&String::from("forge.receipt/v2")));
+        assert!(ids.contains(&String::from("forge.evidence/v1")));
+        assert!(ids.contains(&String::from("forge.evidence/v2")));
     }
 
     #[test]
@@ -930,6 +1505,339 @@ mod tests {
             SchemaKind::from_str("forge.model/v1")?,
             SchemaKind::ProjectModel
         );
+        assert_eq!(SchemaKind::from_str("receipt")?, SchemaKind::Receipt);
+        assert_eq!(
+            SchemaKind::from_str("forge.receipt/v1")?,
+            SchemaKind::ReceiptV1
+        );
+        assert_eq!(
+            SchemaKind::from_str("forge.receipt/v2")?,
+            SchemaKind::Receipt
+        );
+        assert_eq!(SchemaKind::from_str("evidence")?, SchemaKind::Evidence);
+        assert_eq!(
+            SchemaKind::from_str("forge.evidence/v1")?,
+            SchemaKind::EvidenceV1
+        );
+        assert_eq!(
+            SchemaKind::from_str("forge.evidence/v2")?,
+            SchemaKind::Evidence
+        );
+        assert!(SchemaKind::from_str("forge.receipt/v3").is_err());
+        assert!(SchemaKind::from_str("forge.receipt/v02").is_err());
+        assert!(SchemaKind::from_str("forge.model/v2").is_err());
+        assert_eq!(
+            SchemaVersion::for_kind(SchemaKind::Receipt),
+            SchemaVersion::new("receipt", 2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_dependency_states_do_not_use_digest_sentinels() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let known = DigestDependencyV2Data::Known(Digest::from("blake3:known"));
+        let unknown = DigestDependencyV2Data::Unknown;
+        let not_applicable = BaseTaskDependencyV2Data::NotApplicable;
+
+        assert_eq!(
+            serde_json::to_value(known)?,
+            serde_json::json!({"state": "known", "value": "blake3:known"})
+        );
+        assert_eq!(
+            serde_json::to_value(unknown)?,
+            serde_json::json!({"state": "unknown"})
+        );
+        assert_eq!(
+            serde_json::to_value(not_applicable)?,
+            serde_json::json!({"state": "not-applicable"})
+        );
+        let future_task: TaskAcceptanceV2Data = serde_json::from_str(
+            r#"{"state":"known","reference":"task","acceptance_digest":"digest"}"#,
+        )?;
+        assert_eq!(future_task, TaskAcceptanceV2Data::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_validity_reasons_have_stable_machine_codes() -> Result<(), Box<dyn std::error::Error>> {
+        let dependencies = [
+            (EvidenceDependencyV2Data::Repository, "repository"),
+            (EvidenceDependencyV2Data::Scope, "scope"),
+            (EvidenceDependencyV2Data::Command, "command"),
+            (EvidenceDependencyV2Data::Toolchain, "toolchain"),
+            (EvidenceDependencyV2Data::Environment, "environment"),
+            (EvidenceDependencyV2Data::Policy, "policy"),
+            (EvidenceDependencyV2Data::BaseTask, "base-task"),
+            (EvidenceDependencyV2Data::ForgeBehavior, "forge-behavior"),
+        ];
+        for (dependency, expected) in dependencies {
+            assert_eq!(
+                serde_json::to_value(dependency)?,
+                serde_json::json!(expected)
+            );
+            assert_eq!(
+                serde_json::to_value(ReceiptValidityReasonV2Data::DependencyChanged {
+                    dependency
+                })?,
+                serde_json::json!({
+                    "code": "dependency-changed",
+                    "dependency": expected
+                })
+            );
+            assert_eq!(
+                serde_json::to_value(ReceiptValidityReasonV2Data::DependencyUnknown {
+                    dependency
+                })?,
+                serde_json::json!({
+                    "code": "dependency-unknown",
+                    "dependency": expected
+                })
+            );
+        }
+
+        let reason_codes = [
+            (
+                ReceiptValidityReasonV2Data::HistoricalIncompatible,
+                "historical-incompatible",
+            ),
+            (
+                ReceiptValidityReasonV2Data::OutcomeNotPassing,
+                "outcome-not-passing",
+            ),
+            (
+                ReceiptValidityReasonV2Data::ReadOnlyScopeChangedDuringRun,
+                "read-only-scope-changed-during-run",
+            ),
+            (
+                ReceiptValidityReasonV2Data::ExternalSideEffectScopeChangedDuringRun,
+                "external-side-effect-scope-changed-during-run",
+            ),
+            (
+                ReceiptValidityReasonV2Data::WorkingTreeWriteRequiresReadOnlyFollowUp,
+                "working-tree-write-requires-read-only-follow-up",
+            ),
+            (
+                ReceiptValidityReasonV2Data::MutabilityUnknown,
+                "mutability-unknown",
+            ),
+            (ReceiptValidityReasonV2Data::Unknown, "unknown"),
+        ];
+        for (reason, expected) in reason_codes {
+            assert_eq!(
+                serde_json::to_value(reason)?,
+                serde_json::json!({"code": expected})
+            );
+        }
+
+        let future: ReceiptValidityReasonV2Data =
+            serde_json::from_str(r#"{"code":"future-reason","detail":"ignored"}"#)?;
+        assert_eq!(future, ReceiptValidityReasonV2Data::Unknown);
+
+        assert_eq!(
+            serde_json::to_value(ComparisonProtocolV2Data::WorktreeV1)?,
+            serde_json::json!("forge.worktree-comparison/v1")
+        );
+        let future_protocol: ComparisonProtocolV2Data =
+            serde_json::from_str(r#""forge.worktree-comparison/v2""#)?;
+        assert_eq!(future_protocol, ComparisonProtocolV2Data::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn comparison_baseline_accepts_only_canonical_full_object_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sha1 = "1".repeat(40);
+        let sha256 = "a".repeat(64);
+        assert_eq!(GitSha1ObjectIdV2Data::new(&sha1)?.as_str(), sha1);
+        assert_eq!(GitSha256ObjectIdV2Data::new(&sha256)?.as_str(), sha256);
+
+        let parsed_sha1: GitObjectIdV2Data = serde_json::from_value(serde_json::json!({
+            "object_format": "sha1",
+            "oid": sha1
+        }))?;
+        let parsed_sha256: GitObjectIdV2Data = serde_json::from_value(serde_json::json!({
+            "object_format": "sha256",
+            "oid": sha256
+        }))?;
+        assert!(matches!(parsed_sha1, GitObjectIdV2Data::Sha1 { .. }));
+        assert!(matches!(parsed_sha256, GitObjectIdV2Data::Sha256 { .. }));
+
+        for invalid in [
+            "HEAD".to_owned(),
+            "1".repeat(39),
+            "0".repeat(40),
+            "A".repeat(40),
+        ] {
+            assert!(
+                serde_json::from_value::<GitObjectIdV2Data>(serde_json::json!({
+                    "object_format": "sha1",
+                    "oid": invalid
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<GitObjectIdV2Data>(serde_json::json!({
+                "object_format": "sha1",
+                "oid": "1".repeat(64)
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<GitObjectIdV2Data>(serde_json::json!({
+                "object_format": "sha256",
+                "oid": "1".repeat(40)
+            }))
+            .is_err()
+        );
+
+        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::Receipt)?)?;
+        assert_eq!(
+            schema.pointer("/$defs/GitSha1ObjectIdV2Data/pattern"),
+            Some(&serde_json::json!("^[0-9a-f]{40}$"))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/GitSha256ObjectIdV2Data/pattern"),
+            Some(&serde_json::json!("^[0-9a-f]{64}$"))
+        );
+        Ok(())
+    }
+
+    fn evidence_v2_value() -> Value {
+        serde_json::json!({
+            "id": "evidence:test",
+            "created_at": "2026-07-27T00:00:00Z",
+            "repository": "local:blake3:test",
+            "comparison": {
+                "basis": {
+                    "protocol": "forge.worktree-comparison/v1",
+                    "baseline": {
+                        "state": "head",
+                        "commit": {
+                            "object_format": "sha1",
+                            "oid": "1".repeat(40)
+                        }
+                    },
+                    "task_acceptance": {"state": "not-applicable"},
+                    "policy_base_digest": {"state": "known", "value": "blake3:policy"}
+                },
+                "candidate_scope_digest": {"state": "known", "value": "blake3:scope"}
+            },
+            "risk": {"level": "low", "matched": [], "provenance": []},
+            "valid_receipts": [{
+                "schema": "forge.receipt/v2",
+                "id": "receipt:test",
+                "intent": "test",
+                "outcome": "pass",
+                "coverage": ["unit-test"]
+            }],
+            "stale_receipts": [],
+            "coverage_and_gaps": {
+                "verified": ["unit-test"],
+                "advisory": [],
+                "not_verified": [],
+                "external_required": []
+            },
+            "local_state": "sufficient",
+            "external_requirements": [],
+            "external_attestations": [],
+            "log_refs": []
+        })
+    }
+
+    #[test]
+    fn evidence_v2_requires_own_time_and_log_references_and_serializes_stably()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = evidence_v2_value();
+        let evidence: EvidenceV2Data = serde_json::from_value(value.clone())?;
+        assert_eq!(serde_json::to_value(&evidence)?, value);
+        assert_eq!(
+            serde_json::to_string(&evidence)?,
+            serde_json::to_string(&evidence)?
+        );
+
+        for required in ["created_at", "log_refs"] {
+            let mut missing = value.clone();
+            missing
+                .as_object_mut()
+                .ok_or_else(|| std::io::Error::other("test Evidence is not an object"))?
+                .remove(required);
+            assert!(serde_json::from_value::<EvidenceV2Data>(missing).is_err());
+        }
+
+        for invalid_schema in ["forge.receipt/v1", "forge.receipt/v3"] {
+            let mut invalid = value.clone();
+            invalid["valid_receipts"][0]["schema"] = serde_json::json!(invalid_schema);
+            assert!(serde_json::from_value::<EvidenceV2Data>(invalid).is_err());
+        }
+        let mut failing = value;
+        failing["valid_receipts"][0]["outcome"] = serde_json::json!("product-failure");
+        assert!(serde_json::from_value::<EvidenceV2Data>(failing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_v2_keeps_v1_historical_and_rejects_satisfying_receipts_as_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut historical = evidence_v2_value();
+        historical["valid_receipts"] = serde_json::json!([]);
+        historical["stale_receipts"] = serde_json::json!([{
+            "schema": "forge.receipt/v1",
+            "id": "receipt:old",
+            "intent": "test",
+            "outcome": "pass",
+            "dependency_validity": "unknown",
+            "applicability": "unknown",
+            "reason": "historical-incompatible"
+        }]);
+        let parsed_historical: EvidenceV2Data = serde_json::from_value(historical.clone())?;
+        assert_eq!(serde_json::to_value(parsed_historical)?, historical);
+
+        historical["stale_receipts"][0]["dependency_validity"] = serde_json::json!("current");
+        assert!(serde_json::from_value::<EvidenceV2Data>(historical).is_err());
+
+        let mut satisfying = evidence_v2_value();
+        satisfying["valid_receipts"] = serde_json::json!([]);
+        satisfying["stale_receipts"] = serde_json::json!([{
+            "schema": "forge.receipt/v2",
+            "id": "receipt:current",
+            "intent": "test",
+            "validity": {
+                "dependency_validity": "current",
+                "applicability": "eligible",
+                "outcome": "pass",
+                "reasons": []
+            }
+        }]);
+        assert!(serde_json::from_value::<EvidenceV2Data>(satisfying).is_err());
+
+        let mut stale = evidence_v2_value();
+        stale["valid_receipts"] = serde_json::json!([]);
+        stale["stale_receipts"] = serde_json::json!([{
+            "schema": "forge.receipt/v2",
+            "id": "receipt:stale",
+            "intent": "test",
+            "validity": {
+                "dependency_validity": "stale",
+                "applicability": "eligible",
+                "outcome": "pass",
+                "reasons": [{"code": "dependency-changed", "dependency": "scope"}]
+            }
+        }]);
+        assert!(serde_json::from_value::<EvidenceV2Data>(stale).is_ok());
+
+        let mut future = evidence_v2_value();
+        future["valid_receipts"] = serde_json::json!([]);
+        future["stale_receipts"] = serde_json::json!([{
+            "schema": "forge.receipt/v3",
+            "id": "receipt:future"
+        }]);
+        let future: EvidenceV2Data = serde_json::from_value(future)?;
+        assert!(matches!(
+            future.stale_receipts.as_slice(),
+            [StaleReceiptV2Data::Unknown]
+        ));
         Ok(())
     }
 
@@ -1202,11 +2110,60 @@ mod tests {
     }
 
     #[test]
+    fn receipt_and_evidence_v1_and_v2_generate_distinct_root_documents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let receipt_v1: Value = serde_json::from_str(&schema_json(SchemaKind::ReceiptV1)?)?;
+        let receipt_v2: Value = serde_json::from_str(&schema_json(SchemaKind::Receipt)?)?;
+        let evidence_v1: Value = serde_json::from_str(&schema_json(SchemaKind::EvidenceV1)?)?;
+        let evidence_v2: Value = serde_json::from_str(&schema_json(SchemaKind::Evidence)?)?;
+
+        assert_eq!(receipt_v1["$id"], "forge.receipt/v1");
+        assert!(receipt_v1.pointer("/$defs/ReceiptData").is_some());
+        assert!(receipt_v1.pointer("/$defs/ReceiptV2Data").is_none());
+        assert_eq!(receipt_v2["$id"], "forge.receipt/v2");
+        assert!(receipt_v2.pointer("/$defs/ReceiptV2Data").is_some());
+        assert!(
+            receipt_v2
+                .pointer("/$defs/ReceiptDependenciesV2Data")
+                .is_some()
+        );
+
+        assert_eq!(evidence_v1["$id"], "forge.evidence/v1");
+        assert!(evidence_v1.pointer("/$defs/EvidenceData").is_some());
+        assert!(evidence_v1.pointer("/$defs/EvidenceV2Data").is_none());
+        assert_eq!(evidence_v2["$id"], "forge.evidence/v2");
+        assert!(evidence_v2.pointer("/$defs/EvidenceV2Data").is_some());
+        assert!(
+            evidence_v2
+                .pointer("/$defs/ReceiptValidityReasonV2Data")
+                .is_some()
+        );
+        assert!(
+            evidence_v2
+                .pointer("/$defs/ComparisonContextV2Data")
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn schema_index_uses_the_same_deterministic_order_as_schema_kind() {
         let index = SchemaIndexData::current();
         let expected: Vec<String> = SchemaKind::all().iter().map(|kind| kind.id()).collect();
         let actual: Vec<String> = index.schemas.into_iter().map(|item| item.id).collect();
 
         assert_eq!(actual, expected);
+        let receipt_ids: Vec<&str> = actual
+            .iter()
+            .filter(|id| id.starts_with("forge.receipt/"))
+            .map(String::as_str)
+            .collect();
+        let evidence_ids: Vec<&str> = actual
+            .iter()
+            .filter(|id| id.starts_with("forge.evidence/"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(receipt_ids, ["forge.receipt/v1", "forge.receipt/v2"]);
+        assert_eq!(evidence_ids, ["forge.evidence/v1", "forge.evidence/v2"]);
     }
 }

@@ -1,0 +1,960 @@
+{
+  "$id": "forge.evidence/v2",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge evidence v2",
+  "description": "Common JSON envelope for every machine-readable command result.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/EvidenceV2Data"
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Diagnostic"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.evidence/v2"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "tool_version",
+    "ok",
+    "data",
+    "diagnostics",
+    "truncated",
+    "artifacts"
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file or state artifact referenced by a command result.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/WirePath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "description"
+      ]
+    },
+    "ComparisonBaselineV2Data": {
+      "description": "Resolved `HEAD` state used as the worktree comparison baseline.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "commit": {
+              "$ref": "#/$defs/GitObjectIdV2Data"
+            },
+            "state": {
+              "type": "string",
+              "const": "head"
+            }
+          },
+          "required": [
+            "state",
+            "commit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "$ref": "#/$defs/GitObjectFormatV2Data"
+            },
+            "state": {
+              "type": "string",
+              "const": "unborn"
+            }
+          },
+          "required": [
+            "state",
+            "object_format"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "ComparisonBasisV2Data": {
+      "description": "Stable inputs needed to identify and recompute the v0 `HEAD` comparison baseline.",
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/ComparisonBaselineV2Data"
+        },
+        "policy_base_digest": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ComparisonProtocolV2Data"
+        },
+        "task_acceptance": {
+          "$ref": "#/$defs/TaskAcceptanceV2Data"
+        }
+      },
+      "required": [
+        "protocol",
+        "baseline",
+        "task_acceptance",
+        "policy_base_digest"
+      ]
+    },
+    "ComparisonContextV2Data": {
+      "description": "Comparison basis plus the candidate scope observed when Evidence is aggregated.",
+      "type": "object",
+      "properties": {
+        "basis": {
+          "$ref": "#/$defs/ComparisonBasisV2Data"
+        },
+        "candidate_scope_digest": {
+          "$ref": "#/$defs/DigestDependencyV2Data"
+        }
+      },
+      "required": [
+        "basis",
+        "candidate_scope_digest"
+      ]
+    },
+    "ComparisonProtocolV2Data": {
+      "description": "The comparison protocol that produced a receipt or evidence bundle.",
+      "type": "string",
+      "enum": [
+        "forge.worktree-comparison/v1",
+        "unknown"
+      ]
+    },
+    "CoverageStatementData": {
+      "type": "object",
+      "properties": {
+        "advisory": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "external_required": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_verified": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verified": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "verified",
+        "advisory",
+        "not_verified",
+        "external_required"
+      ]
+    },
+    "CurrentReceiptSchemaV2Data": {
+      "description": "Exact receipt schema that may contribute to current v2 Evidence.",
+      "type": "string",
+      "enum": [
+        "forge.receipt/v2"
+      ]
+    },
+    "DependencyValidityV2Data": {
+      "description": "Whether all receipt dependencies are known and current.",
+      "type": "string",
+      "enum": [
+        "current",
+        "stale",
+        "unknown"
+      ]
+    },
+    "Diagnostic": {
+      "description": "An actionable diagnostic with all mandatory explanatory fields.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "next": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "what": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "what",
+        "where",
+        "why",
+        "next"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable FGE diagnostic code.",
+      "type": "string"
+    },
+    "Digest": {
+      "description": "Versioned content or policy digest.",
+      "type": "string"
+    },
+    "DigestDependencyV2Data": {
+      "description": "A required digest dependency that is either known or explicitly unavailable.\n\nUnknown knowledge is a distinct wire state. Callers must not manufacture a digest sentinel.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "known"
+            },
+            "value": {
+              "$ref": "#/$defs/Digest"
+            }
+          },
+          "required": [
+            "state",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "EvidenceDependencyV2Data": {
+      "description": "One dependency dimension named by a stable validity reason.",
+      "type": "string",
+      "enum": [
+        "repository",
+        "scope",
+        "command",
+        "toolchain",
+        "environment",
+        "policy",
+        "base-task",
+        "forge-behavior",
+        "unknown"
+      ]
+    },
+    "EvidenceId": {
+      "description": "Stable evidence-bundle identity.",
+      "type": "string"
+    },
+    "EvidenceV2Data": {
+      "description": "Root data for a current local evidence bundle (`forge.evidence/v2`).",
+      "type": "object",
+      "properties": {
+        "comparison": {
+          "$ref": "#/$defs/ComparisonContextV2Data"
+        },
+        "coverage_and_gaps": {
+          "$ref": "#/$defs/CoverageStatementData"
+        },
+        "created_at": {
+          "description": "Evidence-object creation time in UTC RFC 3339 form; retention must parse this value.",
+          "type": "string"
+        },
+        "external_attestations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExternalAttestationData"
+          }
+        },
+        "external_requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExternalRequirementData"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/EvidenceId"
+        },
+        "local_state": {
+          "$ref": "#/$defs/LocalEvidenceStateData"
+        },
+        "log_refs": {
+          "description": "State-relative references to immutable bounded logs retained by this Evidence object.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WirePath"
+          }
+        },
+        "repository": {
+          "$ref": "#/$defs/RepoId"
+        },
+        "risk": {
+          "$ref": "#/$defs/RiskAssessmentData"
+        },
+        "stale_receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StaleReceiptV2Data"
+          }
+        },
+        "valid_receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ValidReceiptV2Data"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "created_at",
+        "repository",
+        "comparison",
+        "risk",
+        "valid_receipts",
+        "stale_receipts",
+        "coverage_and_gaps",
+        "local_state",
+        "external_requirements",
+        "external_attestations",
+        "log_refs"
+      ]
+    },
+    "ExternalAttestationData": {
+      "type": "object",
+      "properties": {
+        "reference": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "trust_level": {
+          "$ref": "#/$defs/TrustLevelData"
+        },
+        "verified": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "trust_level",
+        "verified",
+        "reference"
+      ]
+    },
+    "ExternalRequirementData": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "trust_level": {
+          "$ref": "#/$defs/TrustLevelData"
+        }
+      },
+      "required": [
+        "id",
+        "trust_level",
+        "reason"
+      ]
+    },
+    "GitObjectFormatV2Data": {
+      "description": "Git object format required to validate a recorded baseline object ID.",
+      "type": "string",
+      "enum": [
+        "sha1",
+        "sha256",
+        "unknown"
+      ]
+    },
+    "GitObjectIdV2Data": {
+      "description": "A validated object ID paired with its Git object format.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha1"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha1ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha256"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha256ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "object_format"
+          ]
+        }
+      ]
+    },
+    "GitSha1ObjectIdV2Data": {
+      "description": "A validated full SHA-1 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "GitSha256ObjectIdV2Data": {
+      "description": "A validated full SHA-256 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "HistoricalDependencyValidityV2Data": {
+      "description": "Fixed dependency validity of a historical v1 receipt.",
+      "type": "string",
+      "enum": [
+        "unknown"
+      ]
+    },
+    "HistoricalReceiptApplicabilityV2Data": {
+      "description": "Fixed applicability of a historical v1 receipt.",
+      "type": "string",
+      "enum": [
+        "unknown"
+      ]
+    },
+    "HistoricalReceiptReasonV2Data": {
+      "description": "Fixed reason why a v1 receipt can only be shown as history.",
+      "type": "string",
+      "enum": [
+        "historical-incompatible"
+      ]
+    },
+    "IntentData": {
+      "description": "Project operation intent on the wire.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "format-check",
+        "format",
+        "check",
+        "fix",
+        "test",
+        "verify",
+        "build",
+        "unknown"
+      ]
+    },
+    "LocalEvidenceStateData": {
+      "description": "Local evidence state. It intentionally has no merge-ready state.",
+      "type": "string",
+      "enum": [
+        "insufficient",
+        "failing",
+        "sufficient",
+        "unknown"
+      ]
+    },
+    "NonSatisfyingReceiptValidityV2Data": {
+      "description": "A v2 validity result that is guaranteed not to satisfy current Evidence.",
+      "$ref": "#/$defs/ReceiptValidityV2Data"
+    },
+    "OutcomeData": {
+      "description": "Normalized command outcome. Unknown values cannot satisfy evidence.",
+      "type": "string",
+      "enum": [
+        "pass",
+        "product-failure",
+        "infrastructure-failure",
+        "inconclusive",
+        "timed-out",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "PassingOutcomeV2Data": {
+      "description": "The only outcome that can contribute to satisfied local evidence.",
+      "type": "string",
+      "enum": [
+        "pass"
+      ]
+    },
+    "PathEncoding": {
+      "description": "Encoding used to preserve a native path on the wire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "unix-bytes",
+            "windows-wide"
+          ]
+        },
+        {
+          "description": "A future encoding that this binary cannot safely interpret.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "ReceiptApplicabilityV2Data": {
+      "description": "Whether a local command observation can directly support an evidence decision.",
+      "type": "string",
+      "enum": [
+        "eligible",
+        "non-proving",
+        "unknown"
+      ]
+    },
+    "ReceiptId": {
+      "description": "Stable local receipt identity.",
+      "type": "string"
+    },
+    "ReceiptValidityReasonV2Data": {
+      "description": "Stable machine-readable reason that a receipt cannot satisfy current evidence.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "historical-incompatible"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "dependency-changed"
+            },
+            "dependency": {
+              "$ref": "#/$defs/EvidenceDependencyV2Data"
+            }
+          },
+          "required": [
+            "code",
+            "dependency"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "dependency-unknown"
+            },
+            "dependency": {
+              "$ref": "#/$defs/EvidenceDependencyV2Data"
+            }
+          },
+          "required": [
+            "code",
+            "dependency"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "outcome-not-passing"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "read-only-scope-changed-during-run"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "external-side-effect-scope-changed-during-run"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "working-tree-write-requires-read-only-follow-up"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "mutability-unknown"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        }
+      ]
+    },
+    "ReceiptValidityV2Data": {
+      "description": "Complete typed validity result retained for a non-satisfying receipt.",
+      "type": "object",
+      "properties": {
+        "applicability": {
+          "$ref": "#/$defs/ReceiptApplicabilityV2Data"
+        },
+        "dependency_validity": {
+          "$ref": "#/$defs/DependencyValidityV2Data"
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeData"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReceiptValidityReasonV2Data"
+          }
+        }
+      },
+      "required": [
+        "dependency_validity",
+        "applicability",
+        "outcome",
+        "reasons"
+      ]
+    },
+    "RepoId": {
+      "description": "Stable repository identity.",
+      "type": "string"
+    },
+    "RiskAssessmentData": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/RiskLevelData"
+        },
+        "matched": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "level",
+        "matched",
+        "provenance"
+      ]
+    },
+    "RiskLevelData": {
+      "description": "Risk level. Unknown values are never interpreted as low risk.",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical",
+        "unknown"
+      ]
+    },
+    "Severity": {
+      "description": "Diagnostic severity. Unknown future values fail closed in consumers.",
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "unknown"
+      ]
+    },
+    "StaleReceiptV2Data": {
+      "description": "A historical, stale, unknown, failing, or otherwise non-proving receipt.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "applicability": {
+              "$ref": "#/$defs/HistoricalReceiptApplicabilityV2Data"
+            },
+            "dependency_validity": {
+              "$ref": "#/$defs/HistoricalDependencyValidityV2Data"
+            },
+            "id": {
+              "$ref": "#/$defs/ReceiptId"
+            },
+            "intent": {
+              "$ref": "#/$defs/IntentData"
+            },
+            "outcome": {
+              "$ref": "#/$defs/OutcomeData"
+            },
+            "reason": {
+              "$ref": "#/$defs/HistoricalReceiptReasonV2Data"
+            },
+            "schema": {
+              "type": "string",
+              "const": "forge.receipt/v1"
+            }
+          },
+          "required": [
+            "schema",
+            "id",
+            "intent",
+            "outcome",
+            "dependency_validity",
+            "applicability",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/ReceiptId"
+            },
+            "intent": {
+              "$ref": "#/$defs/IntentData"
+            },
+            "schema": {
+              "type": "string",
+              "const": "forge.receipt/v2"
+            },
+            "validity": {
+              "$ref": "#/$defs/NonSatisfyingReceiptValidityV2Data"
+            }
+          },
+          "required": [
+            "schema",
+            "id",
+            "intent",
+            "validity"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "schema": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "schema"
+          ]
+        }
+      ]
+    },
+    "TaskAcceptanceV2Data": {
+      "description": "Task-acceptance input to the comparison.\n\nv0 has no task-acceptance input. Unknown is retained as a fail-closed read state rather than\ntreating missing or future semantics as not applicable.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "not-applicable"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      ]
+    },
+    "TrustLevelData": {
+      "description": "Trust level of an evidence item. Unknown never upgrades authority.",
+      "type": "string",
+      "enum": [
+        "local-observation",
+        "external-attestation",
+        "approval",
+        "deployed-observation",
+        "unknown"
+      ]
+    },
+    "ValidReceiptV2Data": {
+      "description": "A current v2 receipt that contributes local evidence.",
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/ReceiptId"
+        },
+        "intent": {
+          "$ref": "#/$defs/IntentData"
+        },
+        "outcome": {
+          "$ref": "#/$defs/PassingOutcomeV2Data"
+        },
+        "schema": {
+          "$ref": "#/$defs/CurrentReceiptSchemaV2Data"
+        }
+      },
+      "required": [
+        "schema",
+        "id",
+        "intent",
+        "outcome",
+        "coverage"
+      ]
+    },
+    "WirePath": {
+      "description": "A displayable and, when needed, lossless path representation.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PathEncoding"
+        },
+        "raw_base64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "display",
+        "encoding"
+      ]
+    }
+  }
+}
