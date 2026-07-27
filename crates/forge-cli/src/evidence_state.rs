@@ -1144,14 +1144,14 @@ fn validate_schema(
         return Ok(());
     }
     let prefix = format!("forge.{domain}/v");
-    if let Some(major) = schema.strip_prefix(&prefix)
-        && !major.is_empty()
-        && major.bytes().all(|byte| byte.is_ascii_digit())
-        && !major.starts_with('0')
-        && major
-            .parse::<u16>()
-            .is_ok_and(|major| major > version.major())
-    {
+    let is_future_schema = schema
+        .strip_prefix(&prefix)
+        .filter(|major| !major.is_empty())
+        .filter(|major| major.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|major| !major.starts_with('0'))
+        .and_then(|major| major.parse::<u16>().ok())
+        .is_some_and(|major| major > version.major());
+    if is_future_schema {
         return Err(EvidenceStateDecodeError::FutureSchema);
     }
     Err(EvidenceStateDecodeError::Malformed)
@@ -1289,17 +1289,17 @@ fn validate_receipt_v2_semantics(
             && logs.complete
             && observation_outcome_validation.can_support_current_evidence;
         can_support_current_evidence &= command_is_complete;
-        if let Some(enforcement) = enforcement
-            && coverage.complete
-            && observation_outcome_validation.aggregate_is_known
-        {
-            aggregate_inputs.push(CommandEvidenceObservation::new(
-                enforcement,
-                observation_outcome,
-                coverage.dimensions,
-            ));
-        } else {
-            aggregate_is_complete = false;
+        match enforcement {
+            Some(enforcement)
+                if coverage.complete && observation_outcome_validation.aggregate_is_known =>
+            {
+                aggregate_inputs.push(CommandEvidenceObservation::new(
+                    enforcement,
+                    observation_outcome,
+                    coverage.dimensions,
+                ));
+            }
+            Some(_) | None => aggregate_is_complete = false,
         }
     }
 

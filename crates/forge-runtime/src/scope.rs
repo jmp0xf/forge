@@ -253,9 +253,11 @@ fn prepare_scope(
         }
 
         if index_mode == ScopeMode::Gitlink {
-            if let Some(PathStatus::Tracked { xy, .. }) = path_status
-                && xy.worktree == ChangeKind::TypeChanged
-            {
+            if matches!(
+                path_status,
+                Some(PathStatus::Tracked { xy, .. })
+                    if xy.worktree == ChangeKind::TypeChanged
+            ) {
                 append_worktree_entry(
                     root,
                     &index_entry.path,
@@ -406,10 +408,11 @@ fn collect_path_statuses(
             StatusEntry::Untracked(path) => Some((path.clone(), PathStatus::Untracked)),
             StatusEntry::Ignored(_) => None,
         };
-        if let Some((path, state)) = candidate
-            && paths.insert(path.clone(), state).is_some()
-        {
-            return Err(ScopeAcquisitionError::InconsistentGitState { path });
+        match candidate {
+            Some((path, state)) if paths.insert(path.clone(), state).is_some() => {
+                return Err(ScopeAcquisitionError::InconsistentGitState { path });
+            }
+            Some(_) | None => {}
         }
     }
     Ok(paths)

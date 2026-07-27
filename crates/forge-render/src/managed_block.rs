@@ -794,10 +794,12 @@ mod tests {
         impl Hasher for HexHasher {
             fn digest(&self, chunks: &[&[u8]]) -> Digest {
                 let body = chunks.last().copied().unwrap_or_default();
-                let encoded = body
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let mut encoded = String::with_capacity(body.len().saturating_mul(2));
+                for byte in body {
+                    encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                    encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                }
                 Digest::new(format!("fixture:{encoded}"))
             }
         }
