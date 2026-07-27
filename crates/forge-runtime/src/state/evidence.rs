@@ -4380,7 +4380,7 @@ mod tests {
         )?;
         drop(lock);
 
-        let read_only = AtomicStateStore::open_existing_evidence_read_only(layout)?
+        let read_only = AtomicStateStore::open_existing_evidence_read_only(layout.clone())?
             .ok_or_else(|| io::Error::other("Windows evidence state disappeared"))?;
         let mut visited = Vec::new();
         read_only.visit_evidence_state_snapshot(
