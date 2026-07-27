@@ -3,10 +3,13 @@
 //! This module transforms or compares already-computed facts. It deliberately owns no hashing,
 //! filesystem, process, clock, network, persistence, JSON parsing, or wire-format behavior.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use forge_schema::{Digest, RepoId};
 
+use crate::domain::CommandEnforcement;
 use crate::ports::{ProcessErrorKind, ProcessObservation};
-use crate::{Mutability, SuccessPredicate};
+use crate::{CoverageDimension, Intent, Mutability, SuccessPredicate};
 
 /// Pure command-success normalization behavior bound into the Forge behavior dependency.
 pub const SUCCESS_NORMALIZATION_PROTOCOL_VERSION: &str = "forge.success-normalization/v1";
@@ -369,6 +372,264 @@ const fn combine_predicate_outcomes(
     }
 }
 
+/// One normalized command observation supplied to Receipt-level aggregation.
+///
+/// The command's enforcement is kept beside its outcome so an advisory check can remain visible
+/// without silently becoming a project admission gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandEvidenceObservation {
+    enforcement: CommandEnforcement,
+    outcome: EvidenceOutcome,
+    coverage: BTreeSet<CoverageDimension>,
+}
+
+impl CommandEvidenceObservation {
+    #[must_use]
+    pub fn new(
+        enforcement: CommandEnforcement,
+        outcome: EvidenceOutcome,
+        coverage: impl IntoIterator<Item = CoverageDimension>,
+    ) -> Self {
+        Self {
+            enforcement,
+            outcome,
+            coverage: coverage.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub const fn enforcement(&self) -> CommandEnforcement {
+        self.enforcement
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> EvidenceOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn coverage(&self) -> &BTreeSet<CoverageDimension> {
+        &self.coverage
+    }
+}
+
+/// Deterministic result of aggregating an ordered command chain into one Receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEvidenceAggregation {
+    outcome: EvidenceOutcome,
+    verified: BTreeSet<CoverageDimension>,
+    advisory: BTreeSet<CoverageDimension>,
+    not_verified: BTreeSet<CoverageDimension>,
+}
+
+impl ReceiptEvidenceAggregation {
+    #[must_use]
+    pub const fn outcome(&self) -> EvidenceOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn verified(&self) -> &BTreeSet<CoverageDimension> {
+        &self.verified
+    }
+
+    #[must_use]
+    pub const fn advisory(&self) -> &BTreeSet<CoverageDimension> {
+        &self.advisory
+    }
+
+    #[must_use]
+    pub const fn not_verified(&self) -> &BTreeSet<CoverageDimension> {
+        &self.not_verified
+    }
+}
+
+/// Aggregates command observations in execution order without promoting advisory checks.
+///
+/// The first non-passing required observation is the Receipt outcome. Observations after such a
+/// failure violate the v0 stop-on-required-failure protocol and make the aggregate unknown. A
+/// chain containing only advisory observations is also unknown because it has no admission gate.
+#[must_use]
+pub fn aggregate_command_evidence(
+    observations: &[CommandEvidenceObservation],
+) -> ReceiptEvidenceAggregation {
+    let mut required_seen = false;
+    let mut required_failure = None;
+    let mut sequence_violation = false;
+    let mut verified = BTreeSet::new();
+    let mut advisory_pass = BTreeSet::new();
+    let mut non_passing = BTreeSet::new();
+
+    for observation in observations {
+        if required_failure.is_some() {
+            sequence_violation = true;
+        }
+        match observation.enforcement {
+            CommandEnforcement::Required => {
+                required_seen = true;
+                if observation.outcome == EvidenceOutcome::Pass {
+                    verified.extend(observation.coverage.iter().cloned());
+                } else {
+                    non_passing.extend(observation.coverage.iter().cloned());
+                    required_failure.get_or_insert(observation.outcome);
+                }
+            }
+            CommandEnforcement::Advisory => {
+                if observation.outcome == EvidenceOutcome::Pass {
+                    advisory_pass.extend(observation.coverage.iter().cloned());
+                } else {
+                    non_passing.extend(observation.coverage.iter().cloned());
+                }
+            }
+        }
+    }
+
+    let outcome = if sequence_violation || !required_seen {
+        EvidenceOutcome::Unknown
+    } else {
+        required_failure.unwrap_or(EvidenceOutcome::Pass)
+    };
+    let not_verified = non_passing
+        .difference(&verified)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let advisory = advisory_pass
+        .difference(&verified)
+        .filter(|dimension| !not_verified.contains(*dimension))
+        .cloned()
+        .collect();
+    ReceiptEvidenceAggregation {
+        outcome,
+        verified,
+        advisory,
+        not_verified,
+    }
+}
+
+/// Local-only Evidence state. It cannot express or imply merge, release, or deployment approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEvidenceState {
+    Insufficient,
+    Failing,
+    Sufficient,
+    Unknown,
+}
+
+/// Policy sufficiency and its explicitly separated local/external gaps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEvidenceEvaluation {
+    state: LocalEvidenceState,
+    satisfied: Vec<String>,
+    not_verified: Vec<String>,
+    external_required: Vec<String>,
+}
+
+impl LocalEvidenceEvaluation {
+    #[must_use]
+    pub const fn state(&self) -> LocalEvidenceState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn satisfied(&self) -> &[String] {
+        &self.satisfied
+    }
+
+    #[must_use]
+    pub fn not_verified(&self) -> &[String] {
+        &self.not_verified
+    }
+
+    #[must_use]
+    pub fn external_required(&self) -> &[String] {
+        &self.external_required
+    }
+}
+
+/// Evaluates required local intents against the newest current Receipt for each intent.
+///
+/// Requirements also named in `external_requirements` remain external and never become locally
+/// satisfiable. Unknown custom requirements stay in `not_verified`. When risk/policy knowledge is
+/// incomplete, the explicit `risk-classification` gap prevents an empty list from looking green.
+#[must_use]
+pub fn evaluate_local_evidence(
+    requirements_complete: bool,
+    evidence_requirements: impl IntoIterator<Item = String>,
+    external_requirements: impl IntoIterator<Item = String>,
+    newest_current_receipts: &BTreeMap<Intent, ReceiptValidity>,
+) -> LocalEvidenceEvaluation {
+    let required = evidence_requirements.into_iter().collect::<BTreeSet<_>>();
+    let external = external_requirements.into_iter().collect::<BTreeSet<_>>();
+    let mut satisfied = BTreeSet::new();
+    let mut not_verified = BTreeSet::new();
+    let mut has_product_failure = false;
+    let mut has_unknown_observation = false;
+
+    for requirement in required.difference(&external) {
+        let Some(intent) = intent_from_requirement(requirement) else {
+            not_verified.insert(requirement.clone());
+            continue;
+        };
+        let Some(validity) = newest_current_receipts.get(&intent) else {
+            not_verified.insert(requirement.clone());
+            continue;
+        };
+        if validity.is_current_passing_local_observation() {
+            satisfied.insert(requirement.clone());
+            continue;
+        }
+        not_verified.insert(requirement.clone());
+        if validity.dependency_validity() == DependencyValidity::Current {
+            match validity.outcome() {
+                EvidenceOutcome::ProductFailure => has_product_failure = true,
+                EvidenceOutcome::InfrastructureFailure
+                | EvidenceOutcome::Inconclusive
+                | EvidenceOutcome::TimedOut
+                | EvidenceOutcome::Interrupted
+                | EvidenceOutcome::Unknown => has_unknown_observation = true,
+                EvidenceOutcome::Pass => {
+                    if validity.applicability() == ReceiptApplicability::Unknown {
+                        has_unknown_observation = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !requirements_complete {
+        not_verified.insert(String::from("risk-classification"));
+    }
+    let state = if !requirements_complete || has_unknown_observation {
+        LocalEvidenceState::Unknown
+    } else if has_product_failure {
+        LocalEvidenceState::Failing
+    } else if not_verified.is_empty() {
+        LocalEvidenceState::Sufficient
+    } else {
+        LocalEvidenceState::Insufficient
+    };
+    LocalEvidenceEvaluation {
+        state,
+        satisfied: satisfied.into_iter().collect(),
+        not_verified: not_verified.into_iter().collect(),
+        external_required: external.into_iter().collect(),
+    }
+}
+
+const fn intent_from_requirement(requirement: &str) -> Option<Intent> {
+    match requirement.as_bytes() {
+        b"setup" => Some(Intent::Setup),
+        b"format-check" => Some(Intent::FormatCheck),
+        b"format" => Some(Intent::Format),
+        b"check" => Some(Intent::Check),
+        b"fix" => Some(Intent::Fix),
+        b"test" => Some(Intent::Test),
+        b"verify" => Some(Intent::Verify),
+        b"build" => Some(Intent::Build),
+        _ => None,
+    }
+}
+
 /// The receipt facts needed by the pure validity evaluator.
 ///
 /// Fields remain private so callers use the complete constructor. The authoritative builder owns
@@ -712,16 +973,20 @@ fn push_unknown(dependency_reasons: &mut Vec<DependencyReason>, dependency: Evid
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use super::{
-        ApplicabilityReason, BaseTaskDependency, DependencyReason, DependencyValidity,
-        DependencyValue, EvidenceDependency, EvidenceDependencyFingerprint, EvidenceOutcome,
-        ExecutionDependencyFingerprint, JsonErrorStatus, ProcessOutcomeInput, ReceiptApplicability,
-        ReceiptValidityInput, evaluate_receipt_validity, normalize_evidence_outcome,
+        ApplicabilityReason, BaseTaskDependency, CommandEvidenceObservation, DependencyReason,
+        DependencyValidity, DependencyValue, EvidenceDependency, EvidenceDependencyFingerprint,
+        EvidenceOutcome, ExecutionDependencyFingerprint, JsonErrorStatus, LocalEvidenceState,
+        ProcessOutcomeInput, ReceiptApplicability, ReceiptValidity, ReceiptValidityInput,
+        aggregate_command_evidence, evaluate_local_evidence, evaluate_receipt_validity,
+        normalize_evidence_outcome,
     };
+    use crate::domain::CommandEnforcement;
     use crate::ports::{ProcessErrorKind, ProcessObservation};
-    use crate::{Mutability, SuccessPredicate};
+    use crate::{CoverageDimension, Intent, Mutability, SuccessPredicate};
     use forge_schema::{Digest, RepoId};
 
     type FingerprintMutation = fn(&mut EvidenceDependencyFingerprint);
@@ -760,6 +1025,11 @@ mod tests {
     ) -> ReceiptValidityInput {
         let scope_before = dependencies.scope.clone();
         ReceiptValidityInput::new(dependencies, scope_before, mutability, outcome)
+    }
+
+    fn validity(outcome: EvidenceOutcome, mutability: Mutability) -> ReceiptValidity {
+        let current = fingerprint();
+        evaluate_receipt_validity(&receipt(current.clone(), mutability, outcome), &current)
     }
 
     fn process_observation(exit_code: Option<i32>, stdout_total_bytes: u64) -> ProcessObservation {
@@ -1477,6 +1747,147 @@ mod tests {
             &[ApplicabilityReason::MutabilityUnknown]
         );
         assert!(!validity.is_current_passing_local_observation());
+    }
+
+    #[test]
+    fn advisory_failure_stays_visible_without_failing_required_receipt() {
+        let aggregation = aggregate_command_evidence(&[
+            CommandEvidenceObservation::new(
+                CommandEnforcement::Required,
+                EvidenceOutcome::Pass,
+                [CoverageDimension::Compile],
+            ),
+            CommandEvidenceObservation::new(
+                CommandEnforcement::Advisory,
+                EvidenceOutcome::ProductFailure,
+                [CoverageDimension::Lint],
+            ),
+        ]);
+
+        assert_eq!(aggregation.outcome(), EvidenceOutcome::Pass);
+        assert_eq!(
+            aggregation.verified(),
+            &[CoverageDimension::Compile].into_iter().collect()
+        );
+        assert!(aggregation.advisory().is_empty());
+        assert_eq!(
+            aggregation.not_verified(),
+            &[CoverageDimension::Lint].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn passing_advisory_coverage_is_separate_from_verified_coverage() {
+        let aggregation = aggregate_command_evidence(&[
+            CommandEvidenceObservation::new(
+                CommandEnforcement::Required,
+                EvidenceOutcome::Pass,
+                [CoverageDimension::Compile],
+            ),
+            CommandEvidenceObservation::new(
+                CommandEnforcement::Advisory,
+                EvidenceOutcome::Pass,
+                [CoverageDimension::Lint],
+            ),
+        ]);
+
+        assert_eq!(aggregation.outcome(), EvidenceOutcome::Pass);
+        assert_eq!(
+            aggregation.advisory(),
+            &[CoverageDimension::Lint].into_iter().collect()
+        );
+        assert!(aggregation.not_verified().is_empty());
+    }
+
+    #[test]
+    fn advisory_only_and_post_failure_sequences_fail_closed() {
+        let advisory_only = aggregate_command_evidence(&[CommandEvidenceObservation::new(
+            CommandEnforcement::Advisory,
+            EvidenceOutcome::Pass,
+            [CoverageDimension::Lint],
+        )]);
+        let post_failure = aggregate_command_evidence(&[
+            CommandEvidenceObservation::new(
+                CommandEnforcement::Required,
+                EvidenceOutcome::ProductFailure,
+                [CoverageDimension::Compile],
+            ),
+            CommandEvidenceObservation::new(
+                CommandEnforcement::Required,
+                EvidenceOutcome::Pass,
+                [CoverageDimension::UnitTest],
+            ),
+        ]);
+
+        assert_eq!(advisory_only.outcome(), EvidenceOutcome::Unknown);
+        assert_eq!(post_failure.outcome(), EvidenceOutcome::Unknown);
+    }
+
+    #[test]
+    fn local_sufficiency_never_consumes_external_requirements() {
+        let receipts = BTreeMap::from([(
+            Intent::Check,
+            validity(EvidenceOutcome::Pass, Mutability::ReadOnly),
+        )]);
+
+        let evaluation = evaluate_local_evidence(
+            true,
+            [String::from("check"), String::from("protected-ci")],
+            [String::from("protected-ci")],
+            &receipts,
+        );
+
+        assert_eq!(evaluation.state(), LocalEvidenceState::Sufficient);
+        assert_eq!(evaluation.satisfied(), ["check"]);
+        assert!(evaluation.not_verified().is_empty());
+        assert_eq!(evaluation.external_required(), ["protected-ci"]);
+    }
+
+    #[test]
+    fn current_product_failure_beats_missing_requirements() {
+        let receipts = BTreeMap::from([(
+            Intent::Check,
+            validity(EvidenceOutcome::ProductFailure, Mutability::ReadOnly),
+        )]);
+
+        let evaluation = evaluate_local_evidence(
+            true,
+            [String::from("check"), String::from("test")],
+            Vec::new(),
+            &receipts,
+        );
+
+        assert_eq!(evaluation.state(), LocalEvidenceState::Failing);
+        assert_eq!(evaluation.not_verified(), ["check", "test"]);
+    }
+
+    #[test]
+    fn incomplete_risk_or_inconclusive_current_receipt_is_unknown() {
+        let receipts = BTreeMap::from([(
+            Intent::Check,
+            validity(EvidenceOutcome::Inconclusive, Mutability::ReadOnly),
+        )]);
+        let incomplete = evaluate_local_evidence(false, Vec::new(), Vec::new(), &BTreeMap::new());
+        let inconclusive =
+            evaluate_local_evidence(true, [String::from("check")], Vec::new(), &receipts);
+
+        assert_eq!(incomplete.state(), LocalEvidenceState::Unknown);
+        assert_eq!(incomplete.not_verified(), ["risk-classification"]);
+        assert_eq!(inconclusive.state(), LocalEvidenceState::Unknown);
+        assert_eq!(inconclusive.not_verified(), ["check"]);
+    }
+
+    #[test]
+    fn custom_local_requirement_remains_an_explicit_gap() {
+        let evaluation = evaluate_local_evidence(
+            true,
+            [String::from("real-database-integration")],
+            Vec::new(),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(evaluation.state(), LocalEvidenceState::Insufficient);
+        assert_eq!(evaluation.not_verified(), ["real-database-integration"]);
     }
 
     #[test]
