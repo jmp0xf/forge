@@ -1143,28 +1143,28 @@ fn next_on_unborn_changes_is_deterministic_read_only_and_never_executes_commands
 }
 
 #[test]
-fn next_does_not_call_a_committed_repository_idle_without_an_approved_base()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = TestWorkspace::clean_runner_repository("next-base-unknown")?;
+fn next_uses_the_builtin_policy_when_head_has_no_config() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = TestWorkspace::clean_runner_repository("next-head-config-absent")?;
     let before = fixture.snapshot()?;
 
     let output = fixture.run_forge(&["next", "--json"])?;
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let document: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(document["schema"], "forge.next/v1");
-    assert_eq!(document["data"]["state"], "unknown");
-    assert_eq!(document["data"]["required_action"], "run-doctor");
+    assert_eq!(document["data"]["state"], "idle");
+    assert_eq!(document["data"]["required_action"], "none");
     assert_eq!(document["data"]["risk"]["level"], "unknown");
     assert!(
         document["data"]["uncertain_assumptions"]
             .as_array()
-            .is_some_and(|assumptions| assumptions.iter().any(|assumption| {
-                assumption["provenance"].as_array().is_some_and(|sources| {
+            .is_some_and(|assumptions| assumptions.iter().all(|assumption| {
+                assumption["provenance"].as_array().is_none_or(|sources| {
                     sources
                         .iter()
-                        .any(|source| source == "navigation.approved-base-unknown.v1")
+                        .all(|source| source != "navigation.approved-base-unknown.v1")
                 })
             }))
     );

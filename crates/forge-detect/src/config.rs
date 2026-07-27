@@ -268,15 +268,7 @@ where
             },
         });
     }
-    if text.binary {
-        return Err(ConfigError::Load {
-            reason: ConfigLoadError::Binary,
-        });
-    }
-    let input = std::str::from_utf8(&text.bytes).map_err(|_| ConfigError::Load {
-        reason: ConfigLoadError::InvalidUtf8,
-    })?;
-    parse_forge_config(input).map(Some)
+    parse_forge_config_bytes(&text.bytes, text.binary).map(Some)
 }
 
 fn map_config_read_error(error: InventoryError) -> ConfigError {
@@ -305,6 +297,26 @@ pub fn parse_forge_config(input: &str) -> Result<ForgeConfig, ConfigError> {
         span: error.span(),
     })?;
     raw.validate()
+}
+
+/// Parses bounded raw configuration bytes obtained from an immutable Git blob.
+///
+/// The caller remains responsible for applying the byte bound before retaining the input. This
+/// helper keeps binary and UTF-8 handling identical between the worktree and commit snapshots.
+pub fn parse_forge_config_blob(bytes: &[u8]) -> Result<ForgeConfig, ConfigError> {
+    parse_forge_config_bytes(bytes, bytes.contains(&0))
+}
+
+fn parse_forge_config_bytes(bytes: &[u8], binary: bool) -> Result<ForgeConfig, ConfigError> {
+    if binary {
+        return Err(ConfigError::Load {
+            reason: ConfigLoadError::Binary,
+        });
+    }
+    let input = std::str::from_utf8(bytes).map_err(|_| ConfigError::Load {
+        reason: ConfigLoadError::InvalidUtf8,
+    })?;
+    parse_forge_config(input)
 }
 
 /// Preserves the zero-configuration state without synthesizing a default file.
@@ -737,7 +749,7 @@ mod tests {
     use super::{
         CONFIG_SCHEMA_V1, ConfigError, ConfigLoadError, DEFAULT_MAX_CONFIG_FILE_BYTES, RiskLevel,
         load_default_forge_config, load_forge_config_at, parse_forge_config,
-        parse_optional_forge_config,
+        parse_forge_config_blob, parse_optional_forge_config,
     };
 
     #[derive(Debug, Clone)]
@@ -745,6 +757,32 @@ mod tests {
         Value(BoundedText),
         Io(io::ErrorKind),
         Git(GitErrorKind),
+    }
+
+    #[test]
+    fn immutable_blob_parser_uses_the_same_strict_text_contract() {
+        assert_eq!(
+            parse_forge_config_blob(b"schema = 1\n")
+                .ok()
+                .map(|config| config.schema),
+            Some(CONFIG_SCHEMA_V1)
+        );
+        assert!(matches!(
+            parse_forge_config_blob(b"schema = 1\0"),
+            Err(ConfigError::Load {
+                reason: ConfigLoadError::Binary
+            })
+        ));
+        assert!(matches!(
+            parse_forge_config_blob(b"schema = 1\n# \xff"),
+            Err(ConfigError::Load {
+                reason: ConfigLoadError::InvalidUtf8
+            })
+        ));
+        assert!(matches!(
+            parse_forge_config_blob(b"schema = 1\nunknown = true\n"),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[derive(Debug)]

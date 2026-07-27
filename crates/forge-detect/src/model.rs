@@ -8,14 +8,17 @@ use std::time::Duration;
 
 use forge_core::ports::{FileSystemPort, GitPort, Hasher, ProcessPort};
 use forge_core::{
-    Assumption, CommandSource, CommandSpec, Confidence, Diagnostic, GitError, GitFileSet, Intent,
-    InvalidCommandResolution, Inventory, InventoryError, InventoryKind, InventoryOptions,
-    ProjectModel, ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance,
+    Assumption, CommandSource, CommandSpec, Confidence, Diagnostic, GitError, GitErrorKind,
+    GitFileSet, Intent, InvalidCommandResolution, Inventory, InventoryError, InventoryKind,
+    InventoryOptions, ProjectModel, ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance,
     RelativePathError, RepoRelativePath, Severity,
 };
 
 use crate::assets::{AssetDiscoveryError, StandardAssetDiscovery, discover_standard_assets};
-use crate::config::{ConfigError, ForgeConfig, load_default_forge_config, load_forge_config_at};
+use crate::config::{
+    ConfigError, DEFAULT_MAX_CONFIG_FILE_BYTES, ForgeConfig, load_default_forge_config,
+    load_forge_config_at, parse_forge_config_blob,
+};
 use crate::go::{
     GoProvider, GoProviderContext, GoProviderError, GoProviderIssue, GoProviderIssueKind,
 };
@@ -82,6 +85,41 @@ pub struct NavigationSnapshot {
     /// Known lower-bound content used by risk/navigation, paired with explicit base completeness.
     pub effective_policy: forge_core::EffectivePolicyContent,
     pub policy_base_completeness: PolicyBaseCompleteness,
+    /// Digest of built-in policy plus accepted HEAD policy; never includes candidate changes.
+    pub policy_base_digest: Option<forge_core::Digest>,
+    /// Typed source or failure for the immutable policy predecessor.
+    pub policy_base_origin: PolicyBaseOrigin,
+}
+
+/// How the immutable policy predecessor was resolved for this detection snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyBaseOrigin {
+    /// An unborn repository has no predecessor commit; the built-in minimum is the complete base.
+    Unborn,
+    /// The selected config path is absent from the exact baseline commit.
+    HeadConfigAbsent,
+    /// A regular config blob was read and validated from the exact baseline commit.
+    HeadConfig,
+    /// Repository status did not provide an immutable commit to query.
+    HeadUnavailable,
+    /// Git could not safely read the selected path from the baseline commit.
+    HeadReadFailed { kind: GitErrorKind },
+    /// The bounded baseline blob was present but not a valid Forge configuration.
+    HeadConfigMalformed,
+}
+
+impl PolicyBaseOrigin {
+    #[must_use]
+    pub const fn completeness(self) -> PolicyBaseCompleteness {
+        match self {
+            Self::Unborn | Self::HeadConfigAbsent | Self::HeadConfig => {
+                PolicyBaseCompleteness::Complete
+            }
+            Self::HeadUnavailable | Self::HeadReadFailed { .. } | Self::HeadConfigMalformed => {
+                PolicyBaseCompleteness::Unknown
+            }
+        }
+    }
 }
 
 impl NavigationSnapshot {
@@ -185,6 +223,7 @@ pub fn detect_project_model(
         &repository.facts.root,
         options.config_path.as_ref(),
     )?;
+    let policy_base = load_policy_base_config(git, &repository, &config_path);
     let runners = scan_runners(
         filesystem,
         &repository.facts.root,
@@ -198,12 +237,118 @@ pub fn detect_project_model(
         standard_assets,
         PolicyAssemblyInput {
             config,
+            base_config: policy_base.config,
+            base_origin: policy_base.origin,
+            base_diagnostic: policy_base.diagnostic,
             config_path: &config_path,
             hasher,
         },
         runners,
         language,
     )
+}
+
+#[derive(Debug)]
+struct PolicyBaseLoad {
+    config: Option<ForgeConfig>,
+    origin: PolicyBaseOrigin,
+    diagnostic: Option<Diagnostic>,
+}
+
+fn load_policy_base_config<G>(
+    git: &G,
+    repository: &RepositoryDetection,
+    config_path: &RepoRelativePath,
+) -> PolicyBaseLoad
+where
+    G: GitPort + ?Sized,
+{
+    let Some(head) = repository.facts.head.as_ref() else {
+        let origin = if repository.facts.work_state == forge_core::WorkState::Unborn {
+            PolicyBaseOrigin::Unborn
+        } else {
+            PolicyBaseOrigin::HeadUnavailable
+        };
+        return PolicyBaseLoad {
+            config: None,
+            origin,
+            diagnostic: policy_base_diagnostic(origin, &repository.facts.root),
+        };
+    };
+    match git.read_commit_file_bounded(
+        &repository.facts.root,
+        head.as_git_object_id(),
+        config_path,
+        DEFAULT_MAX_CONFIG_FILE_BYTES,
+    ) {
+        Ok(None) => PolicyBaseLoad {
+            config: None,
+            origin: PolicyBaseOrigin::HeadConfigAbsent,
+            diagnostic: None,
+        },
+        Ok(Some(bytes)) => match parse_forge_config_blob(&bytes) {
+            Ok(config) => PolicyBaseLoad {
+                config: Some(config),
+                origin: PolicyBaseOrigin::HeadConfig,
+                diagnostic: None,
+            },
+            Err(_) => {
+                let origin = PolicyBaseOrigin::HeadConfigMalformed;
+                PolicyBaseLoad {
+                    config: None,
+                    origin,
+                    diagnostic: policy_base_diagnostic(origin, &repository.facts.root),
+                }
+            }
+        },
+        Err(error) => {
+            let origin = PolicyBaseOrigin::HeadReadFailed { kind: error.kind() };
+            PolicyBaseLoad {
+                config: None,
+                origin,
+                diagnostic: policy_base_diagnostic(origin, &repository.facts.root),
+            }
+        }
+    }
+}
+
+fn policy_base_diagnostic(origin: PolicyBaseOrigin, root: &Path) -> Option<Diagnostic> {
+    let (code, what, why, next) = match origin {
+        PolicyBaseOrigin::Unborn
+        | PolicyBaseOrigin::HeadConfigAbsent
+        | PolicyBaseOrigin::HeadConfig => return None,
+        PolicyBaseOrigin::HeadUnavailable => (
+            "FGE2227",
+            "the immutable policy base is unavailable",
+            "repository status did not provide an exact baseline commit",
+            "repair Git status access before relying on reusable evidence",
+        ),
+        PolicyBaseOrigin::HeadReadFailed { kind } => (
+            "FGE2227",
+            "the immutable policy base could not be read",
+            match kind {
+                GitErrorKind::OutputLimit => {
+                    "the baseline config blob exceeded its bounded read limit"
+                }
+                _ => "the exact baseline commit path could not be read safely",
+            },
+            "repair the Git repository or baseline config path before relying on reusable evidence",
+        ),
+        PolicyBaseOrigin::HeadConfigMalformed => (
+            "FGE2228",
+            "the immutable policy base is malformed",
+            "the baseline config blob failed strict schema or text validation",
+            "repair and commit the selected Forge configuration before relying on reusable evidence",
+        ),
+    };
+    Some(Diagnostic::new(
+        code,
+        Severity::Warning,
+        what,
+        root.display().to_string(),
+        why,
+        next,
+    ))
 }
 
 fn load_config<F>(
@@ -530,6 +675,9 @@ fn go_issue_reason(kind: GoProviderIssueKind) -> &'static str {
 
 struct PolicyAssemblyInput<'a> {
     config: Option<ForgeConfig>,
+    base_config: Option<ForgeConfig>,
+    base_origin: PolicyBaseOrigin,
+    base_diagnostic: Option<Diagnostic>,
     config_path: &'a RepoRelativePath,
     hasher: &'a dyn Hasher,
 }
@@ -544,6 +692,9 @@ fn assemble_project_model(
 ) -> Result<ModelDetectionOutcome, ModelDetectionError> {
     let PolicyAssemblyInput {
         config,
+        base_config,
+        base_origin,
+        base_diagnostic,
         config_path,
         hasher,
     } = policy_input;
@@ -570,9 +721,9 @@ fn assemble_project_model(
         language_default,
     })
     .map_err(ModelDetectionError::CommandResolution)?;
-    let policy_base_completeness =
-        policy_base_completeness(repository.facts.work_state, repository.facts.head.is_some());
+    let policy_base_completeness = base_origin.completeness();
     let policy_resolution = resolve_effective_policy(
+        base_config.as_ref(),
         config.as_ref(),
         config_path,
         policy_base_completeness,
@@ -602,6 +753,7 @@ fn assemble_project_model(
     model.units = language.units;
     model.commands = commands;
     model.diagnostics = repository_diagnostics;
+    model.diagnostics.extend(base_diagnostic);
     model.diagnostics.extend(language.diagnostics);
     model.assumptions = language.assumptions;
     let model = model
@@ -617,6 +769,8 @@ fn assemble_project_model(
             config_path: config_path.clone(),
             effective_policy: policy_resolution.effective,
             policy_base_completeness,
+            policy_base_digest: policy_resolution.policy_base_digest,
+            policy_base_origin: base_origin,
         },
     })
 }
@@ -634,17 +788,6 @@ fn model_detection_completion(
         ModelDetectionCompletion::Partial
     } else {
         ModelDetectionCompletion::Complete
-    }
-}
-
-fn policy_base_completeness(
-    work_state: forge_core::WorkState,
-    has_head: bool,
-) -> PolicyBaseCompleteness {
-    if work_state == forge_core::WorkState::Unborn && !has_head {
-        PolicyBaseCompleteness::Complete
-    } else {
-        PolicyBaseCompleteness::Unknown
     }
 }
 
@@ -806,6 +949,7 @@ mod tests {
         BoundedText, BranchHead, BranchOid, BranchStatus, CommandResolution, Confidence,
         CoverageDimension, Digest, GitFileSet, GitObjectFormat, InventoryEntry, Mutability,
         NetworkIntent, PathKind, PorcelainV2Status, RepoFacts, RepoId, SuccessPredicate, WorkState,
+        parse_status_porcelain_v2,
     };
     use serde_json::json;
 
@@ -840,6 +984,7 @@ mod tests {
     struct ModelGit {
         file_set: GitFileSet,
         status: PorcelainV2Status,
+        head_file: Result<Option<Vec<u8>>, GitError>,
     }
 
     impl GitPort for ModelGit {
@@ -861,6 +1006,16 @@ mod tests {
 
         fn file_set(&self, _root: &Path) -> Result<GitFileSet, GitError> {
             Ok(self.file_set.clone())
+        }
+
+        fn read_commit_file_bounded(
+            &self,
+            _root: &Path,
+            _commit: &forge_core::GitObjectId,
+            _path: &RepoRelativePath,
+            _max_bytes: u64,
+        ) -> Result<Option<Vec<u8>>, GitError> {
+            self.head_file.clone()
         }
     }
 
@@ -1013,7 +1168,15 @@ mod tests {
                 },
                 entries: Vec::new(),
             },
+            head_file: Ok(None),
         })
+    }
+
+    fn committed_status() -> Result<PorcelainV2Status, forge_core::PorcelainV2ParseError> {
+        parse_status_porcelain_v2(
+            b"# branch.oid 1111111111111111111111111111111111111111\0# branch.head main\0",
+            GitObjectFormat::Sha1,
+        )
     }
 
     /// Opaque placeholder: these model-provider tests do not consume process-output digests.
@@ -1114,6 +1277,9 @@ mod tests {
             standard_assets,
             PolicyAssemblyInput {
                 config: config.cloned(),
+                base_config: None,
+                base_origin: PolicyBaseOrigin::Unborn,
+                base_diagnostic: None,
                 config_path: &RepoRelativePath::new("forge.toml").map_err(|source| {
                     ModelDetectionError::InvalidInventoryPath {
                         path: PathBuf::from("forge.toml"),
@@ -1130,13 +1296,6 @@ mod tests {
             language,
         )
         .map(|outcome| outcome.model)
-    }
-
-    fn policy_completeness_for_fixture(
-        work_state: WorkState,
-        has_head: bool,
-    ) -> PolicyBaseCompleteness {
-        policy_base_completeness(work_state, has_head)
     }
 
     #[test]
@@ -1339,6 +1498,7 @@ enforcement = "advisory"
             outcome.navigation.policy_base_completeness,
             PolicyBaseCompleteness::Complete
         );
+        assert!(outcome.navigation.policy_base_digest.is_some());
         assert_eq!(outcome.navigation.effective_policy.rules().len(), 9);
         assert!(outcome.model.policy.digest.is_some());
         assert_eq!(outcome.model.policy.confidence, Confidence::High);
@@ -1374,6 +1534,136 @@ enforcement = "advisory"
                 .skip(1)
                 .any(|command| command.program == "go" || command.program == "gofmt")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_head_config_is_the_complete_non_weakenable_policy_base()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
+        let mut git = model_git(&inventory)?;
+        git.status = committed_status()?;
+        git.head_file = Ok(Some(
+            br#"
+schema = 1
+[[risk]]
+id = "risk/accepted-head"
+level = "high"
+paths = ["accepted/**"]
+external = ["owner-review"]
+"#
+            .to_vec(),
+        ));
+        let filesystem = ModelFileSystem::new(inventory);
+        let process = ModelProcess::default();
+
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(outcome.completion, ModelDetectionCompletion::Complete);
+        assert_eq!(
+            outcome.navigation.policy_base_origin,
+            PolicyBaseOrigin::HeadConfig
+        );
+        assert_eq!(
+            outcome.navigation.policy_base_completeness,
+            PolicyBaseCompleteness::Complete
+        );
+        assert!(outcome.navigation.policy_base_digest.is_some());
+        assert_eq!(outcome.model.policy.confidence, Confidence::High);
+        let rule = outcome
+            .navigation
+            .effective_policy
+            .rule("risk/accepted-head")
+            .ok_or("accepted HEAD rule was not retained")?;
+        assert_eq!(rule.level(), forge_core::RiskLevel::High);
+        assert!(rule.external_requirements().contains("owner-review"));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_head_config_uses_a_complete_builtin_base() -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
+        let mut git = model_git(&inventory)?;
+        git.status = committed_status()?;
+        git.head_file = Ok(None);
+        let outcome = detect_project_model(
+            Path::new("/repo"),
+            &git,
+            &ModelFileSystem::new(inventory),
+            &ModelProcess::default(),
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+        )?;
+
+        assert_eq!(
+            outcome.navigation.policy_base_origin,
+            PolicyBaseOrigin::HeadConfigAbsent
+        );
+        assert_eq!(
+            outcome.navigation.policy_base_completeness,
+            PolicyBaseCompleteness::Complete
+        );
+        assert_eq!(outcome.model.policy.confidence, Confidence::High);
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_or_malformed_head_config_is_typed_unknown_without_breaking_detection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
+        for (head_file, expected_origin, diagnostic_code) in [
+            (
+                Err(GitError::new(
+                    GitErrorKind::Io,
+                    "read-commit-file",
+                    "fixture failure",
+                )),
+                PolicyBaseOrigin::HeadReadFailed {
+                    kind: GitErrorKind::Io,
+                },
+                "FGE2227",
+            ),
+            (
+                Ok(Some(b"not valid toml = [".to_vec())),
+                PolicyBaseOrigin::HeadConfigMalformed,
+                "FGE2228",
+            ),
+        ] {
+            let mut git = model_git(&inventory)?;
+            git.status = committed_status()?;
+            git.head_file = head_file;
+            let outcome = detect_project_model(
+                Path::new("/repo"),
+                &git,
+                &ModelFileSystem::new(inventory.clone()),
+                &ModelProcess::default(),
+                &ModelHasher,
+                &ModelDetectionOptions::default(),
+            )?;
+
+            assert_eq!(outcome.completion, ModelDetectionCompletion::Complete);
+            assert_eq!(outcome.navigation.policy_base_origin, expected_origin);
+            assert_eq!(
+                outcome.navigation.policy_base_completeness,
+                PolicyBaseCompleteness::Unknown
+            );
+            assert_eq!(outcome.navigation.policy_base_digest, None);
+            assert_eq!(outcome.model.policy.confidence, Confidence::Unknown);
+            assert!(
+                outcome
+                    .model
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code.as_str() == diagnostic_code)
+            );
+        }
         Ok(())
     }
 
@@ -1523,17 +1813,28 @@ enforcement = "advisory"
     }
 
     #[test]
-    fn only_an_unborn_repository_has_a_complete_policy_base() {
+    fn policy_base_origin_distinguishes_complete_and_failed_sources() {
         assert_eq!(
-            policy_completeness_for_fixture(WorkState::Unborn, false),
+            PolicyBaseOrigin::Unborn.completeness(),
             PolicyBaseCompleteness::Complete
         );
         assert_eq!(
-            policy_completeness_for_fixture(WorkState::Clean, true),
+            PolicyBaseOrigin::HeadConfigAbsent.completeness(),
+            PolicyBaseCompleteness::Complete
+        );
+        assert_eq!(
+            PolicyBaseOrigin::HeadConfig.completeness(),
+            PolicyBaseCompleteness::Complete
+        );
+        assert_eq!(
+            PolicyBaseOrigin::HeadReadFailed {
+                kind: GitErrorKind::Io,
+            }
+            .completeness(),
             PolicyBaseCompleteness::Unknown
         );
         assert_eq!(
-            policy_completeness_for_fixture(WorkState::Unknown, false),
+            PolicyBaseOrigin::HeadConfigMalformed.completeness(),
             PolicyBaseCompleteness::Unknown
         );
     }
