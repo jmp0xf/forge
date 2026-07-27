@@ -1,0 +1,5 @@
+schema = 1
+
+[project]
+# These are inert detection corpora, not buildable units of the Forge repository itself.
+exclude = ["fixtures/**"]

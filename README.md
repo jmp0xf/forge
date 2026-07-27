@@ -2,45 +2,114 @@
 
 Forge is a repository-native, executor-neutral engineering runtime layer for humans and coding agents.
 It discovers the repository's own build and verification interface, produces minimal host adapters,
-computes the next verifiable action, and is designed to record scope-bound local evidence. It does **not** own project
-build logic, call an LLM, run an agent loop, or replace independent CI and approval.
+computes the next verifiable action, and records scope-bound local evidence. It does **not** own project build logic,
+call an LLM, run an agent loop, or replace independent CI and approval.
 
 This repository contains:
 
 - the accepted implementation design in [`docs/design-proposal.md`](docs/design-proposal.md);
-- the initial architecture decision records in [`docs/adr/`](docs/adr/);
-- a Rust workspace that fixes crate boundaries before implementation;
-- thin `AGENTS.md` and `CLAUDE.md` entry points;
-- a CI skeleton whose main verification path uses Cargo directly and does not depend on a built Forge binary.
+- accepted architecture decisions and supersession history in [`docs/adr/`](docs/adr/);
+- the six-crate Rust implementation and repository-only `xtask`;
+- checked-in JSON Schemas, public fixtures, fuzz corpora, and human-output snapshots;
+- thin `AGENTS.md` and `CLAUDE.md` entry points; and
+- a candidate-controlled CI definition whose Cargo verification path does not depend on a built Forge binary.
 
 ## Status
 
-M0 through M5 are implemented. Forge now provides typed contracts and diagnostics, hardened Git/filesystem/process
-boundaries, Rust and Go project-model detection, deterministic command resolution, minimal managed-block `init`, host
-adapter drift/sync, `doctor`, and the read-only `next` reducer with effective-policy, risk, and bounded context output.
+The local M0-M6 implementation surface is present. Forge provides versioned contracts and diagnostics; bounded
+Git/filesystem/process/state ports; Rust, Go, mixed-repository, and existing-runner detection; deterministic command
+resolution; managed-block `init`; host-adapter drift/sync; `doctor`; `next`; `explain`; and Receipt/Evidence v2.
 
-M6 Receipt/Evidence foundations are in progress. The accepted design does not yet define a trustworthy comparison
-base for committed repositories and the published Receipt v1 shape cannot represent every invalidation dimension
-required by the accepted ADRs. Until those contracts are resolved, committed-repository navigation remains explicitly
-`unknown` and evidence commands fail closed instead of claiming that local observations are sufficient. Explicit
-runner/CI generation also remains disabled because its generated-file contracts are not frozen.
+`forge evidence run` executes a resolved project intent and stores an immutable worktree-local Receipt. `show` and
+`verify` recompute current applicability without creating state, while `export` persists and emits a versioned local
+Evidence bundle. Receipt validity binds repository, scope, command, toolchain, environment, policy, comparison, and
+Forge behavior dependencies. Receipt/Evidence v1 remain readable only as historical, non-proving observations. Local
+Evidence always remains separate from CI, review, merge, deployment, and release authority.
 
-See the [v0 implementation status](docs/v0-implementation-status.md) for the exact implemented boundary and the
-decisions required before the public Evidence surface can be enabled.
+`init` remains a dry-run by default and does not generate a runner unless explicitly requested. The implemented
+`--with-runner make|just|task` path adds only a reviewable managed `verify` target backed by already resolved native
+commands. CI generation remains unavailable, even when requested, and fails explicitly rather than guessing a provider
+contract.
 
-## Bootstrap commands
+The in-repository parts of M7 include the complete 28-fixture public matrix, checked-in schemas and instance validation,
+human-output goldens, a public two-binary compatibility harness that serves as the N-1 skeleton, four fuzz targets and
+seed corpora, a bounded mutation configuration, a 100,000-file opt-in benchmark, and an `init --dry-run --json`
+dogfood fixed-point test. The harness has not been run against a released predecessor, and these assets do not prove
+that the current candidate passed independent CI, review, release, signing, cross-platform validation, or the
+physically separate authority set required by the design.
+
+See the [v0 implementation status](docs/v0-implementation-status.md) for the precise local boundary and remaining
+release and authority work.
+
+## Install from source
+
+Forge is not published from this workspace (`publish = false`). Rust 1.85 is the declared MSRV, but the current
+candidate still requires release verification on Rust 1.85. To install from a reviewed checkout:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo run -p forge-cli -- version
-cargo run -p forge-cli -- version --json
-cargo run -p forge-cli -- schema
-cargo run -p xtask -- check-schemas
+cargo install --locked --path crates/forge-cli
+forge version
+forge schema
 ```
 
-Rust 2024 Edition is required. The declared MSRV is Rust 1.85; CI should test both 1.85 and current stable.
+To run the checkout without installing it:
+
+```bash
+cargo run --locked -p forge-cli -- version
+cargo run --locked -p forge-cli -- --help
+```
+
+Installation only places the `forge` binary in Cargo's configured binary directory. It does not initialize a
+repository, install project tools, or modify dependencies.
+
+## First use in a repository
+
+```bash
+# Preview the minimal integration plan; this is the default and writes nothing.
+forge init
+
+# Apply the reviewed plan. A dirty worktree requires the separate --allow-dirty acknowledgement.
+forge init --apply
+
+# Optionally preview a project-native runner; none is generated by default.
+forge init --with-runner make
+
+# Run and inspect local evidence.
+forge evidence run test
+forge evidence show
+forge evidence verify
+forge evidence export
+```
+
+Use `forge explain` to inspect detection provenance, `forge doctor` for environment and contract readiness,
+`forge next` for the next deterministic action, and `forge adapters check|sync` for generated host projections.
+`--json` selects one versioned machine document; `--no-cache` bypasses the reusable inventory cache.
+
+Forge keeps worktree-specific Receipt/Evidence state under that worktree's private Git directory and keeps only
+eligible content-addressed inventory data under the Git common directory. It never creates a committed `.forge/`
+working-tree directory.
+
+## Verify a checkout
+
+Run the required local Cargo gates from the repository root and report their exact exit codes:
+
+```bash
+RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check
+RUSTUP_AUTO_INSTALL=0 cargo check --workspace --all-targets
+RUSTUP_AUTO_INSTALL=0 cargo clippy --workspace --all-targets -- -D warnings
+RUSTUP_AUTO_INSTALL=0 cargo test --workspace --no-fail-fast
+
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --all-targets)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --no-fail-fast)
+
+RUSTUP_AUTO_INSTALL=0 cargo run -p xtask -- check-schemas
+```
+
+Rust 2024 Edition is required and the declared MSRV is Rust 1.85. Verification on Rust 1.85 remains required before
+release. A local pass is necessary evidence for the current worktree, but it is not proof of the required CI matrix,
+independent review, or release approval. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for focused fixture, compatibility, dogfood, fuzz, mutation, and performance checks.
 
 ## Repository shape
 
@@ -52,6 +121,8 @@ crates/forge-detect   repository, runner, Rust, and Go discovery
 crates/forge-render   managed blocks, change plans, and host adapter rendering
 crates/forge-cli      binary composition, I/O discipline, and exit-code mapping
 xtask                 schema export, fixture generation, and compatibility checks
+fixtures              versioned public fixture definitions and generated repositories
+fuzz                   separate cargo-fuzz workspace and regression corpora
 ```
 
 The stable interface of projects analyzed by Forge remains their own commands (`cargo`, `go`, `make`, `just`,
@@ -59,10 +130,9 @@ The stable interface of projects analyzed by Forge remains their own commands (`
 
 ## Current implementation boundary
 
-The implemented command surface is `init`, `doctor`, `next`, `adapters`, `explain`, `schema`, `version`, and
-`completions`. `init --with-runner`, `init --with-ci`, and every `evidence` subcommand report explicit unsupported
-boundaries rather than generating or validating contracts that the accepted design has not fixed. `improve` and
-`evolve` are intentionally not v0 commands; controlled improvement candidates and bounded self-hosting remain later
-version work.
+The implemented command surface is `init`, `doctor`, `next`, `evidence run|show|verify|export`,
+`adapters sync|check`, `explain`, `schema`, `version`, and `completions`. Explicit local runner generation is
+implemented; CI generation is not. `improve`, `evolve`, external-attestation import, release orchestration, and model
+integration are intentionally outside v0.
 
 Do not add a feature that changes an accepted decision without an ADR that supersedes the relevant record.
