@@ -52,6 +52,12 @@ impl ScopeObjectId {
     pub const fn object_format(&self) -> GitObjectFormat {
         self.object_format
     }
+
+    /// Returns the canonical full object ID for versioned comparison contracts.
+    #[must_use]
+    pub fn lowercase_hex(&self) -> &[u8] {
+        &self.lowercase_hex
+    }
 }
 
 /// The repository's known `HEAD` state.
@@ -626,6 +632,10 @@ mod tests {
 
     #[test]
     fn object_format_is_canonical_and_repository_wide() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            ScopeObjectId::new(GitObjectFormat::Sha1, &[b'A'; 40])?.lowercase_hex(),
+            &[b'a'; 40]
+        );
         let lowercase = scope(
             ScopeHead::Commit(sha1(b'a')?),
             vec![entry(
