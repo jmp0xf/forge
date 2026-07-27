@@ -833,24 +833,43 @@ mod tests {
         )?)
     }
 
-    fn current_validity(outcome: EvidenceOutcome) -> ReceiptValidity {
+    fn validity_with_scope(
+        outcome: EvidenceOutcome,
+        recorded_scope: &str,
+        current_scope: &str,
+    ) -> ReceiptValidity {
         let known = |value: &str| DependencyValue::Known(Digest::from(value));
-        let scope = known("scope:current");
-        let dependencies = EvidenceDependencyFingerprint::new(
-            DependencyValue::Known(RepoId::from("repo:fixture")),
-            scope.clone(),
-            ExecutionDependencyFingerprint::new(
-                known("command:current"),
-                known("toolchain:current"),
-                known("environment:current"),
-            ),
-            known("policy:current"),
-            BaseTaskDependency::Known(Digest::from("base-task:current")),
-            known("forge-behavior:current"),
+        let dependencies_for_scope = |scope: &str| {
+            EvidenceDependencyFingerprint::new(
+                DependencyValue::Known(RepoId::from("repo:fixture")),
+                known(scope),
+                ExecutionDependencyFingerprint::new(
+                    known("command:current"),
+                    known("toolchain:current"),
+                    known("environment:current"),
+                ),
+                known("policy:current"),
+                BaseTaskDependency::Known(Digest::from("base-task:current")),
+                known("forge-behavior:current"),
+            )
+        };
+        let recorded_dependencies = dependencies_for_scope(recorded_scope);
+        let current_dependencies = dependencies_for_scope(current_scope);
+        let receipt = ReceiptValidityInput::new(
+            recorded_dependencies,
+            known(recorded_scope),
+            Mutability::ReadOnly,
+            outcome,
         );
-        let receipt =
-            ReceiptValidityInput::new(dependencies.clone(), scope, Mutability::ReadOnly, outcome);
-        evaluate_receipt_validity(&receipt, &dependencies)
+        evaluate_receipt_validity(&receipt, &current_dependencies)
+    }
+
+    fn current_validity(outcome: EvidenceOutcome) -> ReceiptValidity {
+        validity_with_scope(outcome, "scope:current", "scope:current")
+    }
+
+    fn stale_validity(outcome: EvidenceOutcome) -> ReceiptValidity {
+        validity_with_scope(outcome, "scope:recorded", "scope:current")
     }
 
     fn current_receipts(
@@ -1078,6 +1097,36 @@ mod tests {
         let multiple_missing = decision(multiple_missing)?;
         assert_eq!(multiple_missing.state(), NavigationState::PartiallyVerified);
         assert_eq!(multiple_missing.intent(), Some(Intent::Test));
+        Ok(())
+    }
+
+    #[test]
+    fn current_failure_is_not_masked_by_an_earlier_stale_failure() -> TestResult {
+        let mut observed = input(true)?;
+        observed
+            .commands
+            .insert(Intent::Test, command_set(Intent::Test)?);
+        observed.receipts = ReceiptObservation::current(
+            true,
+            [String::from("check"), String::from("test")],
+            Vec::new(),
+            BTreeMap::from([
+                (
+                    Intent::Check,
+                    stale_validity(EvidenceOutcome::ProductFailure),
+                ),
+                (
+                    Intent::Test,
+                    current_validity(EvidenceOutcome::ProductFailure),
+                ),
+            ]),
+            vec![provenance("receipts.stale-and-current")],
+        )?;
+
+        let observed = decision(observed)?;
+        assert_eq!(observed.state(), NavigationState::ChecksFailing);
+        assert_eq!(observed.action(), NavigationAction::FixFailures);
+        assert_eq!(observed.intent(), Some(Intent::Test));
         Ok(())
     }
 

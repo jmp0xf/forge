@@ -535,7 +535,6 @@ fn validate_receipt_bindings<'a>(
             for summary in &evidence.valid_receipts {
                 let reference = receipt_reference(EvidenceStateVersion::V2, summary.id.as_str())?;
                 let receipt = require_indexed_receipt(&index, &reference)?;
-                complete &= receipt.complete;
                 // The v2 semantic validator makes `can_support_current_evidence` false for every
                 // unknown or incomplete contract fact, and `binding_fact` derives `complete` from
                 // that same predicate. Check the proving predicate once instead of maintaining two
@@ -2741,6 +2740,39 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_output_sentinels_require_a_typed_process_failure() -> TestResult {
+        let (unavailable_stdout, unavailable_stderr) =
+            forge_core::fingerprint::process_output_unavailable_digests(
+                &forge_runtime::hash::Blake3Hasher,
+            );
+
+        for (pointer, digest) in [
+            (
+                "/data/observations/0/stdout_digest",
+                unavailable_stdout.as_str(),
+            ),
+            (
+                "/data/observations/0/stderr_digest",
+                unavailable_stderr.as_str(),
+            ),
+        ] {
+            let mut receipt = receipt_value(json!([]))?;
+            *receipt
+                .pointer_mut(pointer)
+                .ok_or_else(|| std::io::Error::other("output digest pointer is missing"))? =
+                json!(digest);
+            receipt = sign(receipt, DocumentKind::Receipt)?;
+
+            assert_eq!(
+                JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &bytes(&receipt)?),
+                Err(forge_runtime::state::EvidenceStateDecodeError::Malformed),
+                "an unavailable sentinel without process_error_kind was accepted: {pointer}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn typed_process_boundary_failure_rejects_incoherent_fields() -> TestResult {
         let mutations = [
             ("/data/observations/0/raw_exit_code", json!(1)),
@@ -3384,6 +3416,11 @@ mod tests {
             loaded_receipt_v2.binding_fact(),
             loaded_receipt_v1.binding_fact(),
         ];
+        assert_eq!(
+            receipt_facts[0].complete,
+            loaded_receipt_v2.can_support_current_evidence(),
+            "a v2 binding has one proving-completeness predicate",
+        );
         let bindings = validate_evidence_receipt_bindings(&loaded_evidence, &receipt_facts)?;
         assert_eq!(bindings.references().len(), 2);
         assert!(bindings.is_complete());
@@ -3540,6 +3577,16 @@ mod tests {
             validate_evidence_receipt_bindings(&loaded_evidence, [&valid_fact, &stale_fact])?;
         assert!(bindings.is_complete());
 
+        let mut incomplete_valid = valid_fact.clone();
+        incomplete_valid.complete = false;
+        let bindings =
+            validate_evidence_receipt_bindings(&loaded_evidence, [&incomplete_valid, &stale_fact])?;
+        assert_eq!(bindings.references().len(), 2);
+        assert!(
+            !bindings.is_complete(),
+            "an incomplete v1 valid Receipt must keep the complete binding set non-proving",
+        );
+
         let mut wrong_intent = valid_fact.clone();
         wrong_intent.intent = IntentData::Build;
         assert_eq!(
@@ -3583,6 +3630,20 @@ mod tests {
         assert_eq!(
             prepare_evidence(evidence, &receipt_facts),
             Err(forge_runtime::state::EvidenceStateDecodeError::InvalidReference)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_evidence_rejects_a_public_receipt_id_reused_across_schema_versions() -> TestResult {
+        let receipt_id = format!("receipt:blake3:{}", "a".repeat(64));
+        let mut evidence = evidence_value(&receipt_id, json!([]))?;
+        evidence["data"]["stale_receipts"][0]["id"] = json!(receipt_id);
+        let evidence: Envelope<EvidenceV2Data> = serde_json::from_value(evidence)?;
+
+        assert_eq!(
+            super::validate_evidence_v2_semantics(&evidence.data),
+            Err(forge_runtime::state::EvidenceStateDecodeError::InvalidReference),
         );
         Ok(())
     }
@@ -3716,6 +3777,31 @@ mod tests {
 
     #[test]
     fn incomplete_top_or_observation_log_refs_force_conservative_retention() -> TestResult {
+        let mut receipt = receipt_value(json!([]))?;
+        receipt["data"]["observations"][0]["log_refs"] = json!([{
+            "display": "known explicit unknown observation log",
+            "encoding": "unknown"
+        }]);
+        receipt = sign(receipt, DocumentKind::Receipt)?;
+        let object_name = super::parse_public_id(
+            receipt["data"]["id"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::other("receipt id is not a string"))?,
+            super::RECEIPT_ID_PREFIX,
+        )?;
+        let raw = bytes(&receipt)?;
+        let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &raw)?;
+        assert!(!loaded.has_unknown_contract_content());
+        assert!(!loaded.can_support_current_evidence());
+        assert_eq!(
+            JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &raw)?,
+            ReceiptRetentionMetadata::with_log_reference_closure(
+                object_name,
+                EvidenceRetentionTime::Current(parse_utc_rfc3339("2026-07-27T00:00:00Z")?),
+                ReferenceClosure::RetainAll,
+            )
+        );
+
         let mut receipt = receipt_value(json!([]))?;
         receipt["data"]["observations"][0]["log_refs"] = json!([{
             "display": "future opaque observation log",

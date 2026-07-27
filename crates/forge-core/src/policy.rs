@@ -105,12 +105,7 @@ impl PathPattern {
 
     #[must_use]
     pub fn matches(&self, repository_relative_utf8_path: &str) -> bool {
-        if repository_relative_utf8_path.is_empty()
-            || repository_relative_utf8_path.starts_with('/')
-            || repository_relative_utf8_path
-                .split('/')
-                .any(|part| part.is_empty())
-        {
+        if repository_relative_utf8_path.split('/').any(str::is_empty) {
             return false;
         }
 
@@ -451,12 +446,13 @@ fn matches_segments(
         path_index == path.len()
     } else if pattern[pattern_index] == "**" {
         matches_segments(pattern, path, pattern_index + 1, path_index, memo)
-            || (path_index < path.len()
+            || (path.get(path_index).is_some()
                 && matches_segments(pattern, path, pattern_index, path_index + 1, memo))
-    } else {
-        path_index < path.len()
-            && matches_segment(pattern[pattern_index], path[path_index])
+    } else if let Some(path_segment) = path.get(path_index) {
+        matches_segment(pattern[pattern_index], path_segment)
             && matches_segments(pattern, path, pattern_index + 1, path_index + 1, memo)
+    } else {
+        false
     };
     memo.insert((pattern_index, path_index), result);
     result

@@ -545,6 +545,27 @@ mod tests {
                 ))
                 .all(|provenance| !provenance.detail.contains("proved"))
         );
+        let path_detail = |rule_id: &str| {
+            assessment
+                .provenance
+                .iter()
+                .find(|provenance| {
+                    provenance.rule_id == rule_id && provenance.source_path.is_some()
+                })
+                .map(|provenance| provenance.detail.as_str())
+        };
+        assert_eq!(
+            path_detail("risk/test-weakening"),
+            Some(
+                "path matches a test or lint surface; this does not establish that assertions, tests, or lint were weakened"
+            )
+        );
+        assert_eq!(
+            path_detail("risk/public-api"),
+            Some(
+                "path matches a conventional API surface; this does not establish that its public contract changed"
+            )
+        );
         Ok(())
     }
 
@@ -578,11 +599,21 @@ mod tests {
         let assessment = assess_risk(&policy, &paths(&["docs/guide.md"])?);
         assert_eq!(assessment.level, RiskLevel::Unknown);
         assert_eq!(assessment.evidence_requirements, ["check"]);
+        let unknown_risk_assumptions = assessment
+            .uncertain_assumptions
+            .iter()
+            .filter(|assumption| assumption.statement.contains("unknown risk level"))
+            .collect::<Vec<_>>();
+        assert_eq!(unknown_risk_assumptions.len(), 1);
+        assert_eq!(
+            unknown_risk_assumptions[0].statement,
+            "effective rule `risk/unknown` matched but has an unknown risk level"
+        );
         assert!(
-            assessment
-                .uncertain_assumptions
+            unknown_risk_assumptions[0]
+                .provenance
                 .iter()
-                .any(|assumption| assumption.statement.contains("unknown risk level"))
+                .all(|provenance| provenance.rule_id == "risk/unknown")
         );
         Ok(())
     }
