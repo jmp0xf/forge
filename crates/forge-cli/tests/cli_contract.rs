@@ -1179,6 +1179,134 @@ fn init_apply_is_brownfield_safe_and_second_plan_is_empty() -> Result<(), Box<dy
 
 #[cfg(unix)]
 #[test]
+fn init_postcheck_rejects_changed_repository_layout_after_verified_apply()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = TestWorkspace::clean_rust_repository("init-postcheck-layout-changed")?;
+    let real_git = executable_on_path("git")?;
+    let alternate_worktree = fixture.root.join("support/alternate-worktree");
+    fs::create_dir(&alternate_worktree)?;
+    let mut init_alternate = ProcessCommand::new(&real_git);
+    init_alternate
+        .current_dir(&alternate_worktree)
+        .args(["init", "--quiet"]);
+    fixture.configure_git_environment(&mut init_alternate);
+    let initialized = init_alternate.output()?;
+    assert!(
+        initialized.status.success(),
+        "alternate git init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&initialized.stdout),
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let wrapper_directory = fixture.root.join("support/layout-bin");
+    fs::create_dir(&wrapper_directory)?;
+    let wrapper = wrapper_directory.join("git");
+    let agents = fixture.worktree.join("AGENTS.md");
+    let switched = fixture.root.join("support/layout-switched");
+    let alternate_git_dir = alternate_worktree.join(".git");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ -f {agents} ]; then\n  if [ ! -f {switched} ]; then printf '%s\\n' switched > {switched}; fi\n  exec {real_git} --git-dir={alternate_git_dir} --work-tree={worktree} \"$@\"\nfi\nexec {real_git} \"$@\"\n",
+        agents = shell_single_quote(&agents)?,
+        switched = shell_single_quote(&switched)?,
+        real_git = shell_single_quote(&real_git)?,
+        alternate_git_dir = shell_single_quote(&alternate_git_dir)?,
+        worktree = shell_single_quote(&fixture.worktree)?,
+    );
+    fs::write(&wrapper, script)?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+
+    let output =
+        fixture.run_forge_with_path_prefix(&["init", "--apply", "--json"], &wrapper_directory)?;
+
+    assert_json_diagnostic_failure(&output, 70, "FGE0210")?;
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let diagnostic = &required_array(&document, "diagnostics")?[0];
+    assert_eq!(diagnostic["where"], "init post-check");
+    assert!(
+        diagnostic["why"].as_str().is_some_and(|why| {
+            why.contains("apply report: written=[")
+                && why.contains("AGENTS.md(kind=create")
+                && why.contains("verified=true")
+        }),
+        "post-apply write progress was missing: {diagnostic:#}"
+    );
+    assert!(
+        diagnostic["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("treat the reported write progress as authoritative"))
+    );
+    assert!(
+        switched.is_file(),
+        "the post-apply Git layout was never selected"
+    );
+    assert!(
+        agents.is_file(),
+        "the verified apply was unexpectedly rolled back"
+    );
+    assert!(
+        !fixture.generated_manifest_path()?.exists(),
+        "repository-layout failure must precede adapter-manifest persistence"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn init_postcheck_rejects_nonconvergent_output_after_verified_apply()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = TestWorkspace::clean_rust_repository("init-postcheck-nonconvergent")?;
+    let wrapper_directory = fixture.root.join("support/nonconvergent-bin");
+    fs::create_dir(&wrapper_directory)?;
+    let wrapper = wrapper_directory.join("git");
+    let agents = fixture.worktree.join("AGENTS.md");
+    let changed = fixture.root.join("support/agents-changed-after-apply");
+    let real_git = executable_on_path("git")?;
+    let injected = b"# Concurrent edit after Forge apply\n";
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ -f {agents} ] && [ ! -f {changed} ]; then\n  printf '%s\\n' changed > {changed}\n  printf '%s\\n' '# Concurrent edit after Forge apply' > {agents}\nfi\nexec {real_git} \"$@\"\n",
+        agents = shell_single_quote(&agents)?,
+        changed = shell_single_quote(&changed)?,
+        real_git = shell_single_quote(&real_git)?,
+    );
+    fs::write(&wrapper, script)?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+
+    let output =
+        fixture.run_forge_with_path_prefix(&["init", "--apply", "--json"], &wrapper_directory)?;
+
+    assert_json_diagnostic_failure(&output, 70, "FGE0211")?;
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let diagnostic = &required_array(&document, "diagnostics")?[0];
+    assert_eq!(diagnostic["where"], "init post-check");
+    assert!(
+        diagnostic["why"].as_str().is_some_and(|why| {
+            why.contains("a fresh detection still planned edits for [AGENTS.md]")
+                && why.contains("apply report: written=[")
+                && why.contains("AGENTS.md(kind=create")
+                && why.contains("verified=true")
+        }),
+        "post-check convergence or write progress was missing: {diagnostic:#}"
+    );
+    assert!(
+        diagnostic["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("treat the reported write progress as authoritative"))
+    );
+    assert!(changed.is_file(), "the post-apply edit was never injected");
+    assert_eq!(fs::read(&agents)?, injected);
+    assert!(
+        !fixture.generated_manifest_path()?.exists(),
+        "convergence failure must precede adapter-manifest persistence"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn portable_script_command_is_identical_in_model_receipt_and_agents()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = TestWorkspace::clean_rust_repository("portable-script-command")?;
