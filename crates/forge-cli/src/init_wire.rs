@@ -180,7 +180,7 @@ mod tests {
         AdapterTarget, ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, FileEditReason,
         ManagedBlockKind, RollbackPlan, SkippedChange, SkippedReason,
     };
-    use forge_schema::{ConfidenceData, FileEditData, PathEncoding};
+    use forge_schema::{ConfidenceData, FileEditData};
 
     use super::{InitPlanWireError, project_init_plan_to_wire};
 
@@ -297,6 +297,8 @@ mod tests {
     fn preserves_non_utf8_repository_and_edit_paths() -> Result<(), Box<dyn Error>> {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
+
+        use forge_schema::PathEncoding;
 
         let root = PathBuf::from(OsString::from_vec(b"/repo-\xff".to_vec()));
         let edit_path = RepoRelativePath::new(OsString::from_vec(b"AGENTS-\xfe.md".to_vec()))?;

@@ -189,6 +189,10 @@ struct PreparedEdit {
 ///
 /// Each file replacement is atomic through `RepositoryFilePort`; multiple targets are not one OS
 /// transaction. Any write or verification failure returns an `ApplyError` with partial progress.
+// `ApplyError` deliberately retains the typed source, target path, and recovery ledger. Its
+// Windows ABI crosses Clippy's size heuristic; boxing the public error would change the API and
+// add an allocation to every failure path.
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 pub fn apply_change_plan<F, H>(
     repository_root: &Path,
     plan: &ChangePlan,
@@ -347,6 +351,9 @@ fn initial_report(edits: &[&FileEdit]) -> ApplyReport {
     }
 }
 
+// Keep the same concrete error as `apply_change_plan`: it carries the preimage/recovery context
+// needed to diagnose a failed all-files preflight, and only its Windows ABI exceeds the heuristic.
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 fn preflight_edit<F, H>(
     repository_root: &Path,
     edit: &FileEdit,

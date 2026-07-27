@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use forge_core::UnlimitedOperationControl;
 use forge_core::domain::{
     CommandSource, CommandSpec, Confidence, Intent, Mutability, NetworkIntent,
@@ -815,7 +815,7 @@ fn map_index_read_error(operation: GitOperation, error: GitIndexReadError) -> Gi
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn read_index_snapshot_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, GitError> {
     read_index_snapshot_file_controlled(path, max_bytes, &UnlimitedOperationControl)
 }
@@ -828,7 +828,7 @@ fn read_index_snapshot_file_controlled(
     read_index_snapshot_file_after_inspection_controlled(path, max_bytes, control, || Ok(()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn read_index_snapshot_file_after_inspection<F>(
     path: &Path,
     max_bytes: usize,
@@ -1333,8 +1333,12 @@ mod tests {
         INDEX_PATH_ARGS, OBJECT_FORMAT_ARGS, STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS,
         UNTRACKED_FILES_ARGS, checked_stdout, classify_command_failure, hardened_git_environment,
         indexed_git_config_key, modification_times_differ_or_are_unobservable,
-        parse_absolute_git_path, parse_blob_size, parse_exact_tree_blob, parse_index_snapshot_path,
-        parse_object_format, read_index_snapshot_file, read_index_snapshot_file_after_inspection,
+        parse_absolute_git_path, parse_blob_size, parse_exact_tree_blob, parse_object_format,
+    };
+    #[cfg(unix)]
+    use super::{
+        parse_index_snapshot_path, read_index_snapshot_file,
+        read_index_snapshot_file_after_inspection,
     };
 
     #[test]

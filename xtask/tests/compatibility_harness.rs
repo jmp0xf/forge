@@ -1,10 +1,12 @@
 //! CLI-level checks for the public N-1 compatibility harness.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 #[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[test]
 fn diff_plans_requires_both_explicit_binaries() -> Result<(), Box<dyn std::error::Error>> {

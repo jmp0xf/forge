@@ -506,9 +506,7 @@ mod tests {
     use forge_core::RepoRelativePath;
     use tempfile::tempdir;
 
-    use super::{
-        InventoryKind, InventoryOptions, build_non_git_filesystem_inventory, read_bounded_text,
-    };
+    use super::{InventoryOptions, build_non_git_filesystem_inventory, read_bounded_text};
 
     #[test]
     fn inventory_respects_gitignore_and_generated_directory_boundaries()
@@ -553,6 +551,8 @@ mod tests {
     #[test]
     fn symlink_is_inventoried_but_never_followed() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
+
+        use super::InventoryKind;
 
         let directory = tempdir()?;
         let outside = tempdir()?;

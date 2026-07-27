@@ -1,6 +1,8 @@
 //! Per-worktree state layout, atomic storage, and process locking.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 

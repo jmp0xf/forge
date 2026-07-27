@@ -452,7 +452,6 @@ fn append_length_prefixed(output: &mut Vec<u8>, value: &[u8]) {
 mod tests {
     use std::cell::Cell;
     use std::error::Error;
-    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use forge_schema::Digest;
@@ -788,6 +787,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_utf8_paths_are_lossless_and_distinct_from_lossy_display() -> Result<(), Box<dyn Error>> {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
         let native = PathBuf::from(OsString::from_vec(b"src/bad-\xff.rs".to_vec()));

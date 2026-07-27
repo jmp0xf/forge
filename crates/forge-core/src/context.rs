@@ -384,7 +384,7 @@ fn native_path_bytes(value: &OsStr) -> usize {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use crate::{Confidence, Provenance, RepoRelativePath};
 
@@ -613,6 +613,7 @@ mod tests {
     fn non_utf8_paths_sort_by_native_bytes() -> Result<(), Box<dyn Error>> {
         use std::ffi::OsString;
         use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::path::PathBuf;
 
         let paths = [vec![0xff], vec![0xfe]];
         let candidates = paths

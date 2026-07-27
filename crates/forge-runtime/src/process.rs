@@ -1707,7 +1707,7 @@ mod tests {
     use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
     use std::process::Command as ProcessCommand;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1719,10 +1719,12 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    #[cfg(target_vendor = "apple")]
+    use super::platform;
     use super::{
-        DEFAULT_OUTPUT_LIMIT_BYTES, ExecutableAvailability, OutputStream, SynchronousProcessRunner,
-        TerminationMode, drain_bounded, is_windows_batch_program, platform,
-        private_anonymous_tempfile, process_environment_dependency_digest, sanitized_environment,
+        DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SynchronousProcessRunner, TerminationMode,
+        drain_bounded, is_windows_batch_program, private_anonymous_tempfile,
+        process_environment_dependency_digest, sanitized_environment,
     };
     use crate::hash::Blake3Hasher;
 
@@ -1752,6 +1754,8 @@ mod tests {
     fn executable_lookup_checks_path_without_running_repository_code() -> Result<(), Box<dyn Error>>
     {
         use std::os::unix::fs::PermissionsExt as _;
+
+        use super::ExecutableAvailability;
 
         let root = tempdir()?;
         let bin = root.path().join("bin");
@@ -2656,6 +2660,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancellation_kills_descendants_without_reporting_timeout() -> Result<(), Box<dyn Error>> {
+        use std::sync::atomic::Ordering;
+
         let root = tempdir()?;
         let heartbeat = root.path().join("cancel-heartbeat");
         let cancellation = Arc::new(AtomicBool::new(false));

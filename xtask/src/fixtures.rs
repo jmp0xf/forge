@@ -786,7 +786,7 @@ mod tests {
 
         let setup = TestDefinitions::new(&[TestFixture::new("alpha", &["safe.txt"])])?;
         fs::create_dir_all(setup.paths.generated.join("alpha"))?;
-        let outside = setup.temporary.path().join("outside.txt");
+        let outside = setup._temporary.path().join("outside.txt");
         fs::write(&outside, b"outside\n")?;
         symlink(&outside, setup.paths.generated.join("alpha/safe.txt"))?;
 
@@ -837,7 +837,7 @@ mod tests {
     }
 
     struct TestDefinitions {
-        temporary: TempDir,
+        _temporary: TempDir,
         paths: FixturePaths,
     }
 
@@ -883,7 +883,7 @@ mod tests {
             }
 
             Ok(Self {
-                temporary,
+                _temporary: temporary,
                 paths: FixturePaths {
                     definitions,
                     generated,

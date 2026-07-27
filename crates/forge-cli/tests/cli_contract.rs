@@ -3,13 +3,17 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Output, Stdio};
+use std::process::{Command as ProcessCommand, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use forge_runtime::state::{AtomicStateStore, GitStateLayout};
 use serde_json::Value;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::time::Duration;
 
 const MODEL_INTENTS: [&str; 8] = [
     "setup",
@@ -53,6 +57,7 @@ const GENERATED_RUNNER_CASES: [(&str, &str, &str); 1] =
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(unix)]
 type PrivateStateSnapshot = Vec<(PathBuf, Vec<u8>)>;
 
 #[cfg(unix)]
@@ -381,6 +386,7 @@ impl TestWorkspace {
         ))
     }
 
+    #[cfg(unix)]
     fn private_state_snapshot(&self) -> Result<PrivateStateSnapshot, Box<dyn std::error::Error>> {
         fn visit(
             root: &Path,
@@ -417,6 +423,7 @@ impl TestWorkspace {
         Ok(entries)
     }
 
+    #[cfg(unix)]
     fn persisted_receipts(&self) -> Result<Vec<(String, Value)>, Box<dyn std::error::Error>> {
         let directory = self.private_forge_state_dir()?.join("receipts/v2");
         if !directory.exists() {

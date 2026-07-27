@@ -1,7 +1,9 @@
 //! Immutable Receipt, Evidence, and log storage with bounded read-only scans and retention.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -2916,6 +2918,7 @@ fn write_new_private_evidence_file(
         )
     })?;
     validate_private_regular_file(&target, &persisted_metadata)?;
+    #[cfg(not(windows))]
     let path_metadata = fs::symlink_metadata(&target).map_err(|source| {
         StateError::io(
             "reinspect persisted immutable evidence object path",
@@ -3531,24 +3534,31 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
+    #[cfg(unix)]
     use forge_core::Digest;
     use tempfile::{TempDir, tempdir};
 
+    #[cfg(unix)]
     use crate::state::{SharedCacheKind, SharedCacheStore, SharedCacheWrite};
 
     use super::{
         AtomicStateStore, EVIDENCE_GC_KEEP_AGE, EVIDENCE_GC_MAX_LOGS, EVIDENCE_OBJECT_MAX_BYTES,
-        EVIDENCE_STATE_MAX_BYTES, EvidenceGcPlan, EvidenceRetentionMetadata, EvidenceRetentionTime,
+        EVIDENCE_STATE_MAX_BYTES, EvidenceRetentionMetadata, EvidenceRetentionTime,
         EvidenceStateDecodeError, EvidenceStateMetadataDecoder, EvidenceStateObjectKind,
-        EvidenceStateObjectName, EvidenceStateVersion, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX,
-        GitStateLayout, PlannedDeletion, RECEIPT_OBJECT_MAX_BYTES, ReceiptRetentionMetadata,
-        ReceiptStateReference, ReferenceClosure, StateError, UtcTimestampError,
-        apply_evidence_gc_plan, ensure_retained_budget, format_utc_rfc3339, log_content_address,
-        parse_utc_rfc3339, preflight_deletions, remove_regular_state_file_with_hook,
-        snapshot_private_state_file, store_new_atomic_idempotent_evidence_with_hook,
-        stream_opened_private_state_file_with_hook, validate_private_evidence_directory,
-        validate_private_regular_file, validate_state_key,
+        EvidenceStateObjectName, EvidenceStateVersion, GitStateLayout, RECEIPT_OBJECT_MAX_BYTES,
+        ReceiptRetentionMetadata, ReceiptStateReference, StateError, UtcTimestampError,
+        ensure_retained_budget, format_utc_rfc3339, log_content_address, parse_utc_rfc3339,
+        stream_opened_private_state_file_with_hook, validate_state_key,
     };
+    #[cfg(unix)]
+    use super::{
+        EvidenceGcPlan, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX, PlannedDeletion,
+        ReferenceClosure, apply_evidence_gc_plan, preflight_deletions,
+        remove_regular_state_file_with_hook, snapshot_private_state_file,
+        store_new_atomic_idempotent_evidence_with_hook,
+    };
+    #[cfg(target_os = "macos")]
+    use super::{validate_private_evidence_directory, validate_private_regular_file};
 
     type FileSystemSnapshot = Vec<(PathBuf, u32, Option<Vec<u8>>)>;
 
@@ -3649,6 +3659,7 @@ mod tests {
         store.load_inner(&relative)
     }
 
+    #[cfg(unix)]
     fn list_immutable_fixture(
         store: &AtomicStateStore,
         directory: &str,
@@ -3685,15 +3696,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-    }
-
-    #[cfg(windows)]
-    fn set_private_test_directory_mode(path: &Path) -> io::Result<()> {
-        super::super::windows::set_owner_only_path(
-            path,
-            super::super::windows_acl_policy::PrivateWindowsObjectKind::Directory,
-        )
-        .map_err(StateError::into_io_error)
     }
 
     #[cfg(windows)]
@@ -4350,8 +4352,6 @@ mod tests {
     #[test]
     fn windows_typed_evidence_state_round_trips_an_idempotent_immutable_log()
     -> Result<(), Box<dyn Error>> {
-        use std::io::Read as _;
-
         let temporary = tempdir()?;
         let git_dir = temporary.path().join("git");
         let common_dir = temporary.path().join("common");
