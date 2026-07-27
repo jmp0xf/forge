@@ -1,5 +1,6 @@
 //! Read-only P1-P9 assembly of the generic v0 project model.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -535,7 +536,7 @@ pub fn detect_project_model_with_cache_controlled(
         project_detection_inventory(&inventory, config.as_ref().map(|config| &config.project));
     let mut language = detect_language_providers(
         &repository,
-        &detection_inventory,
+        detection_inventory.as_ref(),
         &file_set,
         filesystem,
         process,
@@ -571,7 +572,7 @@ pub fn detect_project_model_with_cache_controlled(
             Ok(_) => scan_runners_controlled(
                 filesystem,
                 &repository.facts.root,
-                &detection_inventory,
+                detection_inventory.as_ref(),
                 options.inventory.max_text_file_bytes,
                 control,
             )?,
@@ -774,17 +775,17 @@ fn optional_cache_git_result<T>(
     }
 }
 
-fn project_detection_inventory(
-    inventory: &Inventory,
+fn project_detection_inventory<'a>(
+    inventory: &'a Inventory,
     project: Option<&ProjectConfig>,
-) -> Inventory {
+) -> Cow<'a, Inventory> {
     let Some(project) = project else {
-        return inventory.clone();
+        return Cow::Borrowed(inventory);
     };
     if project.include.is_empty() && project.exclude.is_empty() {
-        return inventory.clone();
+        return Cow::Borrowed(inventory);
     }
-    Inventory {
+    Cow::Owned(Inventory {
         entries: inventory
             .entries
             .iter()
@@ -801,7 +802,7 @@ fn project_detection_inventory(
             })
             .cloned()
             .collect(),
-    }
+    })
 }
 
 fn project_path_selected(path: &Path, project: &ProjectConfig) -> bool {
@@ -2117,6 +2118,23 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_project_detection_borrows_the_authoritative_inventory() {
+        let inventory = model_inventory(&[("Cargo.toml", InventoryKind::File)]);
+
+        let absent = project_detection_inventory(&inventory, None);
+        let unbounded = project_detection_inventory(&inventory, Some(&ProjectConfig::default()));
+
+        assert!(matches!(
+            absent,
+            Cow::Borrowed(selected) if std::ptr::eq(selected, &inventory)
+        ));
+        assert!(matches!(
+            unbounded,
+            Cow::Borrowed(selected) if std::ptr::eq(selected, &inventory)
+        ));
+    }
+
+    #[test]
     fn project_boundaries_filter_provider_and_runner_discovery_without_mutating_inventory()
     -> Result<(), Box<dyn Error>> {
         let inventory = model_inventory(&[
@@ -2132,6 +2150,7 @@ mod tests {
 
         let selected = project_detection_inventory(&inventory, Some(&project));
 
+        assert!(matches!(&selected, Cow::Owned(_)));
         assert_eq!(inventory.entries.len(), 4);
         assert_eq!(
             selected
