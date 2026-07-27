@@ -16,6 +16,7 @@ pub mod inventory;
 pub mod process;
 pub mod scope;
 pub mod state;
+pub mod toolchain;
 
 /// Production runtime composition marker.
 #[derive(Debug, Default, Clone, Copy)]
