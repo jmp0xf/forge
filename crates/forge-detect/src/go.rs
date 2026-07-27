@@ -12,12 +12,11 @@ use forge_core::ports::{ExecSpec, FileSystemPort, Hasher, ProcessPort};
 use forge_core::{
     CommandSource, CommandSpec, Confidence, CoverageDimension, GitFileSet, Intent, Inventory,
     InventoryKind, Mutability, NetworkIntent, OperationControl, OperationControlError, PathKind,
-    ProjectKind, ProjectModel, ProjectUnit, Provenance, RepoRelativePath, SuccessPredicate,
-    ToolchainInfo, UnlimitedOperationControl,
+    ProjectKind, ProjectUnit, Provenance, RepoRelativePath, SuccessPredicate, ToolchainInfo,
+    UnlimitedOperationControl,
 };
 use serde::Deserialize;
 
-use crate::LanguageProvider;
 use crate::resolution::{CommandPlanCandidate, InvalidCommandPlanCandidate};
 
 const PROVIDER_ID: &str = "go";
@@ -157,22 +156,6 @@ impl GoProvider {
         control: &dyn OperationControl,
     ) -> Result<GoProviderResult, GoProviderError> {
         analyze_go(context, control)
-    }
-}
-
-// The generic bootstrap trait remains until the M3 model assembler switches to the typed provider
-// API above. Returning no guessed commands is safer than retaining the old placeholder.
-impl LanguageProvider for GoProvider {
-    fn id(&self) -> &'static str {
-        PROVIDER_ID
-    }
-
-    fn detect(&self, _model: &ProjectModel) -> Vec<ProjectUnit> {
-        Vec::new()
-    }
-
-    fn default_commands(&self, _model: &ProjectModel, _units: &[ProjectUnit]) -> Vec<CommandSpec> {
-        Vec::new()
     }
 }
 

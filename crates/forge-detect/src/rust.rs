@@ -22,7 +22,6 @@ use forge_core::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::LanguageProvider;
 use crate::resolution::{CommandPlanCandidate, InvalidCommandPlanCandidate};
 
 const RUST_UNIT_ID_DOMAIN: &[u8] = b"forge.rust-unit-id/v1";
@@ -1759,28 +1758,6 @@ fn intent_name(intent: Intent) -> &'static str {
         Intent::Test => "test",
         Intent::Verify => "verify",
         Intent::Build => "build",
-    }
-}
-
-impl LanguageProvider for RustProvider {
-    fn id(&self) -> &'static str {
-        "rust"
-    }
-
-    fn detect(&self, _model: &ProjectModel) -> Vec<ProjectUnit> {
-        // The legacy pure trait cannot safely perform metadata I/O. The model assembler calls the
-        // explicit port-bearing `detect_project` API instead.
-        Vec::new()
-    }
-
-    fn default_commands(&self, _model: &ProjectModel, units: &[ProjectUnit]) -> Vec<CommandSpec> {
-        match rust_default_plan_fragments(units) {
-            Ok(plans) => plans
-                .into_iter()
-                .flat_map(|plan| plan.commands().to_vec())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
     }
 }
 
