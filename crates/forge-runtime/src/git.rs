@@ -1680,14 +1680,23 @@ mod tests {
                 .windows(b"[workspace]".len())
                 .any(|window| window == b"[workspace]")
         );
-        assert_eq!(
-            git.read_commit_file_bounded(
+        let committed_forge_config = git
+            .read_commit_file_bounded(
                 &root,
                 &head,
                 &RepoRelativePath::new("forge.toml")?,
                 1024 * 1024,
-            )?,
-            None
+            )?
+            .ok_or("dogfood forge.toml was absent from the committed tree")?;
+        assert!(
+            committed_forge_config
+                .windows(b"schema = 1".len())
+                .any(|window| window == b"schema = 1")
+        );
+        assert!(
+            committed_forge_config
+                .windows(b"exclude = [\"fixtures/**\"]".len())
+                .any(|window| window == b"exclude = [\"fixtures/**\"]")
         );
         assert_eq!(
             git.read_commit_file_bounded(&root, &head, &RepoRelativePath::new("Cargo.toml")?, 1,)
