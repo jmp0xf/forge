@@ -32,5 +32,8 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0016](0016-use-dependency-based-evidence-invalidation.md) | Accepted | Evidence 按依赖变化失效 |
 | [0017](0017-do-not-generate-runner-ci-or-organization-docs-by-default.md) | Accepted | 默认不生成 runner、CI 或组织文档 |
 | [0018](0018-derive-local-repository-identity-from-git-common-dir.md) | Accepted | 从 Git common-dir 派生本地仓库身份 |
+| [0019](0019-use-head-as-the-v0-worktree-comparison-baseline.md) | Accepted | v0 使用 HEAD 作为工作树比较基线 |
+| [0020](0020-version-the-complete-local-evidence-contract.md) | Accepted | 版本化完整的本地 Evidence 契约 |
+| [0021](0021-store-immutable-evidence-with-bounded-retention.md) | Accepted | Evidence 状态使用不可变对象和有界保留 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。
