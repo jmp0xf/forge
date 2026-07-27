@@ -1,0 +1,61 @@
+# Forge's bounded M7 mutation surface. These modules contain the local-evidence state machine,
+# risk classification, Receipt validity, and the same-change policy anti-weakening rules named by
+# the accepted design. Expanding this list is deliberate; an unrestricted workspace run is too
+# expensive to be a useful maintainer feedback loop.
+test_tool = "cargo"
+test_workspace = true
+additional_cargo_args = ["--locked"]
+minimum_test_timeout = 120.0
+build_timeout_multiplier = 4.0
+timeout_multiplier = 4.0
+output = "target/mutants"
+# The workspace contract and dogfood tests intentionally exercise the real Git boundary. Preserve
+# VCS metadata in cargo-mutants' isolated copies so the baseline and every mutant see that same
+# public test surface instead of failing merely because the scratch tree is not a repository.
+copy_vcs = true
+
+examine_globs = [
+  "crates/forge-core/src/evidence.rs",
+  "crates/forge-core/src/navigation.rs",
+  "crates/forge-core/src/policy.rs",
+  "crates/forge-core/src/risk.rs",
+  "crates/forge-detect/src/policy.rs",
+  "crates/forge-cli/src/evidence_state.rs",
+  "crates/forge-cli/src/evidence_state/**/*.rs",
+  "crates/forge-cli/src/evidence_view.rs",
+]
+
+# Mutation is a focused review gate, not a line-coverage contest. Keep the default run on the
+# decision functions named by the v0 design so `cargo mutants` remains a usable maintainer loop.
+# File globs above bound the ownership surface; these regexes select the state transitions and
+# anti-weakening predicates within it.
+examine_re = [
+  "evaluate_receipt_validity",
+  "evaluate_success_predicate",
+  "aggregate_command_evidence",
+  "evaluate_local_evidence",
+  "combine_predicate_outcomes",
+  "normalize_evidence_outcome",
+  "reduce_next",
+  "EffectivePolicyContent::merge_candidate",
+  "matches_segments",
+  "matches_segment",
+  "validate_pattern",
+  "PathPattern::matches",
+  "assess_risk",
+  "add_content_uncertainty",
+  "validate_receipt_v2_semantics",
+  "receipt_dependencies_are_complete",
+  "command_semantics_are_complete",
+  "validate_evidence_v2_semantics",
+  "validate_observation_outcome",
+  "outcome_from_success_predicate",
+  "validate_receipt_bindings",
+  "validate_evidence_receipt_bindings",
+  "requirements_are_complete",
+  "partition_coverage",
+  "require_stable_detection",
+  "require_same_detection_baseline",
+  "require_stable_scope",
+  "crates/forge-detect/src/policy.rs",
+]

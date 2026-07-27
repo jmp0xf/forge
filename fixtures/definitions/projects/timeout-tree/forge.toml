@@ -1,0 +1,15 @@
+schema = 1
+
+[policy]
+default_timeout_seconds = 1
+
+[commands.check]
+program = "forge-fixture-sleep"
+args = ["30"]
+cwd = "."
+inputs = ["**"]
+mutability = "read-only"
+network = "offline-requested"
+success = "exit-zero"
+coverage = ["compile"]
+enforcement = "required"

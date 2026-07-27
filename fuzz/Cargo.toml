@@ -11,11 +11,35 @@ cargo-fuzz = true
 
 [dependencies]
 forge-core = { path = "../crates/forge-core" }
+forge-detect = { path = "../crates/forge-detect" }
+forge-render = { path = "../crates/forge-render" }
+forge-schema = { path = "../crates/forge-schema" }
 libfuzzer-sys = "=0.4.13"
 
 [[bin]]
 name = "parse_status_porcelain_v2"
 path = "fuzz_targets/parse_status_porcelain_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merge_managed_block"
+path = "fuzz_targets/merge_managed_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_forge_config"
+path = "fuzz_targets/parse_forge_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_native_path"
+path = "fuzz_targets/roundtrip_native_path.rs"
 test = false
 doc = false
 bench = false

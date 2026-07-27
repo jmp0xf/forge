@@ -1,0 +1,17 @@
+# Forge local evidence
+
+- operation: export
+- local state: unknown
+- worktree comparison: current HEAD baseline (not a PR or merge approval)
+- evidence object: <EVIDENCE_OBJECT>
+- persisted privately: true
+
+## Current passing receipts (0)
+
+## Historical, stale, or non-passing receipts (0)
+
+## Coverage and gaps
+- verified: none
+- advisory: none
+- not verified: risk-classification
+- external required: none

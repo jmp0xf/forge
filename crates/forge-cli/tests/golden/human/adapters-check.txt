@@ -1,0 +1,5 @@
+mode: check
+detection: complete
+changed: true
+applied: false
+  - codex AGENTS.md block=project-index drift=asset-changed: authoritative project facts render different managed content

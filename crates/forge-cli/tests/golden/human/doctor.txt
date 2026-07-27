@@ -1,0 +1,25 @@
+Forge doctor: fail
+[pass] git.repository: Git repository identity and worktree facts were read successfully
+  next: no repository repair is required
+[pass] git.operation: no conflicting merge or rebase operation is active
+  next: no Git operation repair is required
+[unknown] state.layout: optional private Forge state is absent, so this read-only check cannot prove state writing or exclusive locking
+  next: run `forge init --apply` only when repository integration is desired, then verify the authorized write
+[pass] config.schema: the selected Forge configuration parsed as schema v1
+  next: no configuration repair is required
+[pass] project.units: project unit discovery completed within its configured bounds
+  next: no unit-discovery repair is required
+[pass] project.commands: every v0 command intent is explicitly resolved or absent
+  next: no command-resolution repair is required
+[fail] toolchain.required: required toolchain probes failed: project-command executable (unavailable)
+  next: install or repair the named project tool, then rerun `forge doctor`
+[pass] adapters.drift: this repository has not adopted Forge-managed host adapters
+  next: run `forge init` only when managed adapters are desired
+[unknown] ci.visible: no local GitHub workflow is visible; server-side protection is not observable from this clone
+  next: add or identify CI that invokes the required project-native verification entry, then verify hosting-platform protection
+[unknown] ownership.visible: no conventional CODEOWNERS file is visible
+  next: identify the human authority for protected changes before modifying them
+[pass] path.safety: repository inventory and 1 automatically selected managed target confinement check(s) completed
+  next: no path-safety repair is required
+[pass] process.capability: the compiled runtime provides Unix process-group isolation for timeout and cancellation
+  next: no local process-runtime repair is required
