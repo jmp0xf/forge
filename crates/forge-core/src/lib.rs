@@ -50,8 +50,8 @@ pub use policy::{
 };
 pub use risk::{RiskAssessment, RiskMatch, assess_risk, built_in_policy};
 pub use wire::{
-    ProjectModelWireError, command_detail_v2_to_wire, coverage_dimension_name,
-    evidence_outcome_to_wire, intent_to_wire, local_evidence_state_to_wire,
-    non_satisfying_receipt_validity_v2_to_wire, project_model_to_wire,
-    receipt_dependencies_v2_to_wire,
+    ProjectModelWireError, command_detail_v2_to_wire, comparison_basis_v2_to_wire,
+    coverage_dimension_name, evidence_outcome_to_wire, intent_to_wire,
+    local_evidence_state_to_wire, non_satisfying_receipt_validity_v2_to_wire,
+    project_model_to_wire, receipt_dependencies_v2_to_wire,
 };

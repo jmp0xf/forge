@@ -9,14 +9,16 @@ use forge_schema::{
     AdapterData, AdapterDetailData, AdapterDriftData, AssetData, AssetDetailData, AssumptionData,
     AssumptionDetailData, BaseTaskDependencyV2Data, CommandData, CommandDetailData,
     CommandDetailV2Data, CommandEnforcementData, CommandId, CommandResolutionData, CommandSetData,
-    CommandSourceData, ConfidenceData, DependencyValidityV2Data, DerivationEvidenceData,
-    DigestDependencyV2Data, EvidenceDependencyV2Data, IntentData, InvalidReceiptValidityV2Data,
+    CommandSourceData, ComparisonBaselineV2Data, ComparisonBasisV2Data, ComparisonProtocolV2Data,
+    ConfidenceData, DependencyValidityV2Data, DerivationEvidenceData, DigestDependencyV2Data,
+    EvidenceDependencyV2Data, GitObjectFormatV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
+    GitSha256ObjectIdV2Data, IntentData, InvalidGitObjectIdV2Data, InvalidReceiptValidityV2Data,
     LocalEvidenceStateData, MutabilityData, NativeStringData, NativeStringEncodingData,
     NetworkIntentData, NonSatisfyingReceiptValidityV2Data, OutcomeData, ProjectModelData,
     ProjectUnitData, ProjectUnitDetailData, ProvenanceData, ReceiptApplicabilityV2Data,
     ReceiptDependenciesV2Data, ReceiptValidityReasonV2Data, ReceiptValidityV2Data,
-    RepositoryDependencyV2Data, SuccessPredicateData, TextRangeData, UnitDependencyDetailData,
-    WirePath,
+    RepositoryDependencyV2Data, SuccessPredicateData, TaskAcceptanceV2Data, TextRangeData,
+    UnitDependencyDetailData, WirePath,
 };
 use thiserror::Error;
 
@@ -30,6 +32,8 @@ use crate::evidence::{
     EvidenceDependency, EvidenceDependencyFingerprint, EvidenceOutcome, LocalEvidenceState,
     ReceiptApplicability, ReceiptValidity,
 };
+use crate::git::GitObjectFormat;
+use crate::scope::ScopeHead;
 
 /// A domain model cannot be represented by the additive `forge.model/v1` wire contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -234,6 +238,44 @@ pub fn receipt_dependencies_v2_to_wire(
         base_task: base_task_dependency_to_wire(dependencies.base_task()),
         forge_behavior: digest_dependency_to_wire(dependencies.forge_behavior()),
     }
+}
+
+/// Projects the fixed v0 worktree-comparison basis from an acquired canonical scope.
+///
+/// The baseline comes from the same scope snapshot used by the Receipt, not from a branch name,
+/// upstream, merge base, or other local topology that could be mistaken for authority.
+pub fn comparison_basis_v2_to_wire(
+    head: &ScopeHead,
+    policy_base: &DependencyValue<forge_schema::Digest>,
+) -> Result<ComparisonBasisV2Data, InvalidGitObjectIdV2Data> {
+    let baseline = match head {
+        ScopeHead::Commit(object_id) => {
+            let hexadecimal = std::str::from_utf8(object_id.lowercase_hex())
+                .map_err(|_| InvalidGitObjectIdV2Data)?
+                .to_owned();
+            let commit = match object_id.object_format() {
+                GitObjectFormat::Sha1 => GitObjectIdV2Data::Sha1 {
+                    oid: GitSha1ObjectIdV2Data::new(hexadecimal)?,
+                },
+                GitObjectFormat::Sha256 => GitObjectIdV2Data::Sha256 {
+                    oid: GitSha256ObjectIdV2Data::new(hexadecimal)?,
+                },
+            };
+            ComparisonBaselineV2Data::Head { commit }
+        }
+        ScopeHead::Unborn(format) => ComparisonBaselineV2Data::Unborn {
+            object_format: match format {
+                GitObjectFormat::Sha1 => GitObjectFormatV2Data::Sha1,
+                GitObjectFormat::Sha256 => GitObjectFormatV2Data::Sha256,
+            },
+        },
+    };
+    Ok(ComparisonBasisV2Data {
+        protocol: ComparisonProtocolV2Data::WorktreeV1,
+        baseline,
+        task_acceptance: TaskAcceptanceV2Data::NotApplicable,
+        policy_base_digest: digest_dependency_to_wire(policy_base),
+    })
 }
 
 fn digest_dependency_to_wire(
@@ -738,10 +780,11 @@ mod tests {
     use std::time::Duration;
 
     use forge_schema::{
-        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ConfidenceData,
-        DependencyValidityV2Data, Digest, DigestDependencyV2Data, EvidenceDependencyV2Data,
+        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ComparisonBaselineV2Data,
+        ComparisonProtocolV2Data, ConfidenceData, DependencyValidityV2Data, Digest,
+        DigestDependencyV2Data, EvidenceDependencyV2Data, GitObjectFormatV2Data, GitObjectIdV2Data,
         LanguageId, NativeStringEncodingData, OutcomeData, ReceiptValidityReasonV2Data, RepoId,
-        RepositoryDependencyV2Data, UnitId, WirePath,
+        RepositoryDependencyV2Data, TaskAcceptanceV2Data, UnitId, WirePath,
     };
 
     use crate::domain::{
@@ -755,11 +798,13 @@ mod tests {
         BaseTaskDependency, DependencyValue, EvidenceDependencyFingerprint, EvidenceOutcome,
         ExecutionDependencyFingerprint, ReceiptValidityInput, evaluate_receipt_validity,
     };
+    use crate::git::GitObjectFormat;
     use crate::path::RepoRelativePath;
+    use crate::scope::{ScopeHead, ScopeObjectId};
 
     use super::{
-        ProjectModelWireError, command_detail_v2_to_wire, native_string_data,
-        non_satisfying_receipt_validity_v2_to_wire, project_model_to_wire,
+        ProjectModelWireError, command_detail_v2_to_wire, comparison_basis_v2_to_wire,
+        native_string_data, non_satisfying_receipt_validity_v2_to_wire, project_model_to_wire,
         receipt_dependencies_v2_to_wire,
     };
 
@@ -1414,6 +1459,43 @@ mod tests {
             wire.base_task,
             forge_schema::BaseTaskDependencyV2Data::NotApplicable
         );
+    }
+
+    #[test]
+    fn comparison_basis_uses_the_acquired_head_without_external_topology()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let head = ScopeHead::Commit(ScopeObjectId::new(GitObjectFormat::Sha1, &[b'A'; 40])?);
+
+        let basis = comparison_basis_v2_to_wire(
+            &head,
+            &DependencyValue::Known(Digest::from("policy-base:wire")),
+        )?;
+
+        assert_eq!(basis.protocol, ComparisonProtocolV2Data::WorktreeV1);
+        assert_eq!(basis.task_acceptance, TaskAcceptanceV2Data::NotApplicable);
+        assert_eq!(
+            basis.policy_base_digest,
+            DigestDependencyV2Data::Known(Digest::from("policy-base:wire"))
+        );
+        assert!(matches!(
+            basis.baseline,
+            ComparisonBaselineV2Data::Head {
+                commit: GitObjectIdV2Data::Sha1 { ref oid }
+            } if oid.as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+
+        let unborn = comparison_basis_v2_to_wire(
+            &ScopeHead::Unborn(GitObjectFormat::Sha256),
+            &DependencyValue::Unknown,
+        )?;
+        assert_eq!(
+            unborn.baseline,
+            ComparisonBaselineV2Data::Unborn {
+                object_format: GitObjectFormatV2Data::Sha256
+            }
+        );
+        assert_eq!(unborn.policy_base_digest, DigestDependencyV2Data::Unknown);
+        Ok(())
     }
 
     #[test]
