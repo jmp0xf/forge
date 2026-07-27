@@ -128,7 +128,7 @@ fn navigation_integrity(
         )),
         _ if navigation.policy_base_completeness == PolicyBaseCompleteness::Unknown => Some((
             false,
-            "an approved branch comparison and custom-policy base are unavailable for this committed repository",
+            "the immutable HEAD policy base could not be read and validated for this committed repository",
             "navigation.approved-base-unknown.v1",
         )),
         _ => None,
@@ -435,7 +435,7 @@ fn project_next(
     if detected.navigation.policy_base_completeness == PolicyBaseCompleteness::Unknown {
         assumptions.push(AssumptionData {
             statement: String::from(
-                "the committed repository has no accepted contract for selecting the branch and prior custom-policy base",
+                "the committed repository's immutable HEAD policy base could not be read or validated",
             ),
             provenance: vec![String::from("navigation.approved-base-unknown.v1")],
             confidence: ConfidenceData::Unknown,
