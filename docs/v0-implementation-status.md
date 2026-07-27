@@ -108,6 +108,33 @@ The public fixture and N-1 harness are candidate-controlled self-checks. Special
 is constructed by integration tests and the harness currently uses reviewed Unix process-group
 containment; it fails closed on Windows rather than pretending equivalent Job Object coverage.
 
+## Current local calibration
+
+On 2026-07-27, the ignored release benchmark completed on macOS 26.5.2 arm64 with Rust/Cargo
+1.96.0 against its generated 100,000-committed-file fixture. This is one local observation, not a
+portable performance qualification:
+
+| Measurement | Observed p95 or cold value | Design target | Result |
+|---|---:|---:|---|
+| First inventory | 2,886 ms | < 5,000 ms | met |
+| Cold Forge peak RSS | 129.62 MiB | < 150 MiB | met |
+| `version` | 3 ms | < 50 ms | met |
+| warm `next` | 1,687 ms | < 200 ms | not met |
+| warm `adapters check` | 616 ms | < 300 ms | not met |
+| warm `doctor` | 691 ms | < 3,000 ms | met |
+
+The same fixture measured bare `git status` at 271 ms p95. That host-level lower bound does not
+weaken or redefine Forge's targets; it means this machine cannot qualify the 200 ms `next` target
+and the remaining Forge overhead still requires measurement and reduction on a calibrated runner
+and representative real repositories. The benchmark intentionally reports instead of asserting, so
+its process success must not be described as every performance target passing.
+
+The pre-hardening bounded mutation campaign tested 309 mutants: 272 were caught, 11 survived, 26
+were unviable, and none timed out. Review classified eight survivors as real test gaps and three as
+equivalent or redundant expressions. After the fixes, exact reruns caught all eight real mutants and
+the other three mutation sites were no longer generated. The complete 309-mutant campaign was not
+rerun after those fixes, so this is not a claim that every mutant of the final candidate is caught.
+
 ## Work still required before v0 release
 
 The following boundaries are intentionally not inferred from local implementation or test assets:
@@ -120,14 +147,20 @@ The following boundaries are intentionally not inferred from local implementatio
    ancestor handles against a concurrent untrusted rename. `SECURITY.md` remains authoritative for
    this TOCTOU limitation. A private reporting channel and independent security review are still
    required before public release.
-3. **Cross-platform evidence.** Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64
+3. **Declared MSRV verification.** The workspace declares Rust 1.85, but the local toolchains used
+   for this candidate were Rust 1.96 stable and nightly. Rust 1.85 was not installed or exercised;
+   its workspace build, tests, generated assets, and CLI behavior remain release evidence to obtain.
+4. **Performance qualification.** The local calibration above did not meet the warm `next` or
+   `adapters check` goals. Keep those targets unchanged, separate host Git cost from Forge overhead,
+   and obtain repeatable results on calibrated release runners and representative real repositories.
+5. **Cross-platform evidence.** Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64
    build/E2E/process/path matrices have not been proven by this local worktree. Windows Job Object,
    UNC/wide-path, case, ACL, and native replacement behavior require their actual platform tests.
-4. **Independent CI and review.** A checked-in workflow is candidate-controlled configuration, not
+6. **Independent CI and review.** A checked-in workflow is candidate-controlled configuration, not
    proof that required CI ran or that maintainers reviewed and approved the result.
-5. **Distribution and release.** Version selection, packaging, SBOM, checksums, signing, publishing,
+7. **Distribution and release.** Version selection, packaging, SBOM, checksums, signing, publishing,
    provenance, rollback, and release ownership remain unimplemented or externally unauthorized.
-6. **No self-authorization claim.** v0 remains ordinary dogfooding: candidate-controlled tests and
+8. **No self-authorization claim.** v0 remains ordinary dogfooding: candidate-controlled tests and
    the public N-1 harness are reviewable self-checks, not final authority. Held-out tests and the
    physically separate Authority Set are v0.3 requirements rather than v0 release blockers; they
    must exist before Forge can claim trusted self-hosting. Independent CI, review, release,
