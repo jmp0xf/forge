@@ -7,12 +7,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use forge_schema::{
     AdapterData, AdapterDetailData, AdapterDriftData, AssetData, AssetDetailData, AssumptionData,
-    AssumptionDetailData, CommandData, CommandDetailData, CommandDetailV2Data,
-    CommandEnforcementData, CommandId, CommandResolutionData, CommandSetData, CommandSourceData,
-    ConfidenceData, DerivationEvidenceData, IntentData, MutabilityData, NativeStringData,
-    NativeStringEncodingData, NetworkIntentData, ProjectModelData, ProjectUnitData,
-    ProjectUnitDetailData, ProvenanceData, SuccessPredicateData, TextRangeData,
-    UnitDependencyDetailData, WirePath,
+    AssumptionDetailData, BaseTaskDependencyV2Data, CommandData, CommandDetailData,
+    CommandDetailV2Data, CommandEnforcementData, CommandId, CommandResolutionData, CommandSetData,
+    CommandSourceData, ConfidenceData, DependencyValidityV2Data, DerivationEvidenceData,
+    DigestDependencyV2Data, EvidenceDependencyV2Data, IntentData, InvalidReceiptValidityV2Data,
+    LocalEvidenceStateData, MutabilityData, NativeStringData, NativeStringEncodingData,
+    NetworkIntentData, NonSatisfyingReceiptValidityV2Data, OutcomeData, ProjectModelData,
+    ProjectUnitData, ProjectUnitDetailData, ProvenanceData, ReceiptApplicabilityV2Data,
+    ReceiptDependenciesV2Data, ReceiptValidityReasonV2Data, ReceiptValidityV2Data,
+    RepositoryDependencyV2Data, SuccessPredicateData, TextRangeData, UnitDependencyDetailData,
+    WirePath,
 };
 use thiserror::Error;
 
@@ -20,6 +24,11 @@ use crate::domain::{
     CommandEnforcement, CommandResolution, CommandSource, CommandSpec, Confidence,
     CoverageDimension, Intent, Mutability, NetworkIntent, ProjectKind, ProjectModel,
     ProjectModelError, Provenance, SuccessPredicate, WorkState,
+};
+use crate::evidence::{
+    ApplicabilityReason, BaseTaskDependency, DependencyReason, DependencyValidity, DependencyValue,
+    EvidenceDependency, EvidenceDependencyFingerprint, EvidenceOutcome, LocalEvidenceState,
+    ReceiptApplicability, ReceiptValidity,
 };
 
 /// A domain model cannot be represented by the additive `forge.model/v1` wire contract.
@@ -206,6 +215,151 @@ pub fn command_detail_v2_to_wire(
         enforcement: detail.enforcement,
         success: detail.success,
     })
+}
+
+/// Projects the complete v2 Receipt dependency set without inventing sentinels for unknown facts.
+#[must_use]
+pub fn receipt_dependencies_v2_to_wire(
+    dependencies: &EvidenceDependencyFingerprint,
+    scope_before: &DependencyValue<forge_schema::Digest>,
+) -> ReceiptDependenciesV2Data {
+    ReceiptDependenciesV2Data {
+        repository: repository_dependency_to_wire(dependencies.repository()),
+        scope_before: digest_dependency_to_wire(scope_before),
+        scope_after: digest_dependency_to_wire(dependencies.scope()),
+        command: digest_dependency_to_wire(dependencies.command()),
+        toolchain: digest_dependency_to_wire(dependencies.toolchain()),
+        environment: digest_dependency_to_wire(dependencies.environment()),
+        policy: digest_dependency_to_wire(dependencies.policy()),
+        base_task: base_task_dependency_to_wire(dependencies.base_task()),
+        forge_behavior: digest_dependency_to_wire(dependencies.forge_behavior()),
+    }
+}
+
+fn digest_dependency_to_wire(
+    dependency: &DependencyValue<forge_schema::Digest>,
+) -> DigestDependencyV2Data {
+    match dependency {
+        DependencyValue::Known(digest) => DigestDependencyV2Data::Known(digest.clone()),
+        DependencyValue::Unknown => DigestDependencyV2Data::Unknown,
+    }
+}
+
+fn repository_dependency_to_wire(
+    dependency: &DependencyValue<forge_schema::RepoId>,
+) -> RepositoryDependencyV2Data {
+    match dependency {
+        DependencyValue::Known(repository) => RepositoryDependencyV2Data::Known(repository.clone()),
+        DependencyValue::Unknown => RepositoryDependencyV2Data::Unknown,
+    }
+}
+
+fn base_task_dependency_to_wire(dependency: &BaseTaskDependency) -> BaseTaskDependencyV2Data {
+    match dependency {
+        BaseTaskDependency::Known(digest) => BaseTaskDependencyV2Data::Known(digest.clone()),
+        BaseTaskDependency::NotApplicable => BaseTaskDependencyV2Data::NotApplicable,
+        BaseTaskDependency::Unknown => BaseTaskDependencyV2Data::Unknown,
+    }
+}
+
+/// Projects a normalized command/Receipt outcome into its stable wire enum.
+#[must_use]
+pub const fn evidence_outcome_to_wire(outcome: EvidenceOutcome) -> OutcomeData {
+    match outcome {
+        EvidenceOutcome::Pass => OutcomeData::Pass,
+        EvidenceOutcome::ProductFailure => OutcomeData::ProductFailure,
+        EvidenceOutcome::InfrastructureFailure => OutcomeData::InfrastructureFailure,
+        EvidenceOutcome::Inconclusive => OutcomeData::Inconclusive,
+        EvidenceOutcome::TimedOut => OutcomeData::TimedOut,
+        EvidenceOutcome::Interrupted => OutcomeData::Interrupted,
+        EvidenceOutcome::Unknown => OutcomeData::Unknown,
+    }
+}
+
+/// Projects a non-satisfying validity result with every typed reason retained.
+///
+/// A current, eligible pass deliberately returns [`InvalidReceiptValidityV2Data`] because it must
+/// be represented as `valid_receipts`, never smuggled into the stale branch.
+pub fn non_satisfying_receipt_validity_v2_to_wire(
+    validity: &ReceiptValidity,
+) -> Result<NonSatisfyingReceiptValidityV2Data, InvalidReceiptValidityV2Data> {
+    let mut reasons = validity
+        .dependency_reasons()
+        .iter()
+        .map(|reason| match reason {
+            DependencyReason::Changed(dependency) => {
+                ReceiptValidityReasonV2Data::DependencyChanged {
+                    dependency: evidence_dependency_to_wire(*dependency),
+                }
+            }
+            DependencyReason::Unknown(dependency) => {
+                ReceiptValidityReasonV2Data::DependencyUnknown {
+                    dependency: evidence_dependency_to_wire(*dependency),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    reasons.extend(
+        validity
+            .applicability_reasons()
+            .iter()
+            .map(|reason| match reason {
+                ApplicabilityReason::ReadOnlyScopeChangedDuringRun => {
+                    ReceiptValidityReasonV2Data::ReadOnlyScopeChangedDuringRun
+                }
+                ApplicabilityReason::ExternalSideEffectScopeChangedDuringRun => {
+                    ReceiptValidityReasonV2Data::ExternalSideEffectScopeChangedDuringRun
+                }
+                ApplicabilityReason::WorkingTreeWriteRequiresReadOnlyFollowUp => {
+                    ReceiptValidityReasonV2Data::WorkingTreeWriteRequiresReadOnlyFollowUp
+                }
+                ApplicabilityReason::MutabilityUnknown => {
+                    ReceiptValidityReasonV2Data::MutabilityUnknown
+                }
+            }),
+    );
+    if validity.outcome() != EvidenceOutcome::Pass {
+        reasons.push(ReceiptValidityReasonV2Data::OutcomeNotPassing);
+    }
+
+    NonSatisfyingReceiptValidityV2Data::new(ReceiptValidityV2Data {
+        dependency_validity: match validity.dependency_validity() {
+            DependencyValidity::Current => DependencyValidityV2Data::Current,
+            DependencyValidity::Stale => DependencyValidityV2Data::Stale,
+            DependencyValidity::Unknown => DependencyValidityV2Data::Unknown,
+        },
+        applicability: match validity.applicability() {
+            ReceiptApplicability::Eligible => ReceiptApplicabilityV2Data::Eligible,
+            ReceiptApplicability::NonProving => ReceiptApplicabilityV2Data::NonProving,
+            ReceiptApplicability::Unknown => ReceiptApplicabilityV2Data::Unknown,
+        },
+        outcome: evidence_outcome_to_wire(validity.outcome()),
+        reasons,
+    })
+}
+
+const fn evidence_dependency_to_wire(dependency: EvidenceDependency) -> EvidenceDependencyV2Data {
+    match dependency {
+        EvidenceDependency::Repository => EvidenceDependencyV2Data::Repository,
+        EvidenceDependency::Scope => EvidenceDependencyV2Data::Scope,
+        EvidenceDependency::Command => EvidenceDependencyV2Data::Command,
+        EvidenceDependency::Toolchain => EvidenceDependencyV2Data::Toolchain,
+        EvidenceDependency::Environment => EvidenceDependencyV2Data::Environment,
+        EvidenceDependency::Policy => EvidenceDependencyV2Data::Policy,
+        EvidenceDependency::BaseTask => EvidenceDependencyV2Data::BaseTask,
+        EvidenceDependency::ForgeBehavior => EvidenceDependencyV2Data::ForgeBehavior,
+    }
+}
+
+/// Projects the local-only state without adding any external authority meaning.
+#[must_use]
+pub const fn local_evidence_state_to_wire(state: LocalEvidenceState) -> LocalEvidenceStateData {
+    match state {
+        LocalEvidenceState::Insufficient => LocalEvidenceStateData::Insufficient,
+        LocalEvidenceState::Failing => LocalEvidenceStateData::Failing,
+        LocalEvidenceState::Sufficient => LocalEvidenceStateData::Sufficient,
+        LocalEvidenceState::Unknown => LocalEvidenceStateData::Unknown,
+    }
 }
 
 fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWireError> {
@@ -584,8 +738,10 @@ mod tests {
     use std::time::Duration;
 
     use forge_schema::{
-        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ConfidenceData, Digest,
-        LanguageId, NativeStringEncodingData, RepoId, UnitId, WirePath,
+        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ConfidenceData,
+        DependencyValidityV2Data, Digest, DigestDependencyV2Data, EvidenceDependencyV2Data,
+        LanguageId, NativeStringEncodingData, OutcomeData, ReceiptValidityReasonV2Data, RepoId,
+        RepositoryDependencyV2Data, UnitId, WirePath,
     };
 
     use crate::domain::{
@@ -595,10 +751,16 @@ mod tests {
         ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance, RepoFacts,
         ResolvedCommandSet, SuccessPredicate, TextRange, ToolchainInfo, UnitEdge, WorkState,
     };
+    use crate::evidence::{
+        BaseTaskDependency, DependencyValue, EvidenceDependencyFingerprint, EvidenceOutcome,
+        ExecutionDependencyFingerprint, ReceiptValidityInput, evaluate_receipt_validity,
+    };
     use crate::path::RepoRelativePath;
 
     use super::{
-        ProjectModelWireError, command_detail_v2_to_wire, native_string_data, project_model_to_wire,
+        ProjectModelWireError, command_detail_v2_to_wire, native_string_data,
+        non_satisfying_receipt_validity_v2_to_wire, project_model_to_wire,
+        receipt_dependencies_v2_to_wire,
     };
 
     fn provenance(rule_id: impl Into<String>) -> Provenance {
@@ -1204,5 +1366,98 @@ mod tests {
                 }
             ))
         );
+    }
+
+    fn evidence_fingerprint(policy: &str) -> EvidenceDependencyFingerprint {
+        EvidenceDependencyFingerprint::new(
+            DependencyValue::Known(RepoId::from("repo:wire")),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            ExecutionDependencyFingerprint::new(
+                DependencyValue::Known(Digest::from("command:wire")),
+                DependencyValue::Known(Digest::from("toolchain:wire")),
+                DependencyValue::Known(Digest::from("environment:wire")),
+            ),
+            DependencyValue::Known(Digest::from(policy)),
+            BaseTaskDependency::NotApplicable,
+            DependencyValue::Known(Digest::from("behavior:wire")),
+        )
+    }
+
+    #[test]
+    fn receipt_dependency_projection_preserves_known_unknown_and_not_applicable() {
+        let dependencies = EvidenceDependencyFingerprint::new(
+            DependencyValue::Known(RepoId::from("repo:wire")),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            ExecutionDependencyFingerprint::new(
+                DependencyValue::Known(Digest::from("command:wire")),
+                DependencyValue::Unknown,
+                DependencyValue::Known(Digest::from("environment:wire")),
+            ),
+            DependencyValue::Known(Digest::from("policy:wire")),
+            BaseTaskDependency::NotApplicable,
+            DependencyValue::Known(Digest::from("behavior:wire")),
+        );
+
+        let wire = receipt_dependencies_v2_to_wire(&dependencies, &DependencyValue::Unknown);
+
+        assert_eq!(wire.scope_before, DigestDependencyV2Data::Unknown);
+        assert_eq!(
+            wire.repository,
+            RepositoryDependencyV2Data::Known(RepoId::from("repo:wire"))
+        );
+        assert_eq!(wire.toolchain, DigestDependencyV2Data::Unknown);
+        assert_eq!(
+            wire.policy,
+            DigestDependencyV2Data::Known(Digest::from("policy:wire"))
+        );
+        assert_eq!(
+            wire.base_task,
+            forge_schema::BaseTaskDependencyV2Data::NotApplicable
+        );
+    }
+
+    #[test]
+    fn non_satisfying_projection_retains_dependency_and_outcome_reasons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorded = evidence_fingerprint("policy:old");
+        let receipt = ReceiptValidityInput::new(
+            recorded.clone(),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            Mutability::ReadOnly,
+            EvidenceOutcome::ProductFailure,
+        );
+        let validity = evaluate_receipt_validity(&receipt, &evidence_fingerprint("policy:new"));
+
+        let wire = non_satisfying_receipt_validity_v2_to_wire(&validity)?;
+
+        assert_eq!(
+            wire.as_inner().dependency_validity,
+            DependencyValidityV2Data::Stale
+        );
+        assert_eq!(wire.as_inner().outcome, OutcomeData::ProductFailure);
+        assert_eq!(
+            wire.as_inner().reasons,
+            [
+                ReceiptValidityReasonV2Data::DependencyChanged {
+                    dependency: EvidenceDependencyV2Data::Policy,
+                },
+                ReceiptValidityReasonV2Data::OutcomeNotPassing,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_passing_receipt_cannot_be_projected_as_stale() {
+        let dependencies = evidence_fingerprint("policy:wire");
+        let receipt = ReceiptValidityInput::new(
+            dependencies.clone(),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            Mutability::ReadOnly,
+            EvidenceOutcome::Pass,
+        );
+        let validity = evaluate_receipt_validity(&receipt, &dependencies);
+
+        assert!(non_satisfying_receipt_validity_v2_to_wire(&validity).is_err());
     }
 }
