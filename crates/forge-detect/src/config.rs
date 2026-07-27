@@ -8,9 +8,13 @@ use std::ops::Range;
 use std::path::Path;
 
 use forge_core::branding::CONFIG_FILE;
+use forge_core::domain::CommandEnforcement;
 use forge_core::inventory::DEFAULT_MAX_TEXT_FILE_BYTES;
 use forge_core::ports::FileSystemPort;
-use forge_core::{GitErrorKind, Intent, InventoryError, PathKind, RepoRelativePath};
+use forge_core::{
+    CoverageDimension, GitErrorKind, Intent, InventoryError, Mutability, NetworkIntent, PathKind,
+    RepoRelativePath, SuccessPredicate,
+};
 use serde::Deserialize;
 
 /// The only configuration schema understood by this Forge version.
@@ -60,6 +64,11 @@ pub struct ConfiguredCommand {
     pub args: Vec<String>,
     pub cwd: RepoRelativePath,
     pub inputs: Vec<String>,
+    pub mutability: Mutability,
+    pub network: NetworkIntent,
+    pub success: SuccessPredicate,
+    pub coverage: BTreeSet<CoverageDimension>,
+    pub enforcement: CommandEnforcement,
 }
 
 /// Optional evidence-requirement overrides by risk level.
@@ -438,6 +447,12 @@ struct RawConfiguredCommand {
     cwd: String,
     #[serde(default)]
     inputs: Vec<String>,
+    mutability: Option<String>,
+    network: Option<String>,
+    success: Option<String>,
+    #[serde(default)]
+    coverage: Vec<String>,
+    enforcement: Option<String>,
 }
 
 impl RawConfiguredCommand {
@@ -448,6 +463,15 @@ impl RawConfiguredCommand {
         validate_no_nul_values(&format!("{prefix}.args"), &self.args)?;
         validate_nonempty_values(&format!("{prefix}.inputs"), &self.inputs)?;
         validate_no_nul_values(&format!("{prefix}.inputs"), &self.inputs)?;
+        let mutability =
+            parse_command_mutability(&format!("{prefix}.mutability"), self.mutability.as_deref())?;
+        let network = parse_command_network(&format!("{prefix}.network"), self.network.as_deref())?;
+        let success = parse_command_success(&format!("{prefix}.success"), self.success.as_deref())?;
+        let coverage = parse_command_coverage(&format!("{prefix}.coverage"), self.coverage)?;
+        let enforcement = parse_command_enforcement(
+            &format!("{prefix}.enforcement"),
+            self.enforcement.as_deref(),
+        )?;
         let cwd = RepoRelativePath::new(&self.cwd).map_err(|error| {
             invalid_value(
                 format!("{prefix}.cwd"),
@@ -459,12 +483,114 @@ impl RawConfiguredCommand {
             args: self.args,
             cwd,
             inputs: self.inputs,
+            mutability,
+            network,
+            success,
+            coverage,
+            enforcement,
         })
     }
 }
 
 fn default_command_cwd() -> String {
     String::from(".")
+}
+
+fn parse_command_mutability(field: &str, value: Option<&str>) -> Result<Mutability, ConfigError> {
+    match value {
+        None | Some("unknown") => Ok(Mutability::Unknown),
+        Some("read-only") => Ok(Mutability::ReadOnly),
+        Some("working-tree-write") => Ok(Mutability::WorkingTreeWrite),
+        Some("external-side-effect") => Ok(Mutability::ExternalSideEffect),
+        Some(_) => Err(invalid_value(
+            field,
+            "must be one of `read-only`, `working-tree-write`, `external-side-effect`, or `unknown`",
+        )),
+    }
+}
+
+fn parse_command_network(field: &str, value: Option<&str>) -> Result<NetworkIntent, ConfigError> {
+    match value {
+        None | Some("unknown") => Ok(NetworkIntent::Unknown),
+        Some("inherit") => Ok(NetworkIntent::Inherit),
+        Some("offline-requested") => Ok(NetworkIntent::OfflineRequested),
+        Some("required") => Ok(NetworkIntent::Required),
+        Some(_) => Err(invalid_value(
+            field,
+            "must be one of `inherit`, `offline-requested`, `required`, or `unknown`",
+        )),
+    }
+}
+
+fn parse_command_success(
+    field: &str,
+    value: Option<&str>,
+) -> Result<SuccessPredicate, ConfigError> {
+    match value {
+        None | Some("exit-zero") => Ok(SuccessPredicate::ExitZero),
+        Some("exit-zero-and-stdout-empty") => Ok(SuccessPredicate::ExitZeroAndStdoutEmpty),
+        Some("json-has-no-errors") => Ok(SuccessPredicate::JsonHasNoErrors),
+        Some(_) => Err(invalid_value(
+            field,
+            "must be one of `exit-zero`, `exit-zero-and-stdout-empty`, or `json-has-no-errors`",
+        )),
+    }
+}
+
+fn parse_command_coverage(
+    field: &str,
+    values: Vec<String>,
+) -> Result<BTreeSet<CoverageDimension>, ConfigError> {
+    let mut coverage = BTreeSet::new();
+    for value in values {
+        let dimension = match value.as_str() {
+            "format" => CoverageDimension::Format,
+            "compile" => CoverageDimension::Compile,
+            "lint" => CoverageDimension::Lint,
+            "unit-test" => CoverageDimension::UnitTest,
+            "integration-test" => CoverageDimension::IntegrationTest,
+            "build" => CoverageDimension::Build,
+            "security" => CoverageDimension::Security,
+            value => {
+                let Some(custom) = value.strip_prefix("custom:") else {
+                    return Err(invalid_value(
+                        field,
+                        "must contain only known dimensions or `custom:<non-empty-name>`",
+                    ));
+                };
+                validate_nonempty(field, custom)?;
+                validate_no_nul(field, custom)?;
+                if custom.chars().any(char::is_control) {
+                    return Err(invalid_value(
+                        field,
+                        "custom dimension names must not contain control characters",
+                    ));
+                }
+                CoverageDimension::Custom(custom.to_owned())
+            }
+        };
+        if !coverage.insert(dimension) {
+            return Err(invalid_value(
+                field,
+                "must not contain duplicate dimensions",
+            ));
+        }
+    }
+    Ok(coverage)
+}
+
+fn parse_command_enforcement(
+    field: &str,
+    value: Option<&str>,
+) -> Result<CommandEnforcement, ConfigError> {
+    match value {
+        None | Some("required") => Ok(CommandEnforcement::Required),
+        Some("advisory") => Ok(CommandEnforcement::Advisory),
+        Some(_) => Err(invalid_value(
+            field,
+            "must be either `required` or `advisory`",
+        )),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -600,10 +726,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use forge_core::branding::CONFIG_FILE;
+    use forge_core::domain::CommandEnforcement;
     use forge_core::ports::FileSystemPort;
     use forge_core::{
-        BoundedText, GitError, GitErrorKind, GitFileSet, Intent, Inventory, InventoryError,
-        InventoryOptions, PathKind, RepoRelativePath,
+        BoundedText, CoverageDimension, GitError, GitErrorKind, GitFileSet, Intent, Inventory,
+        InventoryError, InventoryOptions, Mutability, NetworkIntent, PathKind, RepoRelativePath,
+        SuccessPredicate,
     };
 
     use super::{
@@ -758,6 +886,11 @@ program = "make"
 args = ["verify"]
 cwd = "."
 inputs = ["**"]
+mutability = "read-only"
+network = "offline-requested"
+success = "exit-zero-and-stdout-empty"
+coverage = ["format", "compile", "custom:api-contract"]
+enforcement = "advisory"
 
 [commands.format-check]
 program = "cargo"
@@ -971,9 +1104,109 @@ external = ["owner-review", "protected-ci"]
         assert_eq!(verify.program, "make");
         assert_eq!(verify.args, ["verify"]);
         assert_eq!(verify.cwd.as_path(), Path::new("."));
+        assert_eq!(verify.inputs, ["**"]);
+        assert_eq!(verify.mutability, Mutability::ReadOnly);
+        assert_eq!(verify.network, NetworkIntent::OfflineRequested);
+        assert_eq!(verify.success, SuccessPredicate::ExitZeroAndStdoutEmpty);
+        assert_eq!(
+            verify.coverage,
+            [
+                CoverageDimension::Format,
+                CoverageDimension::Compile,
+                CoverageDimension::Custom(String::from("api-contract")),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(verify.enforcement, CommandEnforcement::Advisory);
         assert!(config.commands.contains_key(&Intent::FormatCheck));
         assert_eq!(config.risks[0].level, RiskLevel::Critical);
         Ok(())
+    }
+
+    #[test]
+    fn missing_command_evidence_fields_preserve_v1_execution_defaults() -> Result<(), ConfigError> {
+        let config = parse_forge_config(
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\ninputs = ['src/**']\n",
+        )?;
+        let command = &config.commands[&Intent::Check];
+
+        assert_eq!(command.inputs, ["src/**"]);
+        assert_eq!(command.mutability, Mutability::Unknown);
+        assert_eq!(command.network, NetworkIntent::Unknown);
+        assert_eq!(command.success, SuccessPredicate::ExitZero);
+        assert!(command.coverage.is_empty());
+        assert_eq!(command.enforcement, CommandEnforcement::Required);
+        Ok(())
+    }
+
+    #[test]
+    fn command_evidence_values_use_the_existing_domain_vocabulary() -> Result<(), ConfigError> {
+        let variants = [
+            (
+                "mutability",
+                [
+                    "read-only",
+                    "working-tree-write",
+                    "external-side-effect",
+                    "unknown",
+                ]
+                .as_slice(),
+            ),
+            (
+                "network",
+                ["inherit", "offline-requested", "required", "unknown"].as_slice(),
+            ),
+            (
+                "success",
+                [
+                    "exit-zero",
+                    "exit-zero-and-stdout-empty",
+                    "json-has-no-errors",
+                ]
+                .as_slice(),
+            ),
+            ("enforcement", ["required", "advisory"].as_slice()),
+        ];
+        for (field, values) in variants {
+            for value in values {
+                parse_forge_config(&format!(
+                    "schema = 1\n[commands.check]\nprogram = 'cargo'\n{field} = '{value}'\n"
+                ))?;
+            }
+        }
+
+        let coverage = parse_forge_config(
+            r#"schema = 1
+[commands.check]
+program = "cargo"
+coverage = ["format", "compile", "lint", "unit-test", "integration-test", "build", "security", "custom:api-contract"]
+"#,
+        )?;
+        assert_eq!(coverage.commands[&Intent::Check].coverage.len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_or_unsafe_command_evidence_values_are_rejected() {
+        for input in [
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\nmutability = 'sometimes'\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\nnetwork = 'maybe'\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\nsuccess = 'ignore-exit'\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = ['unknown']\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = ['custom:']\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = [\"custom:api\\tcontract\"]\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\ncoverage = ['compile', 'compile']\n",
+            "schema = 1\n[commands.check]\nprogram = 'cargo'\nenforcement = 'optional'\n",
+        ] {
+            assert!(
+                matches!(
+                    parse_forge_config(input),
+                    Err(ConfigError::InvalidValue { .. })
+                ),
+                "unsafe evidence metadata unexpectedly parsed: {input}"
+            );
+        }
     }
 
     #[test]

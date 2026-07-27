@@ -665,14 +665,24 @@ fn explicit_config_layer(
             )
             .with_args(&configured.args);
             command.timeout = Duration::from_secs(timeout_seconds);
+            command.mutability = configured.mutability;
+            command.network = configured.network;
+            command.success = configured.success.clone();
+            command.coverage = configured.coverage.clone();
+            command.enforcement = configured.enforcement;
             command.confidence = Confidence::High;
+            let coverage_confidence = if configured.coverage.is_empty() {
+                Confidence::Unknown
+            } else {
+                Confidence::High
+            };
             candidates.push(CommandPlanCandidate::single(
                 command,
                 vec![config_provenance(
                     config_path,
                     "configured command is declared directly in the selected Forge configuration",
                 )],
-                Confidence::Unknown,
+                coverage_confidence,
             ));
         }
     }
@@ -784,17 +794,18 @@ fn intent_name(intent: Intent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::ffi::OsString;
     use std::io;
     use std::path::{Path, PathBuf};
 
+    use forge_core::domain::CommandEnforcement;
     use forge_core::inventory::DEFAULT_MAX_TEXT_FILE_BYTES;
     use forge_core::ports::{ExecSpec, ProcessError, ProcessErrorKind, ProcessObservation};
     use forge_core::{
-        BoundedText, BranchHead, BranchOid, BranchStatus, CommandResolution, Confidence, Digest,
-        GitFileSet, GitObjectFormat, InventoryEntry, PathKind, PorcelainV2Status, RepoFacts,
-        RepoId, WorkState,
+        BoundedText, BranchHead, BranchOid, BranchStatus, CommandResolution, Confidence,
+        CoverageDimension, Digest, GitFileSet, GitObjectFormat, InventoryEntry, Mutability,
+        NetworkIntent, PathKind, PorcelainV2Status, RepoFacts, RepoId, SuccessPredicate, WorkState,
     };
     use serde_json::json;
 
@@ -1218,6 +1229,12 @@ schema = 1
 [commands.test]
 program = "cargo"
 args = ["test", "--workspace"]
+inputs = ["crates/**", "Cargo.toml"]
+mutability = "external-side-effect"
+network = "inherit"
+success = "json-has-no-errors"
+coverage = ["unit-test", "integration-test", "custom:workspace-contract"]
+enforcement = "advisory"
 "#,
         )?;
         let (_, unknown_runner) = file("Makefile", b"include commands.mk\ntest:\n");
@@ -1230,8 +1247,31 @@ args = ["test", "--workspace"]
 
         let test = &model.commands[&Intent::Test];
         assert_eq!(test.resolution(), CommandResolution::Resolved);
+        assert_eq!(test.coverage_confidence, Confidence::High);
         assert_eq!(test.commands()[0].program, "cargo");
         assert_eq!(test.commands()[0].args, ["test", "--workspace"]);
+        assert_eq!(
+            test.commands()[0].mutability,
+            Mutability::ExternalSideEffect
+        );
+        assert_eq!(test.commands()[0].network, NetworkIntent::Inherit);
+        assert_eq!(
+            test.commands()[0].success,
+            SuccessPredicate::JsonHasNoErrors
+        );
+        assert_eq!(
+            test.commands()[0].coverage,
+            BTreeSet::from([
+                CoverageDimension::UnitTest,
+                CoverageDimension::IntegrationTest,
+                CoverageDimension::Custom(String::from("workspace-contract")),
+            ])
+        );
+        assert_eq!(test.commands()[0].enforcement, CommandEnforcement::Advisory);
+        assert_eq!(
+            config.commands[&Intent::Test].inputs,
+            ["crates/**", "Cargo.toml"]
+        );
         assert_eq!(
             model.commands[&Intent::Verify].resolution(),
             CommandResolution::Unknown
