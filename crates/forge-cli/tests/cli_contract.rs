@@ -994,6 +994,63 @@ fn init_reports_ambiguous_project_commands_without_selecting_a_candidate()
 }
 
 #[test]
+fn init_reports_unknown_project_commands_without_guessing_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::plain("init-unknown-project-command")?;
+    fixture.run_git(&["init", "--quiet"])?;
+    fs::create_dir(fixture.worktree.join("src"))?;
+    fs::write(
+        fixture.worktree.join("Cargo.toml"),
+        b"[package]\nname = \"unknown-command-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    fs::write(fixture.worktree.join("src/lib.rs"), b"pub fn value() {}\n")?;
+    fs::write(
+        fixture.worktree.join("Makefile"),
+        b"test:\ninclude commands.mk\n",
+    )?;
+    fixture.run_git(&["add", "--", "Cargo.toml", "Makefile", "src/lib.rs"])?;
+    let before = fixture.snapshot()?;
+
+    let output = fixture.run_forge(&["init", "--json"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["schema"], "forge.init-plan/v1");
+    assert!(document["data"].get("diagnostics").is_none());
+    let diagnostic = required_array(&document, "diagnostics")?
+        .iter()
+        .find(|diagnostic| {
+            diagnostic["code"] == "FGE2234" && diagnostic["where"] == "project command `test`"
+        })
+        .ok_or("missing unknown test command diagnostic")?;
+    assert_eq!(diagnostic["severity"], "warning");
+    assert_eq!(
+        diagnostic["what"],
+        "project command `test` cannot be inferred safely"
+    );
+    assert!(
+        diagnostic["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("command resolution remains unknown"))
+    );
+    assert!(
+        diagnostic["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("[commands.test]") && next.contains("will not guess"))
+    );
+    assert_eq!(fixture.snapshot()?, before);
+    fixture.assert_no_forge_artifacts();
+    Ok(())
+}
+
+#[test]
 fn adapter_config_booleans_override_automatic_init_selection()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = TestWorkspace::clean_runner_repository("init-adapter-overrides")?;

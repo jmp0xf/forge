@@ -383,44 +383,62 @@ fn project_gap_diagnostics(plan: &ChangePlan, model: &ProjectModel) -> Vec<Diagn
                 gap.intent == Some(intent)
                     && matches!(
                         gap.kind,
-                        GapKind::MissingProjectCommand | GapKind::AmbiguousCommand
+                        GapKind::MissingProjectCommand
+                            | GapKind::AmbiguousCommand
+                            | GapKind::ConfigurationRequired
                     )
             })?;
-            let commands = model.commands.get(&intent)?;
+            let commands = model.commands.get(&intent);
             let intent_label = intent_name(intent);
-            let evidence = provenance_summary(&commands.provenance);
+            let evidence = commands.map_or_else(
+                || String::from("no command-resolution record was available"),
+                |commands| provenance_summary(&commands.provenance),
+            );
             match gap.kind {
-                GapKind::MissingProjectCommand => Some(Diagnostic::new(
-                    "FGE2232",
+                GapKind::MissingProjectCommand => commands.map(|_| {
+                    Diagnostic::new(
+                        "FGE2232",
+                        Severity::Warning,
+                        format!("project command `{intent_label}` is absent"),
+                        format!("project command `{intent_label}`"),
+                        format!(
+                            "command resolution completed without a project-owned candidate; {evidence}"
+                        ),
+                        format!(
+                            "add a project-owned `{intent_label}` entry point or define `[commands.{intent_label}]` in forge.toml, then rerun forge init"
+                        ),
+                    )
+                }),
+                GapKind::AmbiguousCommand => commands.map(|commands| {
+                    Diagnostic::new(
+                        "FGE2233",
+                        Severity::Warning,
+                        format!("project command `{intent_label}` is ambiguous"),
+                        format!("project command `{intent_label}`"),
+                        format!(
+                            "command resolution retained {} equally authoritative candidates and will not choose one arbitrarily; {evidence}",
+                            commands.commands().len()
+                        ),
+                        format!(
+                            "select one authoritative `{intent_label}` interface or define `[commands.{intent_label}]` in forge.toml, then rerun forge init"
+                        ),
+                    )
+                }),
+                GapKind::ConfigurationRequired => Some(Diagnostic::new(
+                    "FGE2234",
                     Severity::Warning,
-                    format!("project command `{intent_label}` is absent"),
+                    format!("project command `{intent_label}` cannot be inferred safely"),
                     format!("project command `{intent_label}`"),
+                    format!("command resolution remains unknown; {evidence}"),
                     format!(
-                        "command resolution completed without a project-owned candidate; {evidence}"
-                    ),
-                    format!(
-                        "add a project-owned `{intent_label}` entry point or define `[commands.{intent_label}]` in forge.toml, then rerun forge init"
-                    ),
-                )),
-                GapKind::AmbiguousCommand => Some(Diagnostic::new(
-                    "FGE2233",
-                    Severity::Warning,
-                    format!("project command `{intent_label}` is ambiguous"),
-                    format!("project command `{intent_label}`"),
-                    format!(
-                        "command resolution retained {} equally authoritative candidates and will not choose one arbitrarily; {evidence}",
-                        commands.commands().len()
-                    ),
-                    format!(
-                        "select one authoritative `{intent_label}` interface or define `[commands.{intent_label}]` in forge.toml, then rerun forge init"
+                        "choose the repository's authoritative `{intent_label}` argv, define it in `[commands.{intent_label}]` in forge.toml, then rerun forge init; Forge will not guess this decision"
                     ),
                 )),
                 GapKind::MissingHostIndex
                 | GapKind::MissingHostPointer
                 | GapKind::AdapterDrift
                 | GapKind::OptionalRunner
-                | GapKind::OptionalCiDraft
-                | GapKind::ConfigurationRequired => None,
+                | GapKind::OptionalCiDraft => None,
             }
         })
         .collect()
