@@ -1,8 +1,9 @@
 # Machine-readable Schemas
 
 These versioned JSON Schemas are generated from `forge-schema` and checked in because Forge output is a behavior
-interface consumed by humans, agents, scripts, and CI. Each root document fixes its `$id` and the envelope's `schema`
-field to the same `forge.<domain>/v<n>` identifier.
+interface consumed by humans, agents, scripts, and CI. Each root document fixes its `$id` and root `schema` field to
+the same `forge.<domain>/v<n>` identifier. Most contracts use Forge's standard envelope; the standalone release
+manifest intentionally does not.
 
 Regenerate and verify them with:
 

@@ -52,6 +52,7 @@ pub enum SchemaKind {
     EvidenceV1,
     Evidence,
     Adapters,
+    ReleaseManifest,
     Diagnostic,
     #[serde(other)]
     Unknown,
@@ -70,6 +71,7 @@ impl SchemaKind {
         Self::EvidenceV1,
         Self::Evidence,
         Self::Adapters,
+        Self::ReleaseManifest,
         Self::Diagnostic,
     ];
 
@@ -91,6 +93,7 @@ impl SchemaKind {
             Self::ReceiptV1 | Self::Receipt => "receipt",
             Self::EvidenceV1 | Self::Evidence => "evidence",
             Self::Adapters => "adapters",
+            Self::ReleaseManifest => "release-manifest",
             Self::Diagnostic => "diagnostic",
             Self::Unknown => "unknown",
         }
@@ -110,6 +113,7 @@ impl SchemaKind {
             | Self::ReceiptV1
             | Self::EvidenceV1
             | Self::Adapters
+            | Self::ReleaseManifest
             | Self::Diagnostic
             | Self::Unknown => 1,
         }
@@ -155,6 +159,7 @@ impl FromStr for SchemaKind {
             ("evidence", Some(1)) => Self::EvidenceV1,
             ("evidence", None | Some(2)) => Self::Evidence,
             ("adapters", None | Some(1)) => Self::Adapters,
+            ("release-manifest" | "release", None | Some(1)) => Self::ReleaseManifest,
             ("diagnostic", None | Some(1)) => Self::Diagnostic,
             _ => return Err(UnknownSchemaKind(value.to_owned())),
         };
@@ -1485,6 +1490,155 @@ pub struct AdaptersData {
     pub applied: bool,
 }
 
+/// One immutable artifact described by a local release-candidate manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseArtifactKindData {
+    Binary,
+    CyclonedxSbom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("SHA-256 digest must contain exactly 64 lowercase hexadecimal characters")]
+pub struct InvalidReleaseSha256Data;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseSha256Data(#[schemars(regex(pattern = "^[0-9a-f]{64}$"))] String);
+
+impl ReleaseSha256Data {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidReleaseSha256Data> {
+        let value = value.into();
+        if value.len() == 64
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidReleaseSha256Data)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseSha256Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One immutable artifact described by a local release-candidate manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseArtifactData {
+    pub name: String,
+    pub kind: ReleaseArtifactKindData,
+    pub target: String,
+    pub length: u64,
+    pub sha256: ReleaseSha256Data,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseChannelData {
+    ReleaseCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseDistributionData {
+    GithubRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseCandidateStatusData {
+    LocalReviewCandidate,
+}
+
+/// Release identity and candidate-local status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseDescriptorData {
+    pub version: String,
+    pub channel: ReleaseChannelData,
+    pub distribution: ReleaseDistributionData,
+    pub status: ReleaseCandidateStatusData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseProvenanceStatusData {
+    RequiredExternal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ReleasePredicateTypeData {
+    #[serde(rename = "https://slsa.dev/provenance/v1")]
+    SlsaProvenanceV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseSigningData {
+    SigstoreKeylessOidc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseAuthorityStatusData {
+    UnassignedExternal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseSubjectSetData {
+    ExactFinalizedLocalAssets,
+}
+
+/// External provenance and signing work that remains outside the candidate write set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseProvenanceData {
+    pub status: ReleaseProvenanceStatusData,
+    pub predicate_type: ReleasePredicateTypeData,
+    pub signing: ReleaseSigningData,
+    pub authority_status: ReleaseAuthorityStatusData,
+    pub subject_set: ReleaseSubjectSetData,
+    pub subjects: [String; 12],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseRollbackStatusData {
+    FirstCandidateNoNMinusOne,
+}
+
+/// Retention and rollback state frozen for this candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRollbackData {
+    pub retain_published_releases: u8,
+    pub previous_release: Option<String>,
+    pub status: ReleaseRollbackStatusData,
+}
+
+/// Standalone `forge.release-manifest/v1` document shipped with release assets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseManifestData {
+    pub schema: String,
+    pub release: ReleaseDescriptorData,
+    pub artifacts: [ReleaseArtifactData; 10],
+    pub provenance: ReleaseProvenanceData,
+    pub rollback: ReleaseRollbackData,
+}
+
 /// Root data for a standalone structured diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiagnosticData {
@@ -1509,6 +1663,7 @@ pub fn schema_for_kind(kind: SchemaKind) -> SchemaDocument {
         SchemaKind::EvidenceV1 => schema_for!(Envelope<EvidenceData>),
         SchemaKind::Evidence => schema_for!(Envelope<EvidenceV2Data>),
         SchemaKind::Adapters => schema_for!(Envelope<AdaptersData>),
+        SchemaKind::ReleaseManifest => schema_for!(ReleaseManifestData),
         SchemaKind::Diagnostic | SchemaKind::Unknown => {
             schema_for!(Envelope<DiagnosticData>)
         }
@@ -1564,7 +1719,7 @@ mod tests {
         EvidenceDependencyV2Data, EvidenceV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
         GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
         ProcessErrorKindV2Data, ProjectModelData, ProjectUnitDetailData,
-        ReceiptValidityReasonV2Data, SchemaIndexData, SchemaKind, SchemaVersion,
+        ReceiptValidityReasonV2Data, ReleaseSha256Data, SchemaIndexData, SchemaKind, SchemaVersion,
         StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData, schema_json,
     };
     use crate::Digest;
@@ -1613,6 +1768,14 @@ mod tests {
             SchemaKind::from_str("forge.evidence/v2")?,
             SchemaKind::Evidence
         );
+        assert_eq!(
+            SchemaKind::from_str("forge.release-manifest/v1")?,
+            SchemaKind::ReleaseManifest
+        );
+        assert_eq!(
+            SchemaKind::from_str("release")?,
+            SchemaKind::ReleaseManifest
+        );
         assert!(SchemaKind::from_str("forge.receipt/v3").is_err());
         assert!(SchemaKind::from_str("forge.receipt/v02").is_err());
         assert!(SchemaKind::from_str("forge.model/v2").is_err());
@@ -1620,6 +1783,22 @@ mod tests {
             SchemaVersion::for_kind(SchemaKind::Receipt),
             SchemaVersion::new("receipt", 2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn release_sha256_accepts_only_canonical_lowercase_hex()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = "a".repeat(64);
+        let digest = ReleaseSha256Data::new(canonical.clone())?;
+        assert_eq!(serde_json::to_value(digest)?, serde_json::json!(canonical));
+
+        for invalid in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+            assert!(ReleaseSha256Data::new(&invalid).is_err());
+            assert!(
+                serde_json::from_value::<ReleaseSha256Data>(serde_json::json!(invalid)).is_err()
+            );
+        }
         Ok(())
     }
 
