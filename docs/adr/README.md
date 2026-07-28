@@ -49,5 +49,6 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0033](0033-use-pinned-target-directory-for-windows-renames.md) | Superseded | Windows 重命名显式使用固定目标目录句柄 |
 | [0034](0034-fail-closed-when-windows-rejects-directory-swap-renames.md) | Accepted | Windows 拒绝目录交换提交时安全失败 |
 | [0035](0035-confine-evidence-gc-to-pinned-class-directories.md) | Accepted | Evidence GC 固定类目录并使用同目录隔离名 |
+| [0036](0036-fail-closed-on-unreleased-legacy-evidence-gc-residues.md) | Accepted | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。

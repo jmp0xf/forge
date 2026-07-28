@@ -4,7 +4,7 @@
 - Date: 2026-07-29
 - Deciders: Forge maintainers
 - Supersedes: None
-- Superseded by: None
+- Superseded by: ADR-0036（仅旧版目录残留自动迁移）
 - Depends on: ADR-0021, ADR-0034
 
 ## Context
