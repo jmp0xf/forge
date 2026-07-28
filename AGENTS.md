@@ -26,7 +26,7 @@ commands and exit codes. Merge readiness still depends on independent CI and req
 Stop before weakening tests or assertions; changing CI, release, signing, ownership, or authority boundaries;
 changing a versioned machine contract without a migration; or contradicting an accepted ADR without a superseding ADR.
 
-<!-- forge:begin block=project-index schema=1 hash=blake3:1b699f07f34e44258ccadd824ff067ef4127dad19a0a3c9039426fd85c85165d -->
+<!-- forge:begin block=project-index schema=1 hash=blake3:a351ce7d846f914dc040acdf50b8df7960d5dfd37c02ee01d61feb52ebb7086b -->
 ## Authoritative paths
 - `.github/workflows/verify.yml`
 - `CONTRIBUTING.md`
@@ -58,6 +58,8 @@ changing a versioned machine contract without a migration; or contradicting an a
 - check step 4/6 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `fmt` `--all` `--` `--check`; cwd `fuzz`.
 - check step 5/6 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `check` `--all-targets`; cwd `fuzz`; explicit authorization required.
 - check step 6/6 (advisory): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `clippy` `--all-targets`; cwd `fuzz`; explicit authorization required.
+- fix step 1/2 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `fmt` `--all`; cwd `.`.
+- fix step 2/2 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `fmt` `--all`; cwd `fuzz`.
 - test step 1/8 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `fmt` `--all` `--` `--check`; cwd `.`.
 - test step 2/8 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `check` `--workspace` `--all-targets`; cwd `.`; explicit authorization required.
 - test step 3/8 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `clippy` `--workspace` `--all-targets`; cwd `.`; explicit authorization required.
