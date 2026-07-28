@@ -4,7 +4,6 @@ mod canonical_json;
 mod contract_shape;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
 
 use forge_core::domain::{CommandEnforcement, CoverageDimension, Intent, Mutability};
 use forge_core::evidence::{
@@ -19,7 +18,8 @@ use forge_runtime::state::{
     EVIDENCE_GC_MAX_RECEIPTS, EVIDENCE_OBJECT_MAX_BYTES, EvidenceRetentionMetadata,
     EvidenceRetentionTime, EvidenceStateDecodeError, EvidenceStateMetadataDecoder,
     EvidenceStateObjectName, EvidenceStateVersion, RECEIPT_OBJECT_MAX_BYTES,
-    ReceiptRetentionMetadata, ReceiptStateReference, ReferenceClosure, parse_utc_rfc3339,
+    ReceiptRetentionMetadata, ReceiptStateReference, ReferenceClosure, UtcTimestamp,
+    parse_utc_rfc3339,
 };
 use forge_schema::{
     BaseTaskDependencyV2Data, CommandDetailV2Data, CommandEnforcementData,
@@ -385,7 +385,7 @@ pub(crate) struct ReceiptEvaluationProjection {
     pub(crate) id: ReceiptId,
     pub(crate) intent: IntentData,
     pub(crate) domain_intent: Option<Intent>,
-    pub(crate) started_at: Option<SystemTime>,
+    pub(crate) started_at: Option<UtcTimestamp>,
     pub(crate) outcome: EvidenceOutcome,
     pub(crate) coverage: Vec<String>,
     pub(crate) current: Option<CurrentReceiptEvaluationProjection>,

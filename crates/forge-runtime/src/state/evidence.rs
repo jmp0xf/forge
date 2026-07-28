@@ -124,7 +124,27 @@ pub struct EvidenceStateObjectNameError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceRetentionTime {
     Legacy,
-    Current(SystemTime),
+    Current(UtcTimestamp),
+}
+
+/// A platform-independent UTC instant with the wire contract's nanosecond precision.
+///
+/// `SystemTime` cannot represent the final two fractional digits on Windows because its native
+/// representation uses 100-nanosecond intervals. Parsed Receipt and Evidence timestamps therefore
+/// use this value for deterministic ordering and retention on every supported platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UtcTimestamp {
+    unix_nanoseconds: i128,
+}
+
+impl From<SystemTime> for UtcTimestamp {
+    fn from(value: SystemTime) -> Self {
+        let unix_nanoseconds = match value.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(duration) => duration_to_nanos(duration),
+            Err(error) => -duration_to_nanos(error.duration()),
+        };
+        Self { unix_nanoseconds }
+    }
 }
 
 /// Strict UTC RFC 3339 conversion failure.
@@ -137,7 +157,7 @@ pub enum UtcTimestampError {
 }
 
 /// Parses strict UTC `YYYY-MM-DDTHH:MM:SS[.fraction]Z` without accepting numeric offsets.
-pub fn parse_utc_rfc3339(value: &str) -> Result<SystemTime, UtcTimestampError> {
+pub fn parse_utc_rfc3339(value: &str) -> Result<UtcTimestamp, UtcTimestampError> {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || bytes.get(4) != Some(&b'-')
@@ -196,22 +216,16 @@ pub fn parse_utc_rfc3339(value: &str) -> Result<SystemTime, UtcTimestampError> {
         .checked_mul(86_400)
         .and_then(|value| value.checked_add(i128::from(hour * 3_600 + minute * 60 + second)))
         .ok_or(UtcTimestampError::OutOfRange)?;
-    system_time_from_unix_nanos(
-        seconds
-            .checked_mul(1_000_000_000)
-            .and_then(|value| value.checked_add(i128::from(nanoseconds)))
-            .ok_or(UtcTimestampError::OutOfRange)?,
-    )
+    let unix_nanoseconds = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(nanoseconds)))
+        .ok_or(UtcTimestampError::OutOfRange)?;
+    Ok(UtcTimestamp { unix_nanoseconds })
 }
 
-/// Formats one [`SystemTime`] in canonical UTC RFC 3339 form with trimmed fractional seconds.
-pub fn format_utc_rfc3339(value: SystemTime) -> Result<String, UtcTimestampError> {
-    let total_nanoseconds = match value.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration_to_nanos(duration)?,
-        Err(error) => duration_to_nanos(error.duration())?
-            .checked_neg()
-            .ok_or(UtcTimestampError::OutOfRange)?,
-    };
+/// Formats one UTC instant in canonical RFC 3339 form with trimmed fractional seconds.
+pub fn format_utc_rfc3339(value: impl Into<UtcTimestamp>) -> Result<String, UtcTimestampError> {
+    let total_nanoseconds = value.into().unix_nanoseconds;
     let whole_seconds = total_nanoseconds.div_euclid(1_000_000_000);
     let nanoseconds = total_nanoseconds.rem_euclid(1_000_000_000) as u32;
     let days = whole_seconds.div_euclid(86_400);
@@ -291,29 +305,10 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn duration_to_nanos(duration: Duration) -> Result<i128, UtcTimestampError> {
-    i128::from(duration.as_secs())
-        .checked_mul(1_000_000_000)
-        .and_then(|value| value.checked_add(i128::from(duration.subsec_nanos())))
-        .ok_or(UtcTimestampError::OutOfRange)
-}
-
-fn system_time_from_unix_nanos(value: i128) -> Result<SystemTime, UtcTimestampError> {
-    let magnitude = value.unsigned_abs();
-    let seconds =
-        u64::try_from(magnitude / 1_000_000_000).map_err(|_| UtcTimestampError::OutOfRange)?;
-    let nanoseconds =
-        u32::try_from(magnitude % 1_000_000_000).map_err(|_| UtcTimestampError::OutOfRange)?;
-    let duration = Duration::new(seconds, nanoseconds);
-    if value >= 0 {
-        SystemTime::UNIX_EPOCH
-            .checked_add(duration)
-            .ok_or(UtcTimestampError::OutOfRange)
-    } else {
-        SystemTime::UNIX_EPOCH
-            .checked_sub(duration)
-            .ok_or(UtcTimestampError::OutOfRange)
-    }
+fn duration_to_nanos(duration: Duration) -> i128 {
+    // `Duration` stores at most `u64::MAX` seconds, whose nanosecond expansion remains far below
+    // `i128::MAX`; this conversion is therefore exact.
+    i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
 }
 
 /// One Receipt object referenced by an Evidence document.
@@ -2194,6 +2189,8 @@ fn select_time_roots<M>(
     now: SystemTime,
     timestamp: impl Fn(&StoredDocument<M>) -> EvidenceRetentionTime,
 ) -> Result<BTreeSet<String>, StateError> {
+    let now = UtcTimestamp::from(now);
+    let keep_age_nanoseconds = duration_to_nanos(EVIDENCE_GC_KEEP_AGE);
     let mut retained: BTreeSet<String> = objects
         .iter()
         .filter(|item| item.version.is_legacy())
@@ -2225,8 +2222,9 @@ fn select_time_roots<M>(
         current
             .into_iter()
             .filter(|(_, timestamp)| {
-                now.duration_since(*timestamp)
-                    .map_or(true, |age| age <= EVIDENCE_GC_KEEP_AGE)
+                now.unix_nanoseconds
+                    .checked_sub(timestamp.unix_nanoseconds)
+                    .is_none_or(|age| age <= keep_age_nanoseconds)
             })
             .map(|(item, _)| item.key.clone()),
     );
@@ -4056,7 +4054,7 @@ mod tests {
             &mut decoder,
             EvidenceStateVersion::V2,
             object_name(8)?,
-            EvidenceRetentionTime::Current(now),
+            EvidenceRetentionTime::Current(now.into()),
             vec![log_name.clone()],
         )?;
         let log_path = store.layout().worktree_dir().join(&log_key);
@@ -4106,7 +4104,7 @@ mod tests {
             &mut decoder,
             EvidenceStateVersion::V2,
             object_name(9)?,
-            EvidenceRetentionTime::Current(now),
+            EvidenceRetentionTime::Current(now.into()),
             vec![log_name.clone()],
         )?;
         let log_path = store.layout().worktree_dir().join(&log_key);
@@ -4138,7 +4136,7 @@ mod tests {
             &mut decoder,
             EvidenceStateVersion::V2,
             object_name(10)?,
-            EvidenceRetentionTime::Current(now),
+            EvidenceRetentionTime::Current(now.into()),
             vec![log_name.clone()],
         )?;
         let log_path = store.layout().worktree_dir().join(&log_key);
@@ -4436,7 +4434,7 @@ mod tests {
             receipt_bytes.clone(),
             ReceiptRetentionMetadata::new(
                 receipt_name.clone(),
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 [log_name.clone()],
             ),
         );
@@ -4446,7 +4444,7 @@ mod tests {
             evidence_bytes.clone(),
             EvidenceRetentionMetadata::new(
                 evidence_name.clone(),
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 [ReceiptStateReference::new(
                     EvidenceStateVersion::V2,
                     receipt_name.clone(),
@@ -4508,7 +4506,7 @@ mod tests {
             receipt_bytes.clone(),
             ReceiptRetentionMetadata::new(
                 receipt_name.clone(),
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 [],
             ),
         );
@@ -4537,7 +4535,7 @@ mod tests {
             evidence_bytes.clone(),
             EvidenceRetentionMetadata::new(
                 evidence_name.clone(),
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 [ReceiptStateReference::new(
                     EvidenceStateVersion::V2,
                     object_name(201_003)?,
@@ -4650,7 +4648,7 @@ mod tests {
                 &mut decoder,
                 EvidenceStateVersion::V2,
                 object_name(210_000 + index)?,
-                EvidenceRetentionTime::Current(old + Duration::from_secs(index)),
+                EvidenceRetentionTime::Current((old + Duration::from_secs(index)).into()),
                 Vec::new(),
             )?;
             receipt_keys.push(key);
@@ -4662,7 +4660,7 @@ mod tests {
             pending_bytes.clone(),
             ReceiptRetentionMetadata::new(
                 pending_name.clone(),
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 [],
             ),
         );
@@ -4731,7 +4729,7 @@ mod tests {
                 &mut decoder,
                 EvidenceStateVersion::V2,
                 object_name(212_000 + index)?,
-                EvidenceRetentionTime::Current(old + Duration::from_secs(index)),
+                EvidenceRetentionTime::Current((old + Duration::from_secs(index)).into()),
                 Vec::new(),
             )?;
             receipt_keys.push(key);
@@ -4743,7 +4741,7 @@ mod tests {
             pending_bytes.clone(),
             ReceiptRetentionMetadata::new(
                 pending_name.clone(),
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 [],
             ),
         );
@@ -4802,7 +4800,7 @@ mod tests {
             &mut decoder,
             EvidenceStateVersion::V2,
             receipt_name.clone(),
-            EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH),
+            EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH.into()),
             [log_name.clone()].into(),
         )?;
         let (evidence_key, evidence_size) = store_fixture_evidence(
@@ -4810,7 +4808,7 @@ mod tests {
             &mut decoder,
             EvidenceStateVersion::V2,
             object_name(203_002)?,
-            EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH),
+            EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH.into()),
             [ReceiptStateReference::new(
                 EvidenceStateVersion::V2,
                 receipt_name,
@@ -5042,7 +5040,7 @@ mod tests {
                 &mut decoder,
                 EvidenceStateVersion::V2,
                 receipt_name,
-                EvidenceRetentionTime::Current(old_base + Duration::from_secs(index)),
+                EvidenceRetentionTime::Current((old_base + Duration::from_secs(index)).into()),
                 receipt_logs,
             )?;
             if index == 0 {
@@ -5070,7 +5068,7 @@ mod tests {
                 &mut decoder,
                 EvidenceStateVersion::V2,
                 evidence_name,
-                EvidenceRetentionTime::Current(old_base + Duration::from_secs(index)),
+                EvidenceRetentionTime::Current((old_base + Duration::from_secs(index)).into()),
                 receipt_references,
                 evidence_logs,
             )?;
@@ -5110,7 +5108,7 @@ mod tests {
                 &mut decoder,
                 EvidenceStateVersion::V2,
                 object_name(index)?,
-                EvidenceRetentionTime::Current(now - Duration::from_secs(index + 1)),
+                EvidenceRetentionTime::Current((now - Duration::from_secs(index + 1)).into()),
                 Vec::new(),
                 Vec::new(),
             )?;
@@ -5147,7 +5145,7 @@ mod tests {
             first_receipt_bytes,
             ReceiptRetentionMetadata::with_log_reference_closure(
                 first_receipt_name,
-                EvidenceRetentionTime::Current(old),
+                EvidenceRetentionTime::Current(old.into()),
                 ReferenceClosure::RetainAll,
             ),
         );
@@ -5157,7 +5155,7 @@ mod tests {
                 &mut decoder,
                 EvidenceStateVersion::V2,
                 object_name(220_000 + index)?,
-                EvidenceRetentionTime::Current(old + Duration::from_secs(index)),
+                EvidenceRetentionTime::Current((old + Duration::from_secs(index)).into()),
                 Vec::new(),
             )?;
         }
@@ -5169,7 +5167,7 @@ mod tests {
             evidence_bytes,
             EvidenceRetentionMetadata::with_reference_closures(
                 evidence_name,
-                EvidenceRetentionTime::Current(now),
+                EvidenceRetentionTime::Current(now.into()),
                 ReferenceClosure::RetainAll,
                 ReferenceClosure::complete([]),
             ),
@@ -5284,7 +5282,7 @@ mod tests {
                         bytes,
                         ReceiptRetentionMetadata::new(
                             object_name(90_002)?,
-                            EvidenceRetentionTime::Current(now),
+                            EvidenceRetentionTime::Current(now.into()),
                             Vec::new(),
                         ),
                     );
@@ -5295,7 +5293,7 @@ mod tests {
                         &mut decoder,
                         EvidenceStateVersion::V2,
                         object_name(90_001)?,
-                        EvidenceRetentionTime::Current(now),
+                        EvidenceRetentionTime::Current(now.into()),
                         vec![ReceiptStateReference::new(
                             EvidenceStateVersion::V2,
                             object_name(90_002)?,
@@ -5309,7 +5307,7 @@ mod tests {
                         &mut decoder,
                         EvidenceStateVersion::V1,
                         object_name(90_001)?,
-                        EvidenceRetentionTime::Current(now),
+                        EvidenceRetentionTime::Current(now.into()),
                         Vec::new(),
                     )?;
                 }
@@ -5396,7 +5394,7 @@ mod tests {
                         &mut decoder,
                         EvidenceStateVersion::V2,
                         object_name(91_001)?,
-                        EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH),
+                        EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH.into()),
                         Vec::new(),
                         Vec::new(),
                     )?;

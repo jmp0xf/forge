@@ -10,7 +10,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io;
-use std::time::SystemTime;
 
 use forge_core::evidence::{
     BaseTaskDependency, DependencyValidity, DependencyValue, EvidenceDependencyFingerprint,
@@ -48,7 +47,7 @@ use forge_runtime::scope::{
 };
 use forge_runtime::state::{
     AtomicStateStore, EvidenceStateDecodeError, EvidenceStateObjectKind, EvidenceStateVersion,
-    GitStateLayout, StateError, format_utc_rfc3339,
+    GitStateLayout, StateError, UtcTimestamp, format_utc_rfc3339,
 };
 use forge_runtime::toolchain::{
     ToolchainProbeRequest, probe_toolchain_dependency_digest_controlled,
@@ -147,7 +146,7 @@ struct EvaluatedReceipt {
 #[derive(Debug)]
 struct NewestReceiptCandidate {
     intent: Intent,
-    started_at: SystemTime,
+    started_at: UtcTimestamp,
     id: String,
     validity: ReceiptValidity,
     verified: Vec<String>,
@@ -948,9 +947,9 @@ fn candidate_is_newer(
 }
 
 fn receipt_order_is_newer(
-    candidate_started_at: SystemTime,
+    candidate_started_at: UtcTimestamp,
     candidate_id: &str,
-    existing_started_at: SystemTime,
+    existing_started_at: UtcTimestamp,
     existing_id: &str,
 ) -> bool {
     (candidate_started_at, candidate_id) > (existing_started_at, existing_id)
@@ -1601,6 +1600,7 @@ mod tests {
     use forge_detect::policy::PolicyBaseCompleteness;
     use forge_runtime::hash::Blake3Hasher;
     use forge_runtime::scope::ScopeAcquisitionError;
+    use forge_runtime::state::parse_utc_rfc3339;
     use forge_schema::RepoId;
 
     use super::{
@@ -1820,13 +1820,37 @@ mod tests {
     }
 
     #[test]
-    fn receipt_order_uses_started_at_then_immutable_id() {
+    fn receipt_order_uses_started_at_then_immutable_id() -> Result<(), Box<dyn Error>> {
         let earlier = UNIX_EPOCH + Duration::from_secs(1);
         let later = UNIX_EPOCH + Duration::from_secs(2);
 
-        assert!(receipt_order_is_newer(later, "a", earlier, "z"));
-        assert!(receipt_order_is_newer(earlier, "z", earlier, "a"));
-        assert!(!receipt_order_is_newer(earlier, "a", earlier, "z"));
+        assert!(receipt_order_is_newer(
+            later.into(),
+            "a",
+            earlier.into(),
+            "z"
+        ));
+        assert!(receipt_order_is_newer(
+            earlier.into(),
+            "z",
+            earlier.into(),
+            "a"
+        ));
+        assert!(!receipt_order_is_newer(
+            earlier.into(),
+            "a",
+            earlier.into(),
+            "z"
+        ));
+        let same_windows_tick = parse_utc_rfc3339("2026-07-27T00:00:00.123456700Z")?;
+        let later_inside_windows_tick = parse_utc_rfc3339("2026-07-27T00:00:00.123456789Z")?;
+        assert!(receipt_order_is_newer(
+            later_inside_windows_tick,
+            "a",
+            same_windows_tick,
+            "z"
+        ));
+        Ok(())
     }
 
     #[test]
