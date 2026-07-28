@@ -2272,8 +2272,8 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn darwin_timeout_boundary_accepts_a_zombie_only_process_group() -> Result<(), Box<dyn Error>> {
-        let mut command = ProcessCommand::new("/bin/sh");
-        command.args(["-c", "sleep 0.2"]);
+        let mut command = ProcessCommand::new("/bin/cat");
+        command.stdin(std::process::Stdio::piped());
         let prepared_tree = platform::PreparedTree::prepare(&mut command)?;
         let mut child = command.spawn()?;
         let mut tree = match prepared_tree.attach(&child) {
@@ -2288,8 +2288,8 @@ mod tests {
         // before the timeout branch sends TERM. XNU reports EPERM for this zombie-only group even
         // though no live member remains; both graceful and force termination must accept it.
         assert!(!platform::wait_for_exit(&mut tree, Duration::ZERO)?);
-        thread::sleep(Duration::from_millis(300));
-        assert!(platform::wait_for_exit(&mut tree, Duration::ZERO)?);
+        drop(child.stdin.take());
+        assert!(platform::wait_for_exit(&mut tree, Duration::from_secs(2))?);
 
         let terminate_result = platform::terminate_tree(&tree);
         let kill_result = platform::kill_tree(&tree);
