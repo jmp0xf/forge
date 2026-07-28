@@ -530,10 +530,9 @@ mod platform {
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
         FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-        FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
-        SetFileInformationByHandle, WRITE_DAC,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
+        FileIdInfo, FileRenameInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1121,7 +1120,11 @@ mod platform {
             .len()
             .checked_mul(size_of::<u16>())
             .ok_or_else(|| io::Error::other("Windows rename buffer length overflowed"))?;
-        let total = offset_of!(FILE_RENAME_INFO, FileName)
+        // FILE_RENAME_INFO has a variable-width trailing name. Windows requires the
+        // complete fixed structure in addition to the counted UTF-16 bytes; using
+        // `offset_of!(..., FileName)` leaves the buffer short because of the tail
+        // member and its alignment padding.
+        let total = size_of::<FILE_RENAME_INFO>()
             .checked_add(name_bytes)
             .ok_or_else(|| io::Error::other("Windows rename buffer length overflowed"))?;
         let words = total.div_ceil(size_of::<usize>());
@@ -1130,22 +1133,16 @@ mod platform {
         // SAFETY: `storage` is suitably aligned and sized for the fixed header plus counted UTF-16
         // name. Every pointer remains live for the synchronous SetFileInformationByHandle call.
         unsafe {
-            ptr::write(
-                info,
-                FILE_RENAME_INFO {
-                    Anonymous: FILE_RENAME_INFO_0 {
-                        ReplaceIfExists: replace,
-                    },
-                    RootDirectory: parent.as_raw_handle(),
-                    FileNameLength: u32::try_from(name_bytes).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "Windows repository target exceeds rename limits",
-                        )
-                    })?,
-                    FileName: [0],
-                },
-            );
+            // `storage` is zero-filled, so the reserved union bytes remain zero while
+            // FileRenameInfo reads the boolean member.
+            (*info).Anonymous.ReplaceIfExists = replace;
+            (*info).RootDirectory = parent.as_raw_handle();
+            (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows repository target exceeds rename limits",
+                )
+            })?;
             ptr::copy_nonoverlapping(
                 name.as_ptr().cast::<u8>(),
                 storage
