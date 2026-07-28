@@ -195,7 +195,7 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     Ok(ReleaseCommandOutput::Completed(format!(
         "built and staged {} with its CycloneDX SBOM in {}; local candidate only, not signed or published",
         binary_asset_name(request.target),
-        request.output_directory.display()
+        output.root().display()
     )))
 }
 
@@ -214,7 +214,7 @@ pub(crate) fn run_finalize(arguments: &[String]) -> Result<ReleaseCommandOutput,
     Ok(ReleaseCommandOutput::Completed(format!(
         "finalized the complete local {} asset set in {}; external provenance, signature, approval, upload, and publication remain required",
         RELEASE_VERSION,
-        output.display()
+        output_writer.root().display()
     )))
 }
 
@@ -233,7 +233,7 @@ pub(crate) fn run_check(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     Ok(ReleaseCommandOutput::Completed(format!(
         "verified the complete local {} asset set in {}; this does not verify provenance, signature, approval, upload, or publication",
         RELEASE_VERSION,
-        output.display()
+        output_writer.root().display()
     )))
 }
 
@@ -673,6 +673,9 @@ fn is_cargo_build_environment_key(key: &OsStr) -> bool {
     let Some(key) = key.to_str() else {
         return false;
     };
+    if forge_core::fingerprint::is_secret_like_name(key) {
+        return false;
+    }
     let key = key.to_ascii_uppercase();
     matches!(
         key.as_str(),
@@ -682,7 +685,10 @@ fn is_cargo_build_environment_key(key: &OsStr) -> bool {
             | "CXX"
             | "CXXFLAGS"
             | "DEVELOPER_DIR"
+            | "INCLUDE"
             | "LDFLAGS"
+            | "LIB"
+            | "LIBPATH"
             | "LIBRARY_PATH"
             | "MACOSX_DEPLOYMENT_TARGET"
             | "PKG_CONFIG_PATH"
@@ -695,6 +701,12 @@ fn is_cargo_build_environment_key(key: &OsStr) -> bool {
             | "CARGO_ENCODED_RUSTFLAGS"
             | "RUSTUP_TOOLCHAIN"
             | "SDKROOT"
+            | "UNIVERSALCRTSDKDIR"
+            | "UCRTVERSION"
+            | "VCINSTALLDIR"
+            | "VCTOOLSINSTALLDIR"
+            | "WINDOWSSDKDIR"
+            | "WINDOWSSDKVERSION"
     ) || [
         "AR_",
         "CC_",
@@ -2180,6 +2192,12 @@ mod tests {
         assert!(!super::is_cargo_build_environment_key(
             std::ffi::OsStr::new("CARGO_REGISTRIES_CRATES_IO_TOKEN")
         ));
+        assert!(!super::is_cargo_build_environment_key(
+            std::ffi::OsStr::new("CARGO_TARGET_PRIVATE_TOKEN")
+        ));
+        assert!(super::is_cargo_build_environment_key(std::ffi::OsStr::new(
+            "LIB"
+        )));
     }
 
     #[test]
