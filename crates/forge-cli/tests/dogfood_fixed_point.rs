@@ -127,23 +127,11 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
         current: &Path,
         snapshot: &mut FileTreeSnapshot,
         hasher: &mut blake3::Hasher,
+        discovered_entries: &mut usize,
     ) -> io::Result<()> {
-        let existing_entries = snapshot
-            .directories
-            .checked_add(snapshot.files)
-            .ok_or_else(|| io::Error::other("Forge private-state entry count overflowed"))?;
         let mut children = Vec::new();
         for child in current.read_dir()? {
-            if existing_entries
-                .checked_add(children.len())
-                .and_then(|entries| entries.checked_add(1))
-                .is_none_or(|entries| entries > PRIVATE_TREE_MAX_ENTRIES)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Forge private state exceeds the bounded dogfood snapshot entry count",
-                ));
-            }
+            charge_private_tree_entry(discovered_entries)?;
             children.push(child?);
         }
         children.sort_by_key(fs::DirEntry::file_name);
@@ -168,7 +156,7 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
             if metadata.is_dir() {
                 snapshot.directories += 1;
                 update_snapshot_path(hasher, b"directory", &relative)?;
-                visit(root, &path, snapshot, hasher)?;
+                visit(root, &path, snapshot, hasher, discovered_entries)?;
             } else if metadata.is_file() {
                 snapshot.files += 1;
                 snapshot.total_bytes = snapshot
@@ -225,6 +213,7 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
         Ok(metadata) if metadata.is_dir() => {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"forge.dogfood-private-tree/v1\0");
+            let mut discovered_entries = 0;
             let mut snapshot = FileTreeSnapshot {
                 exists: true,
                 directories: 0,
@@ -232,7 +221,13 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
                 total_bytes: 0,
                 digest: [0; 32],
             };
-            visit(root, root, &mut snapshot, &mut hasher)?;
+            visit(
+                root,
+                root,
+                &mut snapshot,
+                &mut hasher,
+                &mut discovered_entries,
+            )?;
             snapshot.digest = *hasher.finalize().as_bytes();
             Ok(snapshot)
         }
@@ -252,6 +247,19 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
         }),
         Err(error) => Err(error),
     }
+}
+
+fn charge_private_tree_entry(discovered_entries: &mut usize) -> io::Result<()> {
+    *discovered_entries = discovered_entries
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("Forge private-state entry count overflowed"))?;
+    if *discovered_entries > PRIVATE_TREE_MAX_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Forge private state exceeds the bounded dogfood snapshot entry count",
+        ));
+    }
+    Ok(())
 }
 
 fn update_snapshot_path(
@@ -305,6 +313,14 @@ fn repository_snapshot(root: &Path) -> Result<RepositorySnapshot, Box<dyn std::e
         forge_private_state: file_tree_snapshot(&git_dir.join("forge"))?,
         forge_shared_cache: file_tree_snapshot(&common_dir.join("forge/cache"))?,
     })
+}
+
+#[test]
+fn private_tree_entry_budget_counts_discovered_siblings_before_recursion() {
+    let mut discovered_entries = PRIVATE_TREE_MAX_ENTRIES - 1;
+    assert!(charge_private_tree_entry(&mut discovered_entries).is_ok());
+    assert_eq!(discovered_entries, PRIVATE_TREE_MAX_ENTRIES);
+    assert!(charge_private_tree_entry(&mut discovered_entries).is_err());
 }
 
 #[test]
