@@ -20,7 +20,7 @@ env:
   RUSTUP_AUTO_INSTALL: "0"
 
 concurrency:
-  group: verify-${{ github.workflow }}-${{ github.ref }}
+  group: verify-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.mutation }}
   cancel-in-progress: true
 
 jobs:
@@ -69,6 +69,13 @@ jobs:
         run: cargo +1.85.0 test --locked --workspace --no-fail-fast
       - name: Check schemas on MSRV
         run: cargo +1.85.0 run --locked -p xtask -- check-schemas
+      - name: Regenerate fixtures on MSRV
+        run: cargo +1.85.0 run --locked -p xtask -- generate-fixtures
+      - name: Reject MSRV-generated drift
+        shell: bash
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Check fuzz workspace on MSRV
         working-directory: fuzz
         run: cargo +1.85.0 check --locked --all-targets

@@ -840,6 +840,9 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
     let workflow = fs::read_to_string(root.join(".github/workflows/verify.yml"))?;
 
     assert!(workflow.contains("permissions:\n  contents: read\n"));
+    assert!(workflow.contains(
+        "group: verify-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.mutation }}"
+    ));
     assert!(
         !workflow
             .lines()
@@ -900,6 +903,7 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
         "cargo +stable fmt --all -- --check",
         "cargo +1.85.0 check --locked --workspace --all-targets",
         "cargo +1.85.0 test --locked --workspace --no-fail-fast",
+        "cargo +1.85.0 run --locked -p xtask -- generate-fixtures",
         "cargo +stable check --locked --workspace --all-targets --target",
         "cargo +stable clippy --locked --workspace --all-targets --target",
         "cargo +stable test --locked --workspace --target",
