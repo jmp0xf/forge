@@ -98,7 +98,26 @@ cargo run -p xtask -- generate-fixtures
 
 `schema-export` and `generate-fixtures` are writes. Run them only when intentionally updating their source contracts,
 then review the complete diff. Fixture definitions live under `fixtures/definitions/`; generated material belongs only
-under `fixtures/generated/`. The public N-1 self-check requires two explicit binaries:
+under `fixtures/generated/`.
+
+The default fixture matrix remains portable: it runs every declared project-native command whose tool is available and
+reports unavailable host tools without treating those commands as release evidence. Release qualification requires a
+runner provisioned with every declared native tool and the explicit strict gate:
+
+```bash
+RUSTUP_AUTO_INSTALL=0 cargo test --locked -p forge-cli --test fixture_matrix \
+  every_declared_native_command_survives_fixture_install_and_uninstall_for_release \
+  -- --ignored --exact --nocapture
+```
+
+The strict gate emits a deterministic fixture/command availability ledger before modifying a fixture, rejects a
+missing or failed tool probe, verifies the complete install-uninstall baseline, and then requires every declared native
+command to pass with Forge absent from `PATH`. The four explicitly named scenario-only fixtures still must pass their
+install/refusal and complete-baseline restoration checks; no native command applies to them. Preserve the ledger with
+the candidate evidence. A skipped default-matrix command or a nonzero strict preflight is a recorded qualification gap,
+not a pass.
+
+The public N-1 self-check requires two explicit binaries:
 
 ```bash
 cargo run -p xtask -- diff-plans \

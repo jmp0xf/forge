@@ -95,7 +95,8 @@ The repository contains, without claiming that every campaign passed for the cur
   accepted design;
 - E2E construction for dirty indexes, linked worktrees, non-UTF-8 paths, symlinks, submodules,
   timeouts/process trees, bounded huge output, malicious manifests, CRLF, uninstallability, and
-  cache side effects;
+  cache side effects, plus an explicit strict exitability qualification that fails closed unless
+  every declared project-native tool is available and every native command passes after uninstall;
 - checked-in JSON Schemas, schema-drift checks, and representative CLI-instance validation;
 - byte-level human-output goldens and representative stable failure diagnostics;
 - `xtask diff-plans`, which compares two explicit binaries over public fixture plans, diagnostics,
@@ -175,7 +176,11 @@ The following boundaries are intentionally not inferred from local implementatio
 1. **Current-candidate verification.** Every handoff must run the root and fuzz Cargo commands from
    `AGENTS.md`, schema checks, applicable fixtures, and targeted hardening campaigns, then report
    exact commands, exit codes, platform, tool versions, and remaining gaps. This document is not a
-   substitute for that run ledger.
+   substitute for that run ledger. Against commit `089fb51`, the strict exitability preflight
+   accounted for all 28 fixtures and 27 declared native commands, then exited 101 before fixture
+   mutation because this host lacked `just` and `task` (25 commands had available tools). That is
+   an explicit release-qualification gap, not evidence that those two commands passed; rerun the
+   ignored strict gate on a controlled runner provisioned with every declared tool.
 2. **Filesystem threat model and security review.** Repository writes and release-asset reads/writes
    now pin root directory handles and revalidate the visible root identity. Native adversarial tests
    and independent security review remain required; `SECURITY.md` still lacks a usable private
