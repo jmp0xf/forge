@@ -1475,6 +1475,7 @@ mod tests {
         fs::create_dir_all(intermediate.join("b"))?;
         fs::write(intermediate.join("b/target.txt"), b"reviewed")?;
         let writer = RepositoryWriter::new(repository.path())?;
+        let swap_completed = Cell::new(false);
 
         let error = match writer.write_atomic_if_unchanged_with_hook(
             Path::new("a/b/target.txt"),
@@ -1486,6 +1487,7 @@ mod tests {
                     fs::rename(&intermediate, &saved_intermediate)?;
                     fs::create_dir_all(intermediate.join("b"))?;
                     fs::write(intermediate.join("b/target.txt"), b"replacement")?;
+                    swap_completed.set(true);
                 }
                 Ok(())
             },
@@ -1499,22 +1501,30 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"replacement");
-
         #[cfg(unix)]
-        assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
-        #[cfg(unix)]
-        assert_eq!(fs::read(saved_intermediate.join("b/target.txt"))?, b"forge");
+        {
+            assert!(swap_completed.get());
+            assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
+            assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"replacement");
+            assert_eq!(fs::read(saved_intermediate.join("b/target.txt"))?, b"forge");
+        }
 
         #[cfg(windows)]
         {
             assert_eq!(error.commit(), RepositoryWriteCommit::NotCommitted);
-            assert_eq!(
-                fs::read(saved_intermediate.join("b/target.txt"))?,
-                b"reviewed"
-            );
-            assert_no_repository_temporary_files(&intermediate.join("b"))?;
-            assert_no_repository_temporary_files(&saved_intermediate.join("b"))?;
+            if swap_completed.get() {
+                assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"replacement");
+                assert_eq!(
+                    fs::read(saved_intermediate.join("b/target.txt"))?,
+                    b"reviewed"
+                );
+                assert_no_repository_temporary_files(&intermediate.join("b"))?;
+                assert_no_repository_temporary_files(&saved_intermediate.join("b"))?;
+            } else {
+                assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"reviewed");
+                assert!(!saved_intermediate.exists());
+                assert_no_repository_temporary_files(&intermediate.join("b"))?;
+            }
         }
         Ok(())
     }

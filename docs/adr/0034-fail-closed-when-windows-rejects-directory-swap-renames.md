@@ -15,13 +15,14 @@ rename 在祖先被移动后仍提交到旧树。这个决定误读了 Microsoft
 目标目录解析的移动。固定父目录仍负责临时文件创建、目标读取和身份复核，但不应作为同目录 rename 的
 目标参数重复传入。
 
-GitHub Actions run `30374770619` 的 Windows job `90327596634` 还区分了两个此前混在一起的阶段：
+GitHub Actions run `30374770619` 和 `30377585092` 的 Windows jobs 还区分了此前混在一起的阶段：
 
-- 中间祖先在 prewrite 后、临时文件创建前成功移动时，最终 rename 返回提交前失败；commit state 是
-  `NotCommitted`，替换树没有收到 Forge 内容；
-- root/最终父目录在 `BeforeCommit` 回调中移动的用例，此时临时文件已经打开。Windows 可以先拒绝回调
-  内的目录移动，所以测试不能假设 `saved-*` 树一定已经产生，更不能把随后读取不存在路径的错误当成
-  rename 已经执行的证据；
+- 中间祖先在 prewrite 后、临时文件创建前尝试移动时，Windows 可以先拒绝回调内的目录移动；
+- root/最终父目录在 `BeforeCommit` 回调中移动的用例，此时临时文件已经打开，Windows 同样可以先拒绝
+  目录移动。测试不能假设 `saved-*` 树一定已经产生，更不能把随后读取不存在路径的错误当成 rename
+  已经执行的证据；
+- 若目录交换已经完成但最终 rename 被文件系统拒绝，commit state 仍必须是 `NotCommitted`，替换树
+  不得收到 Forge 内容；
 - 同一候选上的 Linux 和 macOS `renameat` 可以安全提交到固定旧目录，随后因可见身份变化返回
   `CommittedUnverified`。
 
@@ -41,11 +42,10 @@ GitHub Actions run `30374770619` 的 Windows job `90327596634` 还区分了两�
 4. Windows 因已打开文件或陈旧祖先名称拒绝目录移动/rename 时允许安全失败。不得为了取得与 Unix 相同
    的进展而改写 commit state、解析可见完整路径或把内容写到替换树；
 5. 确定性测试必须按实际阶段证明拓扑：
-   - Windows 中间祖先交换完成但 rename 被拒绝时，替换树保留 replacement、旧树保留 reviewed、无临时
-     文件，commit state 为 `NotCommitted`；
-   - Windows `BeforeCommit` 测试记录目录移动是否完成：若文件系统拒绝移动，原拓扑不变；若移动完成，
-     替换树仍不得收到内容，旧树目标只能缺失或包含完整 postimage；所有仍存在的相关目录都无临时
-     文件；
+   - Windows 中间祖先和 `BeforeCommit` 测试记录目录移动是否完成：若文件系统拒绝移动，原拓扑不变；
+     若移动完成，替换树仍不得收到 Forge 内容，旧树目标只能保留完整 preimage、缺失或包含完整
+     postimage；所有仍存在的相关目录都无临时文件；
+   - Windows 在原生 rename 前失败时必须报告 `NotCommitted`；
    - Unix 相应用例继续要求旧树收到完整内容、替换树不变，并报告 `CommittedUnverified`。
 
 `RepositoryWriteCommit` 已经同时表达这两种真实结果，本决定不修改 versioned machine contract。
@@ -80,8 +80,8 @@ GitHub Actions run `30374770619` 的 Windows job `90327596634` 还区分了两�
 
 ### 以同一个父目录句柄重新打开 source 后重试
 
-中间祖先测试已经在交换完成后通过该父目录句柄创建临时文件，仍得到提交前失败。重复同构操作没有
-新增身份信息或真实运行证据。
+这没有解决 Windows 先拒绝目录交换的路径；在交换确实完成的文件系统上，重复同构操作也没有新增
+身份信息或真实运行证据。
 
 ### 立即引入 OpenFileById 恢复路径
 
