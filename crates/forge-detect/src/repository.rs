@@ -37,7 +37,8 @@ pub struct RepositoryDetection {
 ///
 /// Keeping these values together lets callers establish process and private-state boundaries from
 /// the same Git observations later consumed by repository detection. Construction remains behind
-/// the controlled resolvers so a relative common directory cannot enter the detection pipeline.
+/// the controlled resolvers so relative repository or Git-state paths cannot enter the detection
+/// pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryTopology {
     root: PathBuf,
@@ -155,7 +156,11 @@ where
     G: GitPort + ?Sized,
 {
     control_step("repository root", control)?;
-    let root = required_git_step("repository root", git.repository_root(start))?;
+    let root = require_absolute_topology_path(
+        "repository root",
+        "repository-root",
+        required_git_step("repository root", git.repository_root(start))?,
+    )?;
     resolve_repository_topology_from_root_controlled(root, git, control)
 }
 
@@ -171,25 +176,42 @@ pub fn resolve_repository_topology_from_root_controlled<G>(
 where
     G: GitPort + ?Sized,
 {
+    let root = require_absolute_topology_path("repository root", "repository-root", root)?;
     control_step("worktree Git directory", control)?;
-    let git_dir = required_git_step("worktree Git directory", git.git_dir(&root))?;
+    let git_dir = require_absolute_topology_path(
+        "worktree Git directory",
+        "git-dir",
+        required_git_step("worktree Git directory", git.git_dir(&root))?,
+    )?;
     control_step("common Git directory", control)?;
-    let git_common_dir = required_git_step("common Git directory", git.git_common_dir(&root))?;
-    if !git_common_dir.is_absolute() {
-        return Err(RepositoryDetectionError {
-            step: "common Git directory",
-            source: GitError::new(
-                GitErrorKind::InvalidData,
-                "git-common-dir",
-                "Git returned a non-absolute common directory",
-            ),
-        });
-    }
+    let git_common_dir = require_absolute_topology_path(
+        "common Git directory",
+        "git-common-dir",
+        required_git_step("common Git directory", git.git_common_dir(&root))?,
+    )?;
     Ok(RepositoryTopology {
         root,
         git_dir,
         git_common_dir,
     })
+}
+
+fn require_absolute_topology_path(
+    step: &'static str,
+    command: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, RepositoryDetectionError> {
+    if !path.is_absolute() {
+        return Err(RepositoryDetectionError {
+            step,
+            source: GitError::new(
+                GitErrorKind::InvalidData,
+                command,
+                format!("Git returned a non-absolute path for {step}"),
+            ),
+        });
+    }
+    Ok(path)
 }
 
 /// Detects repository facts from Git locations already resolved by a controlled topology resolver.
@@ -904,24 +926,35 @@ mod tests {
     }
 
     #[test]
-    fn repository_detection_rejects_a_relative_common_dir_before_hashing()
+    fn repository_detection_rejects_relative_topology_paths_before_hashing()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
-        git.common_dir = Ok(PathBuf::from(".git"));
-        let hasher = RecordingHasher::returning("blake3:must-not-be-used");
+        for (field, expected_step) in [
+            ("root", "repository root"),
+            ("git-dir", "worktree Git directory"),
+            ("common-dir", "common Git directory"),
+        ] {
+            let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+            match field {
+                "root" => git.root = Ok(PathBuf::from("repo")),
+                "git-dir" => git.git_dir = Ok(PathBuf::from(".git")),
+                "common-dir" => git.common_dir = Ok(PathBuf::from(".git")),
+                _ => unreachable!(),
+            }
+            let hasher = RecordingHasher::returning("blake3:must-not-be-used");
 
-        let error = detect_repository(
-            repository_root(),
-            &git,
-            &MarkerFileSystem::default(),
-            &hasher,
-        )
-        .err()
-        .ok_or("relative common directory unexpectedly produced facts")?;
+            let error = detect_repository(
+                repository_root(),
+                &git,
+                &MarkerFileSystem::default(),
+                &hasher,
+            )
+            .err()
+            .ok_or("relative repository topology unexpectedly produced facts")?;
 
-        assert_eq!(error.step(), "common Git directory");
-        assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
-        assert!(hasher.calls.borrow().is_empty());
+            assert_eq!(error.step(), expected_step);
+            assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
+            assert!(hasher.calls.borrow().is_empty());
+        }
         Ok(())
     }
 
