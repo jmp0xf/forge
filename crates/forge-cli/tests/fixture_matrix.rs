@@ -1,6 +1,6 @@
 //! Named end-to-end checks for special conditions in the public v0 fixture matrix.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -42,9 +42,26 @@ const REQUIRED_FIXTURES: &[&str] = &[
     "timeout-tree",
 ];
 
+const COMMANDLESS_UNINSTALL_SCENARIOS: &[&str] = &[
+    "empty-repo",
+    "huge-output",
+    "malicious-runner",
+    "timeout-tree",
+];
+
+const INIT_MANAGED_PROJECT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "forge.toml"];
+
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
-type WorktreeSnapshot = Vec<(PathBuf, Vec<u8>)>;
+#[derive(Debug, Eq, PartialEq)]
+enum WorktreeEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+    Other,
+}
+
+type WorktreeSnapshot = Vec<(PathBuf, WorktreeEntry)>;
 
 #[test]
 fn public_manifest_contains_the_exact_v0_matrix_without_forge_owned_project_commands()
@@ -782,42 +799,41 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
         repository_root().join("fixtures/generated/manifest-v1.json"),
     )?)?;
     let fixtures = required_array(&manifest, "fixtures")?;
-    let mut executed = 0_usize;
-    let mut install_failures = Vec::new();
+    let mut fixture_proofs = BTreeMap::new();
 
     for fixture_definition in fixtures {
         let id = fixture_definition["id"]
             .as_str()
             .ok_or("fixture manifest entry omitted id")?;
         let fixture = FixtureWorkspace::from_generated(id)?;
-        let original_agents = read_optional(fixture.worktree.join("AGENTS.md"))?;
-        let original_claude = read_optional(fixture.worktree.join("CLAUDE.md"))?;
+        // `.git` is intentionally outside the worktree baseline; fixture support and tool caches
+        // live under `fixture.root`, beside rather than inside this copied project.
+        let baseline = fixture.snapshot_worktree()?;
+        let original_managed_files = INIT_MANAGED_PROJECT_FILES
+            .iter()
+            .map(|relative| Ok((*relative, read_optional(fixture.worktree.join(relative))?)))
+            .collect::<Result<Vec<_>, io::Error>>()?;
 
         if id != "non-git" {
             fixture.initialize_git()?;
-            let applied = fixture.run_forge(&["init", "--apply", "--json"])?;
-            let expected = match id {
-                "empty-repo" => 2,
-                "managed-block-conflict" => 65,
-                _ => 0,
-            };
-            if applied.status.code() != Some(expected) {
-                let follow_up = fixture.run_forge(&["init", "--json"])?;
-                install_failures.push(format!(
-                    "fixture `{id}` expected init exit {expected}: {}; fresh plan after failure: {}",
-                    summarize_init_output(&applied),
-                    summarize_init_output(&follow_up)
-                ));
-            }
+        }
+        let applied = fixture.run_forge(&["init", "--apply", "--json"])?;
+        let expected_init_exit = match id {
+            "empty-repo" | "non-git" => 2,
+            "managed-block-conflict" => 65,
+            _ => 0,
+        };
+        assert_eq!(
+            applied.status.code(),
+            Some(expected_init_exit),
+            "fixture `{id}` expected init exit {expected_init_exit}: {}",
+            summarize_init_output(&applied)
+        );
 
-            restore_optional(
-                fixture.worktree.join("AGENTS.md"),
-                original_agents.as_deref(),
-            )?;
-            restore_optional(
-                fixture.worktree.join("CLAUDE.md"),
-                original_claude.as_deref(),
-            )?;
+        for (relative, original) in original_managed_files {
+            restore_optional(fixture.worktree.join(relative), original.as_deref())?;
+        }
+        if id != "non-git" {
             let state = fixture.git_dir(&fixture.worktree)?.join("forge");
             if state.exists() {
                 fs::remove_dir_all(&state)?;
@@ -828,20 +844,29 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
             );
         }
 
-        let config = fixture.worktree.join("forge.toml");
-        if config.exists() {
-            fs::remove_file(config)?;
-        }
-        assert!(!fixture.worktree.join(".forge").exists());
+        assert_eq!(
+            fixture.snapshot_worktree()?,
+            baseline,
+            "fixture `{id}` uninstall did not restore the complete pre-test worktree baseline"
+        );
 
-        for (command_index, command) in required_array(fixture_definition, "commands")?
-            .iter()
-            .enumerate()
-        {
+        let commands = required_array(fixture_definition, "commands")?;
+        if commands.is_empty() {
+            assert!(
+                COMMANDLESS_UNINSTALL_SCENARIOS.contains(&id),
+                "fixture `{id}` has no native command without an explicit scenario-only classification"
+            );
+        }
+        let mut proven_commands = 0_usize;
+        let mut unavailable_commands = 0_usize;
+        let mut missing_host_tools = BTreeSet::new();
+        for (command_index, command) in commands.iter().enumerate() {
             let program = command["program"]
                 .as_str()
                 .ok_or("fixture command omitted program")?;
             if !tool_is_available(program)? {
+                missing_host_tools.insert(program.to_owned());
+                unavailable_commands += 1;
                 continue;
             }
             let arguments = required_array(command, "args")?
@@ -862,18 +887,47 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
                 "fixture `{id}` native command {command_index}: {}",
                 display_output(&output)
             );
-            executed += 1;
+            proven_commands += 1;
         }
+
+        assert_eq!(
+            proven_commands + unavailable_commands,
+            commands.len(),
+            "fixture `{id}` did not account for every declared native command"
+        );
+        let native_proof = if commands.is_empty() {
+            "scenario-only".to_owned()
+        } else if missing_host_tools.is_empty() {
+            assert_eq!(proven_commands, commands.len());
+            format!("Proven(native_commands={proven_commands})")
+        } else {
+            format!(
+                "missing-host-tool(programs={missing_host_tools:?}, native_commands_proven={proven_commands})"
+            )
+        };
+        let proof = if expected_init_exit == 0 {
+            native_proof
+        } else {
+            format!("expected-refusal(init_exit={expected_init_exit}); native={native_proof}")
+        };
+        assert!(
+            fixture_proofs.insert(id.to_owned(), proof).is_none(),
+            "fixture `{id}` produced more than one uninstall proof"
+        );
     }
 
-    assert!(
-        executed >= 10,
-        "too few native commands ran to make the uninstall gate meaningful: {executed}"
+    assert_eq!(
+        fixture_proofs.len(),
+        fixtures.len(),
+        "not every fixture produced an uninstall proof: {fixture_proofs:#?}"
     );
-    assert!(
-        install_failures.is_empty(),
-        "fixture install failures prevented a clean uninstall proof:\n{}",
-        install_failures.join("\n")
+    assert_eq!(
+        fixture_proofs
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        REQUIRED_FIXTURES.iter().copied().collect::<BTreeSet<_>>(),
+        "the uninstall proof ledger did not cover the public fixture matrix"
     );
     Ok(())
 }
@@ -1530,7 +1584,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error
 fn snapshot_tree(
     root: &Path,
     current: &Path,
-    output: &mut Vec<(PathBuf, Vec<u8>)>,
+    output: &mut WorktreeSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
@@ -1541,14 +1595,23 @@ fn snapshot_tree(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            snapshot_tree(root, &path, output)?;
-        } else if file_type.is_file() {
-            output.push((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?));
-        } else {
             output.push((
                 path.strip_prefix(root)?.to_path_buf(),
-                b"<non-regular>".to_vec(),
+                WorktreeEntry::Directory,
             ));
+            snapshot_tree(root, &path, output)?;
+        } else if file_type.is_file() {
+            output.push((
+                path.strip_prefix(root)?.to_path_buf(),
+                WorktreeEntry::File(fs::read(path)?),
+            ));
+        } else if file_type.is_symlink() {
+            output.push((
+                path.strip_prefix(root)?.to_path_buf(),
+                WorktreeEntry::Symlink(fs::read_link(path)?),
+            ));
+        } else {
+            output.push((path.strip_prefix(root)?.to_path_buf(), WorktreeEntry::Other));
         }
     }
     Ok(())
