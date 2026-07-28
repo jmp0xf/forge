@@ -7,7 +7,6 @@ mod adapters;
 mod args;
 mod doctor;
 mod evidence;
-#[allow(dead_code)]
 mod evidence_state;
 mod evidence_view;
 mod explain;

@@ -25,10 +25,6 @@ impl ParsedJson {
         &self.semantic
     }
 
-    pub(super) fn into_semantic(self) -> Value {
-        self.semantic
-    }
-
     pub(super) const fn alternate_semantic(&self) -> Option<&Value> {
         self.alternate_semantic.as_ref()
     }

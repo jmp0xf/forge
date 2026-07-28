@@ -39,7 +39,6 @@ use self::contract_shape::has_unknown_contract_content;
 
 const RECEIPT_IDENTITY_DOMAIN: &[u8] = b"forge.receipt-identity/v1";
 const EVIDENCE_IDENTITY_DOMAIN: &[u8] = b"forge.evidence-identity/v1";
-const LOG_IDENTITY_DOMAIN: &[u8] = b"forge.log-identity/v1";
 const RECEIPT_BINDING_COVERAGE_DOMAIN: &[u8] = b"forge.receipt-binding-coverage/v1";
 const RECEIPT_ID_PREFIX: &str = "receipt:blake3:";
 const EVIDENCE_ID_PREFIX: &str = "evidence:blake3:";
@@ -66,13 +65,6 @@ impl DocumentKind {
         }
     }
 
-    const fn directory(self) -> &'static str {
-        match self {
-            Self::Receipt => "receipts/v2",
-            Self::Evidence => "evidence/v2",
-        }
-    }
-
     const fn max_bytes(self) -> usize {
         match self {
             Self::Receipt => RECEIPT_OBJECT_MAX_BYTES,
@@ -86,17 +78,11 @@ impl DocumentKind {
 /// Construction stays private so callers cannot pair arbitrary bytes with a trusted filename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedEvidenceStateObject {
-    key: String,
     object_name: EvidenceStateObjectName,
     bytes: Vec<u8>,
 }
 
 impl PreparedEvidenceStateObject {
-    #[must_use]
-    pub(crate) fn key(&self) -> &str {
-        &self.key
-    }
-
     #[must_use]
     pub(crate) const fn object_name(&self) -> &EvidenceStateObjectName {
         &self.object_name
@@ -126,56 +112,18 @@ enum ParsedEvidence {
 
 /// A Receipt whose schema, content identity, and filename were validated together.
 ///
-/// The original bytes and a bounded semantic JSON projection are deliberately retained.
-/// Same-major fields unknown to this binary participate in the immutable identity and must not
-/// disappear during export. The projection is intentionally not a lossless source for arbitrary
-/// JSON numbers. This wrapper does not implement `Serialize`; callers needing the persisted
-/// document must use [`Self::original_bytes`] instead of reserializing either projection.
+/// Same-major fields unknown to this binary participate in immutable identity and make the Receipt
+/// non-proving. The caller retains the original snapshot bytes; this wrapper keeps only the bounded
+/// typed facts needed for validation and current evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedReceipt {
     version: EvidenceStateVersion,
     object_name: EvidenceStateObjectName,
-    original_bytes: Box<[u8]>,
-    original_json: Value,
-    has_unknown_contract_content: bool,
     can_support_current_evidence: bool,
     parsed: ParsedReceipt,
 }
 
 impl ValidatedReceipt {
-    #[must_use]
-    pub(crate) const fn version(&self) -> EvidenceStateVersion {
-        self.version
-    }
-
-    #[must_use]
-    pub(crate) const fn object_name(&self) -> &EvidenceStateObjectName {
-        &self.object_name
-    }
-
-    #[must_use]
-    pub(crate) fn original_bytes(&self) -> &[u8] {
-        &self.original_bytes
-    }
-
-    #[must_use]
-    /// Returns the fail-closed schema-inspection projection, not a lossless export representation.
-    pub(crate) const fn original_json(&self) -> &Value {
-        &self.original_json
-    }
-
-    /// Unknown same-major content is retained but can never support current Evidence.
-    #[must_use]
-    pub(crate) const fn has_unknown_contract_content(&self) -> bool {
-        self.has_unknown_contract_content
-    }
-
-    /// This only reports wire-semantic eligibility; freshness and policy still require evaluation.
-    #[must_use]
-    pub(crate) const fn can_support_current_evidence(&self) -> bool {
-        self.can_support_current_evidence
-    }
-
     fn parsed(&self) -> &ParsedReceipt {
         &self.parsed
     }
@@ -190,15 +138,9 @@ impl ValidatedReceipt {
     /// retaining binding facts for an Evidence run cannot accidentally retain every Receipt body.
     #[must_use]
     pub(crate) fn binding_fact(&self) -> ReceiptBindingFact {
-        let (complete, intent, outcome, coverage_digest) = match self.parsed() {
-            ParsedReceipt::V1(envelope) => (
-                !self.has_unknown_contract_content,
-                envelope.data.intent,
-                envelope.data.outcome,
-                None,
-            ),
+        let (intent, outcome, coverage_digest) = match self.parsed() {
+            ParsedReceipt::V1(envelope) => (envelope.data.intent, envelope.data.outcome, None),
             ParsedReceipt::V2(envelope) => (
-                !self.has_unknown_contract_content && self.can_support_current_evidence,
                 envelope.data.intent,
                 envelope.data.outcome,
                 Some(receipt_binding_coverage_digest(&envelope.data.coverage)),
@@ -206,7 +148,6 @@ impl ValidatedReceipt {
         };
         ReceiptBindingFact {
             reference: self.state_reference(),
-            complete,
             can_support_current_evidence: self.can_support_current_evidence,
             intent,
             outcome,
@@ -360,13 +301,9 @@ fn aggregate_receipt_mutability(values: impl IntoIterator<Item = MutabilityData>
 }
 
 /// Fixed-size semantic projection of a validated Receipt used while preparing Evidence.
-///
-/// `complete` is false for every same-major extension this binary cannot fully interpret. Such a
-/// fact may still bind a non-proving historical summary, but it can never bind `valid_receipts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReceiptBindingFact {
     reference: ReceiptStateReference,
-    complete: bool,
     can_support_current_evidence: bool,
     intent: IntentData,
     outcome: OutcomeData,
@@ -404,70 +341,16 @@ pub(crate) struct CurrentReceiptEvaluationProjection {
 ///
 /// Persisted `valid_receipts`, coverage, and `local_state` remain historical summaries. This type
 /// intentionally grants no current sufficiency meaning; current decisions must reload Receipt
-/// objects, recompute freshness and policy, and aggregate again. `original_bytes` is the only
-/// lossless representation; `original_json` is a bounded schema-inspection projection.
+/// objects, recompute freshness and policy, and aggregate again. The caller retains the original
+/// snapshot bytes while this wrapper keeps only bounded typed facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedEvidence {
-    version: EvidenceStateVersion,
-    object_name: EvidenceStateObjectName,
-    original_bytes: Box<[u8]>,
-    original_json: Value,
-    has_unknown_contract_content: bool,
     parsed: ParsedEvidence,
 }
 
 impl ValidatedEvidence {
-    #[must_use]
-    pub(crate) const fn version(&self) -> EvidenceStateVersion {
-        self.version
-    }
-
-    #[must_use]
-    pub(crate) const fn object_name(&self) -> &EvidenceStateObjectName {
-        &self.object_name
-    }
-
-    #[must_use]
-    pub(crate) fn original_bytes(&self) -> &[u8] {
-        &self.original_bytes
-    }
-
-    #[must_use]
-    /// Returns the fail-closed schema-inspection projection, not a lossless export representation.
-    pub(crate) const fn original_json(&self) -> &Value {
-        &self.original_json
-    }
-
-    /// A true value means the historical summary may contain references this binary cannot name.
-    #[must_use]
-    pub(crate) const fn has_unknown_contract_content(&self) -> bool {
-        self.has_unknown_contract_content
-    }
-
     fn parsed(&self) -> &ParsedEvidence {
         &self.parsed
-    }
-}
-
-/// Receipt references whose persisted summaries were checked against the immutable objects.
-///
-/// This is only a structural/historical binding. It deliberately contains no persisted
-/// `local_state` or coverage decision and therefore cannot be mistaken for current sufficiency.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EvidenceReceiptBindings {
-    references: BTreeSet<ReceiptStateReference>,
-    complete: bool,
-}
-
-impl EvidenceReceiptBindings {
-    #[must_use]
-    pub(crate) fn references(&self) -> &BTreeSet<ReceiptStateReference> {
-        &self.references
-    }
-
-    #[must_use]
-    pub(crate) const fn is_complete(&self) -> bool {
-        self.complete
     }
 }
 
@@ -478,16 +361,12 @@ impl EvidenceReceiptBindings {
 pub(crate) fn validate_evidence_receipt_bindings<'a>(
     evidence: &ValidatedEvidence,
     receipts: impl IntoIterator<Item = &'a ReceiptBindingFact>,
-) -> Result<EvidenceReceiptBindings, EvidenceStateDecodeError> {
+) -> Result<(), EvidenceStateDecodeError> {
     let summaries = match evidence.parsed() {
         ParsedEvidence::V1(envelope) => EvidenceReceiptSummaries::V1(&envelope.data),
         ParsedEvidence::V2(envelope) => EvidenceReceiptSummaries::V2(&envelope.data),
     };
-    validate_receipt_bindings(
-        summaries,
-        !evidence.has_unknown_contract_content(),
-        receipts,
-    )
+    validate_receipt_bindings(summaries, receipts)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -498,9 +377,8 @@ enum EvidenceReceiptSummaries<'a> {
 
 fn validate_receipt_bindings<'a>(
     summaries: EvidenceReceiptSummaries<'_>,
-    evidence_complete: bool,
     receipts: impl IntoIterator<Item = &'a ReceiptBindingFact>,
-) -> Result<EvidenceReceiptBindings, EvidenceStateDecodeError> {
+) -> Result<(), EvidenceStateDecodeError> {
     let mut index = BTreeMap::new();
     for (offset, receipt) in receipts.into_iter().enumerate() {
         if offset >= EVIDENCE_GC_MAX_RECEIPTS {
@@ -512,13 +390,11 @@ fn validate_receipt_bindings<'a>(
     }
 
     let mut references = BTreeSet::new();
-    let mut complete = evidence_complete;
     match summaries {
         EvidenceReceiptSummaries::V1(evidence) => {
             for summary in &evidence.valid_receipts {
                 let reference = receipt_reference(EvidenceStateVersion::V1, summary.id.as_str())?;
                 let receipt = require_indexed_receipt(&index, &reference)?;
-                complete &= receipt.complete;
                 if receipt.intent != summary.intent || receipt.outcome != summary.outcome {
                     return Err(EvidenceStateDecodeError::InvalidReference);
                 }
@@ -526,8 +402,7 @@ fn validate_receipt_bindings<'a>(
             }
             for summary in &evidence.stale_receipts {
                 let reference = receipt_reference(EvidenceStateVersion::V1, summary.id.as_str())?;
-                let receipt = require_indexed_receipt(&index, &reference)?;
-                complete &= receipt.complete;
+                require_indexed_receipt(&index, &reference)?;
                 references.insert(reference);
             }
         }
@@ -536,9 +411,8 @@ fn validate_receipt_bindings<'a>(
                 let reference = receipt_reference(EvidenceStateVersion::V2, summary.id.as_str())?;
                 let receipt = require_indexed_receipt(&index, &reference)?;
                 // The v2 semantic validator makes `can_support_current_evidence` false for every
-                // unknown or incomplete contract fact, and `binding_fact` derives `complete` from
-                // that same predicate. Check the proving predicate once instead of maintaining two
-                // equivalent rejection branches.
+                // unknown or incomplete contract fact. Check that proving predicate before binding
+                // a persisted valid-Receipt summary.
                 if !receipt.can_support_current_evidence
                     || receipt.intent != summary.intent
                     || receipt.outcome != OutcomeData::Pass
@@ -559,7 +433,6 @@ fn validate_receipt_bindings<'a>(
                     } => {
                         let reference = receipt_reference(EvidenceStateVersion::V1, id.as_str())?;
                         let receipt = require_indexed_receipt(&index, &reference)?;
-                        complete &= receipt.complete;
                         let matches = receipt.intent == *intent && receipt.outcome == *outcome;
                         (reference, matches)
                     }
@@ -570,15 +443,11 @@ fn validate_receipt_bindings<'a>(
                     } => {
                         let reference = receipt_reference(EvidenceStateVersion::V2, id.as_str())?;
                         let receipt = require_indexed_receipt(&index, &reference)?;
-                        complete &= receipt.complete;
                         let matches = receipt.intent == *intent
                             && receipt.outcome == validity.as_inner().outcome;
                         (reference, matches)
                     }
-                    _ => {
-                        complete = false;
-                        continue;
-                    }
+                    _ => continue,
                 };
                 if !matches || !references.insert(reference) {
                     return Err(EvidenceStateDecodeError::InvalidReference);
@@ -587,10 +456,7 @@ fn validate_receipt_bindings<'a>(
         }
     }
 
-    Ok(EvidenceReceiptBindings {
-        references,
-        complete,
-    })
+    Ok(())
 }
 
 fn require_indexed_receipt<'a>(
@@ -601,34 +467,6 @@ fn require_indexed_receipt<'a>(
         .get(reference)
         .copied()
         .ok_or(EvidenceStateDecodeError::InvalidReference)
-}
-
-impl JsonEvidenceStateCodec {
-    pub(crate) fn validate_receipt_object(
-        &self,
-        version: EvidenceStateVersion,
-        filename: &EvidenceStateObjectName,
-        bytes: &[u8],
-    ) -> Result<ReceiptRetentionMetadata, EvidenceStateDecodeError> {
-        let decoded = decode_receipt(version, bytes)?;
-        if &decoded.object_name != filename {
-            return Err(EvidenceStateDecodeError::InvalidReference);
-        }
-        Ok(decoded.metadata)
-    }
-
-    pub(crate) fn validate_evidence_object(
-        &self,
-        version: EvidenceStateVersion,
-        filename: &EvidenceStateObjectName,
-        bytes: &[u8],
-    ) -> Result<EvidenceRetentionMetadata, EvidenceStateDecodeError> {
-        let decoded = decode_evidence(version, bytes)?;
-        if &decoded.object_name != filename {
-            return Err(EvidenceStateDecodeError::InvalidReference);
-        }
-        Ok(decoded.metadata)
-    }
 }
 
 /// Loads a Receipt without exposing a plain-deserialization path that could skip identity checks.
@@ -644,9 +482,6 @@ pub(crate) fn load_receipt(
     Ok(ValidatedReceipt {
         version,
         object_name: decoded.object_name,
-        original_bytes: bytes.into(),
-        original_json: decoded.raw,
-        has_unknown_contract_content: decoded.has_unknown_contract_content,
         can_support_current_evidence: decoded.can_support_current_evidence,
         parsed: decoded.document,
     })
@@ -663,11 +498,6 @@ pub(crate) fn load_evidence(
         return Err(EvidenceStateDecodeError::InvalidReference);
     }
     Ok(ValidatedEvidence {
-        version,
-        object_name: decoded.object_name,
-        original_bytes: bytes.into(),
-        original_json: decoded.raw,
-        has_unknown_contract_content: decoded.has_unknown_contract_content,
         parsed: decoded.document,
     })
 }
@@ -716,32 +546,11 @@ pub(crate) fn prepare_evidence<'a>(
         "evidence",
     )?;
     validate_evidence_v2_semantics(&envelope.data)?;
-    validate_receipt_bindings(
-        EvidenceReceiptSummaries::V2(&envelope.data),
-        true,
-        receipt_facts,
-    )?;
+    validate_receipt_bindings(EvidenceReceiptSummaries::V2(&envelope.data), receipt_facts)?;
     let raw = serde_json::to_value(&envelope).map_err(|_| EvidenceStateDecodeError::Malformed)?;
     let (public_id, _) = calculate_identity(&raw, DocumentKind::Evidence)?;
     envelope.data.id = EvidenceId::new(public_id);
     prepare_document(envelope, DocumentKind::Evidence)
-}
-
-/// Names complete, already-redacted log bytes without interpreting or truncating them.
-pub(crate) fn prepare_log(
-    bytes: Vec<u8>,
-) -> Result<PreparedEvidenceStateObject, EvidenceStateDecodeError> {
-    let object_name = log_object_name(&bytes)?;
-    Ok(PreparedEvidenceStateObject {
-        key: format!("logs/v1/{}.log", object_name.as_str()),
-        object_name,
-        bytes,
-    })
-}
-
-#[must_use]
-pub(crate) fn verify_log_object(filename: &EvidenceStateObjectName, bytes: &[u8]) -> bool {
-    log_object_name(bytes).is_ok_and(|actual| &actual == filename)
 }
 
 fn prepare_document<T: Serialize>(
@@ -755,11 +564,7 @@ fn prepare_document<T: Serialize>(
         DocumentKind::Receipt => decode_receipt(EvidenceStateVersion::V2, &bytes)?.object_name,
         DocumentKind::Evidence => decode_evidence(EvidenceStateVersion::V2, &bytes)?.object_name,
     };
-    Ok(PreparedEvidenceStateObject {
-        key: format!("{}/{}.json", kind.directory(), object_name.as_str()),
-        object_name,
-        bytes,
-    })
+    Ok(PreparedEvidenceStateObject { object_name, bytes })
 }
 
 fn validate_writable_envelope(
@@ -778,8 +583,6 @@ fn validate_writable_envelope(
 struct DecodedReceipt {
     object_name: EvidenceStateObjectName,
     metadata: ReceiptRetentionMetadata,
-    raw: Value,
-    has_unknown_contract_content: bool,
     can_support_current_evidence: bool,
     document: ParsedReceipt,
 }
@@ -788,8 +591,6 @@ struct DecodedReceipt {
 struct DecodedEvidence {
     object_name: EvidenceStateObjectName,
     metadata: EvidenceRetentionMetadata,
-    raw: Value,
-    has_unknown_contract_content: bool,
     document: ParsedEvidence,
 }
 
@@ -828,8 +629,6 @@ fn decode_receipt(
                     log_references,
                 ),
                 object_name,
-                raw: raw.into_semantic(),
-                has_unknown_contract_content,
                 can_support_current_evidence: false,
                 document: ParsedReceipt::V1(envelope),
             })
@@ -858,8 +657,6 @@ fn decode_receipt(
                     log_references,
                 ),
                 object_name,
-                raw: raw.into_semantic(),
-                has_unknown_contract_content,
                 can_support_current_evidence,
                 document: ParsedReceipt::V2(envelope),
             })
@@ -911,8 +708,6 @@ fn decode_evidence(
                     log_references,
                 ),
                 object_name,
-                raw: raw.into_semantic(),
-                has_unknown_contract_content,
                 document: ParsedEvidence::V1(envelope),
             })
         }
@@ -943,8 +738,6 @@ fn decode_evidence(
                     log_references,
                 ),
                 object_name,
-                raw: raw.into_semantic(),
-                has_unknown_contract_content,
                 document: ParsedEvidence::V2(envelope),
             })
         }
@@ -1212,16 +1005,6 @@ fn parse_public_id(
         .ok_or(EvidenceStateDecodeError::InvalidReference)?;
     EvidenceStateObjectName::new(payload.to_owned())
         .map_err(|_| EvidenceStateDecodeError::InvalidReference)
-}
-
-fn log_object_name(bytes: &[u8]) -> Result<EvidenceStateObjectName, EvidenceStateDecodeError> {
-    let digest = Blake3Hasher::digest_chunks(&[LOG_IDENTITY_DOMAIN, bytes]);
-    let payload = digest
-        .as_str()
-        .strip_prefix("blake3:")
-        .ok_or(EvidenceStateDecodeError::Malformed)?;
-    EvidenceStateObjectName::new(payload.to_owned())
-        .map_err(|_| EvidenceStateDecodeError::Malformed)
 }
 
 fn receipt_v1_log_references(
@@ -1876,8 +1659,8 @@ mod tests {
 
     use super::{
         DocumentKind, JsonEvidenceStateCodec, ParsedEvidence, ParsedReceipt, calculate_identity,
-        load_evidence, load_receipt, prepare_evidence, prepare_log, prepare_receipt,
-        validate_evidence_receipt_bindings, verify_log_object,
+        load_evidence, load_receipt, prepare_evidence, prepare_receipt,
+        validate_evidence_receipt_bindings,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -2161,6 +1944,13 @@ mod tests {
         })
     }
 
+    fn log_object_name_fixture()
+    -> Result<forge_runtime::state::EvidenceStateObjectName, Box<dyn Error>> {
+        Ok(forge_runtime::state::EvidenceStateObjectName::new(
+            "a".repeat(64),
+        )?)
+    }
+
     #[test]
     fn canonical_identity_ignores_object_order_and_input_whitespace() -> TestResult {
         let left = super::parse_identity_json(
@@ -2215,20 +2005,12 @@ mod tests {
         let wrong = forge_runtime::state::EvidenceStateObjectName::new("f".repeat(64))?;
 
         assert_eq!(
-            JsonEvidenceStateCodec.validate_receipt_object(
-                EvidenceStateVersion::V2,
-                &wrong,
-                &bytes(&receipt)?,
-            ),
+            load_receipt(EvidenceStateVersion::V2, &wrong, &bytes(&receipt)?),
             Err(forge_runtime::state::EvidenceStateDecodeError::InvalidReference)
         );
         let evidence = evidence_value(&format!("receipt:blake3:{}", "a".repeat(64)), json!([]))?;
         assert_eq!(
-            JsonEvidenceStateCodec.validate_evidence_object(
-                EvidenceStateVersion::V2,
-                &wrong,
-                &bytes(&evidence)?,
-            ),
+            load_evidence(EvidenceStateVersion::V2, &wrong, &bytes(&evidence)?),
             Err(forge_runtime::state::EvidenceStateDecodeError::InvalidReference)
         );
         Ok(())
@@ -2395,7 +2177,7 @@ mod tests {
             receipt = sign(receipt, DocumentKind::Receipt)?;
 
             assert!(
-                load_v2_receipt_fixture(&receipt)?.can_support_current_evidence(),
+                load_v2_receipt_fixture(&receipt)?.can_support_current_evidence,
                 "predicate: {predicate}"
             );
         }
@@ -2409,7 +2191,7 @@ mod tests {
         nonzero_with_empty_stdout["data"]["coverage"] = json!([]);
         nonzero_with_empty_stdout = sign(nonzero_with_empty_stdout, DocumentKind::Receipt)?;
         assert!(
-            load_v2_receipt_fixture(&nonzero_with_empty_stdout)?.can_support_current_evidence(),
+            load_v2_receipt_fixture(&nonzero_with_empty_stdout)?.can_support_current_evidence,
             "a nonzero exit must fail even when stdout is empty",
         );
         Ok(())
@@ -2480,7 +2262,7 @@ mod tests {
         legacy = sign(legacy, DocumentKind::Receipt)?;
 
         let loaded_legacy = load_v2_receipt_fixture(&legacy)?;
-        assert!(!loaded_legacy.can_support_current_evidence());
+        assert!(!loaded_legacy.can_support_current_evidence);
         let ParsedReceipt::V2(parsed_legacy) = loaded_legacy.parsed() else {
             return Err("legacy v2 Receipt loaded as the wrong schema generation".into());
         };
@@ -2500,7 +2282,7 @@ mod tests {
         observation.insert(String::from("output_truncated"), json!(true));
         ambiguous_legacy_truncation = sign(ambiguous_legacy_truncation, DocumentKind::Receipt)?;
         assert!(
-            !load_v2_receipt_fixture(&ambiguous_legacy_truncation)?.can_support_current_evidence()
+            !load_v2_receipt_fixture(&ambiguous_legacy_truncation)?.can_support_current_evidence
         );
 
         let mut ambiguous_recorded_failure = receipt_value(json!([]))?;
@@ -2515,7 +2297,7 @@ mod tests {
         ambiguous_recorded_failure["data"]["coverage"] = json!([]);
         ambiguous_recorded_failure = sign(ambiguous_recorded_failure, DocumentKind::Receipt)?;
         assert!(
-            !load_v2_receipt_fixture(&ambiguous_recorded_failure)?.can_support_current_evidence(),
+            !load_v2_receipt_fixture(&ambiguous_recorded_failure)?.can_support_current_evidence,
             "ambiguous legacy facts must remain readable without recomputing their recorded failure",
         );
 
@@ -2525,7 +2307,7 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("observation is not an object"))?
             .remove("stdout_total_bytes");
         missing_stdout_total = sign(missing_stdout_total, DocumentKind::Receipt)?;
-        assert!(!load_v2_receipt_fixture(&missing_stdout_total)?.can_support_current_evidence());
+        assert!(!load_v2_receipt_fixture(&missing_stdout_total)?.can_support_current_evidence);
 
         let mut missing_stream_facts = receipt_value(json!([]))?;
         let observation = missing_stream_facts["data"]["observations"][0]
@@ -2534,7 +2316,7 @@ mod tests {
         observation.remove("stdout_truncated");
         observation.remove("stderr_truncated");
         missing_stream_facts = sign(missing_stream_facts, DocumentKind::Receipt)?;
-        assert!(!load_v2_receipt_fixture(&missing_stream_facts)?.can_support_current_evidence());
+        assert!(!load_v2_receipt_fixture(&missing_stream_facts)?.can_support_current_evidence);
 
         for (missing, retained) in [
             ("stderr_truncated", "stdout_truncated"),
@@ -2549,7 +2331,7 @@ mod tests {
             observation.insert(String::from("output_truncated"), json!(true));
             partial = sign(partial, DocumentKind::Receipt)?;
             assert!(
-                !load_v2_receipt_fixture(&partial)?.can_support_current_evidence(),
+                !load_v2_receipt_fixture(&partial)?.can_support_current_evidence,
                 "partial stream truncation facts must remain readable but non-proving: {missing}",
             );
 
@@ -2575,7 +2357,7 @@ mod tests {
                 receipt["data"][field] = json!(confidence);
                 receipt = sign(receipt, DocumentKind::Receipt)?;
                 assert!(
-                    !load_v2_receipt_fixture(&receipt)?.can_support_current_evidence(),
+                    !load_v2_receipt_fixture(&receipt)?.can_support_current_evidence,
                     "{field}={confidence} unexpectedly became proving"
                 );
             }
@@ -2589,19 +2371,19 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("observation is not an object"))?
             .remove("json_error_status");
         missing_json_status = sign(missing_json_status, DocumentKind::Receipt)?;
-        assert!(!load_v2_receipt_fixture(&missing_json_status)?.can_support_current_evidence());
+        assert!(!load_v2_receipt_fixture(&missing_json_status)?.can_support_current_evidence);
 
         let mut unknown_status = receipt_value(json!([]))?;
         unknown_status["data"]["observations"][0]["command"]["success"] =
             json!({"kind": "json-has-no-errors"});
         unknown_status["data"]["observations"][0]["json_error_status"] = json!("unknown");
         unknown_status = sign(unknown_status, DocumentKind::Receipt)?;
-        assert!(!load_v2_receipt_fixture(&unknown_status)?.can_support_current_evidence());
+        assert!(!load_v2_receipt_fixture(&unknown_status)?.can_support_current_evidence);
 
         let mut unknown_outcome = receipt_value(json!([]))?;
         unknown_outcome["data"]["observations"][0]["outcome"] = json!("unknown");
         unknown_outcome = sign(unknown_outcome, DocumentKind::Receipt)?;
-        assert!(!load_v2_receipt_fixture(&unknown_outcome)?.can_support_current_evidence());
+        assert!(!load_v2_receipt_fixture(&unknown_outcome)?.can_support_current_evidence);
         Ok(())
     }
 
@@ -2664,7 +2446,7 @@ mod tests {
         )?;
 
         let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &bytes(&receipt)?)?;
-        assert!(!loaded.can_support_current_evidence());
+        assert!(!loaded.can_support_current_evidence);
         Ok(())
     }
 
@@ -2709,10 +2491,12 @@ mod tests {
                 prepared.object_name(),
                 prepared.bytes(),
             )?;
-            assert!(!loaded.has_unknown_contract_content());
+            let ParsedReceipt::V2(parsed) = loaded.parsed() else {
+                return Err("v2 Receipt loaded as the wrong schema generation".into());
+            };
             assert_eq!(
-                loaded.original_json()["data"]["observations"][0]["outcome"],
-                outcome,
+                serde_json::to_value(parsed.data.observations[0].outcome)?,
+                json!(outcome)
             );
 
             let receipt_id = format!("receipt:blake3:{}", prepared.object_name().as_str());
@@ -2733,9 +2517,7 @@ mod tests {
         let receipt = typed_infrastructure_receipt("executable-unavailable")?;
         let loaded = load_v2_receipt_fixture(&receipt)?;
 
-        assert!(!loaded.has_unknown_contract_content());
-        assert!(!loaded.can_support_current_evidence());
-        assert_eq!(loaded.original_bytes(), bytes(&receipt)?);
+        assert!(!loaded.can_support_current_evidence);
         Ok(())
     }
 
@@ -2840,15 +2622,15 @@ mod tests {
     #[test]
     fn future_process_failure_kind_is_preserved_and_non_proving() -> TestResult {
         let receipt = typed_infrastructure_receipt("future-process-boundary")?;
-        let receipt_bytes = bytes(&receipt)?;
         let loaded = load_v2_receipt_fixture(&receipt)?;
 
-        assert!(loaded.has_unknown_contract_content());
-        assert!(!loaded.can_support_current_evidence());
-        assert_eq!(loaded.original_bytes(), receipt_bytes);
+        assert!(!loaded.can_support_current_evidence);
+        let ParsedReceipt::V2(parsed) = loaded.parsed() else {
+            return Err("v2 Receipt loaded as the wrong schema generation".into());
+        };
         assert_eq!(
-            loaded.original_json()["data"]["observations"][0]["process_error_kind"],
-            "future-process-boundary"
+            parsed.data.observations[0].process_error_kind,
+            Some(forge_schema::ProcessErrorKindV2Data::Unknown)
         );
         Ok(())
     }
@@ -2941,7 +2723,7 @@ mod tests {
                 super::RECEIPT_ID_PREFIX,
             )?;
             let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &bytes(&receipt)?)?;
-            assert!(!loaded.can_support_current_evidence(), "pointer: {pointer}");
+            assert!(!loaded.can_support_current_evidence, "pointer: {pointer}");
         }
 
         let mut explicit_unknown = receipt_value(json!([]))?;
@@ -2958,14 +2740,14 @@ mod tests {
             &object_name,
             &bytes(&explicit_unknown)?,
         )?;
-        assert!(!loaded.can_support_current_evidence());
+        assert!(!loaded.can_support_current_evidence);
         Ok(())
     }
 
     #[test]
     fn receipt_log_summary_must_exactly_match_unique_observation_refs() -> TestResult {
-        let prepared_log = prepare_log(b"one log".to_vec())?;
-        let path = log_path(prepared_log.object_name().as_str());
+        let log_name = log_object_name_fixture()?;
+        let path = log_path(log_name.as_str());
 
         let mut missing_observation_ref = receipt_value(json!([]))?;
         missing_observation_ref["data"]["log_refs"] = json!([path.clone()]);
@@ -3053,8 +2835,8 @@ mod tests {
             forge_runtime::state::EvidenceStateDecodeError::Malformed,
         ));
 
-        let prepared_log = prepare_log(b"duplicate evidence log".to_vec())?;
-        let path = log_path(prepared_log.object_name().as_str());
+        let log_name = log_object_name_fixture()?;
+        let path = log_path(log_name.as_str());
         let duplicate_logs = evidence_value(
             &format!("receipt:blake3:{}", "a".repeat(64)),
             json!([path.clone(), path]),
@@ -3087,10 +2869,7 @@ mod tests {
             super::EVIDENCE_ID_PREFIX,
         )?;
         let evidence_bytes = bytes(&evidence)?;
-        let loaded = load_evidence(EvidenceStateVersion::V2, &evidence_name, &evidence_bytes)?;
-        assert!(loaded.has_unknown_contract_content());
-        assert_eq!(loaded.original_bytes(), evidence_bytes);
-        assert_eq!(loaded.original_json(), &evidence);
+        load_evidence(EvidenceStateVersion::V2, &evidence_name, &evidence_bytes)?;
 
         assert_eq!(
             JsonEvidenceStateCodec.decode_evidence(EvidenceStateVersion::V2, &evidence_bytes)?,
@@ -3121,22 +2900,6 @@ mod tests {
     }
 
     #[test]
-    fn log_identity_recomputes_complete_bytes() -> TestResult {
-        let prepared = prepare_log(b"redacted output\n".to_vec())?;
-
-        assert!(verify_log_object(prepared.object_name(), prepared.bytes()));
-        assert!(!verify_log_object(
-            prepared.object_name(),
-            b"redacted output"
-        ));
-        assert_eq!(
-            prepared.key(),
-            format!("logs/v1/{}.log", prepared.object_name().as_str())
-        );
-        Ok(())
-    }
-
-    #[test]
     fn receipt_identity_has_a_fixed_golden_vector() -> TestResult {
         let receipt = receipt_value(json!([]))?;
         let (_, object_name) = calculate_identity(&receipt, DocumentKind::Receipt)?;
@@ -3149,26 +2912,21 @@ mod tests {
     }
 
     #[test]
-    fn evidence_and_log_identities_have_fixed_golden_vectors() -> TestResult {
+    fn evidence_identity_has_a_fixed_golden_vector() -> TestResult {
         let evidence = evidence_value(&format!("receipt:blake3:{}", "a".repeat(64)), json!([]))?;
         let (_, evidence_name) = calculate_identity(&evidence, DocumentKind::Evidence)?;
-        let log_name = super::log_object_name(b"golden log\n")?;
 
         assert_eq!(
             evidence_name.as_str(),
             "990d0908a4e661b6807fa15a5e56dab6b0e5c92b6fcf1160df699a7b9c7343ec"
-        );
-        assert_eq!(
-            log_name.as_str(),
-            "baaff6c6c62c823b372c16ddf3e29e8da2195fb01d30ff8117d0a8278b6a18a9"
         );
         Ok(())
     }
 
     #[test]
     fn v2_metadata_keeps_receipt_and_log_reference_closure() -> TestResult {
-        let prepared_log = prepare_log(b"bounded redacted log".to_vec())?;
-        let log = log_path(prepared_log.object_name().as_str());
+        let log_name = log_object_name_fixture()?;
+        let log = log_path(log_name.as_str());
         let receipt = receipt_value(json!([log.clone()]))?;
         let receipt_id = receipt["data"]["id"]
             .as_str()
@@ -3187,7 +2945,7 @@ mod tests {
             ReceiptRetentionMetadata::new(
                 receipt_name.clone(),
                 EvidenceRetentionTime::Current(receipt_time),
-                [prepared_log.object_name().clone()],
+                [log_name.clone()],
             )
         );
         assert_eq!(
@@ -3205,7 +2963,7 @@ mod tests {
                         )?,
                     ),
                 ],
-                [prepared_log.object_name().clone()],
+                [log_name],
             )
         );
         Ok(())
@@ -3261,10 +3019,8 @@ mod tests {
             return Err("v1 Receipt loaded as the wrong schema generation".into());
         };
         assert_eq!(parsed_receipt_v1.schema, "forge.receipt/v1");
-        assert_eq!(loaded_receipt_v1.version(), EvidenceStateVersion::V1);
-        assert_eq!(loaded_receipt_v1.object_name(), &receipt_v1_name);
-        assert_eq!(loaded_receipt_v1.original_bytes(), receipt_v1_bytes);
-        assert_eq!(loaded_receipt_v1.original_json(), &receipt_v1);
+        assert_eq!(loaded_receipt_v1.version, EvidenceStateVersion::V1);
+        assert_eq!(loaded_receipt_v1.object_name, receipt_v1_name);
 
         let receipt_v2 = receipt_value(json!([]))?;
         let receipt_v2_name = super::parse_public_id(
@@ -3319,10 +3075,6 @@ mod tests {
             return Err("v2 Evidence loaded as the wrong schema generation".into());
         };
         assert_eq!(parsed_evidence_v2.schema, "forge.evidence/v2");
-        assert_eq!(loaded_evidence_v2.version(), EvidenceStateVersion::V2);
-        assert_eq!(loaded_evidence_v2.object_name(), &evidence_v2_name);
-        assert_eq!(loaded_evidence_v2.original_bytes(), evidence_v2_bytes);
-        assert_eq!(loaded_evidence_v2.original_json(), &evidence_v2);
 
         let wrong = forge_runtime::state::EvidenceStateObjectName::new("e".repeat(64))?;
         assert_eq!(
@@ -3348,14 +3100,9 @@ mod tests {
         let original = bytes(&receipt)?;
 
         let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &original)?;
-        assert_eq!(loaded.original_bytes(), original);
-        assert_eq!(loaded.original_json(), &receipt);
-        assert!(loaded.has_unknown_contract_content());
-        assert!(!loaded.can_support_current_evidence());
+        assert!(!loaded.can_support_current_evidence);
         assert_eq!(
-            loaded
-                .original_json()
-                .pointer("/future_same_major/nested/reference"),
+            receipt.pointer("/future_same_major/nested/reference"),
             Some(&json!("logs/v1/future.log"))
         );
         let ParsedReceipt::V2(parsed) = loaded.parsed() else {
@@ -3416,22 +3163,8 @@ mod tests {
             loaded_receipt_v2.binding_fact(),
             loaded_receipt_v1.binding_fact(),
         ];
-        assert_eq!(
-            receipt_facts[0].complete,
-            loaded_receipt_v2.can_support_current_evidence(),
-            "a v2 binding has one proving-completeness predicate",
-        );
-        let bindings = validate_evidence_receipt_bindings(&loaded_evidence, &receipt_facts)?;
-        assert_eq!(bindings.references().len(), 2);
-        assert!(bindings.is_complete());
+        validate_evidence_receipt_bindings(&loaded_evidence, &receipt_facts)?;
 
-        let mut incomplete_v1_stale = receipt_facts[1].clone();
-        incomplete_v1_stale.complete = false;
-        let incomplete_bindings = validate_evidence_receipt_bindings(
-            &loaded_evidence,
-            [&receipt_facts[0], &incomplete_v1_stale],
-        )?;
-        assert!(!incomplete_bindings.is_complete());
         let mut wrong_v1_stale_intent = receipt_facts[1].clone();
         wrong_v1_stale_intent.intent = IntentData::Build;
         assert_eq!(
@@ -3466,28 +3199,16 @@ mod tests {
         }]);
         let stale_v2_evidence: Envelope<EvidenceV2Data> =
             serde_json::from_value(stale_v2_evidence)?;
-        let stale_v2_bindings = super::validate_receipt_bindings(
+        super::validate_receipt_bindings(
             super::EvidenceReceiptSummaries::V2(&stale_v2_evidence.data),
-            true,
             [&receipt_facts[0]],
         )?;
-        assert_eq!(stale_v2_bindings.references().len(), 1);
-        assert!(stale_v2_bindings.is_complete());
-        let mut incomplete_v2_stale = receipt_facts[0].clone();
-        incomplete_v2_stale.complete = false;
-        incomplete_v2_stale.can_support_current_evidence = false;
-        let incomplete_v2_bindings = super::validate_receipt_bindings(
-            super::EvidenceReceiptSummaries::V2(&stale_v2_evidence.data),
-            true,
-            [&incomplete_v2_stale],
-        )?;
-        assert!(!incomplete_v2_bindings.is_complete());
+
         let mut wrong_v2_stale_intent = receipt_facts[0].clone();
         wrong_v2_stale_intent.intent = IntentData::Build;
         assert_eq!(
             super::validate_receipt_bindings(
                 super::EvidenceReceiptSummaries::V2(&stale_v2_evidence.data),
-                true,
                 [&wrong_v2_stale_intent],
             ),
             Err(forge_runtime::state::EvidenceStateDecodeError::InvalidReference),
@@ -3497,7 +3218,6 @@ mod tests {
         assert_eq!(
             super::validate_receipt_bindings(
                 super::EvidenceReceiptSummaries::V2(&stale_v2_evidence.data),
-                true,
                 [&wrong_v2_stale_outcome],
             ),
             Err(forge_runtime::state::EvidenceStateDecodeError::InvalidReference),
@@ -3546,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_receipt_bindings_check_each_summary_axis_and_propagate_incompleteness() -> TestResult {
+    fn v1_receipt_bindings_check_each_summary_axis() -> TestResult {
         let valid_receipt = receipt_v1_value()?;
         let valid_loaded = load_v1_receipt_fixture(&valid_receipt)?;
         let valid_id = valid_receipt["data"]["id"]
@@ -3573,19 +3293,7 @@ mod tests {
         let valid_fact = valid_loaded.binding_fact();
         let stale_fact = stale_loaded.binding_fact();
 
-        let bindings =
-            validate_evidence_receipt_bindings(&loaded_evidence, [&valid_fact, &stale_fact])?;
-        assert!(bindings.is_complete());
-
-        let mut incomplete_valid = valid_fact.clone();
-        incomplete_valid.complete = false;
-        let bindings =
-            validate_evidence_receipt_bindings(&loaded_evidence, [&incomplete_valid, &stale_fact])?;
-        assert_eq!(bindings.references().len(), 2);
-        assert!(
-            !bindings.is_complete(),
-            "an incomplete v1 valid Receipt must keep the complete binding set non-proving",
-        );
+        validate_evidence_receipt_bindings(&loaded_evidence, [&valid_fact, &stale_fact])?;
 
         let mut wrong_intent = valid_fact.clone();
         wrong_intent.intent = IntentData::Build;
@@ -3603,13 +3311,6 @@ mod tests {
             "a v1 valid Receipt outcome mismatch must fail even when its intent matches",
         );
 
-        let mut incomplete_stale = stale_fact;
-        incomplete_stale.complete = false;
-        let bindings = validate_evidence_receipt_bindings(
-            &loaded_evidence,
-            [&valid_loaded.binding_fact(), &incomplete_stale],
-        )?;
-        assert!(!bindings.is_complete());
         Ok(())
     }
 
@@ -3696,9 +3397,7 @@ mod tests {
         let raw = raw.replacen(old_id, &public_id, 1).into_bytes();
 
         let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &raw)?;
-        assert_eq!(loaded.original_bytes(), raw);
-        assert!(loaded.has_unknown_contract_content());
-        assert!(!loaded.can_support_current_evidence());
+        assert!(!loaded.can_support_current_evidence);
         assert_eq!(
             JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &raw)?,
             ReceiptRetentionMetadata::with_log_reference_closure(
@@ -3744,9 +3443,7 @@ mod tests {
             super::calculate_parsed_identity(&parsed, DocumentKind::Evidence)?;
         let raw = raw.replacen(old_id, &public_id, 1).into_bytes();
 
-        let loaded = load_evidence(EvidenceStateVersion::V2, &object_name, &raw)?;
-        assert_eq!(loaded.original_bytes(), raw);
-        assert!(loaded.has_unknown_contract_content());
+        load_evidence(EvidenceStateVersion::V2, &object_name, &raw)?;
         assert_eq!(
             JsonEvidenceStateCodec.decode_evidence(EvidenceStateVersion::V2, &raw)?,
             EvidenceRetentionMetadata::with_reference_closures(
@@ -3791,8 +3488,7 @@ mod tests {
         )?;
         let raw = bytes(&receipt)?;
         let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &raw)?;
-        assert!(!loaded.has_unknown_contract_content());
-        assert!(!loaded.can_support_current_evidence());
+        assert!(!loaded.can_support_current_evidence);
         assert_eq!(
             JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &raw)?,
             ReceiptRetentionMetadata::with_log_reference_closure(
@@ -3839,7 +3535,7 @@ mod tests {
         )?;
         let raw = bytes(&receipt)?;
         let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &raw)?;
-        assert!(!loaded.can_support_current_evidence());
+        assert!(!loaded.can_support_current_evidence);
         assert_eq!(
             JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &raw)?,
             ReceiptRetentionMetadata::with_log_reference_closure(
@@ -3872,7 +3568,7 @@ mod tests {
             receipt = sign(receipt, DocumentKind::Receipt)?;
             let loaded = load_v2_receipt_fixture(&receipt)?;
             assert!(
-                !loaded.can_support_current_evidence(),
+                !loaded.can_support_current_evidence,
                 "unknown dependency remained proving: {pointer}",
             );
         }
@@ -3913,7 +3609,7 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("command pointer is missing"))? = value;
             receipt = sign(receipt, DocumentKind::Receipt)?;
             assert!(
-                !load_v2_receipt_fixture(&receipt)?.can_support_current_evidence(),
+                !load_v2_receipt_fixture(&receipt)?.can_support_current_evidence,
                 "unknown command semantic remained proving: {pointer}",
             );
         }
@@ -3938,8 +3634,7 @@ mod tests {
         )?;
         let receipt_bytes = bytes(&receipt)?;
         let loaded_receipt = load_receipt(EvidenceStateVersion::V2, &receipt_name, &receipt_bytes)?;
-        assert!(loaded_receipt.has_unknown_contract_content());
-        assert!(!loaded_receipt.can_support_current_evidence());
+        assert!(!loaded_receipt.can_support_current_evidence);
         assert_eq!(
             JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &receipt_bytes)?,
             ReceiptRetentionMetadata::with_log_reference_closure(
@@ -3984,9 +3679,7 @@ mod tests {
             &explicit_unknown_name,
             &explicit_unknown_bytes,
         )?;
-        assert!(!explicit_unknown.has_unknown_contract_content());
-        assert!(!explicit_unknown.can_support_current_evidence());
-        assert!(!explicit_unknown.binding_fact().complete);
+        assert!(!explicit_unknown.can_support_current_evidence);
         assert_eq!(
             JsonEvidenceStateCodec
                 .decode_receipt(EvidenceStateVersion::V2, &explicit_unknown_bytes)?,
@@ -4073,13 +3766,8 @@ mod tests {
             &future_reason_name,
             &future_reason_bytes,
         )?;
-        assert!(loaded.has_unknown_contract_content());
-        assert_eq!(loaded.original_bytes(), future_reason_bytes);
-        assert_eq!(loaded.original_json(), &evidence_with_future_reason);
         let no_facts = [];
-        let bindings = validate_evidence_receipt_bindings(&loaded, &no_facts)?;
-        assert!(!bindings.is_complete());
-        assert!(bindings.references().is_empty());
+        validate_evidence_receipt_bindings(&loaded, &no_facts)?;
         assert_eq!(
             JsonEvidenceStateCodec
                 .decode_evidence(EvidenceStateVersion::V2, &future_reason_bytes,)?,
@@ -4154,7 +3842,6 @@ mod tests {
         let receipt: Envelope<ReceiptV2Data> = serde_json::from_value(receipt_value(json!([]))?)?;
         let prepared_receipt = prepare_receipt(receipt)?;
         assert!(prepared_receipt.bytes().ends_with(b"\n"));
-        assert!(prepared_receipt.key().starts_with("receipts/v2/"));
 
         let receipt_id = format!("receipt:blake3:{}", prepared_receipt.object_name().as_str());
         let receipt = load_receipt(
@@ -4168,7 +3855,6 @@ mod tests {
         let evidence: Envelope<EvidenceV2Data> = serde_json::from_value(evidence)?;
         let prepared_evidence = prepare_evidence(evidence, &receipt_facts)?;
         assert!(prepared_evidence.bytes().ends_with(b"\n"));
-        assert!(prepared_evidence.key().starts_with("evidence/v2/"));
         Ok(())
     }
 }

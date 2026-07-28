@@ -3677,6 +3677,18 @@ mod tests {
         Ok((object_name, key, bytes.len() as u64))
     }
 
+    #[test]
+    fn log_content_address_has_a_fixed_golden_vector_and_covers_complete_bytes() {
+        assert_eq!(
+            log_content_address(b"golden log\n"),
+            "baaff6c6c62c823b372c16ddf3e29e8da2195fb01d30ff8117d0a8278b6a18a9"
+        );
+        assert_ne!(
+            log_content_address(b"redacted output\n"),
+            log_content_address(b"redacted output")
+        );
+    }
+
     fn write_private_test_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::write(path, bytes)?;
         set_private_test_file_mode(path)
