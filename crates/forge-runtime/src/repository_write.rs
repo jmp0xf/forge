@@ -80,6 +80,18 @@ mod platform {
             })
         }
 
+        pub(crate) fn validate_visible_root(&self) -> io::Result<()> {
+            let visible = open_root_directory(&self.path)?;
+            if directory_identity(&visible)? == self.identity {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "visible repository root no longer matches the pinned directory handle",
+                ))
+            }
+        }
+
         pub(crate) fn write_atomic(
             &self,
             relative: &Path,
@@ -568,6 +580,18 @@ mod platform {
                 path: path.to_path_buf(),
                 identity,
             })
+        }
+
+        pub(crate) fn validate_visible_root(&self) -> io::Result<()> {
+            let visible = open_root_directory(&self.path)?;
+            if directory_identity(&visible)? == self.identity {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "visible repository root no longer matches the pinned directory handle",
+                ))
+            }
         }
 
         pub(crate) fn write_atomic(
@@ -1252,6 +1276,13 @@ mod platform {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "confined repository writes require Unix or Windows directory handles",
+            ))
+        }
+
+        pub(crate) fn validate_visible_root(&self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined repository root identity checks require Unix or Windows directory handles",
             ))
         }
 

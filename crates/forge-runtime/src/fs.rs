@@ -349,6 +349,17 @@ impl RepositoryWriter {
         &self.root
     }
 
+    /// Verifies that the visible root path still names the pinned directory identity.
+    pub fn validate_visible_root(&self) -> Result<(), FileSystemError> {
+        self.write_root.validate_visible_root().map_err(|source| {
+            FileSystemError::io(
+                "validate visible repository root identity",
+                &self.root,
+                source,
+            )
+        })
+    }
+
     pub fn read(&self, relative_path: impl AsRef<Path>) -> Result<Vec<u8>, FileSystemError> {
         let target = self.checked_target(relative_path.as_ref())?;
         self.filesystem
@@ -1277,6 +1288,23 @@ mod tests {
             })
             .count();
         assert_eq!(temporary_count, 0);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn visible_root_identity_validation_rejects_a_replacement() -> Result<(), Box<dyn Error>> {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let displaced = container.path().join("displaced");
+        fs::create_dir(&repository)?;
+        let writer = RepositoryWriter::new(&repository)?;
+        writer.validate_visible_root()?;
+
+        fs::rename(&repository, &displaced)?;
+        fs::create_dir(&repository)?;
+
+        assert!(writer.validate_visible_root().is_err());
         Ok(())
     }
 
