@@ -42,10 +42,15 @@ physically separate authority set required by the design.
 See the [v0 implementation status](docs/v0-implementation-status.md) for the precise local boundary and remaining
 release and authority work.
 
+The repository also contains a candidate-controlled, local-only `0.1.0-rc.1` asset assembler for the five frozen
+targets. It builds from an isolated exact-commit checkout, validates executable formats, emits target-bound CycloneDX
+SBOMs, and finalizes an exact manifest plus `SHA256SUMS`; it never tags, signs, attests, uploads, publishes, or
+authorizes a release. See the [release-candidate runbook](docs/release.md).
+
 ## Install from source
 
-Forge is not published from this workspace (`publish = false`). Rust 1.85 is the declared MSRV, but the current
-candidate still requires release verification on Rust 1.85. To install from a reviewed checkout:
+Forge is not published from this workspace (`publish = false`). Rust 1.85 is the declared MSRV, and each distributable
+target still requires its own release verification. To install from a reviewed checkout:
 
 ```bash
 cargo install --locked --path crates/forge-cli

@@ -31,6 +31,9 @@ All notable changes will be documented here.
   harness serving as the N-1 skeleton, `init --dry-run --json` dogfood fixed-point checks, four fuzz targets, mutation
   configuration, and an opt-in 100,000-file benchmark, without claiming a released-predecessor comparison.
 - Machine-readable doctor skip reasons and provenance/confidence metadata for every selected `next` context path.
+- A create-only local `0.1.0-rc.1` release assembler for the five supported targets, with exact-commit isolated source
+  binding, executable-format checks, deterministic target-bound CycloneDX 1.6 SBOMs, a complete artifact manifest,
+  SHA-256 checksums, and an explicit external SLSA/Sigstore/ownership/rollback gate.
 
 ### Changed
 

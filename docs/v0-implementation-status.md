@@ -18,6 +18,7 @@ acceptance is not complete.
 | Navigation | `doctor`, deterministic read-only `next`, `explain`, schema/version/completion output |
 | Local evidence | Receipt/Evidence v2 run/show/verify/export, dependency invalidation, immutable state, bounded retention, and v1 historical readers |
 | In-repository hardening | 28 public fixtures, schema/golden/compatibility tests, dogfood fixed point, fuzz corpora, bounded mutation config, and opt-in large-repository benchmark |
+| Local release candidates | Create-only `0.1.0-rc.1` five-target assembler, exact-commit isolated source binding, executable checks, CycloneDX SBOMs, release manifest, SHA-256 checksums, and explicit external authority/rollback gates |
 
 Default `init` still does not generate a runner, CI, configuration, ADR, runbook, or ownership file.
 Runner generation occurs only after an explicit choice and creates a project-native managed `verify`
@@ -25,8 +26,9 @@ target from already resolved required commands. `init --with-ci github` explicit
 missing `.github/workflows/verify.yml`; equivalent complete YAML is a no-op, while non-equivalent or
 unknown existing content fails without writes and is never overwritten.
 
-`improve`, `evolve`, model integration, external-attestation import, and release orchestration remain
-outside the v0 command surface.
+`improve`, `evolve`, model integration, external-attestation import, and external release orchestration remain outside
+the v0 command surface. Repository-only `xtask` commands assemble and check local review candidates; they do not tag,
+sign, attest, upload, publish, or authorize a release.
 
 ## Receipt and Evidence v2
 
@@ -144,13 +146,14 @@ The following boundaries are intentionally not inferred from local implementatio
    `AGENTS.md`, schema checks, applicable fixtures, and targeted hardening campaigns, then report
    exact commands, exit codes, platform, tool versions, and remaining gaps. This document is not a
    substitute for that run ledger.
-2. **Filesystem threat model and security review.** The path-based final replacement does not pin
-   ancestor handles against a concurrent untrusted rename. `SECURITY.md` remains authoritative for
-   this TOCTOU limitation. A private reporting channel and independent security review are still
-   required before public release.
-3. **Declared MSRV verification.** The workspace declares Rust 1.85, but the local toolchains used
-   for this candidate were Rust 1.96 stable and nightly. Rust 1.85 was not installed or exercised;
-   its workspace build, tests, generated assets, and CLI behavior remain release evidence to obtain.
+2. **Filesystem threat model and security review.** Repository writes and release-asset reads/writes
+   now pin root directory handles and revalidate the visible root identity. Native adversarial tests
+   and independent security review remain required; `SECURITY.md` still lacks a usable private
+   reporting channel.
+3. **Declared MSRV verification.** The workspace declares Rust 1.85. A local exact-snapshot Rust
+   1.85 `xtask --all-targets` check passed for the release assembler; the complete required
+   workspace/fuzz tests, generated assets, CLI behavior, and native target matrix still require
+   current-candidate evidence before release.
 4. **Performance qualification.** The local calibration above did not meet the warm `next` or
    `adapters check` goals. Keep those targets unchanged, separate host Git cost from Forge overhead,
    and obtain repeatable results on calibrated release runners and representative real repositories.
@@ -159,8 +162,13 @@ The following boundaries are intentionally not inferred from local implementatio
    UNC/wide-path, case, ACL, and native replacement behavior require their actual platform tests.
 6. **Independent CI and review.** A checked-in workflow is candidate-controlled configuration, not
    proof that required CI ran or that maintainers reviewed and approved the result.
-7. **Distribution and release.** Version selection, packaging, SBOM, checksums, signing, publishing,
-   provenance, rollback, and release ownership remain unimplemented or externally unauthorized.
+7. **Distribution and release.** Version selection and the local raw-binary/SBOM/manifest/checksum
+   assembly plus rollback procedure are implemented as candidate-controlled checks. Native builds,
+   distributable license/notice text, external provenance and signing, immutable GitHub publication,
+   release/security/rollback ownership, OIDC identities, approvals, and withdrawal authority remain
+   unproven, unassigned, or externally unauthorized.
+   The local isolated clone is time-bounded but its copied Git object database is not byte-bounded;
+   use a capacity-controlled builder and treat an interrupted clone as disposable temporary state.
 8. **No self-authorization claim.** v0 remains ordinary dogfooding: candidate-controlled tests and
    the public N-1 harness are reviewable self-checks, not final authority. Held-out tests and the
    physically separate Authority Set are v0.3 requirements rather than v0 release blockers; they

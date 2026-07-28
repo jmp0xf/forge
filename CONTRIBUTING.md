@@ -91,6 +91,27 @@ cargo run -p xtask -- diff-plans \
 That comparison is candidate-controlled public evidence. It is not the external held-out authority or a release
 approval.
 
+## Release-candidate assets
+
+The repository can locally assemble and verify the frozen `0.1.0-rc.1` GitHub Release asset set without mutating any
+external hosting or release system. Start from a clean Git checkout and create a dedicated real output directory
+outside the checkout; an output inside the repository (including `.git/`) is rejected, and the release commands
+intentionally do not create the directory:
+
+```bash
+git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
+mkdir -p /absolute/path/to/dist
+RUSTUP_AUTO_INSTALL=0 cargo build --locked --offline -p xtask
+target/debug/xtask release-build --target <TRIPLE> --output-dir /absolute/path/to/dist
+target/debug/xtask release-finalize --output-dir /absolute/path/to/dist
+target/debug/xtask release-check --output-dir /absolute/path/to/dist
+```
+
+All five targets must be staged before finalization. The exact matrix, external SLSA/Sigstore gate, unassigned
+ownership and license/notice requirements, Windows/PowerShell commands, fixed twelve-subject upload rule, and N−1
+rollback procedure are documented in [`docs/release.md`](docs/release.md). These local commands never tag, sign,
+attest, upload, publish, or authorize a release.
+
 ## Change discipline
 
 - Keep crate dependencies in the direction defined by ADR-0004.
