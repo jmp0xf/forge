@@ -2312,6 +2312,7 @@ mod tests {
         assert_eq!(tests.commands().len(), 2);
         let workspace_root = RepoRelativePath::new("a")?;
         let independent_root = RepoRelativePath::new("c")?;
+        let workspace_file = RepoRelativePath::new("work/go.work")?;
         let workspace_command = tests
             .commands()
             .iter()
@@ -2324,7 +2325,7 @@ mod tests {
             .ok_or_else(|| io::Error::other("independent module test command is missing"))?;
         assert_eq!(
             workspace_command.env.get(OsStr::new("GOWORK")),
-            Some(&repository_path("work/go.work").into_os_string())
+            Some(&repository_path(workspace_file.as_path()).into_os_string())
         );
         assert_eq!(
             independent_command.env.get(OsStr::new("GOWORK")),

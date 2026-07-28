@@ -788,7 +788,12 @@ mod windows_wide_path_fixture {
             )
             .into());
         }
-        FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())
+        let fixture =
+            FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())?;
+        // Git must read this before processing `-C`; a command-scope `-c core.longpaths=true`
+        // arrives too late for Git for Windows to enter the deliberately long worktree.
+        fs::write(&fixture.global_git_config, b"[core]\n\tlongpaths = true\n")?;
+        Ok(fixture)
     }
 
     fn without_verbatim_prefix(path: &Path) -> PathBuf {

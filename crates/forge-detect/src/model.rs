@@ -2816,8 +2816,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let inventory = model_inventory(&[("scripts/test.sh", InventoryKind::File)]);
         let git = model_git(&inventory)?;
+        let script_path = RepoRelativePath::new("scripts/test.sh")?;
         let filesystem = ModelFileSystem::new(inventory).with_text(
-            RepoRelativePath::new("scripts/test.sh")?,
+            script_path.clone(),
             b"#!/usr/bin/env bash\necho test\n".to_vec(),
         );
         let outcome = detect_project_model(
@@ -2835,12 +2836,11 @@ mod tests {
         assert_eq!(test.coverage_confidence, Confidence::Unknown);
         let command = &test.commands()[0];
         assert_eq!(command.program, "bash");
-        assert_eq!(command.args, ["scripts/test.sh"]);
+        assert_eq!(command.args, [script_path.as_path().as_os_str()]);
         assert!(matches!(
             &command.source,
             CommandSource::ExistingProjectTarget { path, target }
-                if path.as_path() == Path::new("scripts/test.sh")
-                    && target == "script-entrypoint"
+                if path == &script_path && target == "script-entrypoint"
         ));
         Ok(())
     }
