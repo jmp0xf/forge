@@ -21,8 +21,10 @@ use forge_detect::inventory_cache::{
 };
 use forge_detect::model::{
     InventoryCacheStatus, ModelDetectionCompletion, ModelDetectionError, ModelDetectionExecution,
-    ModelDetectionOptions, NavigationSnapshot, detect_project_model_with_cache_controlled,
+    ModelDetectionOptions, NavigationSnapshot,
+    detect_project_model_with_cache_from_topology_controlled,
 };
+use forge_detect::repository::resolve_repository_topology_from_root_controlled;
 use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::git::GitCli;
@@ -142,16 +144,18 @@ pub(crate) fn detect_controlled(
     let filesystem = NativeFileSystem;
     let hasher = Blake3Hasher;
     checkpoint(control, "inventory cache discovery")?;
+    let topology =
+        resolve_repository_topology_from_root_controlled(repository_root.clone(), &git, control)
+            .map_err(|error| map_detection_error(ModelDetectionError::Repository(error)))?;
     let inventory_cache = if cli.no_cache {
         None
     } else {
-        git.git_dir(&repository_root)
-            .ok()
-            .zip(git.git_common_dir(&repository_root).ok())
-            .and_then(|(git_dir, common_dir)| {
-                SharedCacheStore::new(&GitStateLayout::new(git_dir, common_dir)).ok()
-            })
-            .map(|store| SharedInventoryCache { store })
+        SharedCacheStore::new(&GitStateLayout::new(
+            topology.git_dir(),
+            topology.git_common_dir(),
+        ))
+        .ok()
+        .map(|store| SharedInventoryCache { store })
     };
     checkpoint(control, "inventory cache discovery")?;
     let default_options = ModelDetectionOptions::default();
@@ -159,8 +163,8 @@ pub(crate) fn detect_controlled(
     let execution = inventory_cache.as_ref().map_or(execution, |cache| {
         execution.with_inventory_cache(cache as &dyn InventoryCacheReadPort)
     });
-    let outcome = detect_project_model_with_cache_controlled(
-        &repository_root,
+    let outcome = detect_project_model_with_cache_from_topology_controlled(
+        topology,
         &git,
         &filesystem,
         &process,

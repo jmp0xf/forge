@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use forge_core::ports::{FileSystemPort, GitPort, Hasher};
 use forge_core::{
@@ -31,6 +31,35 @@ pub struct RepositoryDetection {
     pub provenance: Vec<Provenance>,
     pub confidence: Confidence,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Absolute Git locations resolved once for one repository detection.
+///
+/// Keeping these values together lets callers establish process and private-state boundaries from
+/// the same Git observations later consumed by repository detection. Construction remains behind
+/// the controlled resolvers so a relative common directory cannot enter the detection pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryTopology {
+    root: PathBuf,
+    git_dir: PathBuf,
+    git_common_dir: PathBuf,
+}
+
+impl RepositoryTopology {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    #[must_use]
+    pub fn git_common_dir(&self) -> &Path {
+        &self.git_common_dir
+    }
 }
 
 impl RepositoryDetection {
@@ -112,8 +141,36 @@ where
     F: FileSystemPort + ?Sized,
     H: Hasher + ?Sized,
 {
+    let topology = resolve_repository_topology_controlled(start, git, control)?;
+    detect_repository_from_topology_controlled(topology, git, filesystem, hasher, control)
+}
+
+/// Resolves the repository root and both Git state directories under one caller-owned deadline.
+pub fn resolve_repository_topology_controlled<G>(
+    start: &Path,
+    git: &G,
+    control: &dyn OperationControl,
+) -> Result<RepositoryTopology, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+{
     control_step("repository root", control)?;
     let root = required_git_step("repository root", git.repository_root(start))?;
+    resolve_repository_topology_from_root_controlled(root, git, control)
+}
+
+/// Resolves both Git state directories for an already resolved repository root.
+///
+/// This entry point preserves callers that must establish a root-scoped process boundary before
+/// querying repository-private state, while avoiding a second `repository_root` Git invocation.
+pub fn resolve_repository_topology_from_root_controlled<G>(
+    root: PathBuf,
+    git: &G,
+    control: &dyn OperationControl,
+) -> Result<RepositoryTopology, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+{
     control_step("worktree Git directory", control)?;
     let git_dir = required_git_step("worktree Git directory", git.git_dir(&root))?;
     control_step("common Git directory", control)?;
@@ -128,6 +185,31 @@ where
             ),
         });
     }
+    Ok(RepositoryTopology {
+        root,
+        git_dir,
+        git_common_dir,
+    })
+}
+
+/// Detects repository facts from Git locations already resolved by a controlled topology resolver.
+pub fn detect_repository_from_topology_controlled<G, F, H>(
+    topology: RepositoryTopology,
+    git: &G,
+    filesystem: &F,
+    hasher: &H,
+    control: &dyn OperationControl,
+) -> Result<RepositoryDetection, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+    F: FileSystemPort + ?Sized,
+    H: Hasher + ?Sized,
+{
+    let RepositoryTopology {
+        root,
+        git_dir,
+        git_common_dir,
+    } = topology;
     let id = derive_repository_id(&git_common_dir, hasher);
     let is_linked_worktree = git_dir != git_common_dir;
 
@@ -474,12 +556,13 @@ mod tests {
     use forge_core::{
         BoundedText, Digest, GitError, GitErrorKind, GitFileSet, GitObjectFormat, Inventory,
         InventoryError, InventoryOptions, PathKind, PorcelainV2Status, RepoRelativePath,
-        parse_status_porcelain_v2,
+        UnlimitedOperationControl, parse_status_porcelain_v2,
     };
 
     use super::{
         Confidence, OperationState, WorkState, classify_work_state, derive_repository_id,
-        detect_repository,
+        detect_repository, detect_repository_from_topology_controlled,
+        resolve_repository_topology_controlled,
     };
     use crate::test_support::{absolute_path, repository_path, repository_root};
 
@@ -522,6 +605,7 @@ mod tests {
         git_dir: Result<PathBuf, GitError>,
         common_dir: Result<PathBuf, GitError>,
         status: Result<PorcelainV2Status, GitError>,
+        calls: RefCell<Vec<&'static str>>,
     }
 
     impl MockGit {
@@ -531,24 +615,29 @@ mod tests {
                 git_dir: Ok(repository_path(".git")),
                 common_dir: Ok(repository_path(".git")),
                 status,
+                calls: RefCell::new(Vec::new()),
             }
         }
     }
 
     impl GitPort for MockGit {
         fn repository_root(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            self.calls.borrow_mut().push("repository-root");
             self.root.clone()
         }
 
         fn git_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            self.calls.borrow_mut().push("git-dir");
             self.git_dir.clone()
         }
 
         fn git_common_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            self.calls.borrow_mut().push("git-common-dir");
             self.common_dir.clone()
         }
 
         fn status(&self, _root: &Path) -> Result<PorcelainV2Status, GitError> {
+            self.calls.borrow_mut().push("status");
             self.status.clone()
         }
 
@@ -712,6 +801,48 @@ mod tests {
         assert!(!main_detection.facts.is_linked_worktree);
         assert!(linked_detection.facts.is_linked_worktree);
         assert_eq!(main_detection.facts.id, linked_detection.facts.id);
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_linked_worktree_topology_is_reused_without_location_requeries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+        let linked_root = absolute_path("repo-linked");
+        let linked_git_dir = repository_path(".git/worktrees/repo-linked");
+        let common_dir = repository_path(".git");
+        git.root = Ok(linked_root.clone());
+        git.git_dir = Ok(linked_git_dir.clone());
+
+        let topology =
+            resolve_repository_topology_controlled(&linked_root, &git, &UnlimitedOperationControl)?;
+
+        assert_eq!(topology.root(), linked_root);
+        assert_eq!(topology.git_dir(), linked_git_dir);
+        assert_eq!(topology.git_common_dir(), common_dir);
+        assert_eq!(
+            git.calls.borrow().as_slice(),
+            ["repository-root", "git-dir", "git-common-dir"]
+        );
+        git.calls.borrow_mut().clear();
+
+        let detection = detect_repository_from_topology_controlled(
+            topology,
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+            &UnlimitedOperationControl,
+        )?;
+
+        assert_eq!(git.calls.borrow().as_slice(), ["status"]);
+        assert_eq!(detection.facts.root, linked_root);
+        assert_eq!(detection.facts.git_dir, linked_git_dir);
+        assert_eq!(detection.facts.git_common_dir, common_dir);
+        assert!(detection.facts.is_linked_worktree);
+        assert_eq!(
+            detection.facts.id,
+            derive_repository_id(&repository_path(".git"), &InputSensitiveHasher)
+        );
         Ok(())
     }
 
