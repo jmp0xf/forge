@@ -176,11 +176,19 @@ The following boundaries are intentionally not inferred from local implementatio
 1. **Current-candidate verification.** Every handoff must run the root and fuzz Cargo commands from
    `AGENTS.md`, schema checks, applicable fixtures, and targeted hardening campaigns, then report
    exact commands, exit codes, platform, tool versions, and remaining gaps. This document is not a
-   substitute for that run ledger. Against commit `089fb51`, the strict exitability preflight
+   substitute for that run ledger. Against commit `f6e5e97`, the strict exitability preflight first
    accounted for all 28 fixtures and 27 declared native commands, then exited 101 before fixture
-   mutation because this host lacked `just` and `task` (25 commands had available tools). That is
-   an explicit release-qualification gap, not evidence that those two commands passed; rerun the
-   ignored strict gate on a controlled runner provisioned with every declared tool.
+   mutation because the ambient host lacked `just` and `task`; this confirmed that missing tools
+   cannot be mistaken for a pass. The gate was then rerun with no global installation and a
+   temporary `PATH` containing the official
+   [`just 1.50.0`](https://github.com/casey/just/releases/tag/1.50.0) and
+   [`task 3.51.1`](https://github.com/go-task/task/releases/tag/v3.51.1) macOS arm64 release binaries.
+   Their archives matched the publishers' SHA-256 values
+   `891262207663bff1aa422dbe799a76deae4064eaa445f14eb28aef7a388222cd` and
+   `a0330f0df20dd1187e323f284a7f365c0ea1f2f271c1e154811e9fc4724bed13` respectively. The strict
+   ledger then recorded all 27 declared commands as passed, four explicitly named scenario-only
+   fixtures as not applicable, and exited zero. This is one local qualification; every release
+   candidate still needs the strict gate on its controlled, fully provisioned runner.
 2. **Filesystem threat model and security review.** Repository writes and release-asset reads/writes
    now pin root directory handles and revalidate the visible root identity. Native adversarial tests
    and independent security review remain required; `SECURITY.md` still lacks a usable private
