@@ -709,7 +709,7 @@ where
             state: observed.state,
         });
     }
-    let mut gaps = classify_init_gaps(&model, &targets);
+    let mut gaps = classify_init_gaps(render_model, &targets);
     for target in &whole_file_targets {
         if target.state == WholeFileInspectionState::Missing {
             gaps.push(InitGap {
@@ -2020,6 +2020,14 @@ mod tests {
         assert!(runner_text.contains("# forge:begin block=runner-task-verify"));
         assert!(runner_text.contains("cmd: '''cargo'' ''test'' ''--workspace'''"));
         assert!(!runner_text.contains("forge evidence"));
+        assert!(!first.gaps.iter().any(|gap| {
+            gap.kind == GapKind::MissingProjectCommand && gap.intent == Some(Intent::Verify)
+        }));
+        for intent in [Intent::Setup, Intent::Build] {
+            assert!(first.gaps.iter().any(|gap| {
+                gap.kind == GapKind::MissingProjectCommand && gap.intent == Some(intent)
+            }));
+        }
 
         let files = MemoryFiles::from_files(first.edits.iter().map(|edit| {
             (

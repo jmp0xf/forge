@@ -1536,6 +1536,14 @@ fn init_explicit_runners_apply_converge_and_never_depend_on_forge()
         );
         let preview_document: Value = serde_json::from_slice(&preview.stdout)?;
         assert_eq!(required_array(&preview_document["data"], "edits")?.len(), 2);
+        assert!(
+            !required_array(&preview_document, "diagnostics")?
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "FGE2232"
+                        && diagnostic["where"] == "project command `verify`"
+                })
+        );
         assert!(!fixture.worktree.join(path).exists());
 
         let applied = fixture.run_forge(&["init", "--apply", "--with-runner", choice, "--json"])?;
