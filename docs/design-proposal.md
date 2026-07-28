@@ -2589,16 +2589,16 @@ cargo test --workspace
 
 ### 25.4 可分发性
 
-v0 计划：
+ADR-0029 已冻结首个 v0 候选的可分发边界：
 
-- GitHub Release 预编译二进制；
-- `cargo install --locked forge`（若名称和 crates.io 可用）；
-- checksum；
-- SBOM；
-- 发布签名；
-- 不内置自动更新；
-- Homebrew/Scoop 在首发后按需求加入；
-- Linux glibc baseline/静态链接选择由发布 spike 验证。
+- 首个候选固定为 `0.1.0-rc.1`，只通过 GitHub Release 分发；v0 RC 不发布到 crates.io，
+  也不承诺 Homebrew、Scoop 或自动更新通道；
+- 本地候选包含五个冻结目标的原始二进制和 CycloneDX SBOM，以及
+  `release-manifest.json` 与 `SHA256SUMS`；Linux 一级目标使用 musl 静态链接；
+- 仓库内 `xtask` 只组装和核验 `local-review-candidate`，不得签名、上传、发布或授权；
+- 最终 SLSA provenance、签名、审批、不可变发布和撤回权限属于候选仓库之外的 Authority Set。
+
+完整目标矩阵、资产名、构建隔离、失败残留和回滚规则见 ADR-0029 与 `docs/release.md`。
 
 ### 25.5 无遥测默认
 
@@ -2998,6 +2998,10 @@ N-1 public compatibility harness skeleton
 | 0024 | 进程边界失败写入类型化非证明 Receipt |
 | 0025 | 每条命令使用一个操作级总预算 |
 | 0026 | 声明 Provider 命名空间覆盖与缺口 |
+| 0027 | 显式生成只创建不覆盖的 GitHub CI 工作流 |
+| 0028 | 仓库写入固定目录句柄 |
+| 0029 | 发布可审查、可回滚的 v0 候选版本 |
+| 0030 | 分离 release manifest 的兼容读取与候选验收 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 
