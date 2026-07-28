@@ -7,16 +7,19 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Component as PathComponent, Path, PathBuf};
 use std::time::Duration;
 
 use forge_core::ports::{
     EnvPolicy, ExecSpec, OutputPolicy, ProcessObservation, ProcessPort, StdinPolicy,
 };
-use forge_core::{Mutability, NetworkIntent, RepoRelativePath};
+use forge_core::{
+    GitIndexEntry, GitIndexTag, GitObjectFormat, Mutability, NetworkIntent, RepoRelativePath,
+    parse_git_index_reader,
+};
 use forge_runtime::fs::RepositoryWriter;
-use forge_runtime::git::{HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
+use forge_runtime::git::{GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
 use forge_runtime::process::SynchronousProcessRunner;
 use forge_schema::{
     ReleaseArtifactData, ReleaseArtifactKindData, ReleaseAuthorityStatusData,
@@ -27,13 +30,18 @@ use forge_schema::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MANIFEST_FILE: &str = "release-manifest.json";
 const CHECKSUMS_FILE: &str = "SHA256SUMS";
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SOURCE_TREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GIT_INDEX_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_GIT_INDEX_ENTRIES: usize = 200_000;
+const MAX_HASH_OBJECT_ARGUMENT_UNITS: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const FINALIZED_ASSET_COUNT: u16 = 12;
@@ -173,7 +181,7 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     let repository = repository_root()?;
     let output = open_command_output_directory(&repository, &request.output_directory)?;
     let targets = std::slice::from_ref(request.target);
-    let before = RepositorySnapshot::capture(&repository, targets)?;
+    let source = ReleaseSource::prepare(&repository, targets, &[output.root()])?;
     let build_directory = tempdir().map_err(|error| {
         ReleaseError::environment(format!(
             "failed to create a fresh temporary Cargo target directory: {error}"
@@ -184,14 +192,12 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
             "failed to pin the fresh Cargo target directory before building: {error}"
         ))
     })?;
-    cargo_build(&repository, request.target, build_directory.path())?;
-    let after_build = RepositorySnapshot::capture(&repository, targets)?;
-    before.require_same(&after_build, "Cargo release build")?;
+    cargo_build(source.repository(), request.target, build_directory.path())?;
+    source.require_unchanged(targets, "Cargo release build")?;
     let binary = read_built_binary(&build_output, request.target)?;
     validate_binary_format(request.target, &binary)?;
-    stage_built(&output, request.target, &binary, &before)?;
-    let after_stage = RepositorySnapshot::capture(&repository, targets)?;
-    before.require_same(&after_stage, "release asset staging")?;
+    stage_built(&output, request.target, &binary, source.snapshot())?;
+    source.require_unchanged(targets, "release asset staging")?;
     Ok(ReleaseCommandOutput::Completed(format!(
         "built and staged {} with its CycloneDX SBOM in {}; local candidate only, not signed or published",
         binary_asset_name(request.target),
@@ -207,10 +213,9 @@ pub(crate) fn run_finalize(arguments: &[String]) -> Result<ReleaseCommandOutput,
     let output = PathBuf::from(required_option(&options, "--output-dir")?);
     let repository = repository_root()?;
     let output_writer = open_command_output_directory(&repository, &output)?;
-    let before = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
-    finalize(&output_writer, &before)?;
-    let after = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
-    before.require_same(&after, "release finalization")?;
+    let source = ReleaseSource::prepare(&repository, &RELEASE_TARGETS, &[output_writer.root()])?;
+    finalize(&output_writer, source.snapshot())?;
+    source.require_unchanged(&RELEASE_TARGETS, "release finalization")?;
     Ok(ReleaseCommandOutput::Completed(format!(
         "finalized the complete local {} asset set in {}; external provenance, signature, approval, upload, and publication remain required",
         RELEASE_VERSION,
@@ -226,10 +231,9 @@ pub(crate) fn run_check(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     let output = PathBuf::from(required_option(&options, "--output-dir")?);
     let repository = repository_root()?;
     let output_writer = open_command_output_directory(&repository, &output)?;
-    let before = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
-    check(&output_writer, &before)?;
-    let after = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
-    before.require_same(&after, "release verification")?;
+    let source = ReleaseSource::prepare(&repository, &RELEASE_TARGETS, &[output_writer.root()])?;
+    check(&output_writer, source.snapshot())?;
+    source.require_unchanged(&RELEASE_TARGETS, "release verification")?;
     Ok(ReleaseCommandOutput::Completed(format!(
         "verified the complete local {} asset set in {}; this does not verify provenance, signature, approval, upload, or publication",
         RELEASE_VERSION,
@@ -312,17 +316,21 @@ fn cargo_program() -> OsString {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RepositorySnapshot {
+struct WorktreeGuard {
     source_commit: String,
     status: Vec<u8>,
+    index: Vec<u8>,
+    raw_index: Vec<u8>,
     cargo_lock: Vec<u8>,
-    metadata_by_target: BTreeMap<String, Vec<u8>>,
 }
 
-impl RepositorySnapshot {
-    fn capture(repository: &Path, targets: &[ReleaseTarget]) -> Result<Self, ReleaseError> {
+impl WorktreeGuard {
+    fn capture(repository: &Path) -> Result<Self, ReleaseError> {
         require_expected_git_worktree(repository)?;
+        require_safe_local_git_config(repository)?;
         let source_commit = git_head(repository)?;
+        let raw_index = git_raw_index_snapshot(repository)?;
+        let index = git_index_snapshot(repository, &source_commit)?;
         let status = git_status(repository)?;
         require_clean_status(&status)?;
         let cargo_lock = read_bounded(
@@ -330,13 +338,6 @@ impl RepositorySnapshot {
             MAX_METADATA_BYTES as u64,
             "Cargo.lock",
         )?;
-        let mut metadata_by_target = BTreeMap::new();
-        for target in targets {
-            metadata_by_target.insert(
-                target.triple.to_owned(),
-                cargo_metadata(repository, target)?,
-            );
-        }
 
         require_expected_git_worktree(repository)?;
         let later_lock = read_bounded(
@@ -347,20 +348,47 @@ impl RepositorySnapshot {
         let later_status = git_status(repository)?;
         require_clean_status(&later_status)?;
         let later_commit = git_head(repository)?;
-        if source_commit != later_commit || status != later_status || cargo_lock != later_lock {
+        let later_raw_index = git_raw_index_snapshot(repository)?;
+        let later_index = git_index_snapshot(repository, &later_commit)?;
+        if source_commit != later_commit
+            || status != later_status
+            || index != later_index
+            || raw_index != later_raw_index
+            || cargo_lock != later_lock
+        {
             return Err(ReleaseError::environment(
-                "repository HEAD, complete Git status, or Cargo.lock changed while the release snapshot was captured",
+                "repository HEAD, complete Git status, Git index projection, or Cargo.lock changed while the release snapshot was captured",
             ));
         }
 
         Ok(Self {
             source_commit,
             status,
+            index,
+            raw_index,
             cargo_lock,
-            metadata_by_target,
         })
     }
 
+    fn require_same(&self, later: &Self, operation: &str) -> Result<(), ReleaseError> {
+        if self == later {
+            Ok(())
+        } else {
+            Err(ReleaseError::environment(format!(
+                "repository HEAD, complete Git status, semantic or raw Git index, or Cargo.lock changed during {operation}"
+            )))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositorySnapshot {
+    source_commit: String,
+    cargo_lock: Vec<u8>,
+    metadata_by_target: BTreeMap<String, Vec<u8>>,
+}
+
+impl RepositorySnapshot {
     fn metadata(&self, target: &ReleaseTarget) -> Result<&[u8], ReleaseError> {
         self.metadata_by_target
             .get(target.triple)
@@ -378,15 +406,168 @@ impl RepositorySnapshot {
             Ok(())
         } else {
             Err(ReleaseError::environment(format!(
-                "repository HEAD, complete Git status, Cargo.lock, or target-filtered Cargo metadata changed during {operation}"
+                "isolated source commit, Cargo.lock, or target-filtered Cargo metadata changed during {operation}"
             )))
         }
     }
 }
 
+struct ReleaseSource {
+    original_repository: PathBuf,
+    original_guard: WorktreeGuard,
+    _checkout_directory: TempDir,
+    checkout: RepositoryWriter,
+    snapshot: RepositorySnapshot,
+    source_tree: SourceTreeSnapshot,
+}
+
+impl ReleaseSource {
+    fn prepare(
+        repository: &Path,
+        targets: &[ReleaseTarget],
+        forbidden_temporary_roots: &[&Path],
+    ) -> Result<Self, ReleaseError> {
+        let original_repository = fs::canonicalize(repository).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to resolve release source repository {}: {error}",
+                repository.display()
+            ))
+        })?;
+        let original_guard = WorktreeGuard::capture(&original_repository)?;
+        let (checkout_directory, checkout_path) = materialize_isolated_checkout(
+            &original_repository,
+            &original_guard.source_commit,
+            forbidden_temporary_roots,
+        )?;
+        let isolated_guard = WorktreeGuard::capture(&checkout_path)?;
+        if isolated_guard.source_commit != original_guard.source_commit
+            || isolated_guard.index != original_guard.index
+            || isolated_guard.cargo_lock != original_guard.cargo_lock
+        {
+            return Err(ReleaseError::environment(
+                "isolated source checkout does not match the accepted commit, Git index projection, or Cargo.lock",
+            ));
+        }
+        require_no_non_index_files(&checkout_path)?;
+        detach_isolated_git_control(&checkout_directory, &checkout_path)?;
+        let checkout = RepositoryWriter::new(&checkout_path).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to pin the isolated source checkout {}: {error}",
+                checkout_path.display()
+            ))
+        })?;
+        validate_visible_root(&checkout, "isolated source checkout")?;
+        let source_tree = capture_source_tree(&checkout)?;
+        let metadata_by_target = capture_cargo_metadata(checkout.root(), targets)?;
+        validate_cargo_metadata_source_boundaries(
+            checkout.root(),
+            targets,
+            &metadata_by_target,
+            &source_tree,
+        )?;
+        let snapshot = RepositorySnapshot {
+            source_commit: isolated_guard.source_commit,
+            cargo_lock: isolated_guard.cargo_lock,
+            metadata_by_target,
+        };
+        if capture_source_tree(&checkout)? != source_tree {
+            return Err(ReleaseError::environment(
+                "Cargo metadata changed the detached isolated source tree",
+            ));
+        }
+        original_guard.require_same(
+            &WorktreeGuard::capture(&original_repository)?,
+            "isolated source checkout materialization",
+        )?;
+
+        Ok(Self {
+            original_repository,
+            original_guard,
+            _checkout_directory: checkout_directory,
+            checkout,
+            snapshot,
+            source_tree,
+        })
+    }
+
+    fn repository(&self) -> &Path {
+        self.checkout.root()
+    }
+
+    fn snapshot(&self) -> &RepositorySnapshot {
+        &self.snapshot
+    }
+
+    fn require_unchanged(
+        &self,
+        targets: &[ReleaseTarget],
+        operation: &str,
+    ) -> Result<(), ReleaseError> {
+        validate_visible_root(&self.checkout, "isolated source checkout")?;
+        if capture_source_tree(&self.checkout)? != self.source_tree {
+            return Err(ReleaseError::environment(format!(
+                "detached isolated source tree changed during {operation}"
+            )));
+        }
+        let metadata_by_target = capture_cargo_metadata(self.checkout.root(), targets)?;
+        validate_cargo_metadata_source_boundaries(
+            self.checkout.root(),
+            targets,
+            &metadata_by_target,
+            &self.source_tree,
+        )?;
+        self.snapshot.require_same(
+            &RepositorySnapshot {
+                source_commit: self.snapshot.source_commit.clone(),
+                cargo_lock: self.snapshot.cargo_lock.clone(),
+                metadata_by_target,
+            },
+            operation,
+        )?;
+        if capture_source_tree(&self.checkout)? != self.source_tree {
+            return Err(ReleaseError::environment(format!(
+                "detached isolated source tree changed while metadata was checked during {operation}"
+            )));
+        }
+        self.original_guard.require_same(
+            &WorktreeGuard::capture(&self.original_repository)?,
+            operation,
+        )?;
+        validate_visible_root(&self.checkout, "isolated source checkout")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceTreeEntry {
+    Directory {
+        permissions: u32,
+    },
+    File {
+        length: u64,
+        sha256: String,
+        permissions: u32,
+    },
+}
+
+type SourceTreeSnapshot = BTreeMap<RepoRelativePath, SourceTreeEntry>;
+
 fn git_output(
     repository: &Path,
     arguments: &[&str],
+    label: &str,
+    stdout_limit: usize,
+) -> Result<Vec<u8>, ReleaseError> {
+    git_output_os(
+        repository,
+        arguments.iter().map(OsString::from).collect(),
+        label,
+        stdout_limit,
+    )
+}
+
+fn git_output_os(
+    repository: &Path,
+    arguments: Vec<OsString>,
     label: &str,
     stdout_limit: usize,
 ) -> Result<Vec<u8>, ReleaseError> {
@@ -404,18 +585,12 @@ fn git_output(
         .map(OsString::from)
         .collect();
     argv.push(worktree_argument);
-    argv.extend(arguments.iter().map(OsString::from));
-    let mut environment = EnvPolicy::minimal();
-    environment.overrides.extend(
-        HARDENED_GIT_ENV
-            .iter()
-            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
-    );
+    argv.extend(arguments);
     let observation = run_bounded_process(
         repository,
         OsString::from("git"),
         argv,
-        environment,
+        hardened_git_environment(),
         GIT_TIMEOUT,
         stdout_limit,
         MAX_DIAGNOSTIC_BYTES,
@@ -424,6 +599,683 @@ fn git_output(
         &format!("Git {label}"),
     )?;
     require_process_success(observation, &format!("Git {label}"))
+}
+
+fn hardened_git_environment() -> EnvPolicy {
+    let mut environment = EnvPolicy::minimal();
+    environment.overrides.extend(
+        HARDENED_GIT_ENV
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+    );
+    environment.overrides.extend([
+        (
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            OsString::from(empty_git_config_path()),
+        ),
+        (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_LFS_SKIP_SMUDGE"), OsString::from("1")),
+    ]);
+    environment
+}
+
+#[cfg(windows)]
+const fn empty_git_config_path() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+const fn empty_git_config_path() -> &'static str {
+    "/dev/null"
+}
+
+fn materialize_isolated_checkout(
+    repository: &Path,
+    source_commit: &str,
+    forbidden_temporary_roots: &[&Path],
+) -> Result<(TempDir, PathBuf), ReleaseError> {
+    reject_git_redirect_environment(env::vars_os().map(|(key, _)| key))?;
+    let checkout_directory = tempdir().map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to create a private isolated source directory: {error}"
+        ))
+    })?;
+    require_isolated_temp_boundary(
+        repository,
+        checkout_directory.path(),
+        forbidden_temporary_roots,
+    )?;
+    let empty_git_config = checkout_directory.path().join("empty-gitconfig");
+    File::create(&empty_git_config).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to create the isolated checkout Git config: {error}"
+        ))
+    })?;
+    let isolated_home = checkout_directory.path().join("home");
+    let isolated_xdg = checkout_directory.path().join("xdg");
+    let isolated_hooks = checkout_directory.path().join("hooks");
+    let isolated_template = checkout_directory.path().join("template");
+    for directory in [
+        &isolated_home,
+        &isolated_xdg,
+        &isolated_hooks,
+        &isolated_template,
+    ] {
+        fs::create_dir(directory).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to create isolated Git environment directory {}: {error}",
+                directory.display()
+            ))
+        })?;
+    }
+    let checkout = checkout_directory.path().join("source");
+    let git_control = checkout_directory.path().join("git-control");
+    let mut environment = hardened_git_environment();
+    environment.overrides.extend([
+        (
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            empty_git_config.as_os_str().to_owned(),
+        ),
+        (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_LFS_SKIP_SMUDGE"), OsString::from("1")),
+        (OsString::from("HOME"), isolated_home.as_os_str().to_owned()),
+        (
+            OsString::from("USERPROFILE"),
+            isolated_home.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            isolated_xdg.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("APPDATA"),
+            isolated_xdg.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("LOCALAPPDATA"),
+            isolated_xdg.as_os_str().to_owned(),
+        ),
+    ]);
+
+    let mut hooks_config = OsString::from("core.hooksPath=");
+    hooks_config.push(isolated_hooks.as_os_str());
+    let mut separate_git_directory = OsString::from("--separate-git-dir=");
+    separate_git_directory.push(git_control.as_os_str());
+    let mut template_directory = OsString::from("--template=");
+    template_directory.push(isolated_template.as_os_str());
+
+    let mut clone_arguments: Vec<OsString> = HARDENED_GIT_GLOBAL_ARGS
+        .iter()
+        .map(OsString::from)
+        .collect();
+    clone_arguments.extend([
+        OsString::from("-c"),
+        hooks_config.clone(),
+        OsString::from("-c"),
+        OsString::from("protocol.allow=never"),
+        OsString::from("-c"),
+        OsString::from("protocol.file.allow=always"),
+    ]);
+    clone_arguments.extend([
+        OsString::from("clone"),
+        OsString::from("--quiet"),
+        OsString::from("--no-local"),
+        OsString::from("--no-checkout"),
+        OsString::from("--no-tags"),
+        OsString::from("--no-recurse-submodules"),
+        separate_git_directory,
+        template_directory,
+        OsString::from("--"),
+        repository.as_os_str().to_owned(),
+        checkout.as_os_str().to_owned(),
+    ]);
+    let clone = run_bounded_process(
+        checkout_directory.path(),
+        OsString::from("git"),
+        clone_arguments,
+        environment.clone(),
+        GIT_TIMEOUT,
+        MAX_DIAGNOSTIC_BYTES,
+        MAX_DIAGNOSTIC_BYTES,
+        Mutability::WorkingTreeWrite,
+        NetworkIntent::OfflineRequested,
+        "isolated local Git clone",
+    )?;
+    let _ = require_process_success(clone, "isolated local Git clone")?;
+
+    let mut checkout_arguments: Vec<OsString> = HARDENED_GIT_GLOBAL_ARGS
+        .iter()
+        .map(OsString::from)
+        .collect();
+    checkout_arguments.extend([
+        OsString::from("-c"),
+        hooks_config.clone(),
+        OsString::from("-c"),
+        OsString::from("core.autocrlf=false"),
+        OsString::from("-C"),
+        checkout.as_os_str().to_owned(),
+        OsString::from("checkout"),
+        OsString::from("--quiet"),
+        OsString::from("--detach"),
+        OsString::from("--force"),
+        OsString::from(source_commit),
+        OsString::from("--"),
+    ]);
+    let checkout_observation = run_bounded_process(
+        checkout_directory.path(),
+        OsString::from("git"),
+        checkout_arguments,
+        environment.clone(),
+        GIT_TIMEOUT,
+        MAX_DIAGNOSTIC_BYTES,
+        MAX_DIAGNOSTIC_BYTES,
+        Mutability::WorkingTreeWrite,
+        NetworkIntent::OfflineRequested,
+        "isolated Git checkout",
+    )?;
+    let _ = require_process_success(checkout_observation, "isolated Git checkout")?;
+
+    let mut fsck_arguments: Vec<OsString> = HARDENED_GIT_GLOBAL_ARGS
+        .iter()
+        .map(OsString::from)
+        .collect();
+    fsck_arguments.extend([
+        OsString::from("-c"),
+        hooks_config,
+        OsString::from("-C"),
+        checkout.as_os_str().to_owned(),
+        OsString::from("fsck"),
+        OsString::from("--full"),
+        OsString::from("--strict"),
+        OsString::from("--no-dangling"),
+        OsString::from("--no-progress"),
+        OsString::from("--no-reflogs"),
+        OsString::from(source_commit),
+    ]);
+    let fsck = run_bounded_process(
+        checkout_directory.path(),
+        OsString::from("git"),
+        fsck_arguments,
+        environment,
+        GIT_TIMEOUT,
+        MAX_DIAGNOSTIC_BYTES,
+        MAX_DIAGNOSTIC_BYTES,
+        Mutability::ReadOnly,
+        NetworkIntent::OfflineRequested,
+        "isolated Git object verification",
+    )?;
+    let _ = require_process_success(fsck, "isolated Git object verification")?;
+    let alternates = git_control.join("objects").join("info").join("alternates");
+    match fs::symlink_metadata(&alternates) {
+        Ok(_) => {
+            return Err(ReleaseError::environment(format!(
+                "isolated Git clone retained an external object alternate at {}",
+                alternates.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ReleaseError::environment(format!(
+                "failed to inspect isolated Git alternate path {}: {error}",
+                alternates.display()
+            )));
+        }
+    }
+    require_checkout_matches_index(&checkout, source_commit)?;
+    Ok((checkout_directory, checkout))
+}
+
+fn require_isolated_temp_boundary(
+    repository: &Path,
+    temporary_root: &Path,
+    additional_forbidden_roots: &[&Path],
+) -> Result<(), ReleaseError> {
+    let temporary_root = fs::canonicalize(temporary_root).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve isolated source temporary directory {}: {error}",
+            temporary_root.display()
+        ))
+    })?;
+    let repository = fs::canonicalize(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve release source repository {}: {error}",
+            repository.display()
+        ))
+    })?;
+    let private_directories = git_private_directories(repository.as_path())?;
+    let mut forbidden_roots = vec![(repository, "source repository")];
+    forbidden_roots.extend(private_directories);
+    for root in additional_forbidden_roots {
+        let root = fs::canonicalize(root).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to resolve forbidden release temporary root {}: {error}",
+                root.display()
+            ))
+        })?;
+        forbidden_roots.push((root, "release output"));
+    }
+    for (root, label) in forbidden_roots {
+        if temporary_root == root || temporary_root.starts_with(&root) {
+            return Err(ReleaseError::environment(format!(
+                "isolated source temporary directory must be outside the {label}: {}",
+                temporary_root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_no_non_index_files(repository: &Path) -> Result<(), ReleaseError> {
+    let paths = git_output(
+        repository,
+        &["ls-files", "--others", "--directory", "-z", "--"],
+        "non-index worktree read",
+        MAX_METADATA_BYTES,
+    )?;
+    if paths.is_empty() {
+        Ok(())
+    } else {
+        Err(ReleaseError::environment(
+            "isolated source checkout contains files absent from the exact commit index, including ignored files",
+        ))
+    }
+}
+
+fn detach_isolated_git_control(
+    checkout_directory: &TempDir,
+    checkout: &Path,
+) -> Result<(), ReleaseError> {
+    let expected =
+        fs::canonicalize(checkout_directory.path().join("git-control")).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to resolve isolated Git control directory: {error}"
+            ))
+        })?;
+    let reported = git_path_from_output(&git_output(
+        checkout,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+        "isolated Git control directory read",
+        64 * 1024,
+    )?)?;
+    let reported = fs::canonicalize(&reported).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve Git-reported isolated control directory {}: {error}",
+            reported.display()
+        ))
+    })?;
+    if reported != expected {
+        return Err(ReleaseError::environment(format!(
+            "isolated checkout Git control directory {} does not match expected {}",
+            reported.display(),
+            expected.display()
+        )));
+    }
+
+    let marker = checkout.join(".git");
+    let metadata = fs::symlink_metadata(&marker).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to inspect isolated checkout Git marker {}: {error}",
+            marker.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ReleaseError::environment(format!(
+            "isolated checkout Git marker is not a real regular file: {}",
+            marker.display()
+        )));
+    }
+    fs::remove_file(&marker).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to detach Git control metadata from isolated source {}: {error}",
+            marker.display()
+        ))
+    })?;
+    if fs::symlink_metadata(&marker).is_ok() {
+        return Err(ReleaseError::environment(format!(
+            "isolated source still exposes Git control metadata at {}",
+            marker.display()
+        )));
+    }
+    Ok(())
+}
+
+fn capture_cargo_metadata(
+    repository: &Path,
+    targets: &[ReleaseTarget],
+) -> Result<BTreeMap<String, Vec<u8>>, ReleaseError> {
+    targets
+        .iter()
+        .map(|target| {
+            Ok((
+                target.triple.to_owned(),
+                cargo_metadata(repository, target)?,
+            ))
+        })
+        .collect()
+}
+
+fn validate_cargo_metadata_source_boundaries(
+    repository: &Path,
+    targets: &[ReleaseTarget],
+    metadata_by_target: &BTreeMap<String, Vec<u8>>,
+    source_tree: &SourceTreeSnapshot,
+) -> Result<(), ReleaseError> {
+    let repository = fs::canonicalize(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve isolated Cargo workspace root {}: {error}",
+            repository.display()
+        ))
+    })?;
+    for target in targets {
+        let bytes = metadata_by_target.get(target.triple).ok_or_else(|| {
+            ReleaseError::internal(format!(
+                "release snapshot omitted target-filtered Cargo metadata for {}",
+                target.triple
+            ))
+        })?;
+        let metadata: CargoMetadata = serde_json::from_slice(bytes).map_err(|error| {
+            ReleaseError::environment(format!(
+                "Cargo metadata for {} is not valid JSON: {error}",
+                target.triple
+            ))
+        })?;
+        let workspace_root = metadata.workspace_root.as_deref().ok_or_else(|| {
+            ReleaseError::environment(format!(
+                "Cargo metadata for {} omitted workspace_root",
+                target.triple
+            ))
+        })?;
+        let workspace_root = fs::canonicalize(workspace_root).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to resolve Cargo workspace_root {} for {}: {error}",
+                workspace_root.display(),
+                target.triple
+            ))
+        })?;
+        if workspace_root != repository {
+            return Err(ReleaseError::environment(format!(
+                "Cargo workspace_root {} for {} escapes isolated source root {}",
+                workspace_root.display(),
+                target.triple,
+                repository.display()
+            )));
+        }
+
+        let workspace_members: BTreeSet<_> = metadata
+            .workspace_members
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for package in metadata
+            .packages
+            .iter()
+            .filter(|package| package.source.is_none())
+        {
+            if !workspace_members.contains(package.id.as_str()) {
+                return Err(ReleaseError::environment(format!(
+                    "source-bound release metadata rejects local package outside the exact workspace: `{}`",
+                    package.id
+                )));
+            }
+            let manifest = package.manifest_path.as_deref().ok_or_else(|| {
+                ReleaseError::environment(format!(
+                    "local workspace package `{}` omitted manifest_path",
+                    package.id
+                ))
+            })?;
+            validate_cargo_source_file(
+                &repository,
+                source_tree,
+                manifest,
+                &format!("manifest for local workspace package `{}`", package.id),
+            )?;
+            if package.targets.is_empty() {
+                return Err(ReleaseError::environment(format!(
+                    "local workspace package `{}` has no declared Cargo targets",
+                    package.id
+                )));
+            }
+            for cargo_target in &package.targets {
+                let source = cargo_target.src_path.as_deref().ok_or_else(|| {
+                    ReleaseError::environment(format!(
+                        "a target for local workspace package `{}` omitted src_path",
+                        package.id
+                    ))
+                })?;
+                validate_cargo_source_file(
+                    &repository,
+                    source_tree,
+                    source,
+                    &format!("target source for local workspace package `{}`", package.id),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cargo_source_file(
+    repository: &Path,
+    source_tree: &SourceTreeSnapshot,
+    path: &Path,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    if !path.is_absolute() {
+        return Err(ReleaseError::environment(format!(
+            "{label} is not an absolute Cargo metadata path: {}",
+            path.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to inspect {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || source_entry_is_link_or_reparse(&metadata) {
+        return Err(ReleaseError::environment(format!(
+            "{label} is not a real regular file: {}",
+            path.display()
+        )));
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    let relative = canonical.strip_prefix(repository).map_err(|_| {
+        ReleaseError::environment(format!(
+            "{label} {} escapes isolated source root {}",
+            canonical.display(),
+            repository.display()
+        ))
+    })?;
+    let relative = RepoRelativePath::new(relative).map_err(|error| {
+        ReleaseError::environment(format!(
+            "{label} has an invalid isolated source path {}: {error}",
+            relative.display()
+        ))
+    })?;
+    if !matches!(
+        source_tree.get(&relative),
+        Some(SourceTreeEntry::File { .. })
+    ) {
+        return Err(ReleaseError::environment(format!(
+            "{label} is not covered by the detached source tree snapshot: {}",
+            canonical.display()
+        )));
+    }
+    Ok(())
+}
+
+fn capture_source_tree(writer: &RepositoryWriter) -> Result<SourceTreeSnapshot, ReleaseError> {
+    validate_visible_root(writer, "isolated source checkout")?;
+    let mut snapshot = BTreeMap::new();
+    let mut total_bytes = 0_u64;
+    capture_source_directory(writer, Path::new(""), &mut snapshot, &mut total_bytes)?;
+    validate_visible_root(writer, "isolated source checkout")?;
+    Ok(snapshot)
+}
+
+fn capture_source_directory(
+    writer: &RepositoryWriter,
+    relative_directory: &Path,
+    snapshot: &mut SourceTreeSnapshot,
+    total_bytes: &mut u64,
+) -> Result<(), ReleaseError> {
+    let directory = writer.root().join(relative_directory);
+    let entries =
+        read_bounded_source_directory_entries(&directory, snapshot.len(), MAX_GIT_INDEX_ENTRIES)?;
+    for entry in entries {
+        if snapshot.len() >= MAX_GIT_INDEX_ENTRIES {
+            return Err(ReleaseError::environment(format!(
+                "isolated source contains more than {MAX_GIT_INDEX_ENTRIES} filesystem entries"
+            )));
+        }
+        let relative = relative_directory.join(entry.file_name());
+        if relative == Path::new(".git") {
+            return Err(ReleaseError::environment(
+                "isolated source unexpectedly exposes Git control metadata",
+            ));
+        }
+        let relative = RepoRelativePath::new(&relative).map_err(|error| {
+            ReleaseError::environment(format!(
+                "isolated source contains an invalid repository path {}: {error}",
+                relative.display()
+            ))
+        })?;
+        let path = writer.root().join(relative.as_path());
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to inspect isolated source entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        if source_entry_is_link_or_reparse(&metadata) {
+            return Err(ReleaseError::environment(format!(
+                "isolated source entry is a symbolic link or reparse point: {}",
+                relative.as_path().display()
+            )));
+        }
+        if metadata.is_dir() {
+            snapshot.insert(
+                relative.clone(),
+                SourceTreeEntry::Directory {
+                    permissions: source_entry_permissions(&metadata),
+                },
+            );
+            capture_source_directory(writer, relative.as_path(), snapshot, total_bytes)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(ReleaseError::environment(format!(
+                "isolated source entry is not a regular file or directory: {}",
+                relative.as_path().display()
+            )));
+        }
+        let bytes = writer
+            .read_optional_bounded(relative.as_path(), MAX_SOURCE_FILE_BYTES)
+            .map_err(|error| {
+                ReleaseError::environment(format!(
+                    "failed to read isolated source file {}: {error}",
+                    relative.as_path().display()
+                ))
+            })?
+            .ok_or_else(|| {
+                ReleaseError::environment(format!(
+                    "isolated source file disappeared while being read: {}",
+                    relative.as_path().display()
+                ))
+            })?;
+        let length = u64::try_from(bytes.len()).map_err(|_| {
+            ReleaseError::environment("isolated source file length is not representable")
+        })?;
+        *total_bytes = total_bytes.checked_add(length).ok_or_else(|| {
+            ReleaseError::environment("isolated source tree byte length overflowed")
+        })?;
+        if *total_bytes > MAX_SOURCE_TREE_BYTES {
+            return Err(ReleaseError::environment(format!(
+                "isolated source tree exceeds the {MAX_SOURCE_TREE_BYTES}-byte bound"
+            )));
+        }
+        snapshot.insert(
+            relative,
+            SourceTreeEntry::File {
+                length,
+                sha256: sha256_hex(&bytes),
+                permissions: source_entry_permissions(&metadata),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn read_bounded_source_directory_entries(
+    directory: &Path,
+    existing_entries: usize,
+    max_entries: usize,
+) -> Result<Vec<fs::DirEntry>, ReleaseError> {
+    let reader = fs::read_dir(directory).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to enumerate isolated source directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for entry in reader {
+        if existing_entries
+            .checked_add(entries.len())
+            .is_none_or(|count| count >= max_entries)
+        {
+            return Err(ReleaseError::environment(format!(
+                "isolated source contains more than {max_entries} filesystem entries"
+            )));
+        }
+        entries.push(entry.map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to enumerate isolated source directory {}: {error}",
+                directory.display()
+            ))
+        })?);
+    }
+    entries.sort_by_key(fs::DirEntry::file_name);
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn source_entry_permissions(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(windows)]
+fn source_entry_permissions(metadata: &fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_attributes()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn source_entry_permissions(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+#[cfg(windows)]
+fn source_entry_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn source_entry_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn reject_git_redirect_environment<I>(keys: I) -> Result<(), ReleaseError>
@@ -489,6 +1341,220 @@ fn git_status(repository: &Path) -> Result<Vec<u8>, ReleaseError> {
         "complete status read",
         MAX_METADATA_BYTES,
     )
+}
+
+fn require_safe_local_git_config(repository: &Path) -> Result<(), ReleaseError> {
+    for (scope, label) in [
+        ("--local", "local configuration key read"),
+        ("--worktree", "worktree configuration key read"),
+    ] {
+        let keys = git_output(
+            repository,
+            &[
+                "config",
+                "--no-includes",
+                scope,
+                "--name-only",
+                "--null",
+                "--list",
+            ],
+            label,
+            MAX_METADATA_BYTES,
+        )?;
+        for raw in keys.split(|byte| *byte == 0).filter(|raw| !raw.is_empty()) {
+            let key = std::str::from_utf8(raw).map_err(|_| {
+                ReleaseError::environment("Git configuration contains a non-UTF-8 key")
+            })?;
+            let key = key.to_ascii_lowercase();
+            if key.starts_with("filter.")
+                || key.starts_with("include.")
+                || key.starts_with("includeif.")
+                || key == "uploadpack.packobjectshook"
+                || key == "core.alternaterefscommand"
+            {
+                return Err(ReleaseError::environment(format!(
+                    "release assembly rejects executable or externally included {scope} Git configuration key `{key}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn git_raw_index_snapshot(repository: &Path) -> Result<Vec<u8>, ReleaseError> {
+    GitCli::new()
+        .with_timeout(GIT_TIMEOUT)
+        .index_snapshot_bytes(repository, MAX_METADATA_BYTES)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to capture the bounded raw Git index without links, locks, or split-index omissions: {error}"
+            ))
+        })
+}
+
+fn git_index_snapshot(repository: &Path, source_commit: &str) -> Result<Vec<u8>, ReleaseError> {
+    let bytes = git_output(
+        repository,
+        &["ls-files", "--stage", "-v", "-z", "--"],
+        "complete index read",
+        MAX_METADATA_BYTES,
+    )?;
+    let _ = validated_git_index_entries(&bytes, source_commit)?;
+    Ok(bytes)
+}
+
+fn validated_git_index_entries(
+    bytes: &[u8],
+    source_commit: &str,
+) -> Result<Vec<GitIndexEntry>, ReleaseError> {
+    let object_format = match source_commit.len() {
+        40 => GitObjectFormat::Sha1,
+        64 => GitObjectFormat::Sha256,
+        _ => {
+            return Err(ReleaseError::internal(
+                "validated Git commit has an unsupported object ID width",
+            ));
+        }
+    };
+    let entries = parse_git_index_reader(
+        Cursor::new(&bytes),
+        object_format,
+        MAX_GIT_INDEX_RECORD_BYTES,
+        MAX_GIT_INDEX_ENTRIES,
+    )
+    .map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to parse the complete Git index projection: {error}"
+        ))
+    })?;
+    for entry in &entries {
+        if entry.tag != GitIndexTag::Cached || entry.stage != 0 {
+            return Err(ReleaseError::environment(format!(
+                "release assembly rejects non-ordinary Git index state for {}; clear skip-worktree, assume-unchanged, sparse, removed, killed, or unmerged state before retrying",
+                entry.path.as_path().display()
+            )));
+        }
+        if !matches!(entry.mode.as_bytes(), b"100644" | b"100755") {
+            return Err(ReleaseError::environment(format!(
+                "release assembly supports only regular tracked files, but {} has Git mode {}",
+                entry.path.as_path().display(),
+                String::from_utf8_lossy(entry.mode.as_bytes())
+            )));
+        }
+    }
+    Ok(entries)
+}
+
+fn require_checkout_matches_index(
+    repository: &Path,
+    source_commit: &str,
+) -> Result<(), ReleaseError> {
+    let index = git_index_snapshot(repository, source_commit)?;
+    let entries = validated_git_index_entries(&index, source_commit)?;
+    let object_id_width = source_commit.len();
+    let mut start = 0;
+    while start < entries.len() {
+        let mut arguments = vec![
+            OsString::from("hash-object"),
+            OsString::from("--no-filters"),
+            OsString::from("--"),
+        ];
+        let mut argument_units = arguments
+            .iter()
+            .map(|argument| command_argument_units(argument.as_os_str()).saturating_add(1))
+            .sum::<usize>();
+        let mut end = start;
+        while end < entries.len() {
+            let path = entries[end].path.as_path();
+            let path_units = command_argument_units(path.as_os_str()).saturating_add(1);
+            let next_units = argument_units.checked_add(path_units).ok_or_else(|| {
+                ReleaseError::environment("Git hash-object command length overflowed")
+            })?;
+            if next_units > MAX_HASH_OBJECT_ARGUMENT_UNITS {
+                if end == start {
+                    return Err(ReleaseError::environment(format!(
+                        "tracked source path is too long for bounded exact-byte verification: {}",
+                        path.display()
+                    )));
+                }
+                break;
+            }
+            let absolute = repository.join(path);
+            let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+                ReleaseError::environment(format!(
+                    "failed to inspect checked-out source file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.is_file() || source_entry_is_link_or_reparse(&metadata) {
+                return Err(ReleaseError::environment(format!(
+                    "checked-out source entry is not a real regular file: {}",
+                    path.display()
+                )));
+            }
+            arguments.push(path.as_os_str().to_owned());
+            argument_units = next_units;
+            end += 1;
+        }
+
+        let batch_len = end - start;
+        let stdout_limit = batch_len
+            .checked_mul(object_id_width.saturating_add(2))
+            .ok_or_else(|| ReleaseError::environment("Git hash output bound overflowed"))?;
+        let hashes = git_output_os(
+            repository,
+            arguments,
+            "exact checked-out blob byte verification",
+            stdout_limit,
+        )?;
+        require_expected_hash_lines(&entries[start..end], &hashes)?;
+        start = end;
+    }
+    Ok(())
+}
+
+fn require_expected_hash_lines(
+    entries: &[GitIndexEntry],
+    output: &[u8],
+) -> Result<(), ReleaseError> {
+    let mut lines = output.split(|byte| *byte == b'\n');
+    for entry in entries {
+        let raw = lines.next().ok_or_else(|| {
+            ReleaseError::environment("Git hash-object omitted a checked-out source hash")
+        })?;
+        let actual = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if actual != entry.object_id.as_bytes() {
+            return Err(ReleaseError::environment(format!(
+                "checked-out bytes for {} do not match the exact commit blob; Git attributes or a concurrent mutation changed the worktree representation",
+                entry.path.as_path().display()
+            )));
+        }
+    }
+    if lines.next() != Some(&[][..]) || lines.next().is_some() {
+        return Err(ReleaseError::environment(
+            "Git hash-object emitted an unexpected number of source hashes",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn command_argument_units(value: &OsStr) -> usize {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    value.as_bytes().len()
+}
+
+#[cfg(windows)]
+fn command_argument_units(value: &OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    value.encode_wide().count()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn command_argument_units(value: &OsStr) -> usize {
+    value.to_string_lossy().len()
 }
 
 fn require_expected_git_worktree(repository: &Path) -> Result<(), ReleaseError> {
@@ -565,6 +1631,7 @@ fn cargo_build(
     target: &ReleaseTarget,
     target_directory: &Path,
 ) -> Result<(), ReleaseError> {
+    require_no_external_cargo_configuration(repository)?;
     let mut arguments = [
         "build",
         "--release",
@@ -594,7 +1661,10 @@ fn cargo_build(
         Mutability::Unknown,
         NetworkIntent::OfflineRequested,
         &label,
-    )?;
+    );
+    let later_configuration_boundary = require_no_external_cargo_configuration(repository);
+    let observation = observation?;
+    later_configuration_boundary?;
     let _ = require_process_success(observation, &label)?;
     Ok(())
 }
@@ -626,6 +1696,7 @@ fn read_built_binary(
 }
 
 fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, ReleaseError> {
+    require_no_external_cargo_configuration(repository)?;
     let label = format!("Cargo metadata for {}", target.triple);
     let observation = run_bounded_process(
         repository,
@@ -649,8 +1720,68 @@ fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, 
         Mutability::Unknown,
         NetworkIntent::OfflineRequested,
         &label,
-    )?;
+    );
+    let later_configuration_boundary = require_no_external_cargo_configuration(repository);
+    let observation = observation?;
+    later_configuration_boundary?;
     require_process_success(observation, &label)
+}
+
+fn require_no_external_cargo_configuration(repository: &Path) -> Result<(), ReleaseError> {
+    let repository = fs::canonicalize(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve Cargo source boundary {}: {error}",
+            repository.display()
+        ))
+    })?;
+    let mut configuration_roots = BTreeSet::new();
+    for ancestor in repository.parent().into_iter().flat_map(Path::ancestors) {
+        configuration_roots.insert(ancestor.join(".cargo"));
+    }
+    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
+        let cargo_home = PathBuf::from(cargo_home);
+        if !cargo_home.is_absolute() {
+            return Err(ReleaseError::environment(format!(
+                "release assembly requires an absolute CARGO_HOME, got {}",
+                cargo_home.display()
+            )));
+        }
+        configuration_roots.insert(cargo_home);
+    } else {
+        for home_key in ["HOME", "USERPROFILE"] {
+            if let Some(home) = env::var_os(home_key) {
+                let home = PathBuf::from(home);
+                if !home.is_absolute() {
+                    return Err(ReleaseError::environment(format!(
+                        "release assembly requires an absolute {home_key}, got {}",
+                        home.display()
+                    )));
+                }
+                configuration_roots.insert(home.join(".cargo"));
+            }
+        }
+    }
+    for root in configuration_roots {
+        for name in ["config", "config.toml"] {
+            let path = root.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(ReleaseError::environment(format!(
+                        "release assembly rejects external Cargo configuration discovered at {}; only configuration inside the exact isolated source tree is source-bound",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ReleaseError::environment(format!(
+                        "failed to inspect external Cargo configuration path {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cargo_environment() -> EnvPolicy {
@@ -938,24 +2069,7 @@ fn open_command_output_directory(
     path: &Path,
 ) -> Result<RepositoryWriter, ReleaseError> {
     let output = open_output_directory(repository, path)?;
-    for (arguments, label) in [
-        (
-            ["rev-parse", "--path-format=absolute", "--git-dir"],
-            "worktree-specific Git directory",
-        ),
-        (
-            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            "shared Git directory",
-        ),
-    ] {
-        let bytes = git_output(repository, &arguments, label, 64 * 1024)?;
-        let reported = git_path_from_output(&bytes)?;
-        let private_directory = fs::canonicalize(&reported).map_err(|error| {
-            ReleaseError::environment(format!(
-                "failed to resolve {label} {}: {error}",
-                reported.display()
-            ))
-        })?;
+    for (private_directory, label) in git_private_directories(repository)? {
         if output.root() == private_directory || output.root().starts_with(&private_directory) {
             return Err(ReleaseError::environment(format!(
                 "release output must be outside the {label}: {}",
@@ -965,6 +2079,34 @@ fn open_command_output_directory(
     }
     validate_visible_root(&output, "release output")?;
     Ok(output)
+}
+
+fn git_private_directories(
+    repository: &Path,
+) -> Result<Vec<(PathBuf, &'static str)>, ReleaseError> {
+    [
+        (
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+            "worktree-specific Git directory",
+        ),
+        (
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            "shared Git directory",
+        ),
+    ]
+    .into_iter()
+    .map(|(arguments, label)| {
+        let bytes = git_output(repository, &arguments, label, 64 * 1024)?;
+        let reported = git_path_from_output(&bytes)?;
+        let private_directory = fs::canonicalize(&reported).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to resolve {label} {}: {error}",
+                reported.display()
+            ))
+        })?;
+        Ok((private_directory, label))
+    })
+    .collect()
 }
 
 fn validate_visible_root(writer: &RepositoryWriter, label: &str) -> Result<(), ReleaseError> {
@@ -1632,6 +2774,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ReleaseError> {
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
     workspace_members: Vec<String>,
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
     resolve: Option<CargoResolve>,
 }
 
@@ -1642,6 +2786,16 @@ struct CargoPackage {
     version: String,
     source: Option<String>,
     checksum: Option<String>,
+    #[serde(default)]
+    manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    targets: Vec<CargoTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoTarget {
+    #[serde(default)]
+    src_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2045,6 +3199,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write as _;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::time::Duration;
 
@@ -2054,7 +3209,7 @@ mod tests {
 
     use super::{
         CHECKSUMS_FILE, MANIFEST_FILE, RELEASE_TARGETS, ReleaseError, RepositorySnapshot,
-        binary_asset_name, check, finalize, render_sbom, sha256_hex, stage_built,
+        WorktreeGuard, binary_asset_name, check, finalize, render_sbom, sha256_hex, stage_built,
         validate_binary_format,
     };
 
@@ -2121,7 +3276,433 @@ mod tests {
         fs::write(repository.join("untracked.txt"), b"dirty")
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
 
-        assert!(RepositorySnapshot::capture(&repository, &RELEASE_TARGETS[..1]).is_err());
+        assert!(WorktreeGuard::capture(&repository).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn source_snapshot_rejects_hidden_index_flags() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"tracked")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", "tracked.txt"])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        let head = super::git_head(&repository)?;
+
+        run_git(
+            &repository,
+            &["update-index", "--assume-unchanged", "tracked.txt"],
+        )?;
+        assert!(super::git_index_snapshot(&repository, &head).is_err());
+        run_git(
+            &repository,
+            &["update-index", "--no-assume-unchanged", "tracked.txt"],
+        )?;
+        run_git(
+            &repository,
+            &["update-index", "--skip-worktree", "tracked.txt"],
+        )?;
+        assert!(super::git_index_snapshot(&repository, &head).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_checkout_uses_committed_bytes_and_excludes_ignored_inputs()
+    -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join(".gitignore"), b"ignored-input\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"committed")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", ".gitignore", "tracked.txt"])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        let head = super::git_head(&repository)?;
+        run_git(
+            &repository,
+            &["update-index", "--assume-unchanged", "tracked.txt"],
+        )?;
+        fs::write(repository.join("tracked.txt"), b"hidden worktree bytes")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("ignored-input"), b"ignored build input")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+
+        let (checkout_directory, checkout) =
+            super::materialize_isolated_checkout(&repository, &head, &[])?;
+        assert_eq!(
+            fs::read(checkout.join("tracked.txt"))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            b"committed"
+        );
+        assert!(!checkout.join("ignored-input").exists());
+        super::require_no_non_index_files(&checkout)?;
+        super::detach_isolated_git_control(&checkout_directory, &checkout)?;
+        assert!(!checkout.join(".git").exists());
+        assert!(run_git(&checkout, &["rev-parse", "--git-dir"]).is_err());
+
+        let writer = forge_runtime::fs::RepositoryWriter::new(&checkout)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let baseline = super::capture_source_tree(&writer)?;
+        fs::write(checkout.join("ignored-input"), b"late ignored input")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert_ne!(super::capture_source_tree(&writer)?, baseline);
+        fs::remove_file(checkout.join("ignored-input"))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::create_dir(checkout.join("empty-untracked-directory"))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert_ne!(super::capture_source_tree(&writer)?, baseline);
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_checkout_rejects_git_attribute_byte_transforms() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(
+            repository.join(".gitattributes"),
+            b"tracked.txt text eol=crlf\n",
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"line one\nline two\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", ".gitattributes", "tracked.txt"])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        let head = super::git_head(&repository)?;
+
+        let error = super::materialize_isolated_checkout(&repository, &head, &[])
+            .err()
+            .ok_or_else(|| {
+                ReleaseError::internal(
+                    "attribute-transformed checkout unexpectedly passed exact-byte verification",
+                )
+            })?;
+        assert!(
+            error
+                .to_string()
+                .contains("do not match the exact commit blob")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_temp_root_rejects_repository_and_output_descendants() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        let output = temporary.path().join("output");
+        let repository_temp = repository.join("target/release-source");
+        let output_temp = output.join("release-source");
+        fs::create_dir_all(&repository_temp)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::create_dir_all(&output_temp)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+
+        assert!(super::require_isolated_temp_boundary(&repository, &repository_temp, &[]).is_err());
+        assert!(
+            super::require_isolated_temp_boundary(&repository, &output_temp, &[output.as_path()])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_checkout_rejects_ambient_temp_root_inside_repository() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        let ambient_temp = repository.join("target");
+        fs::create_dir_all(&ambient_temp)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"tracked")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", "tracked.txt"])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+
+        let output = Command::new(
+            env::current_exe().map_err(|error| ReleaseError::internal(error.to_string()))?,
+        )
+        .args([
+            "--exact",
+            "release::tests::bounded_release_process_test_helper",
+            "--nocapture",
+        ])
+        .env("FORGE_RELEASE_PROCESS_TEST", "repository-temp-boundary")
+        .env("FORGE_RELEASE_TEST_REPOSITORY", &repository)
+        .env("TMPDIR", &ambient_temp)
+        .output()
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(
+            output.status.success(),
+            "temp-boundary child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_directory_enumeration_rejects_the_next_entry_before_collecting_it()
+    -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        for name in ["a", "b", "c"] {
+            fs::write(temporary.path().join(name), b"")
+                .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        }
+
+        assert!(super::read_bounded_source_directory_entries(temporary.path(), 0, 2).is_err());
+        assert_eq!(
+            super::read_bounded_source_directory_entries(temporary.path(), 0, 3)?.len(),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_configuration_guard_rejects_a_temporary_ancestor_config() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let source = temporary.path().join("temporary-root/source");
+        let config = temporary.path().join(".cargo/config.toml");
+        fs::create_dir_all(&source).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::create_dir_all(
+            config
+                .parent()
+                .ok_or_else(|| ReleaseError::internal("temporary Cargo config had no parent"))?,
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(&config, b"[build]\nrustc-wrapper = \"false\"\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+
+        let error = super::require_no_external_cargo_configuration(&source)
+            .err()
+            .ok_or_else(|| {
+                ReleaseError::internal("external Cargo configuration was unexpectedly accepted")
+            })?;
+        assert!(error.to_string().contains(&config.display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn source_snapshot_rejects_executable_local_git_configuration() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"tracked")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", "tracked.txt"])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        run_git(
+            &repository,
+            &["config", "filter.release-test.clean", "false"],
+        )?;
+        assert!(super::require_safe_local_git_config(&repository).is_err());
+        run_git(
+            &repository,
+            &["config", "--unset", "filter.release-test.clean"],
+        )?;
+
+        run_git(
+            &repository,
+            &["config", "extensions.worktreeConfig", "true"],
+        )?;
+        let linked_argument = linked.to_str().ok_or_else(|| {
+            ReleaseError::internal("temporary linked worktree path was not UTF-8")
+        })?;
+        run_git(
+            &repository,
+            &["worktree", "add", "--detach", linked_argument],
+        )?;
+        run_git(
+            &linked,
+            &["config", "--worktree", "filter.release-test.clean", "false"],
+        )?;
+        assert!(super::require_safe_local_git_config(&linked).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_index_snapshot_rejects_locks_and_split_indexes() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"tracked")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", "tracked.txt"])?;
+
+        let lock = repository.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(super::git_raw_index_snapshot(&repository).is_err());
+        fs::remove_file(&lock).map_err(|error| ReleaseError::internal(error.to_string()))?;
+
+        run_git(&repository, &["update-index", "--split-index"])?;
+        assert!(super::git_raw_index_snapshot(&repository).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn release_source_runs_cargo_only_in_the_detached_commit_checkout() -> Result<(), ReleaseError>
+    {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(repository.join("forge-cli/src"))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join(".gitignore"), b".cargo/\ntarget/\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(
+            repository.join("Cargo.toml"),
+            b"[workspace]\nmembers = [\"forge-cli\"]\nresolver = \"2\"\n",
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(
+            repository.join("Cargo.lock"),
+            b"# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"forge-cli\"\nversion = \"0.1.0-rc.1\"\n",
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(
+            repository.join("forge-cli/Cargo.toml"),
+            b"[package]\nname = \"forge-cli\"\nversion = \"0.1.0-rc.1\"\nedition = \"2024\"\n\n[[bin]]\nname = \"forge\"\npath = \"src/main.rs\"\n",
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("forge-cli/src/main.rs"), b"fn main() {}\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", "."])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+
+        fs::create_dir(repository.join(".cargo"))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(
+            repository.join(".cargo/config.toml"),
+            b"[build]\nrustc-wrapper = \"/definitely-not-a-real-wrapper\"\n",
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+
+        let source = super::ReleaseSource::prepare(&repository, &RELEASE_TARGETS[..1], &[])?;
+        assert!(!source.repository().join(".git").exists());
+        assert!(!source.repository().join(".cargo/config.toml").exists());
+        source.require_unchanged(&RELEASE_TARGETS[..1], "test verification")?;
+
+        let target = &RELEASE_TARGETS[0];
+        let metadata: serde_json::Value =
+            serde_json::from_slice(source.snapshot().metadata(target)?)
+                .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let outside_source = temporary.path().join("outside.rs");
+        fs::write(&outside_source, b"fn outside() {}\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let validate = |value: serde_json::Value| -> Result<(), ReleaseError> {
+            let bytes = serde_json::to_vec(&value)
+                .map_err(|error| ReleaseError::internal(error.to_string()))?;
+            super::validate_cargo_metadata_source_boundaries(
+                source.repository(),
+                std::slice::from_ref(target),
+                &std::collections::BTreeMap::from([(target.triple.to_owned(), bytes)]),
+                &source.source_tree,
+            )
+        };
+
+        let mut escaped_workspace = metadata.clone();
+        escaped_workspace["workspace_root"] = serde_json::json!(temporary.path().to_string_lossy());
+        assert!(validate(escaped_workspace).is_err());
+
+        let mut escaped_manifest = metadata.clone();
+        escaped_manifest["packages"][0]["manifest_path"] =
+            serde_json::json!(outside_source.to_string_lossy());
+        assert!(validate(escaped_manifest).is_err());
+
+        let mut escaped_target = metadata.clone();
+        escaped_target["packages"][0]["targets"][0]["src_path"] =
+            serde_json::json!(outside_source.to_string_lossy());
+        assert!(validate(escaped_target).is_err());
+
+        let mut external_path_dependency = metadata;
+        external_path_dependency["packages"]
+            .as_array_mut()
+            .ok_or_else(|| ReleaseError::internal("metadata packages were not an array"))?
+            .push(serde_json::json!({
+                "id": "path+file:///outside#external@0.1.0",
+                "name": "external",
+                "version": "0.1.0",
+                "source": null,
+                "checksum": null,
+                "manifest_path": outside_source,
+                "targets": [{"src_path": outside_source}],
+            }));
+        assert!(validate(external_path_dependency).is_err());
         Ok(())
     }
 
@@ -2160,7 +3741,7 @@ mod tests {
 
         super::require_expected_git_worktree(&repository)?;
         assert!(!super::git_status(&repository)?.is_empty());
-        assert!(RepositorySnapshot::capture(&repository, &RELEASE_TARGETS[..1]).is_err());
+        assert!(WorktreeGuard::capture(&repository).is_err());
         Ok(())
     }
 
@@ -2204,15 +3785,36 @@ mod tests {
 
     #[test]
     fn bounded_release_process_test_helper() -> Result<(), ReleaseError> {
-        if env::var_os("FORGE_RELEASE_PROCESS_TEST").as_deref()
-            != Some(std::ffi::OsStr::new("huge-output"))
-        {
-            return Ok(());
+        match env::var_os("FORGE_RELEASE_PROCESS_TEST").as_deref() {
+            Some(value) if value == std::ffi::OsStr::new("huge-output") => std::io::stdout()
+                .lock()
+                .write_all(&[b'x'; 8_192])
+                .map_err(|error| ReleaseError::internal(error.to_string())),
+            #[cfg(unix)]
+            Some(value) if value == std::ffi::OsStr::new("repository-temp-boundary") => {
+                let repository = env::var_os("FORGE_RELEASE_TEST_REPOSITORY")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        ReleaseError::internal("temp-boundary child omitted repository path")
+                    })?;
+                let head = super::git_head(&repository)?;
+                let error = super::materialize_isolated_checkout(&repository, &head, &[])
+                    .err()
+                    .ok_or_else(|| {
+                        ReleaseError::internal(
+                            "repository-local TMPDIR unexpectedly passed source isolation",
+                        )
+                    })?;
+                if error.to_string().contains("outside the source repository") {
+                    Ok(())
+                } else {
+                    Err(ReleaseError::internal(format!(
+                        "temp-boundary child reported an unexpected error: {error}"
+                    )))
+                }
+            }
+            _ => Ok(()),
         }
-        std::io::stdout()
-            .lock()
-            .write_all(&[b'x'; 8_192])
-            .map_err(|error| ReleaseError::internal(error.to_string()))
     }
 
     #[test]
@@ -2250,6 +3852,15 @@ mod tests {
             .metadata_by_target
             .insert(RELEASE_TARGETS[0].triple.to_owned(), b"different".to_vec());
         assert!(before.require_same(&changed_metadata, "test").is_err());
+
+        let guard = worktree_guard();
+        let mut changed_index = guard.clone();
+        changed_index.index.push(0);
+        assert!(guard.require_same(&changed_index, "test").is_err());
+
+        let mut changed_raw_index = guard.clone();
+        changed_raw_index.raw_index.push(0);
+        assert!(guard.require_same(&changed_raw_index, "test").is_err());
     }
 
     #[test]
@@ -2813,12 +4424,21 @@ mod tests {
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
             source_commit: "a".repeat(40),
-            status: Vec::new(),
             cargo_lock: b"lock".to_vec(),
             metadata_by_target: RELEASE_TARGETS
                 .iter()
                 .map(|target| (target.triple.to_owned(), METADATA.as_bytes().to_vec()))
                 .collect(),
+        }
+    }
+
+    fn worktree_guard() -> WorktreeGuard {
+        WorktreeGuard {
+            source_commit: "a".repeat(40),
+            status: Vec::new(),
+            index: b"index".to_vec(),
+            raw_index: b"raw-index".to_vec(),
+            cargo_lock: b"lock".to_vec(),
         }
     }
 
