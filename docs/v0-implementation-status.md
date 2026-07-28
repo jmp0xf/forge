@@ -101,6 +101,9 @@ The repository contains, without claiming that every campaign passed for the cur
 - `xtask diff-plans`, which compares two explicit binaries over public fixture plans, diagnostics,
   exits, supported schema sets, and shared schema documents;
 - a dogfood test requiring this repository's default `init --dry-run --json` plan to be a zero diff;
+- release-source revalidation tests that advance the original repository `HEAD` and mutate the
+  detached source tree or `Cargo.lock` after preparation, requiring each later release boundary to
+  fail closed;
 - four fuzz targets/corpora for porcelain v2, managed blocks, strict config, and native paths;
 - a checked-in bounded `cargo-mutants` surface for evidence, navigation, risk, validity, and policy
   anti-weakening decisions; and
@@ -111,6 +114,27 @@ The repository contains, without claiming that every campaign passed for the cur
 The public fixture and N-1 harness are candidate-controlled self-checks. Specialized platform state
 is constructed by integration tests and the harness currently uses reviewed Unix process-group
 containment; it fails closed on Windows rather than pretending equivalent Job Object coverage.
+
+## Current-candidate local verification
+
+Against commit `7e9b559` on macOS 26.5.2 arm64:
+
+- the stable root format, check, `clippy -D warnings`, and isolated full test suite, plus the fuzz
+  workspace format, check, `clippy -D warnings`, and full test suite, exited zero; schema drift
+  checking, fixture regeneration (0 written, 102 unchanged), and `forge version` also exited zero;
+- locked Rust 1.85 root workspace check/test and fuzz workspace check/test exited zero;
+- all four checked-in fuzz targets completed 60-second `cargo-fuzz 0.13.2` campaigns with checked-in
+  seeds, exited zero, and produced no crash artifacts; and
+- cross-target checks with `-D warnings` passed for `x86_64-apple-darwin`,
+  `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-gnu`. The
+  `aarch64-unknown-linux-musl` check stopped in the `blake3` C build because
+  `aarch64-linux-musl-gcc` was unavailable; this is a builder-toolchain gap, not a successful
+  target qualification.
+
+One earlier root full-suite run executed concurrently with the complete MSRV suite and observed one
+scheduling-sensitive total-command-timeout test failure. The exact test then passed three
+consecutive isolated runs, and the isolated full root suite passed. This is retained as harness
+concurrency evidence rather than treated as a waived failure.
 
 ## Current local calibration
 
@@ -158,16 +182,20 @@ The following boundaries are intentionally not inferred from local implementatio
    now pin root directory handles and revalidate the visible root identity. Native adversarial tests
    and independent security review remain required; `SECURITY.md` still lacks a usable private
    reporting channel.
-3. **Declared MSRV verification.** The workspace declares Rust 1.85. A local exact-snapshot Rust
-   1.85 `xtask --all-targets` check passed for the release assembler; the complete required
-   workspace/fuzz tests, generated assets, CLI behavior, and native target matrix still require
-   current-candidate evidence before release.
+3. **Declared MSRV verification.** The workspace declares Rust 1.85. Current-candidate locked root
+   workspace check/test and fuzz workspace check/test passed locally with the exact Rust 1.85
+   toolchain. This is one macOS-host observation; independent CI enforcement, generated-asset
+   behavior under the MSRV, and the native release target matrix remain release work.
 4. **Performance qualification.** The local calibration above did not meet the warm `next` or
    `adapters check` goals. Keep those targets unchanged, separate host Git cost from Forge overhead,
    and obtain repeatable results on calibrated release runners and representative real repositories.
-5. **Cross-platform evidence.** Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64
-   build/E2E/process/path matrices have not been proven by this local worktree. Windows Job Object,
-   UNC/wide-path, case, ACL, and native replacement behavior require their actual platform tests.
+5. **Cross-platform evidence.** Host-side cross-target checks passed for
+   `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-gnu`;
+   `aarch64-unknown-linux-musl` remains blocked by the unavailable
+   `aarch64-linux-musl-gcc` builder toolchain. These compile-only observations do not prove native
+   Linux, macOS, or Windows E2E/process/path behavior. Windows Job Object, UNC/wide-path, case, ACL,
+   native replacement behavior, and all five release-target native runs still require actual
+   platform evidence.
 6. **Independent CI and review.** A checked-in workflow is candidate-controlled configuration, not
    proof that required CI ran or that maintainers reviewed and approved the result.
 7. **Distribution and release.** Version selection and the local raw-binary/SBOM/manifest/checksum
