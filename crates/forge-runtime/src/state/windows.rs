@@ -254,10 +254,13 @@ pub(super) fn open_private_file_read_write(path: &Path) -> io::Result<File> {
 }
 
 pub(super) fn open_private_file_read(path: &Path) -> io::Result<File> {
+    // Match Unix descriptor semantics: concurrent same-user mutation remains possible, so callers
+    // must detect it with their bounded identity/content recheck instead of relying on a transient
+    // Windows sharing denial as an immutability guarantee.
     open_file(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
         None,

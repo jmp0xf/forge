@@ -741,6 +741,7 @@ mod platform {
                 hook(WriteEvent::BeforeCommit)?;
                 rename_handle_relative(
                     &temporary,
+                    &parent,
                     leaf,
                     matches!(commit_mode, CommitMode::Replace),
                 )?;
@@ -1103,7 +1104,12 @@ mod platform {
         Ok(unsafe { File::from_raw_handle(handle) })
     }
 
-    fn rename_handle_relative(source: &File, target: &OsStr, replace: bool) -> io::Result<()> {
+    fn rename_handle_relative(
+        source: &File,
+        parent: &File,
+        target: &OsStr,
+        replace: bool,
+    ) -> io::Result<()> {
         let name: Vec<u16> = target.encode_wide().collect();
         if name.contains(&0) {
             return Err(io::Error::new(
@@ -1130,11 +1136,11 @@ mod platform {
         // NtSetInformationFile call.
         unsafe {
             // `storage` is zero-filled, so the reserved union bytes remain zero while
-            // FileRenameInformation reads the boolean member. A NULL RootDirectory plus a simple
-            // leaf is the native same-directory form, so the source file's already-pinned parent
-            // remains the destination capability even if its visible path is concurrently moved.
+            // FileRenameInformation reads the boolean member. The already-pinned parent handle and
+            // simple leaf make the destination capability explicit even if a visible ancestor is
+            // concurrently moved or replaced.
             (*info).Anonymous.ReplaceIfExists = replace;
-            (*info).RootDirectory = ptr::null_mut();
+            (*info).RootDirectory = parent.as_raw_handle();
             (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,

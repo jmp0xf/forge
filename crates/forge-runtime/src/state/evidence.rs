@@ -3689,9 +3689,19 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     fn write_private_test_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::write(path, bytes)?;
         set_private_test_file_mode(path)
+    }
+
+    #[cfg(windows)]
+    fn write_private_test_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+
+        let mut file = super::super::windows::create_private_file_new(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
     }
 
     #[cfg(unix)]
@@ -3706,15 +3716,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-    }
-
-    #[cfg(windows)]
-    fn set_private_test_file_mode(path: &Path) -> io::Result<()> {
-        super::super::windows::set_owner_only_path(
-            path,
-            super::super::windows_acl_policy::PrivateWindowsObjectKind::File,
-        )
-        .map_err(StateError::into_io_error)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -5643,7 +5644,12 @@ mod tests {
             for entry in fs::read_dir(directory)? {
                 let path = entry?.path();
                 let metadata = fs::symlink_metadata(&path)?;
-                let contents = if metadata.is_file() {
+                let contents = if metadata.is_file() && metadata.len() == 0 {
+                    // Windows byte-range locks deny an overlapping `ReadFile` even to this test
+                    // process. Metadata already proves a zero-length file has exact empty bytes,
+                    // so do not issue a synthetic non-empty read against the held state lock.
+                    Some(Vec::new())
+                } else if metadata.is_file() {
                     Some(fs::read(&path)?)
                 } else {
                     None

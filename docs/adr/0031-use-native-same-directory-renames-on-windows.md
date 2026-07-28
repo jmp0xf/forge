@@ -1,10 +1,10 @@
 # ADR-0031：Windows 使用原生同目录句柄重命名
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-07-28
 - Deciders: Forge maintainers
 - Supersedes: ADR-0028
-- Superseded by: None
+- Superseded by: ADR-0033
 
 ## Context
 
