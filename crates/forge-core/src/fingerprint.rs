@@ -551,31 +551,6 @@ fn behavior_component(name: &str, version: &[u8]) -> Vec<u8> {
     encoder.finish()
 }
 
-/// Digests only the command/toolchain fingerprint protocol frozen in this module.
-///
-/// This is not the complete Forge evidence behavior dependency from ADR-0016. Scope, process,
-/// validity, and other algorithms must be frozen and composed separately before such a digest can
-/// be claimed.
-#[must_use]
-#[allow(
-    dead_code,
-    reason = "the authoritative receipt builder will compose this protocol digest"
-)]
-pub(crate) fn command_toolchain_fingerprint_protocol_digest<H: Hasher + ?Sized>(
-    hasher: &H,
-) -> Digest {
-    const DIGEST_DOMAIN: &[u8] = b"forge.command-toolchain-fingerprint-protocol-digest/v1";
-
-    let mut encoder = CanonicalEncoder::new("command-toolchain-fingerprint-protocol");
-    encoder.text(
-        "protocol-version",
-        COMMAND_TOOLCHAIN_FINGERPRINT_PROTOCOL_VERSION,
-    );
-    encoder.bytes("command-domain", COMMAND_DIGEST_DOMAIN);
-    encoder.bytes("toolchain-domain", TOOLCHAIN_DIGEST_DOMAIN);
-    hasher.digest(&[DIGEST_DOMAIN, &encoder.finish()])
-}
-
 /// Rejects explicit command environment names that cannot safely enter previews, Receipts, or
 /// dependency fingerprints.
 ///
@@ -2039,14 +2014,9 @@ mod tests {
     }
 
     #[test]
-    fn fixed_vectors_pin_command_toolchain_protocol_and_dependency_domains()
-    -> Result<(), Box<dyn Error>> {
+    fn fixed_vectors_pin_command_and_toolchain_dependency_domains() -> Result<(), Box<dyn Error>> {
         let command = command()?;
         let unit = project_unit()?;
-        assert_eq!(
-            command_toolchain_fingerprint_protocol_digest(&FixtureHasher).as_str(),
-            "fixture:38dc4d1f6c58e179"
-        );
         assert_eq!(
             digest(&command, &[provenance("command/base")])?.as_str(),
             "fixture:07667a0350b767cf"
