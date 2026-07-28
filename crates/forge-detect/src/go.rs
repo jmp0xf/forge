@@ -1746,6 +1746,7 @@ mod tests {
     use super::{
         GoProvider, GoProviderContext, GoProviderIssueKind, MAX_FORMAT_BATCH_FILES, batch_arguments,
     };
+    use crate::test_support::{repository_path, repository_root};
 
     #[derive(Debug)]
     struct FakeFileSystem {
@@ -2016,7 +2017,7 @@ mod tests {
 
         let result = GoProvider.analyze_controlled(
             GoProviderContext {
-                repository_root: Path::new("/repo"),
+                repository_root: repository_root(),
                 inventory: &repository,
                 git_files: &git,
                 changed_files: None,
@@ -2071,7 +2072,7 @@ mod tests {
         let changed = paths(&["main.go", "generated.go", "asset.txt"])?;
         let process = FakeProcess::default();
         let result = GoProvider.analyze(GoProviderContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory: &repository,
             git_files: &git,
             changed_files: Some(&changed),
@@ -2181,7 +2182,7 @@ mod tests {
             br#"{"Go":"1.22","Use":[{"DiskPath":"./a"},{"DiskPath":"./b"}]}"#,
         )]);
         let result = GoProvider.analyze(GoProviderContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory: &repository,
             git_files: &git,
             changed_files: Some(&changed),
@@ -2248,7 +2249,7 @@ mod tests {
         for command in tests.commands() {
             assert_eq!(
                 command.env.get(OsStr::new("GOWORK")),
-                Some(&Path::new("/repo/go.work").as_os_str().to_os_string())
+                Some(&repository_path("go.work").into_os_string())
             );
             assert_eq!(
                 command.env.get(OsStr::new("GOENV")),
@@ -2280,7 +2281,7 @@ mod tests {
         let process =
             FakeProcess::with_responses(vec![observation(br#"{"Use":[{"DiskPath":"../a"}]}"#)]);
         let result = GoProvider.analyze(GoProviderContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory: &repository,
             git_files: &git,
             changed_files: Some(&changed),
@@ -2323,7 +2324,7 @@ mod tests {
             .ok_or_else(|| io::Error::other("independent module test command is missing"))?;
         assert_eq!(
             workspace_command.env.get(OsStr::new("GOWORK")),
-            Some(&OsString::from("/repo/work/go.work"))
+            Some(&repository_path("work/go.work").into_os_string())
         );
         assert_eq!(
             independent_command.env.get(OsStr::new("GOWORK")),
@@ -2355,7 +2356,7 @@ mod tests {
             observation(br#"{"Use":[{"DiskPath":"../a"}]}"#),
         ]);
         let result = GoProvider.analyze(GoProviderContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory: &repository,
             git_files: &git,
             changed_files: Some(&changed),
@@ -2421,7 +2422,7 @@ mod tests {
         interrupted.exit_code = None;
         let process = FakeProcess::with_responses(vec![timed_out, interrupted]);
         let result = GoProvider.analyze(GoProviderContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory: &repository,
             git_files: &git,
             changed_files: Some(&changed),
@@ -2472,7 +2473,7 @@ mod tests {
         let git = git_files(&["go.mod", "main.go", "assets/data.txt"], &[])?;
         let process = FakeProcess::default();
         let result = GoProvider.analyze(GoProviderContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory: &repository,
             git_files: &git,
             changed_files: None,

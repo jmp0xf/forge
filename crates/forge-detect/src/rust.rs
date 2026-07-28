@@ -1778,6 +1778,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::test_support::{absolute_path, repository_path, repository_root};
 
     #[derive(Debug, Default)]
     struct FakeFileSystem {
@@ -1983,36 +1984,38 @@ mod tests {
         }
     }
 
-    fn package_document(root: &str, name: &str, cargo_id: &str) -> Value {
+    fn package_document(root: &Path, name: &str, cargo_id: &str) -> Value {
         json!({
             "packages": [{
                 "name": name,
                 "id": cargo_id,
-                "manifest_path": format!("{root}/Cargo.toml"),
+                "manifest_path": root.join("Cargo.toml").to_string_lossy(),
                 "dependencies": []
             }],
             "workspace_members": [cargo_id],
             "workspace_default_members": [cargo_id],
             "resolve": null,
-            "workspace_root": root,
+            "workspace_root": root.to_string_lossy(),
             "version": 1
         })
     }
 
     fn workspace_document() -> Value {
+        let package_a = repository_path("a");
+        let package_b = repository_path("b");
         json!({
             "packages": [
                 {
                     "name": "a",
                     "id": "path+file:///repo/a#0.1.0",
-                    "manifest_path": "/repo/a/Cargo.toml",
+                    "manifest_path": package_a.join("Cargo.toml").to_string_lossy(),
                     "dependencies": []
                 },
                 {
                     "name": "b",
                     "id": "path+file:///repo/b#0.1.0",
-                    "manifest_path": "/repo/b/Cargo.toml",
-                    "dependencies": [{"path": "/repo/a"}]
+                    "manifest_path": package_b.join("Cargo.toml").to_string_lossy(),
+                    "dependencies": [{"path": package_a.to_string_lossy()}]
                 }
             ],
             "workspace_members": [
@@ -2024,7 +2027,7 @@ mod tests {
                 "path+file:///repo/b#0.1.0"
             ],
             "resolve": null,
-            "workspace_root": "/repo",
+            "workspace_root": repository_root().to_string_lossy(),
             "version": 1
         })
     }
@@ -2035,7 +2038,7 @@ mod tests {
         process: &'a FakeProcess,
     ) -> RustDetectionContext<'a> {
         RustDetectionContext {
-            repository_root: Path::new("/repo"),
+            repository_root: repository_root(),
             inventory,
             filesystem,
             process,
@@ -2088,7 +2091,7 @@ mod tests {
             skipped: Vec::new(),
         };
         let process = FakeProcess::new(vec![Ok(metadata_observation(package_document(
-            "/repo",
+            repository_root(),
             "root-package",
             "path+file:///repo#root-package@0.1.0",
         ))?)]);
@@ -2118,7 +2121,7 @@ mod tests {
         let inventory = inventory(&["Cargo.toml"]);
         let filesystem = FakeFileSystem::default();
         let process = FakeProcess::new(vec![Ok(metadata_observation(package_document(
-            "/repo",
+            repository_root(),
             "root-package",
             "path+file:///repo#root-package@0.1.0",
         ))?)]);
@@ -2366,7 +2369,7 @@ required-features = ["gated"]
         let inventory = inventory(&["Cargo.toml"]);
         let filesystem = FakeFileSystem::default();
         let process = FakeProcess::new(vec![Ok(metadata_observation(package_document(
-            "/repo",
+            repository_root(),
             "root-package",
             "path+file:///repo#root-package@0.1.0",
         ))?)]);
@@ -2652,12 +2655,12 @@ required-features = ["gated"]
         let filesystem = FakeFileSystem::default();
         let process = FakeProcess::new(vec![
             Ok(metadata_observation(package_document(
-                "/repo/a",
+                &repository_path("a"),
                 "a",
                 "a 0.1.0 (path+file:///repo/a)",
             ))?),
             Ok(metadata_observation(package_document(
-                "/repo/b",
+                &repository_path("b"),
                 "b",
                 "b 0.1.0 (path+file:///repo/b)",
             ))?),
@@ -2778,7 +2781,7 @@ required-features = ["gated"]
         let inventory = inventory(&["Cargo.toml"]);
         let filesystem = FakeFileSystem::default();
         let process = FakeProcess::new(vec![Ok(metadata_observation(package_document(
-            "/outside",
+            &absolute_path("outside"),
             "escape",
             "escape 0.1.0 (path+file:///outside)",
         ))?)]);
@@ -2802,7 +2805,7 @@ required-features = ["gated"]
         let inventory = inventory(&["Cargo.toml", "Cargo.toml"]);
         let filesystem = FakeFileSystem::default();
         let process = FakeProcess::new(vec![Ok(metadata_observation(package_document(
-            "/repo",
+            repository_root(),
             "root",
             "root 0.1.0 (path+file:///repo)",
         ))?)]);
@@ -2870,19 +2873,19 @@ required-features = ["gated"]
         ]);
         let filesystem = FakeFileSystem::default();
         let mut format = package_document(
-            "/repo/format",
+            &repository_path("format"),
             "format",
             "format 0.1.0 (path+file:///repo/format)",
         );
         format["version"] = json!(2);
         let mut members = package_document(
-            "/repo/members",
+            &repository_path("members"),
             "members",
             "members 0.1.0 (path+file:///repo/members)",
         );
         members["workspace_members"] = json!(["missing"]);
         let mut resolve = package_document(
-            "/repo/resolve",
+            &repository_path("resolve"),
             "resolve",
             "resolve 0.1.0 (path+file:///repo/resolve)",
         );

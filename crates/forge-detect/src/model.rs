@@ -1762,6 +1762,7 @@ mod tests {
     use serde_json::json;
 
     use crate::inventory_cache::{InventoryCacheWritePort, publish_cached_inventory};
+    use crate::test_support::{repository_path, repository_root};
 
     use super::*;
 
@@ -1769,9 +1770,9 @@ mod tests {
         RepositoryDetection {
             facts: RepoFacts {
                 id: RepoId::from("local:blake3:model-test"),
-                root: PathBuf::from("/repo"),
-                git_dir: PathBuf::from("/repo/.git"),
-                git_common_dir: PathBuf::from("/repo/.git"),
+                root: repository_root().to_path_buf(),
+                git_dir: repository_path(".git"),
+                git_common_dir: repository_path(".git"),
                 is_linked_worktree: false,
                 head: None,
                 branch: None,
@@ -1805,15 +1806,15 @@ mod tests {
 
     impl GitPort for ModelGit {
         fn repository_root(&self, _start: &Path) -> Result<PathBuf, GitError> {
-            Ok(PathBuf::from("/repo"))
+            Ok(repository_root().to_path_buf())
         }
 
         fn git_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
-            Ok(PathBuf::from("/repo/.git"))
+            Ok(repository_path(".git"))
         }
 
         fn git_common_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
-            Ok(PathBuf::from("/repo/.git"))
+            Ok(repository_path(".git"))
         }
 
         fn status(&self, _root: &Path) -> Result<PorcelainV2Status, GitError> {
@@ -2190,7 +2191,7 @@ mod tests {
         let cache = ModelInventoryCache::default();
 
         let first = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -2210,7 +2211,7 @@ mod tests {
         assert_eq!(cache.stores.get(), 1);
 
         let second = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -2270,7 +2271,7 @@ mod tests {
         first_git.status = committed_status()?;
         let cache = ModelInventoryCache::default();
         let first = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &first_git,
             &ModelFileSystem::new(cached_inventory),
             &ModelProcess::default(),
@@ -2291,7 +2292,7 @@ mod tests {
         second_git.status = committed_status()?;
         let filesystem = ModelFileSystem::new(live_inventory.clone());
         let second = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &second_git,
             &filesystem,
             &ModelProcess::default(),
@@ -2315,7 +2316,7 @@ mod tests {
 
         let legitimate_cache = ModelInventoryCache::default();
         let first = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &ModelFileSystem::new(live_inventory.clone()),
             &ModelProcess::default(),
@@ -2356,7 +2357,7 @@ mod tests {
 
         let filesystem = ModelFileSystem::new(live_inventory.clone());
         let detected = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2392,7 +2393,7 @@ mod tests {
         let cache = ModelInventoryCache::default();
 
         let outcome = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2427,7 +2428,7 @@ mod tests {
         let cache = ModelInventoryCache::default();
 
         let outcome = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2472,7 +2473,7 @@ mod tests {
             let cache = ModelInventoryCache::default();
 
             let outcome = detect_project_model_with_cache(
-                Path::new("/repo"),
+                repository_root(),
                 &git,
                 &filesystem,
                 &ModelProcess::default(),
@@ -2503,7 +2504,7 @@ mod tests {
         let cache = ModelInventoryCache::default();
         let first_filesystem = ModelFileSystem::new(cached_inventory);
         let first = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &first_filesystem,
             &ModelProcess::default(),
@@ -2530,7 +2531,7 @@ mod tests {
         };
         let live_filesystem = ModelFileSystem::new(live_inventory.clone());
         let second = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &live_filesystem,
             &ModelProcess::default(),
@@ -2558,7 +2559,7 @@ mod tests {
         git.status = committed_status()?;
         let cache = ModelInventoryCache::default();
         let first = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &ModelFileSystem::new(cached_inventory),
             &ModelProcess::default(),
@@ -2577,7 +2578,7 @@ mod tests {
         let live_inventory = model_inventory(&[]);
         let live_filesystem = ModelFileSystem::new(live_inventory.clone());
         let second = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &live_filesystem,
             &ModelProcess::default(),
@@ -2610,7 +2611,7 @@ mod tests {
         let cache = ModelInventoryCache::default();
 
         let outcome = detect_project_model_with_cache(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2655,13 +2656,13 @@ mod tests {
             "packages": [{
                 "name": "rust-root",
                 "id": "path+file:///repo#rust-root@0.1.0",
-                "manifest_path": "/repo/Cargo.toml",
+                "manifest_path": repository_path("Cargo.toml").to_string_lossy(),
                 "dependencies": []
             }],
             "workspace_members": ["path+file:///repo#rust-root@0.1.0"],
             "workspace_default_members": ["path+file:///repo#rust-root@0.1.0"],
             "resolve": null,
-            "workspace_root": "/repo",
+            "workspace_root": repository_root().to_string_lossy(),
             "version": 1
         }))
     }
@@ -2820,7 +2821,7 @@ mod tests {
             b"#!/usr/bin/env bash\necho test\n".to_vec(),
         );
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2862,7 +2863,7 @@ mod tests {
             );
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2895,7 +2896,7 @@ mod tests {
             );
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &ModelProcess::default(),
@@ -2925,7 +2926,7 @@ mod tests {
         let process = ModelProcess::with_responses(vec![observation(rust_metadata()?)]);
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3117,7 +3118,7 @@ network = "offline-requested"
         ]);
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3201,7 +3202,7 @@ network = "offline-requested"
         };
 
         let outcome = detect_project_model_controlled(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3261,7 +3262,7 @@ external = ["owner-review"]
         let process = ModelProcess::default();
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3297,7 +3298,7 @@ external = ["owner-review"]
         git.status = committed_status()?;
         git.head_file = Ok(None);
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &ModelFileSystem::new(inventory),
             &ModelProcess::default(),
@@ -3344,7 +3345,7 @@ external = ["owner-review"]
             git.head_file = head_file;
             let cache = ModelInventoryCache::default();
             let outcome = detect_project_model_with_cache(
-                Path::new("/repo"),
+                repository_root(),
                 &git,
                 &ModelFileSystem::new(inventory.clone()),
                 &ModelProcess::default(),
@@ -3391,7 +3392,7 @@ external = ["owner-review"]
         let process = ModelProcess::with_responses(vec![failure]);
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3435,7 +3436,7 @@ external = ["owner-review"]
         let process = ModelProcess::with_responses(vec![timeout]);
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3462,7 +3463,7 @@ external = ["owner-review"]
         let process = ModelProcess::with_responses(vec![interrupted]);
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,
@@ -3488,7 +3489,7 @@ external = ["owner-review"]
         let process = ModelProcess::default();
 
         let outcome = detect_project_model(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &filesystem,
             &process,

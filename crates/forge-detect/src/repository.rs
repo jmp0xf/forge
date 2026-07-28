@@ -481,6 +481,7 @@ mod tests {
         Confidence, OperationState, WorkState, classify_work_state, derive_repository_id,
         detect_repository,
     };
+    use crate::test_support::{absolute_path, repository_path, repository_root};
 
     #[derive(Debug)]
     struct RecordingHasher {
@@ -526,9 +527,9 @@ mod tests {
     impl MockGit {
         fn with_status(status: Result<PorcelainV2Status, GitError>) -> Self {
             Self {
-                root: Ok(PathBuf::from("/repo")),
-                git_dir: Ok(PathBuf::from("/repo/.git")),
-                common_dir: Ok(PathBuf::from("/repo/.git")),
+                root: Ok(repository_root().to_path_buf()),
+                git_dir: Ok(repository_path(".git")),
+                common_dir: Ok(repository_path(".git")),
                 status,
             }
         }
@@ -658,9 +659,9 @@ mod tests {
 
     #[test]
     fn repository_identity_is_equal_only_for_the_same_common_dir() {
-        let first = derive_repository_id(Path::new("/repo/.git"), &InputSensitiveHasher);
-        let repeated = derive_repository_id(Path::new("/repo/.git"), &InputSensitiveHasher);
-        let other = derive_repository_id(Path::new("/other/.git"), &InputSensitiveHasher);
+        let first = derive_repository_id(&repository_path(".git"), &InputSensitiveHasher);
+        let repeated = derive_repository_id(&repository_path(".git"), &InputSensitiveHasher);
+        let other = derive_repository_id(&absolute_path("other/.git"), &InputSensitiveHasher);
 
         assert_eq!(first, repeated);
         assert_ne!(first, other);
@@ -673,7 +674,7 @@ mod tests {
         let git = MockGit::with_status(Ok(status.clone()));
 
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -692,17 +693,17 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let main = MockGit::with_status(Ok(committed_status(b"")?));
         let mut linked = MockGit::with_status(Ok(committed_status(b"")?));
-        linked.root = Ok(PathBuf::from("/repo-linked"));
-        linked.git_dir = Ok(PathBuf::from("/repo/.git/worktrees/repo-linked"));
+        linked.root = Ok(absolute_path("repo-linked"));
+        linked.git_dir = Ok(repository_path(".git/worktrees/repo-linked"));
 
         let main_detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &main,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
         )?;
         let linked_detection = detect_repository(
-            Path::new("/repo-linked"),
+            &absolute_path("repo-linked"),
             &linked,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -729,7 +730,7 @@ mod tests {
         let hasher = RecordingHasher::returning("blake3:non-utf8");
 
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &hasher,
@@ -779,7 +780,7 @@ mod tests {
         let hasher = RecordingHasher::returning("blake3:must-not-be-used");
 
         let error = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &hasher,
@@ -797,16 +798,16 @@ mod tests {
     fn assembles_clean_linked_worktree_facts_with_git_provenance()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut git = MockGit::with_status(Ok(committed_status(b"")?));
-        git.git_dir = Ok(PathBuf::from("/repo/.git/worktrees/linked"));
+        git.git_dir = Ok(repository_path(".git/worktrees/linked"));
         let detection = detect_repository(
-            Path::new("/repo/subdir"),
+            &repository_path("subdir"),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
         )?;
 
         assert!(detection.facts.id.as_str().starts_with("local:"));
-        assert_eq!(detection.facts.root, Path::new("/repo"));
+        assert_eq!(detection.facts.root, repository_root());
         assert!(detection.facts.is_linked_worktree);
         assert!(detection.facts.head.is_some());
         assert_eq!(detection.facts.branch.as_deref(), Some("main"));
@@ -876,7 +877,7 @@ mod tests {
         };
 
         let detection =
-            detect_repository(Path::new("/repo"), &git, &filesystem, &InputSensitiveHasher)?;
+            detect_repository(repository_root(), &git, &filesystem, &InputSensitiveHasher)?;
 
         assert_eq!(detection.facts.work_state, WorkState::Unknown);
         assert_eq!(detection.confidence, Confidence::Unknown);
@@ -893,7 +894,7 @@ mod tests {
             "bounded test failure",
         )));
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &corrupt,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -907,7 +908,7 @@ mod tests {
             "bounded test failure",
         )));
         let error = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &timeout,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -927,7 +928,7 @@ mod tests {
         let git = MockGit::with_status(Ok(parsed_status(&input)?));
 
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -953,7 +954,7 @@ mod tests {
         ));
 
         let error = detect_repository(
-            Path::new("/outside"),
+            &absolute_path("outside"),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,

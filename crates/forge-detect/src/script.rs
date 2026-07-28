@@ -359,8 +359,9 @@ mod tests {
     #[test]
     fn env_shebang_is_normalized_to_the_same_path_resolved_program()
     -> Result<(), Box<dyn std::error::Error>> {
+        let script_path = path("scripts/test");
         let script = discover_standard_script(
-            &path("scripts/test"),
+            &script_path,
             &text(b"#!/usr/bin/env bash\r\necho test\r\n".to_vec()),
         );
 
@@ -368,13 +369,13 @@ mod tests {
         let command = script.command().ok_or("complete script command missing")?;
         assert_eq!(command.intent, Intent::Test);
         assert_eq!(command.program, OsStr::new("bash"));
-        assert_eq!(command.args, [OsStr::new("scripts/test")]);
+        assert_eq!(command.args, [script_path.as_path().as_os_str()]);
         assert_eq!(command.confidence, Confidence::Medium);
         assert!(command.coverage.is_empty());
         assert!(matches!(
             &command.source,
             CommandSource::ExistingProjectTarget { path, target }
-                if path.as_path() == Path::new("scripts/test") && target == "script-entrypoint"
+                if path == &script_path && target == "script-entrypoint"
         ));
         Ok(())
     }
