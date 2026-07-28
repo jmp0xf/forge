@@ -161,14 +161,12 @@ performance target passing. When the host blocks `/usr/bin/time` from collecting
 the benchmark reports RSS as unavailable rather than claiming a result, while retaining the
 independent latency samples.
 
-A bounded full mutation campaign against commit `8d26435` tested 300 mutants: 275 were caught, one
-was missed, 24 were unviable, and none timed out. The sole survivor deleted the `risk/docs-only`
-arm in `add_content_uncertainty` and was a real test gap. Commit `e51837c` added an exact regression
-test, and an exact one-mutant rerun caught that mutant. Subsequent changes through `d6ae7b8` are
-tests, the Windows long-path Git argument, and performance-harness work outside the configured
-bounded production mutation surface. The complete campaign was not rerun after the fix or against
-the current candidate, so this is composite bounded evidence rather than a claim that every
-current-candidate mutant was caught.
+A bounded full `cargo-mutants 27.0.0` campaign against commit `7e9b559` tested 300 mutants in 88
+minutes: 276 were caught, 24 were unviable, none were missed, and none timed out. The baseline build
+and test suite passed, so no viable mutant survived this bounded current-candidate surface. The full
+rerun included and caught the previously surviving deletion of the `risk/docs-only` arm in
+`add_content_uncertainty`, confirming the regression test added by `e51837c` within the complete
+campaign.
 
 ## Work still required before v0 release
 
