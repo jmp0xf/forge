@@ -48,6 +48,8 @@ GC 将过期对象改名为同一个已固定类目录内的私有普通文件�
    固定并验证旧目录，只接受空目录或唯一普通文件 `object`，先确保原名下至少有一份完整字节，再以
    句柄相对操作清理旧残留；冲突时保留双方并失败。
 
+   本条已由 ADR-0036 取代：旧目录残留不再自动迁移，而是在任何 mutation 前安全失败并原样保留。
+
 Unix 上，Linux 使用 `renameat2(RENAME_NOREPLACE)`，macOS 使用
 `renameatx_np(RENAME_EXCL)`；没有等价原子无覆盖能力的平台必须返回 unsupported，不能退化为普通
 `renameat`。删除使用固定父目录的 `unlinkat`，并在最终删除前重新打开 `Q` 核对 identity。
@@ -75,7 +77,7 @@ Windows 上，同目录隔离与恢复复用 ADR-0034 的
 - Unix 的 `unlinkat` 最终仍按固定父目录中的 leaf 执行；同权限进程在最后 identity 检查与单条
   unlink 指令之间替换同一 leaf，不属于 Forge 对恶意同主体的 sandbox 保证。
 - Windows NTFS 运行证据不能外推为 ReFS、SMB/UNC 或其他文件系统证据。
-- 旧目录残留需要一条受限迁移路径，直到所有受支持 v0 状态都完成恢复。
+- 旧目录残留迁移的原结论已由 ADR-0036 取代；当前边界是安全失败并原样保留。
 
 ### Implementation constraints
 
@@ -112,7 +114,7 @@ fail closed。
 - Linux、macOS 和真实 Windows 分别覆盖正常删除、`Q` collision、验证失败恢复、恢复冲突、crash
   residue、root/final/intermediate parent swap，以及失败后无临时项泄漏；
 - 每个 swap 测试同时检查 replacement tree 未变化、固定旧树状态与提交阶段一致；
-- 旧空目录、仅 `object`、原名/`object` 同一对象和冲突残留均有迁移测试；
+- 旧目录迁移测试要求已由 ADR-0036 取代；其各类形态改为验证安全失败且原样保留；
 - 完整 GC 测试继续证明保留集合、引用闭包、扫描/字节上限、回收统计与类顺序不变；
 - 若未来需要跨目录批量事务、按 file ID 恢复或针对恶意同主体的 sandbox，必须新增 ADR 和平台兼容
   证据，不能扩大本决定的保证。
