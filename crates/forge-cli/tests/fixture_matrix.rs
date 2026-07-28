@@ -9,6 +9,9 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -606,7 +609,7 @@ mod windows_wide_path_fixture {
 
     use super::{FixtureWorkspace, display_output, required_array};
 
-    const CLASSIC_MAX_PATH_UNITS: usize = 260;
+    pub(super) const CLASSIC_MAX_PATH_UNITS: usize = 260;
     const MIN_TEST_PATH_UNITS: usize = CLASSIC_MAX_PATH_UNITS + 64;
     const MAX_TEST_PATH_UNITS: usize = 1_024;
     const UNC_ROOT_ENV: &str = "FORGE_WINDOWS_UNC_TEST_ROOT";
@@ -790,8 +793,9 @@ mod windows_wide_path_fixture {
         }
         let fixture =
             FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())?;
-        // Git must read this before processing `-C`; a command-scope `-c core.longpaths=true`
-        // arrives too late for Git for Windows to enter the deliberately long worktree.
+        // Keep long-path handling independent of the runner's ambient Git configuration. The
+        // explicit repository options below avoid `-C`'s pre-configuration directory change;
+        // this isolated setting governs subsequent Git for Windows path access.
         fs::write(&fixture.global_git_config, b"[core]\n\tlongpaths = true\n")?;
         Ok(fixture)
     }
@@ -1961,17 +1965,31 @@ impl FixtureWorkspace {
             .arg("--no-pager")
             .arg("--no-optional-locks");
         #[cfg(windows)]
-        command
-            // CreateProcess applies a stricter current-directory limit than ordinary native file
-            // APIs. Launch from the runner's short temp directory and let Git's long-path-aware
-            // `-C` boundary select the fixture without changing what path is under test.
-            .current_dir(std::env::temp_dir())
-            .arg("--no-pager")
-            .arg("--no-optional-locks")
-            .arg("-c")
-            .arg("core.longpaths=true")
-            .arg("-C")
-            .arg(cwd);
+        let requires_explicit_repository = cwd.as_os_str().encode_wide().count()
+            >= windows_wide_path_fixture::CLASSIC_MAX_PATH_UNITS;
+        #[cfg(windows)]
+        {
+            command
+                // CreateProcess applies a stricter current-directory limit than ordinary native file
+                // APIs, so always launch Git from the runner's short temp directory.
+                .current_dir(std::env::temp_dir())
+                .arg("--no-pager")
+                .arg("--no-optional-locks")
+                .arg("-c")
+                .arg("core.longpaths=true");
+            if requires_explicit_repository {
+                // Both `-C <path>` and `init <path>` change directory before Git reads
+                // `core.longpaths`. Explicit repository options avoid that pre-config chdir;
+                // `init` and later worktree commands load the isolated config before access.
+                let mut git_dir = OsString::from("--git-dir=");
+                git_dir.push(cwd.join(".git"));
+                let mut work_tree = OsString::from("--work-tree=");
+                work_tree.push(cwd);
+                command.arg(git_dir).arg(work_tree);
+            } else {
+                command.arg("-C").arg(cwd);
+            }
+        }
         command
             .arg("-c")
             .arg("core.fsmonitor=false")
