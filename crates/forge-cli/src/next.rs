@@ -21,6 +21,7 @@ use forge_core::{
     AppError, CommandSpec, Confidence, ExitCode, Intent, InventoryKind, OperationControl as _,
     ProjectModel, Provenance, RepoRelativePath, ResolvedCommandSet, RiskAssessment, RiskLevel,
     WorkState, assess_risk, assumption_to_wire, command_detail_v2_to_wire,
+    portable_relative_utf8_path,
 };
 use forge_detect::model::{InventoryCacheStatus, ModelDetectionCompletion, NavigationSnapshot};
 use forge_detect::policy::PolicyBaseCompleteness;
@@ -556,7 +557,7 @@ fn exact_document_context(
 
     let changed_utf8 = changed_paths
         .iter()
-        .filter_map(|path| path.as_path().to_str())
+        .filter_map(|path| portable_relative_utf8_path(path.as_path()))
         .collect::<Vec<_>>();
     if changed_utf8.len() != changed_paths.len() {
         return Ok(vec![uncertain_context_candidate(
@@ -605,7 +606,10 @@ fn exact_document_context(
                 continue;
             }
         };
-        let Some(matched_path) = changed_utf8.iter().find(|path| text.contains(**path)) else {
+        let Some(matched_path) = changed_utf8
+            .iter()
+            .find(|path| text.contains(path.as_str()))
+        else {
             continue;
         };
         let mut sources = document.provenance.clone();
@@ -644,11 +648,15 @@ fn uncertain_context_candidate(
 }
 
 fn codeowners_precedence(path: &RepoRelativePath) -> u8 {
-    match path.as_path().to_str() {
-        Some(".github/CODEOWNERS") => 0,
-        Some("CODEOWNERS") => 1,
-        Some("docs/CODEOWNERS") => 2,
-        _ => 3,
+    let path = path.as_path();
+    if path == Path::new(".github").join("CODEOWNERS") {
+        0
+    } else if path == Path::new("CODEOWNERS") {
+        1
+    } else if path == Path::new("docs").join("CODEOWNERS") {
+        2
+    } else {
+        3
     }
 }
 
@@ -1077,7 +1085,7 @@ const fn risk_level_name(level: RiskLevelData) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use forge_core::navigation::{NavigationAction, NavigationState};
     use forge_core::{
@@ -1089,8 +1097,9 @@ mod tests {
     };
 
     use super::{
-        InventoryCacheStatus, NextOutcome, action_to_wire, named_test_for, navigation_exit_code,
-        path_is_within, project_selected_commands, render_human, state_to_wire,
+        InventoryCacheStatus, NextOutcome, action_to_wire, codeowners_precedence, named_test_for,
+        navigation_exit_code, path_is_within, project_selected_commands, render_human,
+        state_to_wire,
     };
 
     fn provenance() -> Vec<Provenance> {
@@ -1142,6 +1151,19 @@ mod tests {
             Path::new("src/parser.rs"),
             Path::new("src/other_tests.rs")
         ));
+    }
+
+    #[test]
+    fn codeowners_precedence_uses_native_repository_components()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let github = RepoRelativePath::new(PathBuf::from(".github").join("CODEOWNERS"))?;
+        let root = RepoRelativePath::new("CODEOWNERS")?;
+        let docs = RepoRelativePath::new(PathBuf::from("docs").join("CODEOWNERS"))?;
+
+        assert_eq!(codeowners_precedence(&github), 0);
+        assert_eq!(codeowners_precedence(&root), 1);
+        assert_eq!(codeowners_precedence(&docs), 2);
+        Ok(())
     }
 
     #[test]
