@@ -279,7 +279,14 @@ fn print_diff_plans_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::schema_directory;
+    use std::process::ExitCode;
+
+    use super::{EXIT_OK, run_check_schemas, schema_directory};
+
+    #[test]
+    fn checked_in_schemas_match_generated_contracts_in_default_test_gate() {
+        assert_eq!(run_check_schemas(), ExitCode::from(EXIT_OK));
+    }
 
     #[test]
     fn schema_directory_is_repository_relative_to_xtask() -> Result<(), String> {
