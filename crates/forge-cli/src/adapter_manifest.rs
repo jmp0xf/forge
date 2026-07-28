@@ -16,7 +16,10 @@ use forge_schema::{Digest, ManagedBlockId, PathEncoding, RepoId, WirePath};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub(crate) const ADAPTER_MANIFEST_STATE_KEY: &str = "generated-v1.json";
-pub(crate) const ADAPTER_BEHAVIOR_VERSION: &str = "managed-markdown-v1";
+// v2 renders repository-relative text with `/` separators on every supported host. Retaining the
+// version in rebuildable private state makes v1 manifests explicitly stale instead of silently
+// certifying host-dependent managed blocks.
+pub(crate) const ADAPTER_BEHAVIOR_VERSION: &str = "managed-markdown-v2";
 const ADAPTER_MANIFEST_SCHEMA: u16 = 1;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_HOST_BYTES: usize = 64;

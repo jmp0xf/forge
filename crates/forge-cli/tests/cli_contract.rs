@@ -1307,7 +1307,7 @@ fn init_apply_is_brownfield_safe_and_second_plan_is_empty() -> Result<(), Box<dy
     let manifest_bytes = fs::read(fixture.generated_manifest_path()?)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
     assert_eq!(manifest["schema"], 1);
-    assert_eq!(manifest["behavior_version"], "managed-markdown-v1");
+    assert_eq!(manifest["behavior_version"], "managed-markdown-v2");
     assert_eq!(manifest["adapters"][0]["path"]["display"], "AGENTS.md");
     assert!(
         !String::from_utf8_lossy(&manifest_bytes).contains(&fixture.worktree.display().to_string())

@@ -9,6 +9,7 @@ use forge_core::domain::{
     ProjectModel,
 };
 use forge_core::fingerprint::{is_secret_like_name, validate_argv_privacy};
+use forge_core::portable_relative_utf8_path;
 
 pub const AGENTS_MAX_LINES: usize = 120;
 pub const AGENTS_MAX_BYTES: usize = 8 * 1024;
@@ -145,7 +146,7 @@ fn compact_authoritative_paths(paths: BTreeSet<PathBuf>) -> BTreeSet<String> {
     let mut compacted = paths
         .into_iter()
         .filter(|path| !covered.contains(path))
-        .filter_map(|path| safe_relative_text(&path).map(str::to_owned))
+        .filter_map(|path| safe_relative_text(&path))
         .collect::<BTreeSet<_>>();
     compacted.extend(directories);
     compacted
@@ -281,7 +282,7 @@ fn render_gowork(value: &str, repository_root: &Path) -> Option<String> {
             format!("<repo>/{relative}")
         });
     }
-    safe_relative_text(path).map(str::to_owned)
+    safe_relative_text(path)
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -310,9 +311,9 @@ fn insert_safe_path(paths: &mut BTreeSet<PathBuf>, path: &Path) {
     }
 }
 
-fn safe_relative_text(path: &Path) -> Option<&str> {
-    let value = path.to_str()?;
-    (!path.is_absolute() && !looks_host_specific(value) && !value.contains('`')).then_some(value)
+fn safe_relative_text(path: &Path) -> Option<String> {
+    let value = portable_relative_utf8_path(path)?;
+    (!looks_host_specific(&value) && !value.contains('`')).then_some(value)
 }
 
 fn looks_host_specific(value: &str) -> bool {
@@ -371,7 +372,11 @@ mod tests {
     fn large_path_families_collapse_to_the_deepest_useful_directory() {
         let mut paths = BTreeSet::from([PathBuf::from("README.md")]);
         for index in 0..8 {
-            paths.insert(PathBuf::from(format!("docs/adr/{index:04}.md")));
+            paths.insert(
+                PathBuf::from("docs")
+                    .join("adr")
+                    .join(format!("{index:04}.md")),
+            );
         }
 
         assert_eq!(
@@ -383,14 +388,34 @@ mod tests {
     #[test]
     fn small_path_families_remain_exact() {
         let paths = (0..7)
-            .map(|index| PathBuf::from(format!("crates/member-{index}/Cargo.toml")))
+            .map(|index| {
+                PathBuf::from("crates")
+                    .join(format!("member-{index}"))
+                    .join("Cargo.toml")
+            })
             .collect::<BTreeSet<_>>();
-        let expected = paths
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+        let expected = (0..7)
+            .map(|index| format!("crates/member-{index}/Cargo.toml"))
             .collect::<BTreeSet<_>>();
 
         assert_eq!(compact_authoritative_paths(paths), expected);
+    }
+
+    #[test]
+    fn command_cwd_uses_portable_repository_separators() -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = CommandSpec::new(
+            "workspace-check",
+            Intent::Check,
+            "cargo",
+            RepoRelativePath::new(PathBuf::from("crates").join("forge-core"))?,
+            CommandSource::ExplicitConfig,
+        );
+        command.confidence = Confidence::High;
+
+        let rendered = render_command(Intent::Check, 0, 1, &command, Path::new("/repo"))
+            .ok_or("portable command was not rendered")?;
+        assert!(rendered.contains("cwd `crates/forge-core`"));
+        Ok(())
     }
 
     #[test]
