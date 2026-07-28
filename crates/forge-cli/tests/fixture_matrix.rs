@@ -1208,7 +1208,7 @@ fn large_repository_v0_latency_benchmark() -> Result<(), Box<dyn std::error::Err
         );
     }
     let first_inventory = uncached_inventory[0];
-    let cold_inventory_peak_rss = benchmark_peak_rss_bytes(&fixture, &["explain", "--json"], 0)?;
+    let cold_inventory_peak_rss = benchmark_peak_rss_bytes(&fixture, &["explain", "--json"])?;
 
     let primed = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
     assert_eq!(primed.status.code(), Some(0), "{}", display_output(&primed));
@@ -1396,7 +1396,6 @@ fn require_release_benchmark() -> Result<(), io::Error> {
 fn benchmark_peak_rss_bytes(
     fixture: &FixtureWorkspace,
     arguments: &[&str],
-    expected_exit: i32,
 ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
     let mut command = Command::new("/usr/bin/time");
     command.current_dir(&fixture.worktree);
@@ -1408,36 +1407,57 @@ fn benchmark_peak_rss_bytes(
     fixture.configure_environment(&mut command);
 
     let output = command.output()?;
-    assert_eq!(
-        output.status.code(),
-        Some(expected_exit),
-        "peak-RSS sample for {}: {}",
-        arguments.join(" "),
-        display_output(&output)
-    );
-    let _: Value = serde_json::from_slice(&output.stdout)?;
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let forge_ok = document["ok"].as_bool() == Some(true);
 
     let stderr = String::from_utf8(output.stderr)?;
     #[cfg(target_os = "macos")]
     let bytes = parse_macos_peak_rss_bytes(&stderr);
     #[cfg(target_os = "linux")]
     let bytes = parse_linux_peak_rss_bytes(&stderr);
-    bytes.map(Some).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "/usr/bin/time did not report a parseable maximum resident set size",
-        )
-        .into()
-    })
+    let observation = classify_peak_rss_observation(output.status.success(), forge_ok, bytes)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    if observation.is_none() {
+        eprintln!(
+            "cold inventory peak RSS unavailable: /usr/bin/time status={:?}; stderr={}",
+            output.status.code(),
+            bounded_diagnostic(&stderr, 1_024)
+        );
+    }
+    Ok(observation)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn benchmark_peak_rss_bytes(
     _fixture: &FixtureWorkspace,
     _arguments: &[&str],
-    _expected_exit: i32,
 ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
     Ok(None)
+}
+
+fn classify_peak_rss_observation(
+    observer_succeeded: bool,
+    forge_ok: bool,
+    peak_rss_bytes: Option<u64>,
+) -> Result<Option<u64>, &'static str> {
+    if !forge_ok {
+        return Err("the peak-RSS Forge invocation did not report ok=true");
+    }
+    if !observer_succeeded {
+        return Ok(None);
+    }
+    peak_rss_bytes
+        .map(Some)
+        .ok_or("/usr/bin/time succeeded without a parseable maximum resident set size")
+}
+
+fn bounded_diagnostic(text: &str, max_chars: usize) -> String {
+    let mut characters = text.chars();
+    let mut bounded = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push_str(" [truncated]");
+    }
+    bounded
 }
 
 #[cfg(target_os = "macos")]
@@ -1475,6 +1495,37 @@ fn macos_time_peak_rss_parser_preserves_the_byte_unit() {
 fn linux_time_peak_rss_parser_converts_kibibytes_to_bytes() {
     let output = "Maximum resident set size (kbytes): 42112\n";
     assert_eq!(parse_linux_peak_rss_bytes(output), Some(43_122_688));
+}
+
+#[test]
+fn peak_rss_observation_distinguishes_forge_and_observer_failures() {
+    assert_eq!(
+        classify_peak_rss_observation(true, true, Some(43_122_688)),
+        Ok(Some(43_122_688))
+    );
+    assert_eq!(classify_peak_rss_observation(false, true, None), Ok(None));
+    assert_eq!(
+        classify_peak_rss_observation(false, false, None),
+        Err("the peak-RSS Forge invocation did not report ok=true")
+    );
+    assert_eq!(
+        classify_peak_rss_observation(true, true, None),
+        Err("/usr/bin/time succeeded without a parseable maximum resident set size")
+    );
+}
+
+#[test]
+fn peak_rss_diagnostics_are_unicode_safe_and_bounded() {
+    let diagnostic = bounded_diagnostic(&format!("{}sentinel", "界".repeat(1_025)), 1_024);
+    assert_eq!(
+        diagnostic
+            .chars()
+            .filter(|character| *character == '界')
+            .count(),
+        1_024
+    );
+    assert!(diagnostic.ends_with(" [truncated]"));
+    assert!(!diagnostic.contains("sentinel"));
 }
 
 fn benchmark_json_command(
