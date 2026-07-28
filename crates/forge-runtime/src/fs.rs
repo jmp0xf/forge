@@ -1,7 +1,10 @@
 //! Native filesystem primitives and repository-confined writes.
 
-use std::fs::{self, File};
-use std::io::{self, Read as _, Write as _};
+use std::ffi::OsStr;
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
+use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,7 +23,9 @@ use crate::inventory::{
     build_inventory_from_git_file_set_controlled, build_non_git_filesystem_inventory_controlled,
     read_bounded_text_controlled as read_repository_bounded_text_controlled,
 };
-use crate::repository_write::{CommitMode, RootHandle};
+use crate::repository_write::{
+    BeginPrivateQuarantine, CommitMode, OpenPrivateQuarantine, RepositoryGcError, RootHandle,
+};
 
 /// The native implementation of [`FileSystemPort`].
 ///
@@ -310,7 +315,6 @@ fn metadata_path_kind(metadata: &fs::Metadata) -> PathKind {
 #[derive(Debug, Clone)]
 pub struct RepositoryWriter {
     root: PathBuf,
-    filesystem: NativeFileSystem,
     write_root: Arc<RootHandle>,
 }
 
@@ -339,7 +343,6 @@ impl RepositoryWriter {
             .map_err(|source| FileSystemError::io("open repository root handle", &root, source))?;
         Ok(Self {
             root,
-            filesystem: NativeFileSystem,
             write_root: Arc::new(write_root),
         })
     }
@@ -361,10 +364,7 @@ impl RepositoryWriter {
     }
 
     pub fn read(&self, relative_path: impl AsRef<Path>) -> Result<Vec<u8>, FileSystemError> {
-        let target = self.checked_target(relative_path.as_ref())?;
-        self.filesystem
-            .read(&target)
-            .map_err(|source| FileSystemError::io("read repository file", &target, source))
+        self.read_required_bounded(relative_path.as_ref(), usize::MAX, "read repository file")
     }
 
     /// Reads a confined regular file while retaining at most `max_bytes`.
@@ -373,9 +373,11 @@ impl RepositoryWriter {
         relative_path: impl AsRef<Path>,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let target = self.checked_target(relative_path.as_ref())?;
-        read_file_bounded(&target, max_bytes)
-            .map_err(|source| FileSystemError::io("read bounded repository file", &target, source))
+        self.read_required_bounded(
+            relative_path.as_ref(),
+            max_bytes,
+            "read bounded repository file",
+        )
     }
 
     /// Reads an optional regular file through this writer's pinned root handle.
@@ -386,15 +388,66 @@ impl RepositoryWriter {
     ) -> Result<Option<Vec<u8>>, FileSystemError> {
         let normalized = normalize_relative_path(relative_path.as_ref())?;
         let target = self.root.join(&normalized);
+        self.read_optional_bounded_normalized(
+            &normalized,
+            max_bytes,
+            "read bounded repository file through root handle",
+            &target,
+        )
+    }
+
+    pub(crate) fn begin_private_quarantine(
+        &self,
+        relative_path: impl AsRef<Path>,
+        quarantine_leaf: &OsStr,
+    ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())
+            .map_err(|error| RepositoryGcError::not_changed(error.into_io_error()))?;
         self.write_root
-            .read_bounded(&normalized, max_bytes)
-            .map_err(|source| {
-                FileSystemError::io(
-                    "read bounded repository file through root handle",
-                    target,
-                    source,
-                )
-            })
+            .begin_private_quarantine(&normalized, quarantine_leaf)
+    }
+
+    pub(crate) fn open_private_quarantine(
+        &self,
+        directory: impl AsRef<Path>,
+        original_leaf: &OsStr,
+        quarantine_leaf: &OsStr,
+    ) -> Result<OpenPrivateQuarantine, RepositoryGcError> {
+        let normalized = normalize_relative_path(directory.as_ref())
+            .map_err(|error| RepositoryGcError::not_changed(error.into_io_error()))?;
+        self.write_root
+            .open_private_quarantine(&normalized, original_leaf, quarantine_leaf)
+    }
+
+    fn read_required_bounded(
+        &self,
+        relative_path: &Path,
+        max_bytes: usize,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path)?;
+        let target = self.root.join(&normalized);
+        let bytes =
+            self.read_optional_bounded_normalized(&normalized, max_bytes, operation, &target)?;
+        bytes.ok_or_else(|| {
+            FileSystemError::io(
+                operation,
+                target,
+                io::Error::new(io::ErrorKind::NotFound, "repository file does not exist"),
+            )
+        })
+    }
+
+    fn read_optional_bounded_normalized(
+        &self,
+        normalized: &Path,
+        max_bytes: usize,
+        operation: &'static str,
+        target: &Path,
+    ) -> Result<Option<Vec<u8>>, FileSystemError> {
+        self.write_root
+            .read_bounded(normalized, max_bytes)
+            .map_err(|source| FileSystemError::io(operation, target, source))
     }
 
     pub fn exists(&self, relative_path: impl AsRef<Path>) -> Result<bool, FileSystemError> {
@@ -701,28 +754,6 @@ impl RepositoryApplyPort for RepositoryWriter {
     }
 }
 
-fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file exceeds its bounded regular-file contract",
-        ));
-    }
-    let capacity = usize::try_from(metadata.len()).map_or(max_bytes, |bytes| bytes.min(max_bytes));
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take((max_bytes as u64).saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file grew beyond its read limit",
-        ));
-    }
-    Ok(bytes)
-}
-
 /// A failure to confine a filesystem operation to its intended root.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -1002,6 +1033,83 @@ mod tests {
             oversized,
             Err(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_writer_required_reads_preserve_not_found_diagnostics()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let writer = RepositoryWriter::new(repository.path())?;
+        let expected_path = writer.root().join("missing.txt");
+
+        for (result, expected_operation) in [
+            (writer.read("missing.txt"), "read repository file"),
+            (
+                writer.read_bounded("missing.txt", 64),
+                "read bounded repository file",
+            ),
+        ] {
+            match result {
+                Err(FileSystemError::Io {
+                    operation,
+                    path,
+                    source,
+                }) => {
+                    assert_eq!(operation, expected_operation);
+                    assert_eq!(path, expected_path);
+                    assert_eq!(source.kind(), io::ErrorKind::NotFound);
+                }
+                other => {
+                    return Err(io::Error::other(format!("unexpected result: {other:?}")).into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_writer_rejects_reads_after_visible_root_replacement() -> Result<(), Box<dyn Error>>
+    {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let saved_repository = container.path().join("saved-repository");
+        fs::create_dir(&repository)?;
+        fs::write(repository.join("target.txt"), b"reviewed")?;
+        let writer = RepositoryWriter::new(&repository)?;
+
+        fs::rename(&repository, &saved_repository)?;
+        fs::create_dir(&repository)?;
+        fs::write(repository.join("target.txt"), b"replacement")?;
+
+        for (result, expected_operation) in [
+            (writer.read("target.txt"), "read repository file"),
+            (
+                writer.read_bounded("target.txt", 8),
+                "read bounded repository file",
+            ),
+            (
+                writer
+                    .read_optional_bounded("target.txt", 8)
+                    .map(|bytes| bytes.unwrap_or_default()),
+                "read bounded repository file through root handle",
+            ),
+        ] {
+            match result {
+                Err(FileSystemError::Io {
+                    operation, source, ..
+                }) => {
+                    assert_eq!(operation, expected_operation);
+                    assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+                }
+                other => {
+                    return Err(io::Error::other(format!("unexpected result: {other:?}")).into());
+                }
+            }
+        }
+        assert_eq!(fs::read(repository.join("target.txt"))?, b"replacement");
+        assert_eq!(fs::read(saved_repository.join("target.txt"))?, b"reviewed");
         Ok(())
     }
 

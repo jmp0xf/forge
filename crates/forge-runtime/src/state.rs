@@ -244,17 +244,16 @@ impl AtomicStateStore {
                     path: entry_path,
                 }));
             }
-            if !metadata.is_file() {
-                let reason = if metadata.is_dir()
-                    && evidence::is_evidence_gc_quarantine_name(&entry.file_name())
-                {
-                    "immutable evidence GC residue requires held-lock recovery"
-                } else {
-                    "listed state directory contains a non-regular entry"
-                };
+            if evidence::is_evidence_gc_quarantine_name(&entry.file_name()) {
                 return Err(StateError::InvalidLayout {
                     path: entry_path,
-                    reason: reason.to_owned(),
+                    reason: "immutable evidence GC residue requires held-lock recovery".to_owned(),
+                });
+            }
+            if !metadata.is_file() {
+                return Err(StateError::InvalidLayout {
+                    path: entry_path,
+                    reason: "listed state directory contains a non-regular entry".to_owned(),
                 });
             }
             validate_private_state_file(&entry_path, &metadata)?;

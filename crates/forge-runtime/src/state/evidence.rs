@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -19,6 +19,10 @@ use super::{
     validate_required_private_state_file, validate_resolved_directory, validate_state_key,
 };
 use crate::fs::{FileSystemError, RepositoryWriter};
+use crate::repository_write::{
+    BeginPrivateQuarantine, OpenPrivateQuarantine, PrivateQuarantine, RepositoryGcCommit,
+    RepositoryGcError,
+};
 
 /// Maximum number of Receipt objects inspected across legacy v1 and current v2 state.
 pub const EVIDENCE_GC_MAX_RECEIPTS: usize = 4_096;
@@ -2008,7 +2012,7 @@ fn resolve_existing_private_state_file(
     if super::is_reserved_state_path(&relative) {
         validate_evidence_ancestor_permissions(store.layout.worktree_dir(), parent)?;
     }
-    let path = store.layout.worktree_dir().join(relative);
+    let path = store.layout.worktree_dir().join(&relative);
     match fs::symlink_metadata(&path) {
         Ok(metadata) => Ok(Some((path, metadata))),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -2034,6 +2038,26 @@ fn validate_private_regular_file(path: &Path, metadata: &fs::Metadata) -> Result
     }
     validate_private_file_permissions(path, metadata)?;
     validate_no_extended_acl_path(path, metadata)
+}
+
+fn validate_private_regular_file_handle(
+    path: &Path,
+    file: &File,
+    metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    if metadata_is_link_or_reparse(metadata) {
+        return Err(StateError::PathSafety(FileSystemError::SymlinkComponent {
+            path: path.to_path_buf(),
+        }));
+    }
+    if !metadata.is_file() {
+        return Err(StateError::InvalidLayout {
+            path: path.to_path_buf(),
+            reason: "immutable state object is not a regular file".to_owned(),
+        });
+    }
+    validate_private_file_permissions(path, metadata)?;
+    validate_private_evidence_file_handle(file, path)
 }
 
 fn ensure_same_file_identity(
@@ -2519,7 +2543,7 @@ fn remove_regular_state_file_with_hook(
     let relative = validate_state_key(&object.key)?;
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
     validate_evidence_ancestor_permissions(store.layout.worktree_dir(), parent)?;
-    let path = store.layout.worktree_dir().join(relative);
+    let path = store.layout.worktree_dir().join(&relative);
     let final_metadata = fs::symlink_metadata(&path).map_err(|source| {
         StateError::io(
             "reinspect immutable state object before removal",
@@ -2538,162 +2562,163 @@ fn remove_regular_state_file_with_hook(
         path: path.clone(),
         reason: "immutable state object has no parent directory".to_owned(),
     })?;
-    let quarantine = gc_quarantine_path(parent_path, &object.key)?;
-    create_gc_quarantine_directory(&quarantine)?;
-    let quarantine_path = quarantine.join(GC_QUARANTINE_OBJECT);
+    let quarantine_leaf = gc_quarantine_leaf(&object.key)?;
+    let quarantine_path = parent_path.join(&quarantine_leaf);
 
     before_quarantine(&path)
         .map_err(|source| StateError::io("run evidence GC race hook", &path, source))?;
-    if let Err(source) = fs::rename(&path, &quarantine_path) {
-        let _cleanup = fs::remove_dir(&quarantine);
-        return Err(StateError::io(
-            "atomically quarantine expired immutable state object",
-            &path,
-            source,
-        ));
-    }
-    sync_directory(&quarantine)?;
-    sync_directory(parent_path)?;
-
-    let verification = (|| {
-        let quarantined_metadata = fs::symlink_metadata(&quarantine_path).map_err(|source| {
-            StateError::io(
-                "inspect quarantined immutable state object",
-                &quarantine_path,
-                source,
+    let mut quarantine = match store
+        .writer
+        .begin_private_quarantine(&relative, quarantine_leaf.as_ref())
+        .map_err(|error| {
+            repository_gc_state_error(
+                "atomically quarantine expired immutable state object",
+                &path,
+                error,
             )
-        })?;
-        validate_private_regular_file(&quarantine_path, &quarantined_metadata)?;
-        stream_opened_private_state_file(
-            &object.key,
-            &quarantine_path,
-            &quarantined_metadata,
-            false,
-        )
-        .map(|(snapshot, _)| snapshot)
-    })();
+        })? {
+        BeginPrivateQuarantine::Missing => {
+            return Err(StateError::StateChanged {
+                key: object.key.clone(),
+            });
+        }
+        BeginPrivateQuarantine::Quarantined(quarantine) => quarantine,
+    };
+
+    let verification = snapshot_private_quarantine_file(
+        &object.key,
+        &quarantine_path,
+        quarantine.object_file(),
+        object.snapshot.identity.size,
+    );
     let quarantined_snapshot = match verification {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return restore_quarantined_replacement(
+            return restore_private_quarantine_after_verification(
                 object,
-                &path,
-                &quarantine,
                 &quarantine_path,
+                quarantine,
                 error,
             );
         }
     };
     if !snapshot_survived_quarantine(&object.snapshot, &quarantined_snapshot) {
-        return restore_quarantined_replacement(
+        return restore_private_quarantine_after_verification(
             object,
-            &path,
-            &quarantine,
             &quarantine_path,
+            quarantine,
             StateError::StateChanged {
                 key: object.key.clone(),
             },
         );
     }
 
-    remove_gc_quarantine(&quarantine, Some(&quarantine_path))
+    quarantine.delete().map_err(|error| {
+        repository_gc_state_error(
+            "delete verified quarantined immutable state object",
+            &quarantine_path,
+            error,
+        )
+    })
 }
 
-#[cfg(unix)]
-fn create_gc_quarantine_directory(path: &Path) -> Result<(), StateError> {
-    use std::os::unix::fs::DirBuilderExt as _;
+fn snapshot_private_quarantine_file(
+    key: &str,
+    path: &Path,
+    file: &mut File,
+    expected_size: u64,
+) -> Result<StateFileSnapshot, StateError> {
+    file.seek(io::SeekFrom::Start(0)).map_err(|source| {
+        StateError::io("rewind quarantined immutable state object", path, source)
+    })?;
+    let open_metadata = file.metadata().map_err(|source| {
+        StateError::io(
+            "inspect quarantined immutable state object handle",
+            path,
+            source,
+        )
+    })?;
+    validate_private_regular_file_handle(path, file, &open_metadata)?;
+    if open_metadata.len() != expected_size {
+        return Err(StateError::StateChanged {
+            key: key.to_owned(),
+        });
+    }
 
-    let mut builder = fs::DirBuilder::new();
-    match builder.mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(StateError::InvalidLayout {
-                path: path.to_path_buf(),
-                reason: "immutable evidence GC residue requires held-lock recovery before deletion"
-                    .to_owned(),
+    let mut remaining = expected_size;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| StateError::StateSizeOverflow)?;
+        let count = file.read(&mut buffer[..limit]).map_err(|source| {
+            StateError::io("read quarantined immutable state object", path, source)
+        })?;
+        if count == 0 {
+            return Err(StateError::StateChanged {
+                key: key.to_owned(),
             });
         }
-        Err(source) => {
-            return Err(StateError::io(
-                "create evidence GC quarantine",
-                path,
-                source,
-            ));
-        }
+        hasher.update(&buffer[..count]);
+        remaining -= u64::try_from(count).map_err(|_| StateError::StateSizeOverflow)?;
     }
-    clear_inherited_extended_acl(path)?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| StateError::io("inspect evidence GC quarantine", path, source))?;
-    validate_private_evidence_directory(path, &metadata)?;
-    sync_directory(path)?;
-    let parent = path.parent().ok_or_else(|| StateError::InvalidLayout {
-        path: path.to_path_buf(),
-        reason: "evidence GC quarantine has no parent directory".to_owned(),
-    })?;
-    sync_directory(parent)
-}
 
-#[cfg(windows)]
-fn create_gc_quarantine_directory(path: &Path) -> Result<(), StateError> {
-    match super::windows::create_private_directory(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(StateError::InvalidLayout {
-                path: path.to_path_buf(),
-                reason: "immutable evidence GC residue requires held-lock recovery before deletion"
-                    .to_owned(),
-            });
-        }
-        Err(source) => {
-            return Err(StateError::io(
-                "create evidence GC quarantine",
-                path,
-                source,
-            ));
-        }
+    let final_metadata = file.metadata().map_err(|source| {
+        StateError::io(
+            "reinspect quarantined immutable state object handle",
+            path,
+            source,
+        )
+    })?;
+    validate_private_regular_file_handle(path, file, &final_metadata)?;
+    if state_file_identity(&open_metadata) != state_file_identity(&final_metadata) {
+        return Err(StateError::StateChanged {
+            key: key.to_owned(),
+        });
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| StateError::io("inspect evidence GC quarantine", path, source))?;
-    validate_private_evidence_directory(path, &metadata)?;
-    sync_directory(path)?;
-    let parent = path.parent().ok_or_else(|| StateError::InvalidLayout {
-        path: path.to_path_buf(),
-        reason: "evidence GC quarantine has no parent directory".to_owned(),
-    })?;
-    sync_directory(parent)
+    Ok(StateFileSnapshot {
+        identity: state_file_identity(&final_metadata),
+        content_digest: *hasher.finalize().as_bytes(),
+    })
 }
 
-#[cfg(not(any(unix, windows)))]
-fn create_gc_quarantine_directory(_path: &Path) -> Result<(), StateError> {
-    ensure_evidence_state_mutation_supported()
-}
-
-fn restore_quarantined_replacement(
+fn restore_private_quarantine_after_verification(
     object: &PlannedDeletion,
-    original_path: &Path,
-    quarantine: &Path,
     quarantine_path: &Path,
+    quarantine: PrivateQuarantine,
     verification_error: StateError,
 ) -> Result<(), StateError> {
-    match fs::hard_link(quarantine_path, original_path) {
-        Ok(()) => {
-            let parent = original_path
-                .parent()
-                .ok_or_else(|| StateError::InvalidLayout {
-                    path: original_path.to_path_buf(),
-                    reason: "restored immutable state object has no parent directory".to_owned(),
-                })?;
-            sync_directory(parent)?;
-            remove_gc_quarantine(quarantine, Some(quarantine_path))?;
-            Err(verification_error)
+    match quarantine.restore() {
+        Ok(()) => Err(verification_error),
+        Err(error) if error.commit() == RepositoryGcCommit::Restored => {
+            Err(repository_gc_state_error(
+                "validate restored immutable state object",
+                quarantine_path,
+                error,
+            ))
         }
-        Err(source) => Err(StateError::QuarantineRestore {
+        Err(error) => Err(StateError::QuarantineRestore {
             key: object.key.clone(),
             quarantine: quarantine_path.to_path_buf(),
             verification: verification_error.to_string(),
-            source,
+            source: repository_gc_io_error(error),
         }),
     }
+}
+
+fn repository_gc_state_error(
+    operation: &'static str,
+    path: &Path,
+    error: RepositoryGcError,
+) -> StateError {
+    if error.commit() == RepositoryGcCommit::NotChanged {
+        return StateError::io(operation, path, error.into_source());
+    }
+    StateError::io(operation, path, repository_gc_io_error(error))
+}
+
+fn repository_gc_io_error(error: RepositoryGcError) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, error)
 }
 
 fn remove_gc_quarantine(quarantine: &Path, object: Option<&Path>) -> Result<(), StateError> {
@@ -2719,14 +2744,19 @@ fn remove_gc_quarantine(quarantine: &Path, object: Option<&Path>) -> Result<(), 
     sync_directory(parent)
 }
 
+#[cfg(all(test, unix))]
 fn gc_quarantine_path(parent: &Path, key: &str) -> Result<PathBuf, StateError> {
+    Ok(parent.join(gc_quarantine_leaf(key)?))
+}
+
+fn gc_quarantine_leaf(key: &str) -> Result<String, StateError> {
     let extension = if key.starts_with("logs/") {
         ".log"
     } else {
         ".json"
     };
     let object_name = object_name_from_key(key, extension)?;
-    Ok(parent.join(format!("{GC_QUARANTINE_PREFIX}{}", object_name.as_str())))
+    Ok(format!("{GC_QUARANTINE_PREFIX}{}", object_name.as_str()))
 }
 
 fn sync_evidence_gc_class(store: &AtomicStateStore, directory: &str) -> Result<(), StateError> {
@@ -2754,6 +2784,7 @@ struct EvidenceGcResidue {
     object: PathBuf,
     object_identity: Option<StateFileIdentity>,
     action: EvidenceGcRecoveryAction,
+    same_directory_file: bool,
 }
 
 fn recover_evidence_gc_quarantines(store: &AtomicStateStore) -> Result<(), StateError> {
@@ -2772,7 +2803,7 @@ fn recover_evidence_gc_quarantines(store: &AtomicStateStore) -> Result<(), State
     // reproducible and prevents directory enumeration order from changing the recovered subset.
     residues.sort_by(|left, right| left.quarantine.cmp(&right.quarantine));
     for residue in &residues {
-        recover_evidence_gc_residue(residue)?;
+        recover_evidence_gc_residue(store, residue)?;
     }
     Ok(())
 }
@@ -2891,7 +2922,13 @@ fn inspect_evidence_gc_residues(
         let metadata = fs::symlink_metadata(&quarantine).map_err(|source| {
             StateError::io("inspect evidence GC recovery residue", &quarantine, source)
         })?;
-        validate_private_evidence_directory(&quarantine, &metadata)?;
+        let same_directory_file = if metadata.is_file() {
+            validate_private_regular_file(&quarantine, &metadata)?;
+            true
+        } else {
+            validate_private_evidence_directory(&quarantine, &metadata)?;
+            false
+        };
         let name = entry
             .file_name()
             .into_string()
@@ -2913,7 +2950,26 @@ fn inspect_evidence_gc_residues(
         })?;
         let key = format!("{directory}/{}{extension}", object_name.as_str());
         let original = parent.join(format!("{}{extension}", object_name.as_str()));
-        let object = quarantine.join(GC_QUARANTINE_OBJECT);
+        let object = if same_directory_file {
+            quarantine.clone()
+        } else {
+            quarantine.join(GC_QUARANTINE_OBJECT)
+        };
+
+        if same_directory_file {
+            let object_identity = state_file_identity(&metadata);
+            let action = evidence_gc_recovery_action(&key, &original, &metadata)?;
+            residues.push(EvidenceGcResidue {
+                key,
+                parent: parent.clone(),
+                quarantine,
+                object,
+                object_identity: Some(object_identity),
+                action,
+                same_directory_file: true,
+            });
+            continue;
+        }
 
         let mut contents = fs::read_dir(&quarantine)
             .map_err(|source| StateError::io("list evidence GC quarantine", &quarantine, source))?;
@@ -2939,6 +2995,7 @@ fn inspect_evidence_gc_residues(
                 object,
                 object_identity: None,
                 action: EvidenceGcRecoveryAction::RemoveEmpty,
+                same_directory_file: false,
             });
             continue;
         };
@@ -2953,30 +3010,7 @@ fn inspect_evidence_gc_residues(
         })?;
         validate_private_regular_file(&object, &object_metadata)?;
         let object_identity = state_file_identity(&object_metadata);
-        let action = match fs::symlink_metadata(&original) {
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                EvidenceGcRecoveryAction::RestoreObject
-            }
-            Err(source) => {
-                return Err(StateError::io(
-                    "inspect original path during evidence GC recovery",
-                    &original,
-                    source,
-                ));
-            }
-            Ok(original_metadata) => {
-                validate_private_regular_file(&original, &original_metadata)?;
-                if !same_file_object(&object_metadata, &original_metadata) {
-                    return Err(StateError::InvalidLayout {
-                        path: original,
-                        reason: format!(
-                            "held-lock recovery found a conflicting original for quarantined `{key}`; both objects were retained"
-                        ),
-                    });
-                }
-                EvidenceGcRecoveryAction::FinishRestore
-            }
-        };
+        let action = evidence_gc_recovery_action(&key, &original, &object_metadata)?;
         residues.push(EvidenceGcResidue {
             key,
             parent: parent.clone(),
@@ -2984,12 +3018,48 @@ fn inspect_evidence_gc_residues(
             object,
             object_identity: Some(object_identity),
             action,
+            same_directory_file: false,
         });
     }
     Ok(())
 }
 
-fn recover_evidence_gc_residue(residue: &EvidenceGcResidue) -> Result<(), StateError> {
+fn evidence_gc_recovery_action(
+    key: &str,
+    original: &Path,
+    object_metadata: &fs::Metadata,
+) -> Result<EvidenceGcRecoveryAction, StateError> {
+    match fs::symlink_metadata(original) {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(EvidenceGcRecoveryAction::RestoreObject)
+        }
+        Err(source) => Err(StateError::io(
+            "inspect original path during evidence GC recovery",
+            original,
+            source,
+        )),
+        Ok(original_metadata) => {
+            validate_private_regular_file(original, &original_metadata)?;
+            if !same_file_object(object_metadata, &original_metadata) {
+                return Err(StateError::InvalidLayout {
+                    path: original.to_path_buf(),
+                    reason: format!(
+                        "held-lock recovery found a conflicting original for quarantined `{key}`; both objects were retained"
+                    ),
+                });
+            }
+            Ok(EvidenceGcRecoveryAction::FinishRestore)
+        }
+    }
+}
+
+fn recover_evidence_gc_residue(
+    store: &AtomicStateStore,
+    residue: &EvidenceGcResidue,
+) -> Result<(), StateError> {
+    if residue.same_directory_file {
+        return recover_same_directory_evidence_gc_residue(store, residue);
+    }
     match residue.action {
         EvidenceGcRecoveryAction::RemoveEmpty => remove_gc_quarantine(&residue.quarantine, None),
         EvidenceGcRecoveryAction::RestoreObject => {
@@ -3070,6 +3140,97 @@ fn recover_evidence_gc_residue(residue: &EvidenceGcResidue) -> Result<(), StateE
             remove_gc_quarantine(&residue.quarantine, Some(&residue.object))
         }
     }
+}
+
+fn recover_same_directory_evidence_gc_residue(
+    store: &AtomicStateStore,
+    residue: &EvidenceGcResidue,
+) -> Result<(), StateError> {
+    let relative = validate_state_key(&residue.key)?;
+    let directory = relative.parent().ok_or_else(|| StateError::InvalidLayout {
+        path: residue.parent.clone(),
+        reason: "evidence GC recovery key has no parent directory".to_owned(),
+    })?;
+    let original_leaf = relative
+        .file_name()
+        .ok_or_else(|| StateError::InvalidLayout {
+            path: residue.parent.clone(),
+            reason: "evidence GC recovery key has no filename".to_owned(),
+        })?;
+    let quarantine_leaf =
+        residue
+            .quarantine
+            .file_name()
+            .ok_or_else(|| StateError::InvalidLayout {
+                path: residue.quarantine.clone(),
+                reason: "evidence GC quarantine has no filename".to_owned(),
+            })?;
+
+    let (mut quarantine, current_action) = match store
+        .writer
+        .open_private_quarantine(directory, original_leaf, quarantine_leaf)
+        .map_err(|error| {
+            repository_gc_state_error(
+                "open immutable evidence GC recovery residue",
+                &residue.quarantine,
+                error,
+            )
+        })? {
+        OpenPrivateQuarantine::Missing => {
+            return Err(StateError::StateChanged {
+                key: residue.key.clone(),
+            });
+        }
+        OpenPrivateQuarantine::QuarantineOnly(quarantine) => {
+            (quarantine, EvidenceGcRecoveryAction::RestoreObject)
+        }
+        OpenPrivateQuarantine::DuplicateSameIdentity(quarantine) => {
+            (quarantine, EvidenceGcRecoveryAction::FinishRestore)
+        }
+    };
+    verify_private_quarantine_identity(residue, &mut quarantine)?;
+
+    match current_action {
+        EvidenceGcRecoveryAction::RemoveEmpty => Err(StateError::InvalidLayout {
+            path: residue.quarantine.clone(),
+            reason: "same-directory evidence GC residue cannot be an empty directory".to_owned(),
+        }),
+        EvidenceGcRecoveryAction::RestoreObject => quarantine.restore().map_err(|error| {
+            repository_gc_state_error(
+                "restore quarantined immutable state object",
+                &residue.quarantine,
+                error,
+            )
+        }),
+        EvidenceGcRecoveryAction::FinishRestore => quarantine.delete().map_err(|error| {
+            repository_gc_state_error(
+                "remove duplicate immutable evidence GC residue",
+                &residue.quarantine,
+                error,
+            )
+        }),
+    }
+}
+
+fn verify_private_quarantine_identity(
+    residue: &EvidenceGcResidue,
+    quarantine: &mut PrivateQuarantine,
+) -> Result<(), StateError> {
+    let file = quarantine.object_file();
+    let metadata = file.metadata().map_err(|source| {
+        StateError::io(
+            "reinspect evidence GC recovery object handle",
+            &residue.object,
+            source,
+        )
+    })?;
+    validate_private_regular_file_handle(&residue.object, file, &metadata)?;
+    if residue.object_identity.as_ref() != Some(&state_file_identity(&metadata)) {
+        return Err(StateError::StateChanged {
+            key: residue.key.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn verify_gc_recovery_object(residue: &EvidenceGcResidue) -> Result<(), StateError> {
@@ -3320,13 +3481,28 @@ pub(super) fn clear_inherited_extended_acl_file(
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn validate_evidence_lock_acl(file: &File, path: &Path) -> Result<(), StateError> {
+fn validate_private_evidence_file_handle(file: &File, path: &Path) -> Result<(), StateError> {
     macos_acl::reject_extended_acl(file, path)
 }
 
 #[cfg(windows)]
-pub(super) fn validate_evidence_lock_acl(file: &File, path: &Path) -> Result<(), StateError> {
+fn validate_private_evidence_file_handle(file: &File, path: &Path) -> Result<(), StateError> {
     super::windows::validate_owner_only_file_handle(file, path)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn validate_private_evidence_file_handle(_file: &File, _path: &Path) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn validate_evidence_lock_acl(file: &File, path: &Path) -> Result<(), StateError> {
+    validate_private_evidence_file_handle(file, path)
+}
+
+#[cfg(windows)]
+pub(super) fn validate_evidence_lock_acl(file: &File, path: &Path) -> Result<(), StateError> {
+    validate_private_evidence_file_handle(file, path)
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -3407,6 +3583,8 @@ fn validate_private_evidence_directory_permissions(
 mod tests {
     #[cfg(any(unix, windows))]
     use std::cell::Cell;
+    #[cfg(unix)]
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::fs;
@@ -3429,14 +3607,14 @@ mod tests {
         EvidenceStateDecodeError, EvidenceStateMetadataDecoder, EvidenceStateObjectKind,
         EvidenceStateObjectName, EvidenceStateVersion, GitStateLayout, RECEIPT_OBJECT_MAX_BYTES,
         ReceiptRetentionMetadata, ReceiptStateReference, StateError, UtcTimestampError,
-        ensure_retained_budget, format_utc_rfc3339, log_content_address, parse_utc_rfc3339,
-        stream_opened_private_state_file_with_hook, validate_state_key,
+        ensure_retained_budget, format_utc_rfc3339, gc_quarantine_leaf, log_content_address,
+        parse_utc_rfc3339, stream_opened_private_state_file_with_hook, validate_state_key,
         write_new_private_evidence_file_with_before_commit,
     };
     #[cfg(unix)]
     use super::{
         EvidenceGcPlan, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX, PlannedDeletion,
-        ReferenceClosure, apply_evidence_gc_plan, preflight_deletions,
+        ReferenceClosure, apply_evidence_gc_plan, gc_quarantine_path, preflight_deletions,
         remove_regular_state_file_with_hook, snapshot_private_state_file,
         store_new_atomic_idempotent_evidence_with_hook,
     };
@@ -4011,6 +4189,123 @@ mod tests {
                 .join(log_state_key(&object))
                 .exists()
         );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn read_only_fails_closed_and_locked_gc_recovers_a_same_directory_quarantine()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut decoder = FixtureDecoder::default();
+        let log_bytes = b"recoverable same-directory log";
+        let (log_name, log_key, _) = store_fixture_log(&store, log_bytes)?;
+        store_fixture_receipt(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            object_name(7)?,
+            EvidenceRetentionTime::Current(now.into()),
+            vec![log_name],
+        )?;
+        let log_path = store.layout().worktree_dir().join(&log_key);
+        let parent = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?;
+        let quarantine = parent.join(gc_quarantine_leaf(&log_key)?);
+        fs::rename(&log_path, &quarantine)?;
+        let before = filesystem_snapshot(temporary.path())?;
+
+        let read_error = match store.visit_evidence_state_snapshot(1_024, &decoder, |_| Ok(())) {
+            Err(error) => error,
+            Ok(()) => {
+                return Err(io::Error::other(
+                    "read-only scan accepted a same-directory GC residue",
+                )
+                .into());
+            }
+        };
+        assert!(matches!(
+            read_error,
+            StateError::InvalidLayout { ref reason, .. }
+                if reason.contains("held-lock recovery")
+        ));
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+
+        let lock = store.try_lock()?;
+        store.collect_evidence_garbage(&lock, now, &decoder)?;
+        assert!(!quarantine.exists());
+        assert_eq!(fs::read(log_path)?, log_bytes);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn locked_gc_removes_a_same_identity_quarantine_duplicate() -> Result<(), Box<dyn Error>> {
+        let (_temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut decoder = FixtureDecoder::default();
+        let log_bytes = b"same identity recovery log";
+        let (log_name, log_key, _) = store_fixture_log(&store, log_bytes)?;
+        store_fixture_receipt(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            object_name(8)?,
+            EvidenceRetentionTime::Current(now.into()),
+            vec![log_name],
+        )?;
+        let log_path = store.layout().worktree_dir().join(&log_key);
+        let parent = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?;
+        let quarantine = parent.join(gc_quarantine_leaf(&log_key)?);
+        fs::hard_link(&log_path, &quarantine)?;
+
+        let lock = store.try_lock()?;
+        store.collect_evidence_garbage(&lock, now, &decoder)?;
+
+        assert!(!quarantine.exists());
+        assert_eq!(fs::read(log_path)?, log_bytes);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn locked_gc_preserves_conflicting_same_directory_recovery_objects()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let log_bytes = b"original same-directory recovery log";
+        let (_, log_key, _) = store_fixture_log(&store, log_bytes)?;
+        let log_path = store.layout().worktree_dir().join(&log_key);
+        let parent = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?;
+        let quarantine = parent.join(gc_quarantine_leaf(&log_key)?);
+        write_private_test_file(&quarantine, b"conflicting recovery bytes")?;
+        let lock = store.try_lock()?;
+        let before = filesystem_snapshot(temporary.path())?;
+
+        let error = match store.collect_evidence_garbage(&lock, now, &FixtureDecoder::default()) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "conflicting same-directory recovery paths were accepted",
+                )
+                .into());
+            }
+        };
+
+        assert!(matches!(
+            error,
+            StateError::InvalidLayout { ref reason, .. }
+                if reason.contains("conflicting original")
+        ));
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        assert_eq!(fs::read(log_path)?, log_bytes);
+        assert_eq!(fs::read(quarantine)?, b"conflicting recovery bytes");
         Ok(())
     }
 
@@ -4892,8 +5187,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn garbage_collection_quarantine_keeps_a_raced_directory_when_restore_is_impossible()
-    -> Result<(), Box<dyn Error>> {
+    fn garbage_collection_quarantine_never_moves_a_raced_directory() -> Result<(), Box<dyn Error>> {
         let (temporary, store) = temporary_store()?;
         let original = b"planned directory race";
         let (_, key, size) = store_fixture_log(&store, original)?;
@@ -4905,23 +5199,22 @@ mod tests {
         let saved_original = temporary.path().join("saved-directory-original.log");
         let state_path = store.layout().worktree_dir().join(&key);
 
-        let error = match remove_regular_state_file_with_hook(&store, &object, |path| {
+        let result = remove_regular_state_file_with_hook(&store, &object, |path| {
             fs::rename(path, &saved_original)?;
             fs::create_dir(path)
-        }) {
-            Err(error) => error,
-            Ok(()) => {
-                return Err(
-                    io::Error::other("a raced directory was deleted as the planned log").into(),
-                );
-            }
-        };
+        });
 
-        let StateError::QuarantineRestore { quarantine, .. } = error else {
-            return Err(io::Error::other(format!("unexpected error: {error}")).into());
-        };
-        assert!(!state_path.exists());
-        assert!(quarantine.is_dir());
+        assert!(result.is_err());
+        assert!(state_path.is_dir());
+        assert!(
+            !gc_quarantine_path(
+                state_path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("state fixture has no parent"))?,
+                &key,
+            )?
+            .exists()
+        );
         assert_eq!(fs::read(saved_original)?, original);
         Ok(())
     }
@@ -4956,6 +5249,113 @@ mod tests {
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))?;
         assert_eq!(fs::read(&state_path)?, replacement);
         assert_eq!(fs::read(saved_original)?, original);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collection_restores_the_pinned_object_after_a_root_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let original = b"planned root replacement";
+        let replacement = b"visible replacement tree";
+        let (_, key, size) = store_fixture_log(&store, original)?;
+        let object = PlannedDeletion {
+            key: key.clone(),
+            size,
+            snapshot: snapshot_private_state_file(&store, &key)?,
+        };
+        let visible_root = store.layout().worktree_dir().to_path_buf();
+        let saved_root = temporary.path().join("saved-state-root");
+        let replacement_before = RefCell::new(None);
+
+        let result = remove_regular_state_file_with_hook(&store, &object, |_| {
+            fs::rename(&visible_root, &saved_root)?;
+            fs::create_dir(&visible_root)?;
+            set_private_test_directory_mode(&visible_root)?;
+            let logs = visible_root.join("logs");
+            fs::create_dir(&logs)?;
+            set_private_test_directory_mode(&logs)?;
+            let version = logs.join("v1");
+            fs::create_dir(&version)?;
+            set_private_test_directory_mode(&version)?;
+            write_private_test_file(&visible_root.join(&key), replacement)?;
+            replacement_before.replace(Some(filesystem_snapshot(&visible_root)?));
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(StateError::Io { .. })));
+        assert_eq!(
+            filesystem_snapshot(&visible_root)?,
+            replacement_before
+                .into_inner()
+                .ok_or_else(|| io::Error::other("root replacement hook did not run"))?
+        );
+        assert_eq!(fs::read(visible_root.join(&key))?, replacement);
+        assert_eq!(fs::read(saved_root.join(&key))?, original);
+        assert!(
+            !gc_quarantine_path(
+                saved_root
+                    .join(&key)
+                    .parent()
+                    .ok_or_else(|| io::Error::other("saved object has no parent"))?,
+                &key,
+            )?
+            .exists()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collection_never_deletes_from_a_replacement_class_directory()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let original = b"planned class replacement";
+        let replacement = b"replacement class payload";
+        let (_, key, size) = store_fixture_log(&store, original)?;
+        let object = PlannedDeletion {
+            key: key.clone(),
+            size,
+            snapshot: snapshot_private_state_file(&store, &key)?,
+        };
+        let visible_object = store.layout().worktree_dir().join(&key);
+        let visible_parent = visible_object
+            .parent()
+            .ok_or_else(|| io::Error::other("state object has no parent"))?
+            .to_path_buf();
+        let saved_parent = temporary.path().join("saved-log-class");
+        let replacement_before = RefCell::new(None);
+
+        let result = remove_regular_state_file_with_hook(&store, &object, |path| {
+            fs::rename(&visible_parent, &saved_parent)?;
+            fs::create_dir(&visible_parent)?;
+            set_private_test_directory_mode(&visible_parent)?;
+            write_private_test_file(path, replacement)?;
+            replacement_before.replace(Some(filesystem_snapshot(&visible_parent)?));
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(StateError::StateChanged { .. })));
+        assert_eq!(
+            filesystem_snapshot(&visible_parent)?,
+            replacement_before
+                .into_inner()
+                .ok_or_else(|| io::Error::other("class replacement hook did not run"))?
+        );
+        assert_eq!(fs::read(&visible_object)?, replacement);
+        assert_eq!(
+            fs::read(
+                saved_parent.join(
+                    visible_object
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("state object has no filename"))?,
+                ),
+            )?,
+            original
+        );
+        assert!(!gc_quarantine_path(&visible_parent, &key)?.exists());
+        assert!(!gc_quarantine_path(&saved_parent, &key)?.exists());
         Ok(())
     }
 
