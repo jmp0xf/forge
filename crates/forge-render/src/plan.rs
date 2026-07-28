@@ -1664,12 +1664,24 @@ mod tests {
         }
     }
 
+    fn fixture_repository_root() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\repo")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/repo")
+        }
+    }
+
     fn model_with_command() -> Result<ProjectModel, Box<dyn Error>> {
+        let root = fixture_repository_root();
         let repository = RepoFacts {
             id: RepoId::from("local:fixture"),
-            root: PathBuf::from("/repo"),
-            git_dir: PathBuf::from("/repo/.git"),
-            git_common_dir: PathBuf::from("/repo/.git"),
+            root: root.clone(),
+            git_dir: root.join(".git"),
+            git_common_dir: root.join(".git"),
             is_linked_worktree: false,
             head: None,
             branch: None,
@@ -2716,6 +2728,7 @@ mod tests {
     fn safe_environment_is_rendered_without_host_paths_and_secrets_are_omitted()
     -> Result<(), Box<dyn Error>> {
         let mut model = model_with_command()?;
+        let gowork = model.repository.root.join("go.work");
         let mut safe = CommandSpec::new(
             "go.test",
             Intent::Test,
@@ -2729,7 +2742,7 @@ mod tests {
         .with_args(["test", "./..."]);
         safe.confidence = Confidence::High;
         safe.env
-            .insert(OsString::from("GOWORK"), OsString::from("/repo/go.work"));
+            .insert(OsString::from("GOWORK"), gowork.as_os_str().to_owned());
         safe.env
             .insert(OsString::from("GOFLAGS"), OsString::from("-mod=readonly"));
         model.commands.insert(
@@ -2750,7 +2763,13 @@ mod tests {
         let safe_preview = std::str::from_utf8(&safe_plan.edits[0].preview_postimage)?;
         assert!(safe_preview.contains("`GOWORK=<repo>/go.work`"));
         assert!(safe_preview.contains("`GOFLAGS=-mod=readonly`"));
-        assert!(!safe_preview.contains("/repo/go.work"));
+        assert!(
+            !safe_preview.contains(
+                gowork
+                    .to_str()
+                    .ok_or("fixture repository path was not UTF-8")?
+            )
+        );
 
         let mut secret = CommandSpec::new(
             "secret.test",
