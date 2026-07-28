@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
-use std::io::{self, Read, Write as _};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -14,9 +14,9 @@ use forge_core::{OperationControl, OperationControlError, UnlimitedOperationCont
 
 use super::{
     AtomicStateStore, GitStateLayout, StateError, StateLock, ensure_private_directory,
-    ensure_private_relative_directories, metadata_is_link_or_reparse, sync_directory,
-    validate_existing_state_directory, validate_private_directory,
-    validate_private_file_permissions, validate_resolved_directory, validate_state_key,
+    metadata_is_link_or_reparse, sync_directory, validate_existing_state_directory,
+    validate_private_directory, validate_private_file_permissions,
+    validate_required_private_state_file, validate_resolved_directory, validate_state_key,
 };
 use crate::fs::{FileSystemError, RepositoryWriter};
 
@@ -2797,9 +2797,11 @@ fn store_new_atomic_idempotent_evidence_with_hook(
         key: key.to_owned(),
         reason: "immutable evidence key must have a version directory".to_owned(),
     })?;
-    ensure_private_relative_directories(store.layout.worktree_dir(), parent)?;
     validate_evidence_root(store)?;
-    validate_evidence_ancestor_permissions(store.layout.worktree_dir(), parent)?;
+    // Validate any existing prefix without creating it by path. The pinned writer owns
+    // component-by-component creation so a concurrent ancestor replacement cannot redirect a
+    // directory side effect before the final handle-relative file commit.
+    let _existing_parent = validate_existing_state_directory(store.layout.worktree_dir(), parent)?;
 
     match write_new_private_evidence_file(store, relative, bytes) {
         Ok(()) => Ok(()),
@@ -2826,140 +2828,20 @@ fn write_new_private_evidence_file(
     relative: &Path,
     bytes: &[u8],
 ) -> Result<(), StateError> {
-    let target = store.layout.worktree_dir().join(relative);
-    let parent = target.parent().ok_or_else(|| StateError::InvalidLayout {
-        path: target.clone(),
-        reason: "immutable evidence target has no parent directory".to_owned(),
-    })?;
-    let mut temporary = new_private_evidence_temporary_file(parent).map_err(|source| {
-        StateError::io(
-            "create private immutable evidence temporary file",
-            parent,
-            source,
-        )
-    })?;
-    clear_inherited_extended_acl_file(temporary.as_file(), temporary.path())?;
-    let temporary_metadata = temporary.as_file().metadata().map_err(|source| {
-        StateError::io(
-            "inspect private immutable evidence temporary file",
-            temporary.path(),
-            source,
-        )
-    })?;
-    validate_private_regular_file(temporary.path(), &temporary_metadata)?;
-    temporary.as_file_mut().write_all(bytes).map_err(|source| {
-        StateError::io(
-            "write private immutable evidence temporary file",
-            temporary.path(),
-            source,
-        )
-    })?;
-    temporary.as_file_mut().flush().map_err(|source| {
-        StateError::io(
-            "flush private immutable evidence temporary file",
-            temporary.path(),
-            source,
-        )
-    })?;
-    temporary.as_file().sync_all().map_err(|source| {
-        StateError::io(
-            "synchronize private immutable evidence temporary file",
-            temporary.path(),
-            source,
-        )
-    })?;
-
-    let parent_relative = relative.parent().ok_or_else(|| StateError::InvalidLayout {
-        path: target.clone(),
-        reason: "immutable evidence target has no version directory".to_owned(),
-    })?;
-    validate_evidence_root(store)?;
-    validate_evidence_ancestor_permissions(store.layout.worktree_dir(), parent_relative)?;
-    #[cfg(windows)]
-    let persistence_target = super::windows::verbatim_child_path(&target).map_err(|source| {
-        StateError::io(
-            "resolve private Windows evidence target without following the final path",
-            &target,
-            source,
-        )
-    })?;
-    #[cfg(not(windows))]
-    let persistence_target = target.clone();
-    #[cfg(windows)]
-    let persisted = {
-        super::windows::persist_private_file_noclobber(temporary.path(), &persistence_target)
-            .map_err(|source| {
-                StateError::io(
-                    "atomically create private immutable evidence object",
-                    &target,
-                    source,
-                )
-            })?;
-        temporary.into_file()
-    };
-    #[cfg(not(windows))]
-    let persisted = temporary
-        .persist_noclobber(&persistence_target)
-        .map_err(|error| {
-            StateError::io(
-                "atomically create private immutable evidence object",
-                &target,
-                error.error,
-            )
-        })?;
-    sync_directory(parent)?;
-    let persisted_metadata = persisted.metadata().map_err(|source| {
-        StateError::io(
-            "inspect persisted immutable evidence object",
-            &target,
-            source,
-        )
-    })?;
-    validate_private_regular_file(&target, &persisted_metadata)?;
-    #[cfg(not(windows))]
-    let path_metadata = fs::symlink_metadata(&target).map_err(|source| {
-        StateError::io(
-            "reinspect persisted immutable evidence object path",
-            &target,
-            source,
-        )
-    })?;
-    #[cfg(windows)]
-    let persisted_still_named = super::windows::file_handle_still_names_path(
-        &persisted,
-        &target,
-        super::windows_acl_policy::PrivateWindowsObjectKind::File,
-    )?;
-    #[cfg(not(windows))]
-    let persisted_still_named = same_file_object(&persisted_metadata, &path_metadata);
-    if !persisted_still_named {
-        return Err(StateError::StateChanged {
-            key: relative.to_string_lossy().into_owned(),
-        });
-    }
-    Ok(())
+    write_new_private_evidence_file_with_before_commit(store, relative, bytes, || Ok(()))
 }
 
-#[cfg(unix)]
-fn new_private_evidence_temporary_file(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o600))
-        .tempfile_in(parent)
-}
-
-#[cfg(windows)]
-fn new_private_evidence_temporary_file(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
-    let parent = fs::canonicalize(parent)?;
-    tempfile::Builder::new()
-        .prefix(".forge-state-")
-        .make_in(&parent, super::windows::create_private_file_new)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn new_private_evidence_temporary_file(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
-    tempfile::NamedTempFile::new_in(parent)
+fn write_new_private_evidence_file_with_before_commit(
+    store: &AtomicStateStore,
+    relative: &Path,
+    bytes: &[u8],
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> Result<(), StateError> {
+    store
+        .writer
+        .write_atomic_private_new_with_before_commit(relative, bytes, before_commit)
+        .map_err(StateError::PathSafety)?;
+    validate_required_private_state_file(store.layout.worktree_dir(), relative)
 }
 
 fn validate_evidence_root(store: &AtomicStateStore) -> Result<(), StateError> {
@@ -3523,6 +3405,8 @@ fn validate_private_evidence_directory_permissions(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(unix, windows))]
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::fs;
@@ -3547,6 +3431,7 @@ mod tests {
         ReceiptRetentionMetadata, ReceiptStateReference, StateError, UtcTimestampError,
         ensure_retained_budget, format_utc_rfc3339, log_content_address, parse_utc_rfc3339,
         stream_opened_private_state_file_with_hook, validate_state_key,
+        write_new_private_evidence_file_with_before_commit,
     };
     #[cfg(unix)]
     use super::{
@@ -3992,6 +3877,82 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read(outside)?, expected);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn immutable_evidence_create_never_enters_a_replacement_parent() -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let relative = PathBuf::from(format!("logs/v1/{}.log", object_name(9)?.as_str()));
+        let visible_parent = store.layout().worktree_dir().join("logs/v1");
+        let saved_parent = temporary.path().join("saved-v1");
+        let replacement_target = visible_parent.join(
+            relative
+                .file_name()
+                .ok_or("immutable evidence fixture omitted its leaf")?,
+        );
+        let saved_target = saved_parent.join(
+            relative
+                .file_name()
+                .ok_or("immutable evidence fixture omitted its leaf")?,
+        );
+        let swap_completed = Cell::new(false);
+
+        let result = write_new_private_evidence_file_with_before_commit(
+            &store,
+            &relative,
+            b"pinned evidence",
+            || {
+                fs::rename(&visible_parent, &saved_parent)?;
+                fs::create_dir(&visible_parent)?;
+                swap_completed.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(
+            !replacement_target.exists(),
+            "immutable Evidence bytes entered the replacement state tree"
+        );
+
+        #[cfg(unix)]
+        {
+            assert!(swap_completed.get());
+            assert_eq!(fs::read(&saved_target)?, b"pinned evidence");
+        }
+
+        #[cfg(windows)]
+        {
+            if swap_completed.get() {
+                assert!(visible_parent.is_dir());
+                assert!(saved_parent.is_dir());
+                if saved_target.exists() {
+                    assert_eq!(fs::read(&saved_target)?, b"pinned evidence");
+                }
+            } else {
+                assert!(visible_parent.is_dir());
+                assert!(!saved_parent.exists());
+                assert!(!saved_target.exists());
+            }
+        }
+
+        for parent in [&visible_parent, &saved_parent] {
+            if !parent.is_dir() {
+                continue;
+            }
+            let temporary_count = fs::read_dir(parent)?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".forge-tmp-")
+                })
+                .count();
+            assert_eq!(temporary_count, 0, "{}", parent.display());
+        }
         Ok(())
     }
 

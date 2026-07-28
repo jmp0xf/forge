@@ -443,7 +443,30 @@ impl RepositoryWriter {
         relative_path: impl AsRef<Path>,
         bytes: &[u8],
     ) -> Result<(), FileSystemError> {
-        self.write_atomic_new_with_mode(relative_path.as_ref(), bytes, NewFileMode::Private)
+        self.write_atomic_private_new_with_before_commit(relative_path, bytes, || Ok(()))
+    }
+
+    /// Atomically creates one private file through the pinned repository root while exposing the
+    /// final pre-commit boundary to state-layer race tests.
+    pub(crate) fn write_atomic_private_new_with_before_commit(
+        &self,
+        relative_path: impl AsRef<Path>,
+        bytes: &[u8],
+        before_commit: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .write_atomic(
+                &normalized,
+                bytes,
+                NewFileMode::Private,
+                CommitMode::CreateNew,
+                before_commit,
+            )
+            .map_err(|source| {
+                FileSystemError::io("atomically create private repository file", target, source)
+            })
     }
 
     fn write_atomic_new_with_mode(

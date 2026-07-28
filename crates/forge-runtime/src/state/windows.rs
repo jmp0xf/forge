@@ -41,8 +41,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL,
-    WRITE_DAC,
+    GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -265,19 +264,6 @@ pub(super) fn open_private_file_read(path: &Path) -> io::Result<File> {
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
         None,
     )
-}
-
-pub(super) fn persist_private_file_noclobber(source: &Path, target: &Path) -> io::Result<()> {
-    let source = win32_path(source)?;
-    let target = win32_path(target)?;
-    // SAFETY: both paths are NUL-terminated. Omitting MOVEFILE_REPLACE_EXISTING preserves the
-    // immutable no-clobber contract; the temporary file is created in the target directory, so
-    // this is a same-volume rename. After the caller has synchronized the temporary file,
-    // WRITE_THROUGH asks Windows not to return until the move is actually performed on disk.
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub(super) fn set_owner_only_acl(
