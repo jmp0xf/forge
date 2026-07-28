@@ -613,6 +613,7 @@ mod windows_wide_path_fixture {
     const MIN_TEST_PATH_UNITS: usize = CLASSIC_MAX_PATH_UNITS + 64;
     const MAX_TEST_PATH_UNITS: usize = 1_024;
     const UNC_ROOT_ENV: &str = "FORGE_WINDOWS_UNC_TEST_ROOT";
+    const GIT_BOOTSTRAP_WORKTREE: &str = "git-bootstrap-worktree";
     const WIDE_TRACKED_NAME: &str = "tracked path-路径-🧪.txt";
 
     #[test]
@@ -701,7 +702,34 @@ mod windows_wide_path_fixture {
 
         let human_agents = b"# Human guidance\r\n\r\nKeep this byte-for-byte.\r\n";
         fs::write(fixture.worktree.join("AGENTS.md"), human_agents)?;
-        fixture.initialize_git()?;
+        initialize_git_then_move_to_long_path(&fixture)?;
+
+        assert!(fixture.worktree.join(".git").is_dir());
+        assert!(fs::read(&fixture.global_git_config)?.is_empty());
+        let bare = fixture.git_stdout_in(
+            &fixture.worktree,
+            &["config", "--local", "--type=bool", "--get", "core.bare"],
+        )?;
+        assert_eq!(String::from_utf8(bare)?.trim(), "false");
+        let head = fixture.git_stdout_in(
+            &fixture.worktree,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+        )?;
+        assert!(!String::from_utf8(head)?.trim().is_empty());
+        let reported_worktree =
+            fixture.git_stdout_in(&fixture.worktree, &["rev-parse", "--show-toplevel"])?;
+        assert_eq!(
+            fs::canonicalize(PathBuf::from(String::from_utf8(reported_worktree)?.trim()))?,
+            canonical_worktree
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.git_dir(&fixture.worktree)?)?,
+            fs::canonicalize(fixture.worktree.join(".git"))?
+        );
+        assert!(
+            !fixture.root.join(GIT_BOOTSTRAP_WORKTREE).exists(),
+            "short Git bootstrap worktree remained after relocation"
+        );
 
         let tracked =
             fixture.git_stdout_in(&fixture.worktree, &["ls-files", "--cached", "-z", "--"])?;
@@ -791,13 +819,58 @@ mod windows_wide_path_fixture {
             )
             .into());
         }
-        let fixture =
-            FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())?;
-        // Keep long-path handling independent of the runner's ambient Git configuration. The
-        // explicit repository options below avoid `-C`'s pre-configuration directory change;
-        // this isolated setting governs subsequent Git for Windows path access.
-        fs::write(&fixture.global_git_config, b"[core]\n\tlongpaths = true\n")?;
-        Ok(fixture)
+        FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())
+    }
+
+    fn initialize_git_then_move_to_long_path(
+        fixture: &FixtureWorkspace,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bootstrap_worktree = fixture.root.join(GIT_BOOTSTRAP_WORKTREE);
+        let bootstrap_units = wide_units(&bootstrap_worktree);
+        if bootstrap_units >= CLASSIC_MAX_PATH_UNITS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Git bootstrap path has {bootstrap_units} UTF-16 units; expected fewer than {CLASSIC_MAX_PATH_UNITS}"
+                ),
+            )
+            .into());
+        }
+
+        fs::rename(&fixture.worktree, &bootstrap_worktree).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "move long fixture worktree to short Git bootstrap path {}: {error}",
+                    bootstrap_worktree.display()
+                ),
+            )
+        })?;
+        if let Err(initialize_error) = fixture.initialize_git_in(&bootstrap_worktree) {
+            return match fs::rename(&bootstrap_worktree, &fixture.worktree) {
+                Ok(()) => Err(io::Error::other(format!(
+                    "initialize fixture Git repository at short path; restored original worktree: {initialize_error}"
+                ))
+                .into()),
+                Err(restore_error) => Err(io::Error::other(format!(
+                    "initialize fixture Git repository at short path: {initialize_error}; restoring {} to {} also failed: {restore_error}",
+                    bootstrap_worktree.display(),
+                    fixture.worktree.display()
+                ))
+                .into()),
+            };
+        }
+        fs::rename(&bootstrap_worktree, &fixture.worktree).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "move initialized fixture from {} to long worktree {}: {error}",
+                    bootstrap_worktree.display(),
+                    fixture.worktree.display()
+                ),
+            )
+        })?;
+        Ok(())
     }
 
     fn without_verbatim_prefix(path: &Path) -> PathBuf {
@@ -1921,18 +1994,25 @@ impl FixtureWorkspace {
     }
 
     fn initialize_git(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_git(&["init", "--quiet"])?;
-        self.run_git(&["add", "--all", "--"])?;
-        self.run_git(&[
-            "-c",
-            "user.name=Forge fixture tests",
-            "-c",
-            "user.email=forge-fixtures@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture baseline",
-        ])?;
+        self.initialize_git_in(&self.worktree)
+    }
+
+    fn initialize_git_in(&self, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_git_in(cwd, &["init", "--quiet"])?;
+        self.run_git_in(cwd, &["add", "--all", "--"])?;
+        self.run_git_in(
+            cwd,
+            &[
+                "-c",
+                "user.name=Forge fixture tests",
+                "-c",
+                "user.email=forge-fixtures@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture baseline",
+            ],
+        )?;
         Ok(())
     }
 
@@ -1978,9 +2058,9 @@ impl FixtureWorkspace {
                 .arg("-c")
                 .arg("core.longpaths=true");
             if requires_explicit_repository {
-                // Both `-C <path>` and `init <path>` change directory before Git reads
-                // `core.longpaths`. Explicit repository options avoid that pre-config chdir;
-                // `init` and later worktree commands load the isolated config before access.
+                // The wide-path fixture constructs a normal repository at a short path and moves
+                // it here with Rust. These options let subsequent Git commands access that
+                // existing repository without Git's pre-configuration `-C` directory change.
                 let mut git_dir = OsString::from("--git-dir=");
                 git_dir.push(cwd.join(".git"));
                 let mut work_tree = OsString::from("--work-tree=");
