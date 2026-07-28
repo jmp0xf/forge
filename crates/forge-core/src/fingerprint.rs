@@ -41,8 +41,11 @@ pub const COMMAND_SET_DEPENDENCY_PROTOCOL_VERSION: &str = "forge.command-set-dep
 /// Marker protocol for process failures that cannot provide stream observations.
 pub const PROCESS_OUTPUT_UNAVAILABLE_PROTOCOL_VERSION: &str = "forge.process-output-unavailable/v1";
 
-/// Complete local-evidence behavior composition frozen by ADR-0020.
-pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v6";
+/// Fixed-size, content-free diagnostic summary recorded for each command observation.
+pub const COMMAND_DIAGNOSTIC_SUMMARY_PROTOCOL_VERSION: &str = "forge.command-diagnostic-summary/v1";
+
+/// Complete local-evidence behavior composition frozen by ADR-0020 and extended by ADR-0032.
+pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v7";
 
 // Existing behavior identifiers are repeated here as composition inputs because their defining
 // modules deliberately keep implementation domains private. A change to any implementation must
@@ -510,6 +513,10 @@ pub fn evidence_behavior_digest<H: Hasher + ?Sized>(hasher: &H) -> Digest {
             ),
             behavior_component("policy-digest-domain", EFFECTIVE_POLICY_DIGEST_DOMAIN),
             behavior_component("process-output-digest-domain", PROCESS_OUTPUT_DIGEST_DOMAIN),
+            behavior_component(
+                "command-diagnostic-summary",
+                COMMAND_DIAGNOSTIC_SUMMARY_PROTOCOL_VERSION.as_bytes(),
+            ),
             behavior_component(
                 "process-output-unavailable",
                 PROCESS_OUTPUT_UNAVAILABLE_PROTOCOL_VERSION.as_bytes(),
@@ -1994,10 +2001,14 @@ mod tests {
     }
 
     #[test]
-    fn evidence_behavior_digest_is_pinned_to_operation_control_and_coverage_v2() {
+    fn evidence_behavior_digest_is_pinned_to_diagnostic_summary_and_coverage_v2() {
         assert_eq!(
             EVIDENCE_BEHAVIOR_PROTOCOL_VERSION,
-            "forge.evidence-behavior/v6"
+            "forge.evidence-behavior/v7"
+        );
+        assert_eq!(
+            COMMAND_DIAGNOSTIC_SUMMARY_PROTOCOL_VERSION,
+            "forge.command-diagnostic-summary/v1"
         );
         assert_eq!(
             OPERATION_CONTROL_PROTOCOL_VERSION,
@@ -2009,7 +2020,7 @@ mod tests {
         );
         assert_eq!(
             evidence_behavior_digest(&FixtureHasher).as_str(),
-            "fixture:2ff6f5d16b92507f"
+            "fixture:55d288e3d97b3fb1"
         );
     }
 

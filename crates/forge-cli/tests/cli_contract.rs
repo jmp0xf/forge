@@ -2977,6 +2977,16 @@ fn evidence_run_json_is_the_exact_persisted_receipt_and_contains_no_child_output
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0]["raw_exit_code"], 0);
     assert!(observations[0]["stdout_total_bytes"].as_u64().is_some());
+    assert_eq!(observations[0]["diagnostic_summary"]["state"], "observed");
+    assert_eq!(
+        observations[0]["diagnostic_summary"]["stdout_total_bytes"],
+        observations[0]["stdout_total_bytes"]
+    );
+    assert!(
+        observations[0]["diagnostic_summary"]["stderr_total_bytes"]
+            .as_u64()
+            .is_some()
+    );
     assert!(observations[0]["stdout_digest"].as_str().is_some());
     assert!(observations[0]["stderr_digest"].as_str().is_some());
     assert!(observations[0]["json_error_status"].is_null());
@@ -3044,6 +3054,17 @@ fn missing_executable_persists_a_typed_infrastructure_receipt()
     let observation = &document["data"]["observations"][0];
     assert_eq!(observation["process_error_kind"], "executable-unavailable");
     assert_eq!(observation["outcome"], "infrastructure-failure");
+    assert_eq!(observation["diagnostic_summary"]["state"], "unavailable");
+    assert!(
+        observation["diagnostic_summary"]
+            .get("stdout_total_bytes")
+            .is_none()
+    );
+    assert!(
+        observation["diagnostic_summary"]
+            .get("stderr_total_bytes")
+            .is_none()
+    );
     assert!(observation["raw_exit_code"].is_null());
     assert!(observation.get("stdout_total_bytes").is_none());
     assert!(observation.get("stdout_truncated").is_none());

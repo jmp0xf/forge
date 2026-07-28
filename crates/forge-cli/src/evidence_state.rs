@@ -525,6 +525,9 @@ pub(crate) fn prepare_receipt(
     mut envelope: Envelope<ReceiptV2Data>,
 ) -> Result<PreparedEvidenceStateObject, EvidenceStateDecodeError> {
     validate_writable_envelope(&envelope.schema, envelope.ok, envelope.truncated, "receipt")?;
+    if !validate_receipt_v2_semantics(&envelope.data, false)?.diagnostic_summaries_are_current {
+        return Err(EvidenceStateDecodeError::Malformed);
+    }
     let raw = serde_json::to_value(&envelope).map_err(|_| EvidenceStateDecodeError::Malformed)?;
     let (public_id, _) = calculate_identity(&raw, DocumentKind::Receipt)?;
     envelope.data.id = ReceiptId::new(public_id);
@@ -644,6 +647,7 @@ fn decode_receipt(
                 log_references: known_log_references,
                 log_references_complete,
                 can_support_current_evidence,
+                diagnostic_summaries_are_current: _,
             } = validate_receipt_v2_semantics(&envelope.data, has_unknown_contract_content)?;
             let log_references = if has_unknown_contract_content || !log_references_complete {
                 ReferenceClosure::retain_all()
@@ -1023,6 +1027,7 @@ struct ReceiptV2SemanticValidation {
     log_references: BTreeSet<EvidenceStateObjectName>,
     log_references_complete: bool,
     can_support_current_evidence: bool,
+    diagnostic_summaries_are_current: bool,
 }
 
 fn validate_receipt_v2_semantics(
@@ -1043,6 +1048,7 @@ fn validate_receipt_v2_semantics(
     let mut command_ids = BTreeSet::new();
     let mut aggregate_inputs = Vec::with_capacity(receipt.observations.len());
     let mut aggregate_is_complete = !matches!(receipt.outcome, OutcomeData::Unknown);
+    let mut diagnostic_summaries_are_current = true;
     let mut observation_logs = BTreeSet::new();
     let mut observation_logs_are_complete = true;
     for observation in &receipt.observations {
@@ -1060,6 +1066,8 @@ fn validate_receipt_v2_semantics(
         let observation_outcome = outcome_from_wire(observation.outcome);
         let observation_outcome_validation =
             validate_observation_outcome(observation, observation_outcome)?;
+        diagnostic_summaries_are_current &=
+            observation_outcome_validation.diagnostic_summary_is_current;
         let logs = decode_log_references(&observation.log_refs)?;
         observation_logs_are_complete &= logs.complete;
         observation_logs.extend(logs.references);
@@ -1113,6 +1121,7 @@ fn validate_receipt_v2_semantics(
         log_references: top_logs.references,
         log_references_complete: top_logs.complete && observation_logs_are_complete,
         can_support_current_evidence,
+        diagnostic_summaries_are_current,
     })
 }
 
@@ -1178,6 +1187,52 @@ fn success_predicate_contains_unknown(predicate: &forge_schema::SuccessPredicate
 struct ObservationOutcomeValidation {
     aggregate_is_known: bool,
     can_support_current_evidence: bool,
+    diagnostic_summary_is_current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticSummaryValidation {
+    LegacyOrUnknown,
+    Observed,
+    Unavailable,
+}
+
+fn validate_diagnostic_summary(
+    observation: &forge_schema::CommandObservationV2Data,
+    has_unavailable_marker: bool,
+) -> Result<DiagnosticSummaryValidation, EvidenceStateDecodeError> {
+    use forge_schema::CommandDiagnosticSummaryStateV2Data;
+
+    let Some(summary) = &observation.diagnostic_summary else {
+        return Ok(DiagnosticSummaryValidation::LegacyOrUnknown);
+    };
+    match summary.state {
+        CommandDiagnosticSummaryStateV2Data::Observed => {
+            if summary.stdout_total_bytes.is_none()
+                || summary.stderr_total_bytes.is_none()
+                || summary.stdout_total_bytes != observation.stdout_total_bytes
+                || observation.process_error_kind.is_some()
+                || has_unavailable_marker
+            {
+                return Err(EvidenceStateDecodeError::Malformed);
+            }
+            Ok(DiagnosticSummaryValidation::Observed)
+        }
+        CommandDiagnosticSummaryStateV2Data::Unavailable => {
+            if summary.stdout_total_bytes.is_some()
+                || summary.stderr_total_bytes.is_some()
+                || observation.process_error_kind.is_none()
+                || !has_unavailable_marker
+            {
+                return Err(EvidenceStateDecodeError::Malformed);
+            }
+            Ok(DiagnosticSummaryValidation::Unavailable)
+        }
+        CommandDiagnosticSummaryStateV2Data::Unknown => {
+            Ok(DiagnosticSummaryValidation::LegacyOrUnknown)
+        }
+        _ => Ok(DiagnosticSummaryValidation::LegacyOrUnknown),
+    }
 }
 
 fn validate_observation_outcome(
@@ -1188,6 +1243,7 @@ fn validate_observation_outcome(
         process_output_unavailable_digests(&Blake3Hasher);
     let has_unavailable_marker = observation.stdout_digest == unavailable_stdout
         || observation.stderr_digest == unavailable_stderr;
+    let diagnostic_summary = validate_diagnostic_summary(observation, has_unavailable_marker)?;
     if observation.process_error_kind.is_some() {
         if !matches!(recorded, EvidenceOutcome::InfrastructureFailure)
             || observation.raw_exit_code.is_some()
@@ -1210,6 +1266,8 @@ fn validate_observation_outcome(
             // An infrastructure observation is explicit and aggregatable, but it can never prove
             // that the selected command satisfied its declared success predicate.
             can_support_current_evidence: false,
+            diagnostic_summary_is_current: diagnostic_summary
+                == DiagnosticSummaryValidation::Unavailable,
         });
     }
     // Current unavailable markers are sentinels, not output digests. Removing the typed kind must
@@ -1234,6 +1292,8 @@ fn validate_observation_outcome(
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: false,
             can_support_current_evidence: false,
+            diagnostic_summary_is_current: diagnostic_summary
+                == DiagnosticSummaryValidation::Observed,
         });
     }
     if observation.raw_exit_code.is_none()
@@ -1247,6 +1307,7 @@ fn validate_observation_outcome(
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: true,
             can_support_current_evidence: false,
+            diagnostic_summary_is_current: false,
         });
     }
     let legacy_truncation_is_ambiguous = !stream_truncation_is_complete
@@ -1278,6 +1339,8 @@ fn validate_observation_outcome(
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: false,
             can_support_current_evidence: false,
+            diagnostic_summary_is_current: diagnostic_summary
+                == DiagnosticSummaryValidation::Observed,
         });
     };
     if expected != recorded {
@@ -1288,7 +1351,9 @@ fn validate_observation_outcome(
     Ok(ObservationOutcomeValidation {
         aggregate_is_known: true,
         can_support_current_evidence: observation.stdout_total_bytes.is_some()
-            && stream_truncation_is_complete,
+            && stream_truncation_is_complete
+            && diagnostic_summary == DiagnosticSummaryValidation::Observed,
+        diagnostic_summary_is_current: diagnostic_summary == DiagnosticSummaryValidation::Observed,
     })
 }
 
@@ -1722,6 +1787,11 @@ mod tests {
                         "duration_ms": 10,
                         "timed_out": false,
                         "interrupted": false,
+                        "diagnostic_summary": {
+                            "state": "observed",
+                            "stdout_total_bytes": 0,
+                            "stderr_total_bytes": 0
+                        },
                         "stdout_digest": "blake3:stdout",
                         "stdout_total_bytes": 0,
                         "stderr_digest": "blake3:stderr",
@@ -1773,6 +1843,10 @@ mod tests {
         observation.insert(
             String::from("process_error_kind"),
             json!(process_error_kind),
+        );
+        observation.insert(
+            String::from("diagnostic_summary"),
+            json!({"state": "unavailable"}),
         );
         observation.insert(String::from("stdout_digest"), json!(stdout_digest.as_str()));
         observation.insert(String::from("stderr_digest"), json!(stderr_digest.as_str()));
@@ -2245,6 +2319,115 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_summary_is_compatible_on_read_and_required_for_current_writes() -> TestResult {
+        let current = receipt_value(json!([]))?;
+        assert!(load_v2_receipt_fixture(&current)?.can_support_current_evidence);
+
+        let mut legacy = current.clone();
+        legacy["data"]["observations"][0]
+            .as_object_mut()
+            .ok_or_else(|| std::io::Error::other("observation is not an object"))?
+            .remove("diagnostic_summary");
+        legacy = sign(legacy, DocumentKind::Receipt)?;
+        assert!(!load_v2_receipt_fixture(&legacy)?.can_support_current_evidence);
+        let legacy: Envelope<ReceiptV2Data> = serde_json::from_value(legacy)?;
+        assert_eq!(
+            prepare_receipt(legacy),
+            Err(forge_runtime::state::EvidenceStateDecodeError::Malformed)
+        );
+
+        let mut future = current.clone();
+        future["data"]["observations"][0]["diagnostic_summary"]["state"] = json!("future-summary");
+        future = sign(future, DocumentKind::Receipt)?;
+        assert!(!load_v2_receipt_fixture(&future)?.can_support_current_evidence);
+        let future: Envelope<ReceiptV2Data> = serde_json::from_value(future)?;
+        assert_eq!(
+            prepare_receipt(future),
+            Err(forge_runtime::state::EvidenceStateDecodeError::Malformed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_summary_known_states_require_exact_stream_facts() -> TestResult {
+        let current = receipt_value(json!([]))?;
+        for field in ["stdout_total_bytes", "stderr_total_bytes"] {
+            let mut missing = current.clone();
+            missing["data"]["observations"][0]["diagnostic_summary"]
+                .as_object_mut()
+                .ok_or_else(|| std::io::Error::other("summary is not an object"))?
+                .remove(field);
+            missing = sign(missing, DocumentKind::Receipt)?;
+            assert_eq!(
+                JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &bytes(&missing)?),
+                Err(forge_runtime::state::EvidenceStateDecodeError::Malformed),
+                "field: {field}"
+            );
+        }
+
+        let mut mismatched = current.clone();
+        mismatched["data"]["observations"][0]["diagnostic_summary"]["stdout_total_bytes"] =
+            json!(1);
+        mismatched = sign(mismatched, DocumentKind::Receipt)?;
+        assert_eq!(
+            JsonEvidenceStateCodec.decode_receipt(EvidenceStateVersion::V2, &bytes(&mismatched)?,),
+            Err(forge_runtime::state::EvidenceStateDecodeError::Malformed)
+        );
+
+        let mut unavailable_normal = current.clone();
+        unavailable_normal["data"]["observations"][0]["diagnostic_summary"] =
+            json!({"state": "unavailable"});
+        unavailable_normal = sign(unavailable_normal, DocumentKind::Receipt)?;
+        assert_eq!(
+            JsonEvidenceStateCodec
+                .decode_receipt(EvidenceStateVersion::V2, &bytes(&unavailable_normal)?,),
+            Err(forge_runtime::state::EvidenceStateDecodeError::Malformed)
+        );
+
+        let mut observed_failure = typed_infrastructure_receipt("spawn")?;
+        observed_failure["data"]["observations"][0]["diagnostic_summary"] = json!({
+            "state": "observed",
+            "stdout_total_bytes": 0,
+            "stderr_total_bytes": 0
+        });
+        observed_failure = sign(observed_failure, DocumentKind::Receipt)?;
+        assert_eq!(
+            JsonEvidenceStateCodec
+                .decode_receipt(EvidenceStateVersion::V2, &bytes(&observed_failure)?,),
+            Err(forge_runtime::state::EvidenceStateDecodeError::Malformed)
+        );
+
+        let mut unavailable_with_count = typed_infrastructure_receipt("spawn")?;
+        unavailable_with_count["data"]["observations"][0]["diagnostic_summary"]["stderr_total_bytes"] =
+            json!(1);
+        unavailable_with_count = sign(unavailable_with_count, DocumentKind::Receipt)?;
+        assert_eq!(
+            JsonEvidenceStateCodec
+                .decode_receipt(EvidenceStateVersion::V2, &bytes(&unavailable_with_count)?,),
+            Err(forge_runtime::state::EvidenceStateDecodeError::Malformed)
+        );
+
+        let mut unavailable_with_explicit_null = typed_infrastructure_receipt("spawn")?;
+        unavailable_with_explicit_null["data"]["observations"][0]["diagnostic_summary"]["stdout_total_bytes"] =
+            serde_json::Value::Null;
+        unavailable_with_explicit_null["data"]["observations"][0]["diagnostic_summary"]["stderr_total_bytes"] =
+            serde_json::Value::Null;
+        unavailable_with_explicit_null =
+            sign(unavailable_with_explicit_null, DocumentKind::Receipt)?;
+        assert!(
+            !load_v2_receipt_fixture(&unavailable_with_explicit_null)?.can_support_current_evidence
+        );
+
+        let (_, first_name) = calculate_identity(&current, DocumentKind::Receipt)?;
+        let mut other_stderr_size = current;
+        other_stderr_size["data"]["observations"][0]["diagnostic_summary"]["stderr_total_bytes"] =
+            json!(1);
+        let (_, second_name) = calculate_identity(&other_stderr_size, DocumentKind::Receipt)?;
+        assert_ne!(first_name, second_name);
+        Ok(())
+    }
+
+    #[test]
     fn legacy_missing_v2_facts_and_unknown_status_remain_non_proving() -> TestResult {
         let mut legacy = receipt_value(json!([]))?;
         let data = legacy["data"]
@@ -2255,6 +2438,7 @@ mod tests {
         let observation = legacy["data"]["observations"][0]
             .as_object_mut()
             .ok_or_else(|| std::io::Error::other("observation is not an object"))?;
+        observation.remove("diagnostic_summary");
         observation.remove("stdout_total_bytes");
         observation.remove("json_error_status");
         observation.remove("stdout_truncated");
@@ -2267,6 +2451,7 @@ mod tests {
             return Err("legacy v2 Receipt loaded as the wrong schema generation".into());
         };
         assert_eq!(parsed_legacy.data.observations[0].stdout_total_bytes, None);
+        assert_eq!(parsed_legacy.data.observations[0].diagnostic_summary, None);
         assert_eq!(parsed_legacy.data.observations[0].json_error_status, None);
         assert_eq!(parsed_legacy.data.observations[0].stdout_truncated, None);
         assert_eq!(parsed_legacy.data.observations[0].stderr_truncated, None);
@@ -2302,10 +2487,11 @@ mod tests {
         );
 
         let mut missing_stdout_total = receipt_value(json!([]))?;
-        missing_stdout_total["data"]["observations"][0]
+        let observation = missing_stdout_total["data"]["observations"][0]
             .as_object_mut()
-            .ok_or_else(|| std::io::Error::other("observation is not an object"))?
-            .remove("stdout_total_bytes");
+            .ok_or_else(|| std::io::Error::other("observation is not an object"))?;
+        observation.remove("stdout_total_bytes");
+        observation.remove("diagnostic_summary");
         missing_stdout_total = sign(missing_stdout_total, DocumentKind::Receipt)?;
         assert!(!load_v2_receipt_fixture(&missing_stdout_total)?.can_support_current_evidence);
 
@@ -2906,7 +3092,7 @@ mod tests {
 
         assert_eq!(
             object_name.as_str(),
-            "c5cbf7bbd274525e6ab4215e7a7b06d1e6cca1d6737d9b453c0859122d503db4"
+            "6b076aa57657dc7f2911447c7f060b4b716bdebc94888b7690df8c6c971264b2"
         );
         Ok(())
     }

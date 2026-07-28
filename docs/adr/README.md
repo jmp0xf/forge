@@ -45,6 +45,7 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0029](0029-publish-reviewable-v0-release-candidates.md) | Accepted | 发布可审查、可回滚的 v0 候选版本 |
 | [0030](0030-separate-release-manifest-compatibility-reading-from-candidate-acceptance.md) | Accepted | 分离 release manifest 的兼容读取与候选验收 |
 | [0031](0031-use-native-same-directory-renames-on-windows.md) | Superseded | Windows 使用原生同目录句柄重命名 |
+| [0032](0032-record-content-free-command-diagnostic-summaries.md) | Accepted | 记录不含输出内容的命令诊断摘要 |
 | [0033](0033-use-pinned-target-directory-for-windows-renames.md) | Accepted | Windows 重命名显式使用固定目标目录句柄 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。

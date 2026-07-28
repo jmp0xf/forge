@@ -47,8 +47,8 @@ use forge_runtime::toolchain::{
     required_probes_for_command,
 };
 use forge_schema::{
-    CommandObservationV2Data, ConfidenceData, Diagnostic, Envelope, ReceiptId, ReceiptV2Data,
-    SchemaKind, Severity,
+    CommandDiagnosticSummaryStateV2Data, CommandDiagnosticSummaryV2Data, CommandObservationV2Data,
+    ConfidenceData, Diagnostic, Envelope, ReceiptId, ReceiptV2Data, SchemaKind, Severity,
 };
 
 use crate::args::{Cli, EvidenceRunArgs, IntentChoice};
@@ -80,6 +80,25 @@ struct CommandChainResult {
 struct CommandExecutionPolicy {
     output_limit_bytes: usize,
     timeout_override: Option<Duration>,
+}
+
+fn observed_diagnostic_summary(
+    stdout_total_bytes: u64,
+    stderr_total_bytes: u64,
+) -> CommandDiagnosticSummaryV2Data {
+    CommandDiagnosticSummaryV2Data {
+        state: CommandDiagnosticSummaryStateV2Data::Observed,
+        stdout_total_bytes: Some(stdout_total_bytes),
+        stderr_total_bytes: Some(stderr_total_bytes),
+    }
+}
+
+fn unavailable_diagnostic_summary() -> CommandDiagnosticSummaryV2Data {
+    CommandDiagnosticSummaryV2Data {
+        state: CommandDiagnosticSummaryStateV2Data::Unavailable,
+        stdout_total_bytes: None,
+        stderr_total_bytes: None,
+    }
 }
 
 impl Default for CommandExecutionPolicy {
@@ -424,6 +443,7 @@ where
                     timed_out: error == OperationControlError::TimedOut,
                     interrupted: error == OperationControlError::Interrupted,
                     process_error_kind: None,
+                    diagnostic_summary: Some(observed_diagnostic_summary(0, 0)),
                     stdout_digest,
                     stdout_total_bytes: Some(0),
                     json_error_status: None,
@@ -462,6 +482,7 @@ where
                     timed_out: error == OperationControlError::TimedOut,
                     interrupted: error == OperationControlError::Interrupted,
                     process_error_kind: None,
+                    diagnostic_summary: Some(observed_diagnostic_summary(0, 0)),
                     stdout_digest,
                     stdout_total_bytes: Some(0),
                     json_error_status: None,
@@ -502,6 +523,7 @@ where
                     timed_out: false,
                     interrupted: false,
                     process_error_kind: Some(process_error_kind_to_wire(error.kind())),
+                    diagnostic_summary: Some(unavailable_diagnostic_summary()),
                     stdout_digest,
                     stdout_total_bytes: None,
                     json_error_status: None,
@@ -536,8 +558,8 @@ where
         }
         let observation_duration_ms = duration_millis(observation.duration);
         duration_ms = duration_ms.saturating_add(observation_duration_ms);
-        // v2 carries the complete stdout byte count needed by success predicates. It has no stderr
-        // total field, so we preserve the complete stderr digest and never invent a byte count.
+        // The compatibility field carries stdout length for success predicates. The fixed-size
+        // diagnostic summary records both complete stream lengths without retaining output text.
         let output_truncated = observation.stdout_truncated || observation.stderr_truncated;
         observations.push(CommandObservationV2Data {
             command: detail,
@@ -548,6 +570,10 @@ where
             timed_out: observation.timed_out,
             interrupted: observation.interrupted,
             process_error_kind: None,
+            diagnostic_summary: Some(observed_diagnostic_summary(
+                observation.stdout_total_bytes,
+                observation.stderr_total_bytes,
+            )),
             stdout_digest: observation.stdout_digest,
             stdout_total_bytes: Some(observation.stdout_total_bytes),
             json_error_status: None,
@@ -1363,6 +1389,21 @@ mod tests {
         assert!(!chain.observations[0].timed_out);
         assert!(chain.observations[1].timed_out);
         assert_eq!(
+            chain.observations[1]
+                .diagnostic_summary
+                .as_ref()
+                .map(|summary| (
+                    summary.state,
+                    summary.stdout_total_bytes,
+                    summary.stderr_total_bytes,
+                )),
+            Some((
+                forge_schema::CommandDiagnosticSummaryStateV2Data::Observed,
+                Some(0),
+                Some(0),
+            ))
+        );
+        assert_eq!(
             chain.aggregate_inputs[1].outcome(),
             EvidenceOutcome::TimedOut
         );
@@ -1414,10 +1455,94 @@ mod tests {
             forge_schema::OutcomeData::TimedOut
         );
         assert_eq!(
+            chain.observations[0].diagnostic_summary,
+            Some(forge_schema::CommandDiagnosticSummaryV2Data {
+                state: forge_schema::CommandDiagnosticSummaryStateV2Data::Observed,
+                stdout_total_bytes: Some(21),
+                stderr_total_bytes: Some(13),
+            })
+        );
+        assert_eq!(
             seen[0].stdout,
             OutputPolicy::CaptureBounded { max_bytes: 17 }
         );
         assert_eq!(seen[0].stderr, seen[0].stdout);
+        Ok(())
+    }
+
+    #[test]
+    fn operation_control_interrupts_record_empty_observed_summaries_at_both_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for steps in [
+            vec![Err(OperationControlError::Interrupted)],
+            vec![
+                Ok(OperationPermit::unlimited()),
+                Err(OperationControlError::Interrupted),
+            ],
+        ] {
+            let command = command(
+                "interrupted",
+                CommandEnforcement::Required,
+                SuccessPredicate::ExitZero,
+                CoverageDimension::Compile,
+            );
+            let process = FakeProcess::new(Vec::new());
+            let control = ScriptedControl::new(steps);
+
+            let chain = run_command_chain_with_policy_controlled(
+                &process,
+                &Blake3Hasher,
+                &[command],
+                CommandExecutionPolicy::default(),
+                &control,
+                known_dependencies,
+            )
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+
+            assert!(process.seen.borrow().is_empty());
+            assert_eq!(chain.observations.len(), 1);
+            assert!(chain.observations[0].interrupted);
+            assert_eq!(
+                chain.observations[0].diagnostic_summary,
+                Some(forge_schema::CommandDiagnosticSummaryV2Data {
+                    state: forge_schema::CommandDiagnosticSummaryStateV2Data::Observed,
+                    stdout_total_bytes: Some(0),
+                    stderr_total_bytes: Some(0),
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_interruption_records_complete_stream_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = command(
+            "interrupted",
+            CommandEnforcement::Required,
+            SuccessPredicate::ExitZero,
+            CoverageDimension::Compile,
+        );
+        let mut interrupted = observation(0);
+        interrupted.timed_out = false;
+        interrupted.interrupted = true;
+        let process = FakeProcess::new(vec![Ok(interrupted)]);
+
+        let chain = run_command_chain(&process, &[command], known_dependencies)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+
+        assert_eq!(
+            chain.observations[0].outcome,
+            forge_schema::OutcomeData::Interrupted
+        );
+        assert_eq!(
+            chain.observations[0].diagnostic_summary,
+            Some(forge_schema::CommandDiagnosticSummaryV2Data {
+                state: forge_schema::CommandDiagnosticSummaryStateV2Data::Observed,
+                stdout_total_bytes: Some(21),
+                stderr_total_bytes: Some(13),
+            })
+        );
         Ok(())
     }
 
@@ -1478,6 +1603,14 @@ mod tests {
         assert_eq!(recorded.raw_exit_code, Some(7));
         assert_eq!(recorded.signal, None);
         assert_eq!(recorded.stdout_total_bytes, Some(21));
+        assert_eq!(
+            recorded.diagnostic_summary,
+            Some(forge_schema::CommandDiagnosticSummaryV2Data {
+                state: forge_schema::CommandDiagnosticSummaryStateV2Data::Observed,
+                stdout_total_bytes: Some(21),
+                stderr_total_bytes: Some(13),
+            })
+        );
         assert_eq!(recorded.stdout_digest.as_str(), "blake3:stdout");
         assert_eq!(recorded.stderr_digest.as_str(), "blake3:stderr");
         assert_eq!(recorded.stdout_truncated, Some(true));
@@ -1592,6 +1725,14 @@ mod tests {
         );
         assert_eq!(recorded.raw_exit_code, None);
         assert_eq!(recorded.signal, None);
+        assert_eq!(
+            recorded.diagnostic_summary,
+            Some(forge_schema::CommandDiagnosticSummaryV2Data {
+                state: forge_schema::CommandDiagnosticSummaryStateV2Data::Unavailable,
+                stdout_total_bytes: None,
+                stderr_total_bytes: None,
+            })
+        );
         assert_eq!(recorded.stdout_total_bytes, None);
         assert_eq!(recorded.stdout_truncated, None);
         assert_eq!(recorded.stderr_truncated, None);
@@ -1600,6 +1741,58 @@ mod tests {
         assert_eq!(
             aggregate_command_evidence(&chain.aggregate_inputs).outcome(),
             EvidenceOutcome::InfrastructureFailure
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_summary_never_persists_captured_output_or_process_error_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const SECRET: &str = "forge-secret-sentinel-7c9169b8";
+        let command = command(
+            "private-output",
+            CommandEnforcement::Required,
+            SuccessPredicate::ExitZero,
+            CoverageDimension::Compile,
+        );
+        let mut private_output = observation(0);
+        private_output.stdout = [b"\xff".as_slice(), SECRET.as_bytes()].concat();
+        private_output.stderr =
+            [b"\xfe".as_slice(), format!("stderr-{SECRET}").as_bytes()].concat();
+        private_output.stdout_total_bytes = 700_000;
+        private_output.stderr_total_bytes = 800_000;
+        private_output.stdout_truncated = true;
+        private_output.stderr_truncated = true;
+        let process = FakeProcess::new(vec![Ok(private_output)]);
+        let chain = run_command_chain(&process, std::slice::from_ref(&command), known_dependencies)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        assert_eq!(
+            chain.observations[0].diagnostic_summary,
+            Some(forge_schema::CommandDiagnosticSummaryV2Data {
+                state: forge_schema::CommandDiagnosticSummaryStateV2Data::Observed,
+                stdout_total_bytes: Some(700_000),
+                stderr_total_bytes: Some(800_000),
+            })
+        );
+        let encoded = serde_json::to_vec(&chain.observations)?;
+        assert!(
+            !encoded
+                .windows(SECRET.len())
+                .any(|window| window == SECRET.as_bytes())
+        );
+
+        let process = FakeProcess::new(vec![Err(ProcessError::new(
+            ProcessErrorKind::Spawn,
+            "spawn private command",
+            io::Error::other(format!("/private/path/{SECRET}")),
+        ))]);
+        let chain = run_command_chain(&process, &[command], known_dependencies)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let encoded = serde_json::to_vec(&chain.observations)?;
+        assert!(
+            !encoded
+                .windows(SECRET.len())
+                .any(|window| window == SECRET.as_bytes())
         );
         Ok(())
     }
@@ -1727,6 +1920,13 @@ mod tests {
         );
         assert_eq!(chain.observations[0].stdout_truncated, Some(false));
         assert_eq!(chain.observations[0].stderr_truncated, Some(true));
+        assert_eq!(
+            chain.observations[0]
+                .diagnostic_summary
+                .as_ref()
+                .and_then(|summary| summary.stderr_total_bytes),
+            Some(13)
+        );
         assert!(chain.observations[0].output_truncated);
         assert_eq!(
             aggregate_command_evidence(&chain.aggregate_inputs).outcome(),

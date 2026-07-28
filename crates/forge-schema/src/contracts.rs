@@ -783,6 +783,33 @@ pub enum ProcessErrorKindV2Data {
     Unknown,
 }
 
+/// Whether a command's bounded, content-free diagnostic summary was observed.
+///
+/// Unknown future states remain readable but cannot support current Evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum CommandDiagnosticSummaryStateV2Data {
+    Observed,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Fixed-size diagnostic metadata for one command observation.
+///
+/// This deliberately contains no stdout/stderr text. An observed summary carries the complete
+/// byte count for both streams. An unavailable summary carries no numeric count: current writers
+/// omit both optional fields, while same-major readers also accept explicit `null` as absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CommandDiagnosticSummaryV2Data {
+    pub state: CommandDiagnosticSummaryStateV2Data,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_total_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandObservationData {
     pub command: CommandData,
@@ -826,6 +853,12 @@ pub struct CommandObservationV2Data {
     /// populate this field for `infrastructure-failure` observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_error_kind: Option<ProcessErrorKindV2Data>,
+    /// Fixed-size, content-free diagnostic metadata.
+    ///
+    /// Optionality is same-major read compatibility for early v2 writers. Current writers always
+    /// populate this field; a missing or unknown summary cannot support current Evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_summary: Option<CommandDiagnosticSummaryV2Data>,
     pub stdout_digest: Digest,
     /// Complete stdout byte count before any bounded retention or display truncation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1743,8 +1776,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        BaseTaskDependencyV2Data, CheckStatusData, CommandDetailData, CommandEnforcementData,
-        CommandObservationV2Data, CommandResolutionData, CommandSourceData,
+        BaseTaskDependencyV2Data, CheckStatusData, CommandDetailData,
+        CommandDiagnosticSummaryStateV2Data, CommandDiagnosticSummaryV2Data,
+        CommandEnforcementData, CommandObservationV2Data, CommandResolutionData, CommandSourceData,
         ComparisonProtocolV2Data, ConfidenceData, DigestDependencyV2Data, Envelope,
         EvidenceDependencyV2Data, EvidenceV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
         GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
@@ -2580,6 +2614,7 @@ mod tests {
         });
         let legacy_observation: CommandObservationV2Data = serde_json::from_value(legacy.clone())?;
         assert_eq!(legacy_observation.process_error_kind, None);
+        assert_eq!(legacy_observation.diagnostic_summary, None);
         assert_eq!(legacy_observation.stdout_total_bytes, None);
         assert_eq!(legacy_observation.json_error_status, None);
         assert_eq!(legacy_observation.stdout_truncated, None);
@@ -2588,16 +2623,25 @@ mod tests {
 
         let mut current = legacy;
         current["stdout_total_bytes"] = serde_json::json!(0);
-        current["process_error_kind"] = serde_json::json!("executable-unavailable");
+        current["diagnostic_summary"] = serde_json::json!({
+            "state": "observed",
+            "stdout_total_bytes": 0,
+            "stderr_total_bytes": 12
+        });
         current["json_error_status"] = serde_json::json!("no-errors");
         current["stdout_truncated"] = serde_json::json!(false);
         current["stderr_truncated"] = serde_json::json!(true);
         let current: CommandObservationV2Data = serde_json::from_value(current)?;
-        assert_eq!(
-            current.process_error_kind,
-            Some(ProcessErrorKindV2Data::ExecutableUnavailable)
-        );
+        assert_eq!(current.process_error_kind, None);
         assert_eq!(current.stdout_total_bytes, Some(0));
+        assert_eq!(
+            current.diagnostic_summary,
+            Some(CommandDiagnosticSummaryV2Data {
+                state: CommandDiagnosticSummaryStateV2Data::Observed,
+                stdout_total_bytes: Some(0),
+                stderr_total_bytes: Some(12),
+            })
+        );
         assert_eq!(
             current.json_error_status,
             Some(JsonErrorStatusV2Data::NoErrors)
@@ -2610,6 +2654,15 @@ mod tests {
         let future_process_kind: ProcessErrorKindV2Data =
             serde_json::from_str(r#""future-process-kind""#)?;
         assert_eq!(future_process_kind, ProcessErrorKindV2Data::Unknown);
+        let process_kind: ProcessErrorKindV2Data =
+            serde_json::from_str(r#""executable-unavailable""#)?;
+        assert_eq!(process_kind, ProcessErrorKindV2Data::ExecutableUnavailable);
+        let future_summary_state: CommandDiagnosticSummaryStateV2Data =
+            serde_json::from_str(r#""future-summary""#)?;
+        assert_eq!(
+            future_summary_state,
+            CommandDiagnosticSummaryStateV2Data::Unknown
+        );
         assert_eq!(
             serde_json::to_value(JsonErrorStatusV2Data::HasErrors)?,
             serde_json::json!("has-errors")
@@ -2628,6 +2681,7 @@ mod tests {
         for optional in [
             "stdout_total_bytes",
             "process_error_kind",
+            "diagnostic_summary",
             "json_error_status",
             "stdout_truncated",
             "stderr_truncated",
@@ -2656,6 +2710,10 @@ mod tests {
                 "invalid",
                 "unknown"
             ]))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/CommandDiagnosticSummaryStateV2Data/enum"),
+            Some(&serde_json::json!(["observed", "unavailable", "unknown"]))
         );
         assert_eq!(
             schema.pointer("/$defs/ProcessErrorKindV2Data/enum"),

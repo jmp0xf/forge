@@ -1046,6 +1046,12 @@ fn huge_output_fixture_drains_complete_stream_but_bounds_the_receipt()
     let receipt: Value = serde_json::from_slice(&output.stdout)?;
     let observation = &receipt["data"]["observations"][0];
     assert_eq!(observation["stdout_total_bytes"], PAYLOAD_BYTES as u64);
+    assert_eq!(observation["diagnostic_summary"]["state"], "observed");
+    assert_eq!(
+        observation["diagnostic_summary"]["stdout_total_bytes"],
+        PAYLOAD_BYTES as u64
+    );
+    assert_eq!(observation["diagnostic_summary"]["stderr_total_bytes"], 0);
     assert_eq!(observation["stdout_truncated"], true);
     assert_eq!(observation["stderr_truncated"], false);
     assert_eq!(observation["output_truncated"], true);
