@@ -339,6 +339,17 @@ fn execute_with_clock_controlled<C: Clock + ?Sized>(
 /// Recomputes the newest current Receipt set used by `forge next` without acquiring a second
 /// project model. Non-navigable project states still validate any existing private state so a
 /// malformed object cannot be mistaken for an absent Receipt.
+fn navigation_receipts_are_validation_only(
+    completion: ModelDetectionCompletion,
+    work_state: WorkState,
+) -> bool {
+    completion != ModelDetectionCompletion::Complete
+        || !matches!(
+            work_state,
+            WorkState::Clean | WorkState::Dirty | WorkState::Unborn
+        )
+}
+
 pub(crate) fn navigation_receipts_controlled(
     _cli: &Cli,
     detected: &explain::DetectedProject,
@@ -346,12 +357,10 @@ pub(crate) fn navigation_receipts_controlled(
     control: &OperationBudget,
 ) -> Result<NavigationReceiptsOutcome, AppError> {
     let log_max_bytes = configured_log_max_bytes(detected)?;
-    if detected.completion != ModelDetectionCompletion::Complete
-        || !matches!(
-            detected.model.repository.work_state,
-            WorkState::Clean | WorkState::Dirty | WorkState::Unborn
-        )
-    {
+    if navigation_receipts_are_validation_only(
+        detected.completion,
+        detected.model.repository.work_state,
+    ) {
         if let Err(error) =
             validate_retained_receipt_state_controlled(detected, log_max_bytes, control)
         {
@@ -1595,10 +1604,10 @@ mod tests {
     use forge_schema::RepoId;
 
     use super::{
-        add_missing_coverage_expectations, map_scope_confirmation_error, partition_coverage,
-        receipt_order_is_newer, require_same_detection_baseline, require_stable_detection,
-        require_stable_scope, requirements_are_complete, selected_command_count,
-        with_persisted_evidence,
+        add_missing_coverage_expectations, map_scope_confirmation_error,
+        navigation_receipts_are_validation_only, partition_coverage, receipt_order_is_newer,
+        require_same_detection_baseline, require_stable_detection, require_stable_scope,
+        requirements_are_complete, selected_command_count, with_persisted_evidence,
     };
     use crate::explain::DetectedProject;
 
@@ -1675,6 +1684,43 @@ mod tests {
             evidence_requirements: Vec::new(),
             external_requirements: Vec::new(),
             uncertain_assumptions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn navigation_receipts_validate_each_independent_non_navigable_axis() {
+        let cases = [
+            (ModelDetectionCompletion::Complete, WorkState::Clean, false),
+            (ModelDetectionCompletion::Complete, WorkState::Dirty, false),
+            (ModelDetectionCompletion::Complete, WorkState::Unborn, false),
+            (
+                ModelDetectionCompletion::Complete,
+                WorkState::Conflicted,
+                true,
+            ),
+            (ModelDetectionCompletion::Complete, WorkState::Merging, true),
+            (
+                ModelDetectionCompletion::Complete,
+                WorkState::Rebasing,
+                true,
+            ),
+            (ModelDetectionCompletion::Complete, WorkState::Corrupt, true),
+            (ModelDetectionCompletion::Complete, WorkState::Unknown, true),
+            (ModelDetectionCompletion::Partial, WorkState::Unborn, true),
+            (ModelDetectionCompletion::TimedOut, WorkState::Clean, true),
+            (
+                ModelDetectionCompletion::Interrupted,
+                WorkState::Dirty,
+                true,
+            ),
+        ];
+
+        for (completion, work_state, expected) in cases {
+            assert_eq!(
+                navigation_receipts_are_validation_only(completion, work_state),
+                expected,
+                "unexpected validation-only decision for {completion:?}/{work_state:?}"
+            );
         }
     }
 

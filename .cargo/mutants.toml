@@ -54,6 +54,8 @@ examine_re = [
   "validate_evidence_receipt_bindings",
   "requirements_are_complete",
   "partition_coverage",
+  "navigation_receipts_controlled",
+  "navigation_receipts_are_validation_only",
   "require_stable_detection",
   "require_same_detection_baseline",
   "require_stable_scope",
