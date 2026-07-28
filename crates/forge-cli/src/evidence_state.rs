@@ -1711,6 +1711,8 @@ fn receipt_reference(
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fs;
+    use std::path::Path;
 
     use forge_runtime::state::{
         EvidenceRetentionMetadata, EvidenceRetentionTime, EvidenceStateMetadataDecoder as _,
@@ -1981,6 +1983,34 @@ mod tests {
 
     fn bytes(value: &Value) -> Result<Vec<u8>, Box<dyn Error>> {
         Ok(serde_json::to_vec_pretty(value)?)
+    }
+
+    fn validate_fixture_against_checked_in_schema(
+        fixture: &Value,
+        schema_file: &str,
+    ) -> TestResult {
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/schemas")
+            .join(schema_file);
+        let schema: Value = serde_json::from_slice(&fs::read(&schema_path)?)?;
+        assert_eq!(
+            fixture.get("schema"),
+            schema.get("$id"),
+            "fixture and checked-in schema disagree: {}",
+            schema_path.display()
+        );
+        let validator = jsonschema::validator_for(&schema)?;
+        let failures = validator
+            .iter_errors(fixture)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "fixture did not satisfy {}: {failures:#?}\n{}",
+            schema_path.display(),
+            serde_json::to_string_pretty(fixture)?
+        );
+        Ok(())
     }
 
     fn load_v2_receipt_fixture(receipt: &Value) -> Result<super::ValidatedReceipt, Box<dyn Error>> {
@@ -3184,6 +3214,19 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    #[test]
+    fn v1_receipt_and_evidence_fixtures_satisfy_checked_in_schemas() -> TestResult {
+        let receipt = receipt_v1_value()?;
+        validate_fixture_against_checked_in_schema(&receipt, "receipt-v1.schema.json")?;
+
+        let valid_id = receipt["data"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("v1 receipt fixture id is not a string"))?;
+        let stale_id = format!("receipt:blake3:{}", "d".repeat(64));
+        let evidence = evidence_v1_value(valid_id, &stale_id)?;
+        validate_fixture_against_checked_in_schema(&evidence, "evidence-v1.schema.json")
     }
 
     #[test]

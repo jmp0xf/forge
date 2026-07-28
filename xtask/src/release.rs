@@ -4019,6 +4019,37 @@ mod tests {
         let _: forge_schema::ReleaseManifestData = serde_json::from_slice(&manifest)
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
         assert_eq!(manifest_json["schema"], "forge.release-manifest/v1");
+        let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/schemas/release-manifest-v1.schema.json");
+        let checked_in_schema: serde_json::Value =
+            serde_json::from_slice(&fs::read(&schema_path).map_err(|error| {
+                ReleaseError::internal(format!(
+                    "failed to read checked-in release manifest schema: {error}"
+                ))
+            })?)
+            .map_err(|error| {
+                ReleaseError::internal(format!(
+                    "failed to parse checked-in release manifest schema: {error}"
+                ))
+            })?;
+        assert_eq!(
+            manifest_json.get("schema"),
+            checked_in_schema.get("$id"),
+            "rendered manifest and checked-in schema disagree: {}",
+            schema_path.display()
+        );
+        let validator = jsonschema::validator_for(&checked_in_schema)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let schema_failures = validator
+            .iter_errors(&manifest_json)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            schema_failures.is_empty(),
+            "rendered manifest did not satisfy {}: {schema_failures:#?}\n{}",
+            schema_path.display(),
+            String::from_utf8_lossy(&manifest)
+        );
         assert_eq!(
             manifest_json["artifacts"].as_array().map(Vec::len),
             Some(10)
