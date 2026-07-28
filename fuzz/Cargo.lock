@@ -52,7 +52,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "forge-core"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64",
  "forge-schema",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "forge-detect"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "forge-core",
  "serde",
@@ -83,14 +83,15 @@ dependencies = [
 
 [[package]]
 name = "forge-render"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "forge-core",
+ "serde_yaml_ng",
 ]
 
 [[package]]
 name = "forge-schema"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64",
  "schemars",

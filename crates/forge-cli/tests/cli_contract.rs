@@ -718,7 +718,7 @@ fn version_human_output_is_stable_and_quiet() -> Result<(), Box<dyn std::error::
     let output = run(&["version"])?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?, "forge 0.0.0\n");
+    assert_eq!(String::from_utf8(output.stdout)?, "forge 0.1.0-rc.1\n");
     assert!(output.stderr.is_empty());
     Ok(())
 }
@@ -733,7 +733,7 @@ fn version_json_is_one_clean_versioned_envelope() -> Result<(), Box<dyn std::err
     assert_eq!(document["schema"], "forge.version/v1");
     assert_eq!(document["ok"], true);
     assert_eq!(document["data"]["name"], "forge");
-    assert_eq!(document["data"]["version"], "0.0.0");
+    assert_eq!(document["data"]["version"], "0.1.0-rc.1");
     Ok(())
 }
 
