@@ -9,6 +9,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::Value;
 
 const REQUIRED_FIXTURES: &[&str] = &[
@@ -52,6 +53,47 @@ const COMMANDLESS_UNINSTALL_SCENARIOS: &[&str] = &[
 const INIT_MANAGED_PROJECT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "forge.toml"];
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureExitabilityMode {
+    AvailableTools,
+    ReleaseQualification,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ToolProbeOutcome {
+    Available,
+    NotFound,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureCommandExecution {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Serialize)]
+struct FixtureCommandQualification {
+    fixture_id: String,
+    command_index: Option<usize>,
+    intent: Option<String>,
+    program: Option<String>,
+    args: Vec<String>,
+    cwd: Option<String>,
+    probe: String,
+    probe_detail: Option<String>,
+    execution: String,
+}
+
+struct FixtureExitabilityPreflight {
+    source_manifest_identity: String,
+    fixture_count: usize,
+    command_count: usize,
+    scenario_only_fixture_count: usize,
+    probes: BTreeMap<String, ToolProbeOutcome>,
+    commands: Vec<FixtureCommandQualification>,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum WorktreeEntry {
@@ -1027,11 +1069,154 @@ fn crlf_fixture_survives_init_uninstall_and_native_verification()
 #[test]
 fn every_available_native_command_survives_fixture_install_and_uninstall()
 -> Result<(), Box<dyn std::error::Error>> {
+    verify_fixture_exitability(FixtureExitabilityMode::AvailableTools)
+}
+
+#[test]
+#[ignore = "explicit release qualification requires every fixture-native tool"]
+fn every_declared_native_command_survives_fixture_install_and_uninstall_for_release()
+-> Result<(), Box<dyn std::error::Error>> {
+    verify_fixture_exitability(FixtureExitabilityMode::ReleaseQualification)
+}
+
+#[test]
+fn strict_fixture_exitability_preflight_is_complete_deterministic_and_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::json!({
+        "source_manifest_identity": "blake3:test-fixture-exitability",
+        "fixtures": [
+            {
+                "id": "empty-repo",
+                "commands": [],
+            },
+            {
+                "id": "brownfield-just",
+                "commands": [{
+                    "intent": "test",
+                    "program": "just",
+                    "args": ["test"],
+                    "cwd": ".",
+                }],
+            },
+            {
+                "id": "brownfield-adapters",
+                "commands": [{
+                    "intent": "test",
+                    "program": "cargo",
+                    "args": ["test", "--offline"],
+                    "cwd": ".",
+                }],
+            },
+        ],
+    });
+    let mut probed_programs = Vec::new();
+    let preflight = FixtureExitabilityPreflight::from_manifest(&manifest, |program| {
+        probed_programs.push(program.to_owned());
+        match program {
+            "cargo" => ToolProbeOutcome::Available,
+            "just" => ToolProbeOutcome::NotFound,
+            unexpected => ToolProbeOutcome::Failed(format!("unexpected probe `{unexpected}`")),
+        }
+    })?;
+
+    assert_eq!(probed_programs, ["cargo", "just"]);
+    preflight.require_ready(FixtureExitabilityMode::AvailableTools)?;
+    let strict_error = match preflight.require_ready(FixtureExitabilityMode::ReleaseQualification) {
+        Ok(()) => return Err("strict preflight accepted a missing required tool".into()),
+        Err(error) => error,
+    };
+    assert!(strict_error.to_string().contains("required program `just`"));
+
+    let rendered = preflight.render()?;
+    let ledger: Value = serde_json::from_str(&rendered)?;
+    assert_eq!(ledger["fixture_count"], 3);
+    assert_eq!(ledger["command_count"], 2);
+    assert_eq!(ledger["scenario_only_fixture_count"], 1);
+    assert_eq!(ledger["summary"]["available_command_count"], 1);
+    assert_eq!(ledger["summary"]["missing_command_count"], 1);
+    assert_eq!(ledger["summary"]["probe_failed_command_count"], 0);
+    let entries = required_array(&ledger, "commands")?;
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["fixture_id"], "brownfield-adapters");
+    assert_eq!(entries[0]["probe"], "available");
+    assert_eq!(entries[1]["fixture_id"], "brownfield-just");
+    assert_eq!(entries[1]["probe"], "not-found");
+    assert_eq!(entries[2]["fixture_id"], "empty-repo");
+    assert_eq!(entries[2]["command_index"], Value::Null);
+
+    let failed_probe = FixtureExitabilityPreflight::from_manifest(&manifest, |program| {
+        if program == "cargo" {
+            ToolProbeOutcome::Failed("version probe exited 9".to_owned())
+        } else {
+            ToolProbeOutcome::NotFound
+        }
+    })?;
+    let failure = match failed_probe.require_ready(FixtureExitabilityMode::AvailableTools) {
+        Ok(()) => return Err("available-tools mode accepted a failed version probe".into()),
+        Err(error) => error,
+    };
+    let failure = failure.to_string();
+    assert!(failure.contains("program `cargo` probe failed"));
+    assert!(failed_probe.render()?.contains("brownfield-just"));
+
+    let mut execution =
+        FixtureExitabilityPreflight::from_manifest(&manifest, |_| ToolProbeOutcome::Available)?;
+    execution.require_ready(FixtureExitabilityMode::ReleaseQualification)?;
+    let incomplete = match execution.require_complete_release_execution() {
+        Ok(()) => return Err("strict qualification accepted commands that were not run".into()),
+        Err(error) => error,
+    };
+    let incomplete = incomplete.to_string();
+    assert!(incomplete.contains("brownfield-adapters#0=not-run"));
+    assert!(incomplete.contains("brownfield-just#0=not-run"));
+
+    execution.record_execution("brownfield-adapters", 0, FixtureCommandExecution::Passed)?;
+    execution.record_execution("brownfield-just", 0, FixtureCommandExecution::Passed)?;
+    execution.require_complete_release_execution()?;
+    let complete: Value = serde_json::from_str(&execution.render()?)?;
+    assert_eq!(complete["summary"]["passed_command_count"], 2);
+    let duplicate =
+        match execution.record_execution("brownfield-just", 0, FixtureCommandExecution::Failed) {
+            Ok(()) => {
+                return Err("qualification ledger accepted duplicate execution evidence".into());
+            }
+            Err(error) => error,
+        };
+    assert!(
+        duplicate
+            .to_string()
+            .contains("already recorded as `passed`")
+    );
+    Ok(())
+}
+
+fn verify_fixture_exitability(
+    mode: FixtureExitabilityMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let manifest: Value = serde_json::from_slice(&fs::read(
         repository_root().join("fixtures/generated/manifest-v1.json"),
     )?)?;
     let fixtures = required_array(&manifest, "fixtures")?;
+    let forge_free_path = forge_free_path()?;
+    let mut preflight = FixtureExitabilityPreflight::from_manifest(&manifest, |program| {
+        probe_tool(program, &forge_free_path)
+    })?;
+    preflight.require_ready(mode)?;
+    if mode == FixtureExitabilityMode::ReleaseQualification {
+        if let Err(error) = require_forge_absent(&forge_free_path) {
+            eprintln!(
+                "{error}\ncomplete fixture/command availability ledger:\n{}",
+                preflight.render()?
+            );
+            return Err(error);
+        }
+        println!(
+            "strict fixture exitability preflight passed; complete fixture/command availability ledger:\n{}",
+            preflight.render()?
+        );
+    }
     let mut fixture_proofs = BTreeMap::new();
+    let mut command_failures = Vec::new();
 
     for fixture_definition in fixtures {
         let id = fixture_definition["id"]
@@ -1091,16 +1276,12 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
         }
         let mut proven_commands = 0_usize;
         let mut unavailable_commands = 0_usize;
+        let mut failed_commands = 0_usize;
         let mut missing_host_tools = BTreeSet::new();
         for (command_index, command) in commands.iter().enumerate() {
             let program = command["program"]
                 .as_str()
                 .ok_or("fixture command omitted program")?;
-            if !tool_is_available(program)? {
-                missing_host_tools.insert(program.to_owned());
-                unavailable_commands += 1;
-                continue;
-            }
             let arguments = required_array(command, "args")?
                 .iter()
                 .map(|argument| argument.as_str().ok_or("fixture argument is not a string"))
@@ -1108,33 +1289,73 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
             let cwd = command["cwd"]
                 .as_str()
                 .ok_or("fixture command omitted cwd")?;
-            let output = fixture.run_declared_native_without_forge(
+            match preflight.probe_for(program)?.clone() {
+                ToolProbeOutcome::Available => {}
+                ToolProbeOutcome::NotFound => {
+                    missing_host_tools.insert(program.to_owned());
+                    unavailable_commands += 1;
+                    continue;
+                }
+                ToolProbeOutcome::Failed(detail) => {
+                    return Err(format!(
+                        "fixture exitability preflight admitted failed probe for `{program}`: {detail}"
+                    )
+                    .into());
+                }
+            }
+            let output = match fixture.run_declared_native_without_forge(
                 program,
                 &arguments,
                 &fixture.worktree.join(cwd),
                 command_index,
-            )?;
-            assert!(
-                output.status.success(),
-                "fixture `{id}` native command {command_index}: {}",
-                display_output(&output)
-            );
-            proven_commands += 1;
+                &forge_free_path,
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    preflight.record_execution(
+                        id,
+                        command_index,
+                        FixtureCommandExecution::Failed,
+                    )?;
+                    failed_commands += 1;
+                    let failure = format!(
+                        "fixture `{id}` native command {command_index} failed to start: {error}"
+                    );
+                    if mode == FixtureExitabilityMode::AvailableTools {
+                        return Err(failure.into());
+                    }
+                    command_failures.push(failure);
+                    continue;
+                }
+            };
+            if output.status.success() {
+                preflight.record_execution(id, command_index, FixtureCommandExecution::Passed)?;
+                proven_commands += 1;
+            } else {
+                preflight.record_execution(id, command_index, FixtureCommandExecution::Failed)?;
+                failed_commands += 1;
+                let failure = format!(
+                    "fixture `{id}` native command {command_index}: {}",
+                    display_output(&output)
+                );
+                if mode == FixtureExitabilityMode::AvailableTools {
+                    return Err(failure.into());
+                }
+                command_failures.push(failure);
+            }
         }
 
         assert_eq!(
-            proven_commands + unavailable_commands,
+            proven_commands + unavailable_commands + failed_commands,
             commands.len(),
             "fixture `{id}` did not account for every declared native command"
         );
         let native_proof = if commands.is_empty() {
             "scenario-only".to_owned()
-        } else if missing_host_tools.is_empty() {
-            assert_eq!(proven_commands, commands.len());
-            format!("Proven(native_commands={proven_commands})")
         } else {
             format!(
-                "missing-host-tool(programs={missing_host_tools:?}, native_commands_proven={proven_commands})"
+                "native-commands(declared={}, passed={proven_commands}, missing_host_tools={missing_host_tools:?}, failed={failed_commands})",
+                commands.len()
             )
         };
         let proof = if expected_init_exit == 0 {
@@ -1161,6 +1382,25 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
         REQUIRED_FIXTURES.iter().copied().collect::<BTreeSet<_>>(),
         "the uninstall proof ledger did not cover the public fixture matrix"
     );
+
+    if mode == FixtureExitabilityMode::ReleaseQualification {
+        if !command_failures.is_empty() {
+            let message = format!(
+                "strict fixture exitability qualification observed native command failures:\n  {}",
+                command_failures.join("\n  ")
+            );
+            eprintln!(
+                "{message}\ncomplete fixture/command ledger:\n{}",
+                preflight.render()?
+            );
+            return Err(message.into());
+        }
+        preflight.require_complete_release_execution()?;
+        println!(
+            "strict fixture exitability qualification passed; complete fixture/command ledger:\n{}",
+            preflight.render()?
+        );
+    }
     Ok(())
 }
 
@@ -1790,12 +2030,13 @@ impl FixtureWorkspace {
         arguments: &[&str],
         cwd: &Path,
         command_index: usize,
+        forge_free_path: &OsString,
     ) -> Result<Output, Box<dyn std::error::Error>> {
         let mut command = Command::new(program);
         command
             .current_dir(cwd)
             .args(arguments)
-            .env("PATH", forge_free_path()?)
+            .env("PATH", forge_free_path)
             .env("RUSTUP_AUTO_INSTALL", "0")
             .env("CARGO_NET_OFFLINE", "true");
         if program == "cargo" {
@@ -1967,7 +2208,276 @@ fn forge_free_path() -> Result<OsString, Box<dyn std::error::Error>> {
     Ok(std::env::join_paths(path)?)
 }
 
-fn tool_is_available(program: &str) -> Result<bool, Box<dyn std::error::Error>> {
+impl ToolProbeOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::NotFound => "not-found",
+            Self::Failed(_) => "probe-failed",
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Failed(detail) => Some(detail),
+            Self::Available | Self::NotFound => None,
+        }
+    }
+
+    fn initial_execution(&self) -> &'static str {
+        match self {
+            Self::Available => "not-run",
+            Self::NotFound => "not-run-tool-missing",
+            Self::Failed(_) => "not-run-probe-failed",
+        }
+    }
+}
+
+impl FixtureCommandExecution {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FixtureExitabilityPreflight {
+    fn from_manifest(
+        manifest: &Value,
+        mut probe: impl FnMut(&str) -> ToolProbeOutcome,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let source_manifest_identity = manifest["source_manifest_identity"]
+            .as_str()
+            .ok_or("fixture manifest omitted source_manifest_identity")?
+            .to_owned();
+        let fixtures = required_array(manifest, "fixtures")?;
+        let mut ordered_fixtures = Vec::with_capacity(fixtures.len());
+        let mut seen_fixture_ids = BTreeSet::new();
+        for fixture in fixtures {
+            let id = fixture["id"]
+                .as_str()
+                .ok_or("fixture manifest entry omitted id")?;
+            if !seen_fixture_ids.insert(id) {
+                return Err(format!("fixture manifest repeated id `{id}`").into());
+            }
+            ordered_fixtures.push((id, fixture));
+        }
+        ordered_fixtures.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut probes: BTreeMap<String, ToolProbeOutcome> = BTreeMap::new();
+        let mut commands = Vec::new();
+        let mut command_count = 0_usize;
+        let mut scenario_only_fixture_count = 0_usize;
+        for (fixture_id, fixture) in ordered_fixtures {
+            let fixture_commands = required_array(fixture, "commands")?;
+            if fixture_commands.is_empty() {
+                if !COMMANDLESS_UNINSTALL_SCENARIOS.contains(&fixture_id) {
+                    return Err(format!(
+                        "fixture `{fixture_id}` has no native command without an explicit scenario-only classification"
+                    )
+                    .into());
+                }
+                scenario_only_fixture_count += 1;
+                commands.push(FixtureCommandQualification {
+                    fixture_id: fixture_id.to_owned(),
+                    command_index: None,
+                    intent: None,
+                    program: None,
+                    args: Vec::new(),
+                    cwd: None,
+                    probe: "not-applicable".to_owned(),
+                    probe_detail: None,
+                    execution: "not-applicable".to_owned(),
+                });
+                continue;
+            }
+
+            for (command_index, command) in fixture_commands.iter().enumerate() {
+                let intent = command["intent"]
+                    .as_str()
+                    .ok_or("fixture command omitted intent")?;
+                let program = command["program"]
+                    .as_str()
+                    .ok_or("fixture command omitted program")?;
+                let args = required_array(command, "args")?
+                    .iter()
+                    .map(|argument| {
+                        argument
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or("fixture argument is not a string")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let cwd = command["cwd"]
+                    .as_str()
+                    .ok_or("fixture command omitted cwd")?;
+                let outcome = match probes.get(program) {
+                    Some(outcome) => outcome.clone(),
+                    None => {
+                        let outcome = probe(program);
+                        probes.insert(program.to_owned(), outcome.clone());
+                        outcome
+                    }
+                };
+                command_count += 1;
+                commands.push(FixtureCommandQualification {
+                    fixture_id: fixture_id.to_owned(),
+                    command_index: Some(command_index),
+                    intent: Some(intent.to_owned()),
+                    program: Some(program.to_owned()),
+                    args,
+                    cwd: Some(cwd.to_owned()),
+                    probe: outcome.label().to_owned(),
+                    probe_detail: outcome.detail().map(str::to_owned),
+                    execution: outcome.initial_execution().to_owned(),
+                });
+            }
+        }
+
+        Ok(Self {
+            source_manifest_identity,
+            fixture_count: fixtures.len(),
+            command_count,
+            scenario_only_fixture_count,
+            probes,
+            commands,
+        })
+    }
+
+    fn require_ready(
+        &self,
+        mode: FixtureExitabilityMode,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut blockers = Vec::new();
+        for (program, outcome) in &self.probes {
+            match outcome {
+                ToolProbeOutcome::Available => {}
+                ToolProbeOutcome::NotFound if mode == FixtureExitabilityMode::AvailableTools => {}
+                ToolProbeOutcome::NotFound => {
+                    blockers.push(format!("required program `{program}` was not found"));
+                }
+                ToolProbeOutcome::Failed(detail) => {
+                    blockers.push(format!("program `{program}` probe failed: {detail}"));
+                }
+            }
+        }
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        let message = format!(
+            "fixture exitability preflight failed:\n  {}",
+            blockers.join("\n  ")
+        );
+        eprintln!(
+            "{message}\ncomplete fixture/command availability ledger:\n{}",
+            self.render()?
+        );
+        Err(message.into())
+    }
+
+    fn probe_for(&self, program: &str) -> Result<&ToolProbeOutcome, Box<dyn std::error::Error>> {
+        self.probes
+            .get(program)
+            .ok_or_else(|| format!("fixture command program `{program}` escaped preflight").into())
+    }
+
+    fn record_execution(
+        &mut self,
+        fixture_id: &str,
+        command_index: usize,
+        outcome: FixtureCommandExecution,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let entry = self
+            .commands
+            .iter_mut()
+            .find(|entry| {
+                entry.fixture_id == fixture_id && entry.command_index == Some(command_index)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "fixture command `{fixture_id}` index {command_index} escaped the qualification ledger"
+                )
+            })?;
+        if entry.execution != "not-run" {
+            return Err(format!(
+                "fixture command `{fixture_id}` index {command_index} was already recorded as `{}`",
+                entry.execution
+            )
+            .into());
+        }
+        entry.execution = outcome.label().to_owned();
+        Ok(())
+    }
+
+    fn require_complete_release_execution(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let incomplete = self
+            .commands
+            .iter()
+            .filter_map(|entry| {
+                let command_index = entry.command_index?;
+                (entry.execution != "passed")
+                    .then(|| format!("{}#{command_index}={}", entry.fixture_id, entry.execution))
+            })
+            .collect::<Vec<_>>();
+        if incomplete.is_empty() {
+            return Ok(());
+        }
+        let message = format!(
+            "strict fixture exitability qualification did not execute every declared command successfully:\n  {}",
+            incomplete.join("\n  ")
+        );
+        eprintln!(
+            "{message}\ncomplete fixture/command ledger:\n{}",
+            self.render()?
+        );
+        Err(message.into())
+    }
+
+    fn render(&self) -> Result<String, serde_json::Error> {
+        let available_command_count = self
+            .commands
+            .iter()
+            .filter(|entry| entry.command_index.is_some() && entry.probe == "available")
+            .count();
+        let missing_command_count = self
+            .commands
+            .iter()
+            .filter(|entry| entry.command_index.is_some() && entry.probe == "not-found")
+            .count();
+        let probe_failed_command_count = self
+            .commands
+            .iter()
+            .filter(|entry| entry.command_index.is_some() && entry.probe == "probe-failed")
+            .count();
+        let passed_command_count = self
+            .commands
+            .iter()
+            .filter(|entry| entry.execution == "passed")
+            .count();
+        let failed_command_count = self
+            .commands
+            .iter()
+            .filter(|entry| entry.execution == "failed")
+            .count();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source_manifest_identity": &self.source_manifest_identity,
+            "fixture_count": self.fixture_count,
+            "command_count": self.command_count,
+            "scenario_only_fixture_count": self.scenario_only_fixture_count,
+            "summary": {
+                "available_command_count": available_command_count,
+                "missing_command_count": missing_command_count,
+                "probe_failed_command_count": probe_failed_command_count,
+                "passed_command_count": passed_command_count,
+                "failed_command_count": failed_command_count,
+            },
+            "commands": &self.commands,
+        }))
+    }
+}
+
+fn probe_tool(program: &str, forge_free_path: &OsString) -> ToolProbeOutcome {
     let version_argument = if program == "go" {
         "version"
     } else {
@@ -1975,17 +2485,39 @@ fn tool_is_available(program: &str) -> Result<bool, Box<dyn std::error::Error>> 
     };
     match Command::new(program)
         .arg(version_argument)
-        .env("PATH", forge_free_path()?)
+        .env("PATH", forge_free_path)
         .output()
     {
-        Ok(output) if output.status.success() => Ok(true),
-        Ok(output) => Err(io::Error::other(format!(
-            "`{program} {version_argument}` failed: {}",
-            display_output(&output)
-        ))
+        Ok(output) if output.status.success() => ToolProbeOutcome::Available,
+        Ok(output) => ToolProbeOutcome::Failed(format!(
+            "`{program} {version_argument}` exited {}",
+            output.status
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ToolProbeOutcome::NotFound,
+        Err(error) => ToolProbeOutcome::Failed(format!(
+            "`{program} {version_argument}` failed to start ({:?})",
+            error.kind()
+        )),
+    }
+}
+
+fn require_forge_absent(forge_free_path: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+    match Command::new("forge")
+        .arg("version")
+        .env("PATH", forge_free_path)
+        .output()
+    {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(output) => Err(format!(
+            "strict fixture exitability qualification requires Forge to be absent from PATH, but `forge version` was discoverable and exited {}",
+            output.status
+        )
         .into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(format!(
+            "strict fixture exitability qualification could not prove Forge absent from PATH ({:?})",
+            error.kind()
+        )
+        .into()),
     }
 }
 
