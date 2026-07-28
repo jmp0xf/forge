@@ -293,6 +293,13 @@ fn non_git_and_empty_repository_fixtures_fail_before_writing_adapters()
 fn linked_worktrees_keep_private_state_and_receipts_isolated()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureWorkspace::from_generated("linked-worktrees")?;
+    // This scenario qualifies worktree-local state, not Cargo itself. Pin its evidence command to
+    // Git, which the fixture has already proven available, so platform-specific Cargo host state
+    // cannot turn an otherwise valid isolation Receipt into a product failure.
+    fs::write(
+        fixture.worktree.join("forge.toml"),
+        b"schema = 1\n\n[commands.test]\nprogram = \"git\"\nargs = [\"--version\"]\ninputs = [\"**\"]\nmutability = \"read-only\"\nnetwork = \"offline-requested\"\nsuccess = \"exit-zero\"\ncoverage = [\"unit-test\"]\nenforcement = \"required\"\n",
+    )?;
     fixture.initialize_git()?;
     let linked = fixture.root.join("linked-worktree");
     let linked_text = linked
@@ -654,6 +661,22 @@ mod windows_wide_path_fixture {
         )));
     }
 
+    #[test]
+    fn windows_fixture_launch_paths_remove_only_the_verbatim_namespace() {
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\C:\forge-tests\root")),
+            PathBuf::from(r"C:\forge-tests\root")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"\\?\UNC\server\forge-tests\root")),
+            PathBuf::from(r"\\server\forge-tests\root")
+        );
+        assert_eq!(
+            without_verbatim_prefix(Path::new(r"C:\forge-tests\root")),
+            PathBuf::from(r"C:\forge-tests\root")
+        );
+    }
+
     fn exercise_wide_fixture(fixture: FixtureWorkspace) -> Result<(), Box<dyn std::error::Error>> {
         let canonical_worktree = fs::canonicalize(&fixture.worktree)?;
         let measured_path = canonical_worktree.join("Cargo.toml");
@@ -757,7 +780,7 @@ mod windows_wide_path_fixture {
         id: &str,
         existing_parent: &Path,
     ) -> Result<FixtureWorkspace, Box<dyn std::error::Error>> {
-        let parent = fs::canonicalize(existing_parent)?;
+        let parent = without_verbatim_prefix(&fs::canonicalize(existing_parent)?);
         if !parent.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -766,6 +789,22 @@ mod windows_wide_path_fixture {
             .into());
         }
         FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())
+    }
+
+    fn without_verbatim_prefix(path: &Path) -> PathBuf {
+        const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        const UNC: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if !units.starts_with(VERBATIM) {
+            return path.to_path_buf();
+        }
+        if units[VERBATIM.len()..].starts_with(UNC) {
+            let mut native = vec![b'\\' as u16, b'\\' as u16];
+            native.extend_from_slice(&units[VERBATIM.len() + UNC.len()..]);
+            return PathBuf::from(OsString::from_wide(&native));
+        }
+        PathBuf::from(OsString::from_wide(&units[VERBATIM.len()..]))
     }
 
     fn long_worktree_relative() -> PathBuf {
@@ -1905,12 +1944,23 @@ impl FixtureWorkspace {
         arguments: &[&str],
     ) -> Result<Output, Box<dyn std::error::Error>> {
         let mut command = Command::new("git");
+        #[cfg(not(windows))]
         command
             .current_dir(cwd)
             .arg("--no-pager")
             .arg("--no-optional-locks");
         #[cfg(windows)]
-        command.arg("-c").arg("core.longpaths=true");
+        command
+            // CreateProcess applies a stricter current-directory limit than ordinary native file
+            // APIs. Launch from the runner's short temp directory and let Git's long-path-aware
+            // `-C` boundary select the fixture without changing what path is under test.
+            .current_dir(std::env::temp_dir())
+            .arg("--no-pager")
+            .arg("--no-optional-locks")
+            .arg("-c")
+            .arg("core.longpaths=true")
+            .arg("-C")
+            .arg(cwd);
         command
             .arg("-c")
             .arg("core.fsmonitor=false")

@@ -1,4 +1,4 @@
-Forge doctor: fail
+Forge doctor: unknown
 [pass] git.repository: Git repository identity and worktree facts were read successfully
   next: no repository repair is required
 [pass] git.operation: no conflicting merge or rebase operation is active
@@ -11,8 +11,8 @@ Forge doctor: fail
   next: no unit-discovery repair is required
 [pass] project.commands: every v0 command intent is explicitly resolved or absent
   next: no command-resolution repair is required
-[fail] toolchain.required: required toolchain probes failed: project-command executable (unavailable)
-  next: install or repair the named project tool, then rerun `forge doctor`
+[unknown] toolchain.required: one or more project commands require a tool without a safe v0 version probe
+  next: verify the runner-declared tool explicitly before executing project commands
 [pass] adapters.drift: this repository has not adopted Forge-managed host adapters
   next: run `forge init` only when managed adapters are desired
 [unknown] ci.visible: no local GitHub workflow is visible; server-side protection is not observable from this clone
@@ -21,5 +21,5 @@ Forge doctor: fail
   next: identify the human authority for protected changes before modifying them
 [pass] path.safety: repository inventory and 1 automatically selected managed target confinement check(s) completed
   next: no path-safety repair is required
-[pass] process.capability: the compiled runtime provides Unix process-group isolation for timeout and cancellation
+[pass] process.capability: the compiled runtime provides <PROCESS_TREE_CAPABILITY> for timeout and cancellation
   next: no local process-runtime repair is required

@@ -102,6 +102,18 @@ impl GoldenWorkspace {
     }
 
     fn run_git(&self, arguments: &[&str]) -> io::Result<()> {
+        let output = self.git_output(arguments)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "git {arguments:?} failed with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        )))
+    }
+
+    fn git_output(&self, arguments: &[&str]) -> io::Result<Output> {
         let mut command = ProcessCommand::new("git");
         command
             .current_dir(&self.worktree)
@@ -113,9 +125,13 @@ impl GoldenWorkspace {
             .arg("core.autocrlf=false")
             .args(arguments);
         self.configure_git_environment(&mut command);
-        let output = command.output()?;
+        command.output()
+    }
+
+    fn git_stdout(&self, arguments: &[&str]) -> io::Result<Vec<u8>> {
+        let output = self.git_output(arguments)?;
         if output.status.success() {
-            return Ok(());
+            return Ok(output.stdout);
         }
         Err(io::Error::other(format!(
             "git {arguments:?} failed with status {:?}: {}",
@@ -177,13 +193,37 @@ impl GoldenWorkspace {
         );
         let mut stdout = String::from_utf8(output.stdout)?;
 
-        // Detection deliberately reports the canonical absolute repository root. The fixture
-        // directory is unique per process, so replace only that exact value.
-        let canonical_worktree = fs::canonicalize(&self.worktree)?;
-        stdout = stdout.replace(
-            canonical_worktree.to_string_lossy().as_ref(),
-            "<REPOSITORY_ROOT>",
+        // Detection reports Git's native absolute repository spelling. On Windows that spelling
+        // intentionally differs from `std::fs::canonicalize`'s verbatim (`\\?\`) path, so derive
+        // the exact display through the same Git contract instead of guessing separator aliases.
+        let repository_root = String::from_utf8(self.git_stdout(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+        ])?)?;
+        let repository_root = repository_root.trim_end();
+        if stdout.lines().any(|line| line.starts_with("root: ")) {
+            assert!(
+                stdout.contains(&format!("root: {repository_root}")),
+                "human output did not use Git's exact repository-root spelling"
+            );
+            stdout = stdout.replace(repository_root, "<REPOSITORY_ROOT>");
+        }
+
+        let process_capability = if cfg!(windows) {
+            "Windows Job Object isolation"
+        } else {
+            "Unix process-group isolation"
+        };
+        let process_capability_line = format!(
+            "[pass] process.capability: the compiled runtime provides {process_capability} for timeout and cancellation"
         );
+        if stdout.contains(&process_capability_line) {
+            stdout = stdout.replace(
+                &process_capability_line,
+                "[pass] process.capability: the compiled runtime provides <PROCESS_TREE_CAPABILITY> for timeout and cancellation",
+            );
+        }
 
         // Repository identity is intentionally derived from the native absolute Git common-dir
         // path, which is unique for every fixture instance.
@@ -348,6 +388,7 @@ fn init_human_output_matches_golden() -> Result<(), Box<dyn std::error::Error>> 
 #[test]
 fn doctor_human_output_matches_golden() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = GoldenWorkspace::clean_repository("doctor")?;
+    fixture.use_git_version_check()?;
     let output = fixture.run_forge(&["doctor"])?;
     let stdout = fixture.normalized_stdout(output, 1, ContentAddressNormalization::None)?;
     assert_golden("doctor.txt", &stdout)

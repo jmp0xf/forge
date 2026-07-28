@@ -474,6 +474,14 @@ fn run(arguments: &[&str]) -> Result<Output, Box<dyn std::error::Error>> {
         .output()?)
 }
 
+fn native_repository_path(components: &[&str]) -> String {
+    components
+        .iter()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(unix)]
 fn executable_on_path(program: &str) -> io::Result<PathBuf> {
     let path = std::env::var_os("PATH")
@@ -909,9 +917,10 @@ fn explicit_github_ci_apply_is_create_only_active_and_idempotent()
     assert!(applied.stderr.is_empty());
     let document: Value = serde_json::from_slice(&applied.stdout)?;
     let edits = required_array(&document["data"], "edits")?;
+    let workflow_display = native_repository_path(&[".github", "workflows", "verify.yml"]);
     let workflow_edit = edits
         .iter()
-        .find(|edit| edit["path"]["display"] == ".github/workflows/verify.yml")
+        .find(|edit| edit["path"]["display"] == workflow_display)
         .ok_or("missing GitHub workflow create edit")?;
     assert_eq!(workflow_edit["kind"], "create");
 
@@ -1720,17 +1729,18 @@ fn adapters_check_is_read_only_after_init_and_detects_missing_generated_target()
     );
     assert_eq!(fixture.snapshot()?, stale_before);
     assert!(!manifest_path.exists());
-    fs::write(&manifest_path, &manifest_before)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
 
-        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))?;
-    }
-
-    fs::remove_file(fixture.worktree.join("AGENTS.md"))?;
-    let missing_before = fixture.snapshot()?;
-    let missing = fixture.run_forge(&["adapters", "check", "--json"])?;
+    // A private manifest is deliberately constrained more tightly than an ordinary file on
+    // Windows and Unix. Use a fresh Forge-created manifest for the missing-target case instead of
+    // recreating protected state with the test process and accidentally testing host ACL defaults.
+    let missing_fixture = TestWorkspace::clean_runner_repository("adapters-check-missing-target")?;
+    let initialized = missing_fixture.run_forge(&["init", "--apply", "--json"])?;
+    assert_eq!(initialized.status.code(), Some(0));
+    let missing_manifest_path = missing_fixture.generated_manifest_path()?;
+    let missing_manifest_before = fs::read(&missing_manifest_path)?;
+    fs::remove_file(missing_fixture.worktree.join("AGENTS.md"))?;
+    let missing_before = missing_fixture.snapshot()?;
+    let missing = missing_fixture.run_forge(&["adapters", "check", "--json"])?;
     assert_eq!(
         missing.status.code(),
         Some(1),
@@ -1743,8 +1753,8 @@ fn adapters_check_is_read_only_after_init_and_detects_missing_generated_target()
         missing_document["data"]["adapters"][0]["drift"],
         "generated-missing"
     );
-    assert_eq!(fixture.snapshot()?, missing_before);
-    assert_eq!(fs::read(&manifest_path)?, manifest_before);
+    assert_eq!(missing_fixture.snapshot()?, missing_before);
+    assert_eq!(fs::read(&missing_manifest_path)?, missing_manifest_before);
     Ok(())
 }
 
@@ -2511,21 +2521,25 @@ fn next_reports_exact_codeowner_and_document_context_with_evidence()
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let context = required_array(&document["data"], "context_paths")?;
     for (path, rule, confidence) in [
-        ("src/widget.rs", "context.exact-change.v1", "high"),
         (
-            ".github/CODEOWNERS",
+            native_repository_path(&["src", "widget.rs"]),
+            "context.exact-change.v1",
+            "high",
+        ),
+        (
+            native_repository_path(&[".github", "CODEOWNERS"]),
             "context.codeowners-match.v1",
             "medium",
         ),
         (
-            "docs/adr/0001-context.md",
+            native_repository_path(&["docs", "adr", "0001-context.md"]),
             "context.exact-document-match.v1",
             "medium",
         ),
     ] {
         let item = context
             .iter()
-            .find(|item| item["path"]["display"] == path)
+            .find(|item| item["path"]["display"] == path.as_str())
             .ok_or_else(|| io::Error::other(format!("missing context path `{path}`")))?;
         assert_eq!(item["confidence"], confidence, "unexpected item: {item:#}");
         assert!(
