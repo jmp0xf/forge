@@ -171,7 +171,7 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
         output_directory: PathBuf::from(required_option(&options, "--output-dir")?),
     };
     let repository = repository_root()?;
-    let output = open_output_directory(&repository, &request.output_directory)?;
+    let output = open_command_output_directory(&repository, &request.output_directory)?;
     let targets = std::slice::from_ref(request.target);
     let before = RepositorySnapshot::capture(&repository, targets)?;
     let build_directory = tempdir().map_err(|error| {
@@ -206,7 +206,7 @@ pub(crate) fn run_finalize(arguments: &[String]) -> Result<ReleaseCommandOutput,
     let options = parse_options(arguments, &["--output-dir"])?;
     let output = PathBuf::from(required_option(&options, "--output-dir")?);
     let repository = repository_root()?;
-    let output_writer = open_output_directory(&repository, &output)?;
+    let output_writer = open_command_output_directory(&repository, &output)?;
     let before = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
     finalize(&output_writer, &before)?;
     let after = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
@@ -225,7 +225,7 @@ pub(crate) fn run_check(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     let options = parse_options(arguments, &["--output-dir"])?;
     let output = PathBuf::from(required_option(&options, "--output-dir")?);
     let repository = repository_root()?;
-    let output_writer = open_output_directory(&repository, &output)?;
+    let output_writer = open_command_output_directory(&repository, &output)?;
     let before = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
     check(&output_writer, &before)?;
     let after = RepositorySnapshot::capture(&repository, &RELEASE_TARGETS)?;
@@ -928,6 +928,40 @@ fn open_output_directory(repository: &Path, path: &Path) -> Result<RepositoryWri
             "release output must be outside the source repository: {}",
             output.root().display()
         )));
+    }
+    validate_visible_root(&output, "release output")?;
+    Ok(output)
+}
+
+fn open_command_output_directory(
+    repository: &Path,
+    path: &Path,
+) -> Result<RepositoryWriter, ReleaseError> {
+    let output = open_output_directory(repository, path)?;
+    for (arguments, label) in [
+        (
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+            "worktree-specific Git directory",
+        ),
+        (
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            "shared Git directory",
+        ),
+    ] {
+        let bytes = git_output(repository, &arguments, label, 64 * 1024)?;
+        let reported = git_path_from_output(&bytes)?;
+        let private_directory = fs::canonicalize(&reported).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to resolve {label} {}: {error}",
+                reported.display()
+            ))
+        })?;
+        if output.root() == private_directory || output.root().starts_with(&private_directory) {
+            return Err(ReleaseError::environment(format!(
+                "release output must be outside the {label}: {}",
+                output.root().display()
+            )));
+        }
     }
     validate_visible_root(&output, "release output")?;
     Ok(output)
@@ -2547,6 +2581,60 @@ mod tests {
         for output in [&repository, &git_output] {
             assert!(super::open_output_directory(&repository, output).is_err());
             assert!(!output.join(&asset).exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn command_output_cannot_use_linked_worktree_git_private_directories()
+    -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let repository = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(repository.join("tracked.txt"), b"tracked")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["add", "tracked.txt"])?;
+        run_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge-test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )?;
+        let linked_argument = linked.to_str().ok_or_else(|| {
+            ReleaseError::internal("temporary linked worktree path was not UTF-8")
+        })?;
+        run_git(
+            &repository,
+            &["worktree", "add", "--detach", linked_argument],
+        )?;
+
+        let git_directory = super::git_path_from_output(&super::git_output(
+            &linked,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+            "test Git directory read",
+            64 * 1024,
+        )?)?;
+        let common_directory = super::git_path_from_output(&super::git_output(
+            &linked,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            "test Git common directory read",
+            64 * 1024,
+        )?)?;
+
+        for private_directory in [git_directory, common_directory] {
+            assert!(
+                super::open_command_output_directory(&linked, &private_directory).is_err(),
+                "release output must reject Git private directory {}",
+                private_directory.display()
+            );
         }
         Ok(())
     }
