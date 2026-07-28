@@ -120,7 +120,7 @@ containment; it fails closed on Windows rather than pretending equivalent Job Ob
 
 ## Current-candidate local verification
 
-Against current code commit `655b42b` on macOS 26.5.2 arm64:
+Against current code commit `a9937d1` on macOS 26.5.2 arm64:
 
 - the stable root format, check, `clippy -D warnings`, and isolated full test suite, plus the fuzz
   workspace format, check, `clippy -D warnings`, and full test suite, exited zero; schema drift
@@ -175,6 +175,12 @@ rerun included and caught the previously surviving deletion of the `risk/docs-on
 `add_content_uncertainty`, confirming the regression test added by `e51837c` within the complete
 campaign.
 
+A later targeted `cargo-mutants 27.0.0` campaign against the navigation-receipt validation predicate
+first exposed one viable `||`-to-`&&` survivor. Commit `a9937d1` added an exhaustive truth-table
+regression and included the predicate in the checked-in bounded mutation surface. The targeted
+rerun passed its baseline, tested six mutants, caught five, classified one as unviable, and missed
+none.
+
 ## Work still required before v0 release
 
 The following boundaries are intentionally not inferred from local implementation or test assets:
@@ -194,7 +200,7 @@ The following boundaries are intentionally not inferred from local implementatio
    `a0330f0df20dd1187e323f284a7f365c0ea1f2f271c1e154811e9fc4724bed13` respectively. The strict
    ledger then recorded all 27 declared commands as passed, four explicitly named scenario-only
    fixtures as not applicable, and exited zero. The same complete gate passed again against
-   current code commit `655b42b`. This is one local qualification; every release
+   current code commit `a9937d1`. This is one local qualification; every release
    candidate still needs the strict gate on its controlled, fully provisioned runner.
 2. **Filesystem threat model and security review.** Repository writes and release-asset reads/writes
    now pin root directory handles and revalidate the visible root identity. Native adversarial tests
