@@ -46,6 +46,20 @@ cargo test -p xtask --test fixture_projects
 cargo test -p xtask --test compatibility_harness
 ```
 
+Native Windows runs include a required local UTF-16 path test beyond the classic `MAX_PATH` limit.
+UNC behavior needs a real externally provisioned writable share and is therefore an explicit
+qualification check, not a hermetic default test. From PowerShell:
+
+```powershell
+$env:FORGE_WINDOWS_UNC_TEST_ROOT = '\\server\share\forge-tests'
+cargo test --locked -p forge-cli --test fixture_matrix `
+  'windows_wide_path_fixture::windows_unc_long_path_survives_detection_init_state_and_write' `
+  -- --ignored --exact --nocapture
+```
+
+The command fails when the path does not resolve to UNC. A verbatim local path, mapped drive, or
+administrative share must not be reported as UNC qualification evidence.
+
 The 100,000-file benchmark is intentionally opt-in and reports measurements rather than turning startup targets into
 portable correctness assertions:
 

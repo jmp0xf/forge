@@ -550,7 +550,7 @@ mod windows_wide_path_fixture {
     use std::fs;
     use std::io;
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf, Prefix};
     use std::process::{Command, Output};
 
     use serde_json::Value;
@@ -560,6 +560,7 @@ mod windows_wide_path_fixture {
     const CLASSIC_MAX_PATH_UNITS: usize = 260;
     const MIN_TEST_PATH_UNITS: usize = CLASSIC_MAX_PATH_UNITS + 64;
     const MAX_TEST_PATH_UNITS: usize = 1_024;
+    const UNC_ROOT_ENV: &str = "FORGE_WINDOWS_UNC_TEST_ROOT";
     const WIDE_TRACKED_NAME: &str = "tracked path-路径-🧪.txt";
 
     #[test]
@@ -569,6 +570,46 @@ mod windows_wide_path_fixture {
         fs::create_dir_all(&parent)?;
         let fixture = long_fixture_at("non-utf8-path", &parent)?;
         exercise_wide_fixture(fixture)
+    }
+
+    #[test]
+    #[ignore = "requires an externally provisioned writable UNC share in FORGE_WINDOWS_UNC_TEST_ROOT"]
+    fn windows_unc_long_path_survives_detection_init_state_and_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw_parent = std::env::var_os(UNC_ROOT_ENV).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{UNC_ROOT_ENV} is required"),
+            )
+        })?;
+        let parent = fs::canonicalize(PathBuf::from(raw_parent))?;
+        if !is_qualifying_unc(&parent) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{UNC_ROOT_ENV} did not resolve to a non-administrative UNC share"),
+            )
+            .into());
+        }
+
+        let fixture = long_fixture_at("non-utf8-path", &parent)?;
+        if !is_qualifying_unc(&fs::canonicalize(&fixture.worktree)?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "long fixture escaped the configured UNC share",
+            )
+            .into());
+        }
+        exercise_wide_fixture(fixture)
+    }
+
+    #[test]
+    fn windows_unc_qualification_rejects_local_and_administrative_roots() {
+        assert!(!is_qualifying_unc(Path::new(r"C:\forge-tests")));
+        assert!(!is_qualifying_unc(Path::new(r"\\server\C$\forge-tests")));
+        assert!(is_qualifying_unc(Path::new(r"\\server\forge-tests\root")));
+        assert!(is_qualifying_unc(Path::new(
+            r"\\?\UNC\server\forge-tests\root"
+        )));
     }
 
     fn exercise_wide_fixture(fixture: FixtureWorkspace) -> Result<(), Box<dyn std::error::Error>> {
@@ -706,6 +747,18 @@ mod windows_wide_path_fixture {
 
     fn wide_units(path: &Path) -> usize {
         path.as_os_str().encode_wide().count()
+    }
+
+    fn is_qualifying_unc(path: &Path) -> bool {
+        match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => {
+                    !share.to_string_lossy().ends_with('$')
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn run_forge_with_explicit_dir(
