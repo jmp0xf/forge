@@ -372,15 +372,38 @@ pub(crate) fn navigation_receipts_controlled(
         });
     }
 
-    // An empty, fully validated state snapshot has no dependency claim to compare with the
-    // current repository. Avoid constructing a 100,000-entry scope merely to prove that an empty
-    // Receipt set stays empty. Malformed Receipt/Evidence objects still fail in the validating
-    // snapshot reader before this branch is taken.
+    // Validate the complete retained object graph before deciding whether current applicability can
+    // affect navigation. A clean repository still needs this read so corrupt or future private
+    // state cannot be hidden behind the earlier idle priority.
     let retained_snapshot =
         match load_retained_receipt_state_controlled(detected, log_max_bytes, None, control) {
             Ok(snapshot) => snapshot,
             Err(error) => return navigation_receipt_state_error(error),
         };
+    if detected
+        .navigation
+        .changed_paths()
+        .as_ref()
+        .is_some_and(Vec::is_empty)
+    {
+        let observation = ReceiptObservation::unavailable(vec![forge_core::Provenance {
+            rule_id: String::from("navigation.receipts-not-applicable-clean.v1"),
+            source_path: None,
+            source_range: None,
+            detail: String::from(
+                "the complete private Receipt/Evidence state was validated, but no changed path exists for current applicability to affect navigation",
+            ),
+        }])
+        .map_err(map_navigation_error)?;
+        return Ok(NavigationReceiptsOutcome {
+            observation,
+            terminal_exit_code: None,
+        });
+    }
+
+    // An empty, fully validated state snapshot has no dependency claim to compare with the
+    // current repository. Avoid constructing a potentially large scope merely to prove that an
+    // empty Receipt set stays empty.
     if retained_snapshot.receipt_facts.is_empty() {
         let observation = ReceiptObservation::current(
             requirements_are_complete(

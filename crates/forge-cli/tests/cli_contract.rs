@@ -2727,12 +2727,34 @@ fn next_advances_from_check_to_test_and_then_local_verified_without_writing()
 }
 
 #[cfg(unix)]
-#[test]
-fn next_confirms_after_receipt_evaluation_and_rejects_repository_drift()
--> Result<(), Box<dyn std::error::Error>> {
+fn install_clippy_version_mutator(
+    fixture: &TestWorkspace,
+    tracked: &Path,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let fixture = TestWorkspace::clean_rust_repository("next-receipt-scope-drift")?;
+    let wrapper_directory = fixture.root.join("support/scope-drift-bin");
+    fs::create_dir(&wrapper_directory)?;
+    let wrapper = wrapper_directory.join("cargo");
+    let trigger = fixture.root.join("support/trigger-scope-drift");
+    fs::write(&trigger, b"armed\n")?;
+    let real_cargo = executable_on_path("cargo")?;
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"clippy\" ] && [ \"${{2-}}\" = \"--version\" ] && [ -f {trigger} ]; then\n  printf '%s\\n' 'pub fn answer() -> u8 {{' '    44' '}}' > {tracked}\n  /bin/rm -f {trigger}\nfi\nexec {real_cargo} \"$@\"\n",
+        trigger = shell_single_quote(&trigger)?,
+        tracked = shell_single_quote(tracked)?,
+        real_cargo = shell_single_quote(&real_cargo)?,
+    );
+    fs::write(&wrapper, script)?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+    Ok((wrapper_directory, trigger))
+}
+
+#[cfg(unix)]
+#[test]
+fn next_does_not_evaluate_receipts_for_a_clean_idle_repository()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_rust_repository("next-clean-receipt-not-applicable")?;
     let tracked = fixture.worktree.join("src/lib.rs");
     let seed = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
     assert_eq!(
@@ -2746,6 +2768,50 @@ fn next_confirms_after_receipt_evaluation_and_rejects_repository_drift()
     assert_eq!(cache_hit.status.code(), Some(0));
     assert_eq!(cache_hit.stderr, b"inventory-cache: hit\n");
     let state_before = fixture.private_state_snapshot()?;
+    let worktree_before = fixture.snapshot()?;
+    let (wrapper_directory, trigger) = install_clippy_version_mutator(&fixture, &tracked)?;
+
+    // Default Clippy is advisory, so doctor does not run this probe. If clean navigation reaches
+    // Receipt applicability, the retained check Receipt does run it and mutates the worktree.
+    let output = fixture.run_forge_with_path_prefix(&["next", "--json"], &wrapper_directory)?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["data"]["state"], "idle");
+    assert_eq!(document["data"]["required_action"], "none");
+    assert!(
+        trigger.exists(),
+        "clean idle navigation unexpectedly ran a Receipt-only probe"
+    );
+    assert_eq!(fs::read(&tracked)?, b"pub fn answer() -> u8 {\n    42\n}\n");
+    assert_eq!(fixture.private_state_snapshot()?, state_before);
+    assert_eq!(fixture.snapshot()?, worktree_before);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn next_confirms_after_receipt_evaluation_and_rejects_repository_drift()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_rust_repository("next-receipt-scope-drift")?;
+    let tracked = fixture.worktree.join("src/lib.rs");
+    let seed = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
+    assert_eq!(
+        seed.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&seed.stdout),
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    fs::write(&tracked, b"pub fn answer() -> u8 {\n    43\n}\n")?;
+    let state_before = fixture.private_state_snapshot()?;
     let status_arguments = [
         "status",
         "--porcelain=v2",
@@ -2754,27 +2820,12 @@ fn next_confirms_after_receipt_evaluation_and_rejects_repository_drift()
         "--untracked-files=all",
     ];
     let status_before = fixture.successful_git_stdout(&status_arguments)?;
+    let (wrapper_directory, trigger) = install_clippy_version_mutator(&fixture, &tracked)?;
 
-    let wrapper_directory = fixture.root.join("support/scope-drift-bin");
-    fs::create_dir(&wrapper_directory)?;
-    let wrapper = wrapper_directory.join("cargo");
-    let trigger = fixture.root.join("support/trigger-scope-drift");
-    fs::write(&trigger, b"armed\n")?;
-    let real_cargo = executable_on_path("cargo")?;
-    let script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"clippy\" ] && [ \"${{2-}}\" = \"--version\" ] && [ -f {trigger} ]; then\n  printf '%s\\n' 'pub fn answer() -> u8 {{' '    44' '}}' > {tracked}\n  /bin/rm -f {trigger}\nfi\nexec {real_cargo} \"$@\"\n",
-        trigger = shell_single_quote(&trigger)?,
-        tracked = shell_single_quote(&tracked)?,
-        real_cargo = shell_single_quote(&real_cargo)?,
-    );
-    fs::write(&wrapper, script)?;
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
-
-    // Inventory cache reuse requires a clean repository, so this cache-hit path necessarily proves
-    // clean-to-dirty repository drift. Default Clippy is advisory, so doctor does not run this
-    // probe: the wrapper changes the worktree only after navigation prepared and digested its
-    // retained scope, while Receipt evaluation is reading current toolchain dependencies. Runtime
-    // scope integration separately proves same-status dirty-content revalidation.
+    // The existing tracked change makes Receipt applicability relevant. Default Clippy is
+    // advisory, so doctor does not run this probe: Receipt evaluation changes the same dirty path
+    // after its content was digested. Porcelain status remains identical, requiring the final
+    // content confirmation to fail closed rather than accepting the raced Receipt evaluation.
     let output = fixture.run_forge_with_path_prefix(&["next", "--json"], &wrapper_directory)?;
 
     assert_eq!(
@@ -2789,10 +2840,10 @@ fn next_confirms_after_receipt_evaluation_and_rejects_repository_drift()
     assert_eq!(structured_diagnostic_code(&document)?, "FGE3313");
     assert!(!trigger.exists(), "the Receipt-only probe did not run");
     assert_eq!(fs::read(&tracked)?, b"pub fn answer() -> u8 {\n    44\n}\n");
-    assert_ne!(
+    assert_eq!(
         fixture.successful_git_stdout(&status_arguments)?,
         status_before,
-        "the Receipt-only probe did not change the worktree"
+        "the fixture must exercise same-status dirty-content revalidation"
     );
     assert_eq!(fixture.private_state_snapshot()?, state_before);
     Ok(())
