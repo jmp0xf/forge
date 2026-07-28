@@ -570,6 +570,38 @@ mod tests {
     }
 
     #[test]
+    fn docs_only_risk_remains_conditioned_on_uninspected_content() -> Result<(), Box<dyn Error>> {
+        let assessment = assess_risk(&built_in_policy()?, &paths(&["docs/guide.md"])?);
+        let assumptions = assessment
+            .uncertain_assumptions
+            .iter()
+            .filter(|assumption| {
+                assumption
+                    .provenance
+                    .iter()
+                    .any(|provenance| provenance.rule_id == "risk/docs-only/path-only-uncertainty")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(assumptions.len(), 1);
+        let assumption = assumptions[0];
+        assert_eq!(
+            assumption.statement,
+            "documentation-shaped paths are treated as low risk only under the unverified assumption that their content has no policy, command, or security semantics"
+        );
+        assert_eq!(assumption.confidence, Confidence::Unknown);
+        assert_eq!(assumption.provenance.len(), 1);
+        assert_eq!(
+            assumption.provenance[0]
+                .source_path
+                .as_ref()
+                .map(|path| path.display.as_str()),
+            Some("docs/guide.md")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unmatched_and_empty_inputs_are_unknown_not_low() -> Result<(), Box<dyn Error>> {
         for changed in [paths(&["assets/logo.png"])?, Vec::new()] {
             let assessment = assess_risk(&built_in_policy()?, &changed);
