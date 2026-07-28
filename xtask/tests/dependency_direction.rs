@@ -67,7 +67,10 @@ fn product_crates_follow_the_accepted_dependency_direction()
             "forge-schema",
         ])
     );
-    assert_eq!(edge(&edges, "xtask")?, &BTreeSet::from(["forge-schema"]));
+    assert_eq!(
+        edge(&edges, "xtask")?,
+        &BTreeSet::from(["forge-core", "forge-runtime", "forge-schema"])
+    );
     Ok(())
 }
 

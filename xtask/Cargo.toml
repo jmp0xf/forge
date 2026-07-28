@@ -10,9 +10,12 @@ default-run = "xtask"
 
 [dependencies]
 blake3.workspace = true
+forge-core = { path = "../crates/forge-core" }
 forge-schema = { path = "../crates/forge-schema" }
+forge-runtime = { path = "../crates/forge-runtime" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]

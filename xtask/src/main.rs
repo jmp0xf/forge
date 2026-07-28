@@ -11,6 +11,7 @@ use forge_schema::{SchemaKind, schema_json};
 
 mod compat;
 mod fixtures;
+mod release;
 
 const EXIT_OK: u8 = 0;
 const EXIT_NEGATIVE: u8 = 1;
@@ -33,9 +34,41 @@ fn main() -> ExitCode {
         [command] if command == "check-schemas" => run_check_schemas(),
         [command] if command == "generate-fixtures" => run_generate_fixtures(),
         [command, rest @ ..] if command == "diff-plans" => run_diff_plans(rest),
+        [command, rest @ ..] if command == "release-build" => {
+            run_release_command(release::run_build(rest))
+        }
+        [command, rest @ ..] if command == "release-finalize" => {
+            run_release_command(release::run_finalize(rest))
+        }
+        [command, rest @ ..] if command == "release-check" => {
+            run_release_command(release::run_check(rest))
+        }
         _ => {
             eprintln!("invalid xtask arguments; run `cargo run -p xtask -- help`");
             ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn run_release_command(
+    result: Result<release::ReleaseCommandOutput, release::ReleaseError>,
+) -> ExitCode {
+    match result {
+        Ok(release::ReleaseCommandOutput::Help(help)) => {
+            println!("{help}");
+            ExitCode::from(EXIT_OK)
+        }
+        Ok(release::ReleaseCommandOutput::Completed(message)) => {
+            println!("{message}");
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => {
+            let code = match error.kind() {
+                release::ReleaseErrorKind::Usage => EXIT_USAGE,
+                release::ReleaseErrorKind::Environment => EXIT_ENV_UNMET,
+                release::ReleaseErrorKind::Internal => EXIT_INTERNAL,
+            };
+            report_error(code, &error.to_string())
         }
     }
 }
@@ -225,7 +258,10 @@ fn print_help() {
          schema-export     export checked-in JSON Schemas\n\
          check-schemas     detect unreviewed Schema drift\n\
          generate-fixtures build deterministic fixture repositories\n\
-         diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate"
+         diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate\n\
+         release-build     build and stage one accepted release target\n\
+         release-finalize  require all targets and write manifest/checksums\n\
+         release-check     verify the complete local release asset set"
     );
 }
 
