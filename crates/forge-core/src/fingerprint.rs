@@ -2017,9 +2017,15 @@ mod tests {
     fn fixed_vectors_pin_command_and_toolchain_dependency_domains() -> Result<(), Box<dyn Error>> {
         let command = command()?;
         let unit = project_unit()?;
+        // Command cwd and source paths are lossless native facts, so their fixed vector is
+        // platform-family specific by contract.
+        #[cfg(not(windows))]
+        let expected_command = "fixture:07667a0350b767cf";
+        #[cfg(windows)]
+        let expected_command = "fixture:cdf9c95f7738c41a";
         assert_eq!(
             digest(&command, &[provenance("command/base")])?.as_str(),
-            "fixture:07667a0350b767cf"
+            expected_command
         );
         assert_eq!(
             known_toolchain_digest(&unit)?.as_str(),

@@ -704,7 +704,12 @@ mod tests {
         let DependencyValue::Known(scope) = &prepared else {
             unreachable!("the fixture constructs a complete prepared scope")
         };
+        // Scope paths intentionally use the lossless native representation; pin each supported
+        // platform family so a separator or encoding change cannot masquerade as portability.
+        #[cfg(not(windows))]
         let expected = Digest::from("fixture-fnv1a64:87f0bec6599c3a7f");
+        #[cfg(windows)]
+        let expected = Digest::from("fixture-fnv1a64:3b4c2f81ede1388b");
         let borrowed = prepared_scope_dependency_digest(&VectorHasher, scope);
 
         assert_eq!(borrowed, expected);

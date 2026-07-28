@@ -114,10 +114,12 @@ mod tests {
         else {
             return Err("authoritative command fixture unexpectedly became unknown".into());
         };
-        assert_eq!(
-            digest.as_str(),
-            "blake3:b6843661067f3213110e31343d11b80ce41b1e0367e85e9a8bd448f5dceb3392"
-        );
+        // This production vector includes the command's lossless native cwd representation.
+        #[cfg(not(windows))]
+        let expected = "blake3:b6843661067f3213110e31343d11b80ce41b1e0367e85e9a8bd448f5dceb3392";
+        #[cfg(windows)]
+        let expected = "blake3:bb4a0ce356e61e06e24d2842ead6ea64a80268892ed3acf5cec1c94683597236";
+        assert_eq!(digest.as_str(), expected);
         Ok(())
     }
 }
