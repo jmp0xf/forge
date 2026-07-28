@@ -362,6 +362,7 @@ fn raw_index_snapshot_rejects_a_non_regular_index() -> Result<(), Box<dyn std::e
         .ok_or("directory index unexpectedly produced a raw snapshot")?;
     assert_eq!(error.kind(), GitErrorKind::CorruptRepository);
     assert_eq!(error.operation(), "index-path");
+    assert!(error.detail().starts_with("exit code Some("));
     Ok(())
 }
 
