@@ -440,13 +440,7 @@ pub fn detect_project_model_with_cache_controlled(
             options.inventory,
             hasher,
             control,
-        )?
-        .map(|inventory| {
-            file_set_from_cached_inventory_controlled(&inventory, control)
-                .map(|file_set| file_set.map(|file_set| (inventory, file_set)))
-        })
-        .transpose()?
-        .flatten();
+        )?;
         if candidate.is_some()
             && cached_projection_matches_index_controlled(
                 git,
@@ -466,7 +460,7 @@ pub fn detect_project_model_with_cache_controlled(
     control.checkpoint()?;
     let mut inventory_cache_publication = None;
     let (inventory, file_set, navigation_scope_seed) = match cached_inventory {
-        Some((inventory, file_set)) => {
+        Some(cached) => {
             inventory_cache_status = InventoryCacheStatus::Hit;
             let scope_seed = repository
                 .status
@@ -476,7 +470,7 @@ pub fn detect_project_model_with_cache_controlled(
                     status,
                     index_entries,
                 });
-            (inventory, file_set, scope_seed)
+            (cached.inventory, cached.file_set, scope_seed)
         }
         None => {
             control.checkpoint()?;
@@ -718,24 +712,6 @@ fn inventory_matches_repository_for_publication(
     }
     control.checkpoint()?;
     Ok(true)
-}
-
-fn file_set_from_cached_inventory_controlled(
-    inventory: &Inventory,
-    control: &dyn OperationControl,
-) -> Result<Option<GitFileSet>, OperationControlError> {
-    let mut tracked = Vec::with_capacity(inventory.entries.len());
-    for entry in &inventory.entries {
-        control.checkpoint()?;
-        let Ok(path) = RepoRelativePath::new(&entry.path) else {
-            return Ok(None);
-        };
-        tracked.push(path);
-    }
-    control.checkpoint()?;
-    let file_set = GitFileSet::new(tracked, Vec::new());
-    control.checkpoint()?;
-    Ok(Some(file_set))
 }
 
 fn cached_projection_matches_index_controlled(
@@ -2346,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn rehashed_forged_paths_under_the_live_key_fall_back_to_authoritative_inventory()
+    fn rehashed_attestation_under_the_live_key_cannot_replace_current_index_paths()
     -> Result<(), Box<dyn std::error::Error>> {
         let live_inventory = model_inventory(&[("README.md", InventoryKind::File)]);
         let mut git = model_git(&live_inventory)?;
@@ -2380,8 +2356,8 @@ mod tests {
             .ok_or("ordinary model index did not produce a projection")?;
 
         // The cache digest is an integrity check, not an authority boundary: an attacker who can
-        // write the cache can recompute it. Publish a structurally valid envelope under the live
-        // key and projection but replace the complete path set.
+        // write the cache can recompute it. Publish a structurally valid attestation under the live
+        // key and projection from an inventory containing a different path.
         let forged_inventory = model_inventory(&[("OTHER.md", InventoryKind::File)]);
         let forged_cache = ModelInventoryCache::default();
         let forged_publication = prepare_cached_inventory(
@@ -2404,10 +2380,17 @@ mod tests {
             Some(&forged_cache),
         )?;
 
-        assert_eq!(detected.inventory_cache_status, InventoryCacheStatus::Miss);
-        assert_eq!(detected.navigation.inventory, live_inventory);
+        assert_eq!(detected.inventory_cache_status, InventoryCacheStatus::Hit);
+        assert_eq!(
+            detected.navigation.inventory.entries,
+            vec![InventoryEntry {
+                path: PathBuf::from("README.md"),
+                kind: InventoryKind::File,
+                size_bytes: None,
+            }]
+        );
         assert_eq!(forged_cache.loads.get(), 1);
-        assert_eq!(filesystem.inventory_calls.get(), 1);
+        assert_eq!(filesystem.inventory_calls.get(), 0);
         Ok(())
     }
 

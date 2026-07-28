@@ -19,16 +19,16 @@ const CACHE_KEY_DOMAIN: &[u8] = b"forge.shared-inventory-cache-key/v3";
 const INDEX_SNAPSHOT_DOMAIN: &[u8] = b"forge.raw-git-index-snapshot/v1";
 const INDEX_PROJECTION_DOMAIN: &[u8] = b"forge.git-index-semantic-projection/v1";
 const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"forge.shared-inventory-cache-payload/v1";
-const CACHE_SCHEMA: &str = "forge.inventory-cache/v2";
-const CACHE_BEHAVIOR: &str = "forge.inventory-cache-behavior/v3";
+const CACHE_SCHEMA: &str = "forge.inventory-cache/v3";
+const CACHE_BEHAVIOR: &str = "forge.inventory-cache-behavior/v4";
 const INVENTORY_COMMAND: &str = "clean-index-path-projection/v3";
 const ELIGIBILITY_RULE: &str = "stage0-cached-regular-files-only/v1";
 const NOT_APPLICABLE_TOOLCHAIN: &str = "not-applicable:inventory-toolchain/v1";
 const EMPTY_ENVIRONMENT: &str = "known-empty:inventory-environment/v1";
 const CONTROL_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Hard bound for one encoded shared inventory entry.
-pub const MAX_INVENTORY_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Hard bound for one fixed-shape shared inventory eligibility attestation.
+pub const MAX_INVENTORY_CACHE_BYTES: usize = 4 * 1024;
 /// Hard bound for the raw Git index bytes used to form a clean snapshot identity.
 pub const MAX_INDEX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -44,11 +44,20 @@ pub trait InventoryCacheWritePort {
     fn store_new(&self, key: &Digest, bytes: &[u8]) -> io::Result<()>;
 }
 
-/// A complete immutable entry retained in memory until a caller reaches a write boundary.
+/// A complete immutable attestation retained in memory until a caller reaches a write boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryCachePublication {
     key: Digest,
     bytes: Vec<u8>,
+}
+
+/// Exact inventory views reconstructed from the current typed Git index after cache validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedInventory {
+    /// Canonical regular-file inventory used by project detection.
+    pub inventory: Inventory,
+    /// Canonical tracked file set used by language and runner discovery.
+    pub file_set: GitFileSet,
 }
 
 /// Produces a reusable key only for a complete, clean, committed repository identity.
@@ -250,7 +259,9 @@ pub fn inventory_cache_basis_is_eligible_controlled(
     Ok(true)
 }
 
-/// Reads and validates a cache entry. Any storage or decoding failure is an ordinary miss.
+/// Validates an attestation and rebuilds exact views from the current typed index.
+///
+/// Any storage, decoding, or index-subset failure is an ordinary miss.
 #[must_use]
 pub fn load_cached_inventory(
     cache: &dyn InventoryCacheReadPort,
@@ -259,7 +270,7 @@ pub fn load_cached_inventory(
     index_entries: &[GitIndexEntry],
     options: InventoryOptions,
     hasher: &dyn Hasher,
-) -> Option<Inventory> {
+) -> Option<CachedInventory> {
     load_cached_inventory_controlled(
         cache,
         key,
@@ -282,7 +293,7 @@ pub fn load_cached_inventory_controlled(
     options: InventoryOptions,
     hasher: &dyn Hasher,
     control: &dyn OperationControl,
-) -> Result<Option<Inventory>, OperationControlError> {
+) -> Result<Option<CachedInventory>, OperationControlError> {
     control.checkpoint()?;
     let Some(bytes) = cache.load(key, MAX_INVENTORY_CACHE_BYTES).ok().flatten() else {
         control.checkpoint()?;
@@ -292,7 +303,7 @@ pub fn load_cached_inventory_controlled(
     if bytes.len() > MAX_INVENTORY_CACHE_BYTES {
         return Ok(None);
     }
-    match decode_inventory(
+    match decode_attestation(
         &bytes,
         key,
         index_projection,
@@ -307,7 +318,7 @@ pub fn load_cached_inventory_controlled(
     }
 }
 
-/// Prepares a complete inventory for later publication without changing the filesystem.
+/// Prepares a fixed-shape eligibility attestation without changing the filesystem.
 #[must_use]
 pub fn prepare_cached_inventory(
     key: &Digest,
@@ -344,7 +355,7 @@ pub fn prepare_cached_inventory_controlled(
             return Ok(None);
         }
     }
-    let bytes = match encode_inventory(inventory, key, index_projection, hasher, control) {
+    let bytes = match encode_attestation(inventory, key, index_projection, hasher, control) {
         Ok(bytes) => bytes,
         Err(CacheCodecError::Invalid) => return Ok(None),
         Err(CacheCodecError::Control(error)) => return Err(error),
@@ -407,7 +418,6 @@ struct CacheEnvelope {
 struct CachePayload {
     platform_encoding: String,
     eligibility: CacheEligibility,
-    entries: Vec<CacheEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -418,34 +428,22 @@ struct CacheEligibility {
     entry_count: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CacheEntry {
-    path_hex: String,
-}
-
-fn encode_inventory(
+fn encode_attestation(
     inventory: &Inventory,
     key: &Digest,
     index_projection: &Digest,
     hasher: &dyn Hasher,
     control: &dyn OperationControl,
 ) -> Result<Vec<u8>, CacheCodecError> {
-    let mut entries = Vec::with_capacity(inventory.entries.len());
-    for entry in &inventory.entries {
-        control.checkpoint()?;
-        entries.push(CacheEntry {
-            path_hex: encode_hex_controlled(&native_path_bytes(&entry.path)?, control)?,
-        });
-    }
+    control.checkpoint()?;
     let payload = CachePayload {
         platform_encoding: platform_encoding().to_owned(),
         eligibility: CacheEligibility {
             rule: ELIGIBILITY_RULE.to_owned(),
             index_projection: index_projection.as_str().to_owned(),
-            entry_count: u64::try_from(entries.len()).map_err(|_| CacheCodecError::Invalid)?,
+            entry_count: u64::try_from(inventory.entries.len())
+                .map_err(|_| CacheCodecError::Invalid)?,
         },
-        entries,
     };
     let payload_bytes = serialize_json_controlled(&payload, control)?;
     control.checkpoint()?;
@@ -462,7 +460,7 @@ fn encode_inventory(
     )
 }
 
-fn decode_inventory(
+fn decode_attestation(
     bytes: &[u8],
     expected_key: &Digest,
     expected_index_projection: &Digest,
@@ -470,15 +468,13 @@ fn decode_inventory(
     options: InventoryOptions,
     hasher: &dyn Hasher,
     control: &dyn OperationControl,
-) -> Result<Inventory, CacheCodecError> {
+) -> Result<CachedInventory, CacheCodecError> {
     let envelope: CacheEnvelope = deserialize_json_controlled(bytes, control)?;
     if envelope.schema != CACHE_SCHEMA
         || envelope.key != expected_key.as_str()
         || envelope.payload.platform_encoding != platform_encoding()
         || envelope.payload.eligibility.rule != ELIGIBILITY_RULE
         || envelope.payload.eligibility.index_projection != expected_index_projection.as_str()
-        || usize::try_from(envelope.payload.eligibility.entry_count).ok()
-            != Some(envelope.payload.entries.len())
     {
         return Err(CacheCodecError::Invalid);
     }
@@ -492,33 +488,24 @@ fn decode_inventory(
         return Err(CacheCodecError::Invalid);
     }
     control.checkpoint()?;
-    if envelope.payload.entries.len() > options.max_entries {
+    let entry_count = usize::try_from(envelope.payload.eligibility.entry_count)
+        .map_err(|_| CacheCodecError::Invalid)?;
+    if entry_count > options.max_entries || entry_count != index_entries.len() {
         return Err(CacheCodecError::Invalid);
     }
 
-    // The current index is already the typed, complete source of the paths used below. Compare the
-    // untrusted cache projection directly against those paths instead of decoding, normalizing,
-    // inserting, and sorting a second 100,000-path tree. This preserves the same exact-path proof
-    // while keeping a warm cache hit linear with one allocation per retained model entry.
-    let mut ordered_index = index_entries.iter().collect::<Vec<_>>();
-    ordered_index.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.stage.cmp(&right.stage))
-    });
-    control.checkpoint()?;
-    if ordered_index.len() != envelope.payload.entries.len() {
-        return Err(CacheCodecError::Invalid);
-    }
+    // The cache is only an eligibility attestation. The current typed index remains the sole source
+    // of paths, and both downstream views are rebuilt together after validating the accepted,
+    // canonical index subset. Cache bytes therefore cannot inject or replace repository paths.
     let mut previous = None;
-    let mut entries = Vec::with_capacity(ordered_index.len());
-    for (cached, index) in envelope.payload.entries.into_iter().zip(ordered_index) {
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut tracked = Vec::with_capacity(entry_count);
+    for index in index_entries {
         control.checkpoint()?;
         if index.stage != 0
             || !matches!(index.tag, GitIndexTag::Cached)
             || !matches!(index.mode.as_bytes(), b"100644" | b"100755")
-            || previous == Some(&index.path)
-            || !path_hex_matches_controlled(&cached.path_hex, index.path.as_path(), control)?
+            || previous.is_some_and(|previous| previous >= &index.path)
         {
             return Err(CacheCodecError::Invalid);
         }
@@ -528,11 +515,20 @@ fn decode_inventory(
             kind: InventoryKind::File,
             size_bytes: None,
         });
+        tracked.push(index.path.clone());
     }
     control.checkpoint()?;
-    Ok(Inventory {
-        entries,
-        skipped: Vec::new(),
+    Ok(CachedInventory {
+        inventory: Inventory {
+            entries,
+            skipped: Vec::new(),
+        },
+        // The input order and uniqueness were proved above, so constructing the public value
+        // directly avoids a redundant sort over a large repository.
+        file_set: GitFileSet {
+            tracked,
+            untracked: Vec::new(),
+        },
     })
 }
 
@@ -671,90 +667,6 @@ impl Read for ControlledSliceReader<'_> {
         buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
         self.offset += count;
         Ok(count)
-    }
-}
-
-#[cfg(test)]
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-fn encode_hex_controlled(
-    bytes: &[u8],
-    control: &dyn OperationControl,
-) -> Result<String, OperationControlError> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for chunk in bytes.chunks(CONTROL_CHUNK_BYTES) {
-        control.checkpoint()?;
-        for byte in chunk {
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    control.checkpoint()?;
-    Ok(encoded)
-}
-
-#[cfg(unix)]
-fn path_hex_matches_controlled(
-    value: &str,
-    path: &Path,
-    control: &dyn OperationControl,
-) -> Result<bool, OperationControlError> {
-    use std::os::unix::ffi::OsStrExt as _;
-    hex_matches_bytes_controlled(value, path.as_os_str().as_bytes(), control)
-}
-
-#[cfg(not(unix))]
-fn path_hex_matches_controlled(
-    value: &str,
-    path: &Path,
-    control: &dyn OperationControl,
-) -> Result<bool, OperationControlError> {
-    let Ok(bytes) = native_path_bytes(path) else {
-        return Ok(false);
-    };
-    hex_matches_bytes_controlled(value, &bytes, control)
-}
-
-fn hex_matches_bytes_controlled(
-    value: &str,
-    expected: &[u8],
-    control: &dyn OperationControl,
-) -> Result<bool, OperationControlError> {
-    if value.len() != expected.len().saturating_mul(2) {
-        return Ok(false);
-    }
-    for (pairs, expected) in value
-        .as_bytes()
-        .chunks(CONTROL_CHUNK_BYTES.saturating_mul(2))
-        .zip(expected.chunks(CONTROL_CHUNK_BYTES))
-    {
-        control.checkpoint()?;
-        if !pairs.chunks_exact(2).zip(expected).all(|(pair, expected)| {
-            decode_nibble(pair[0])
-                .zip(decode_nibble(pair[1]))
-                .is_some_and(|(high, low)| (high << 4) | low == *expected)
-        }) {
-            return Ok(false);
-        }
-    }
-    control.checkpoint()?;
-    Ok(true)
-}
-
-const fn decode_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
     }
 }
 
@@ -970,13 +882,16 @@ mod tests {
         publish_cached_inventory(&cache, &publication)?;
         assert_eq!(
             load_cached_inventory(&cache, &key, &index_projection, &index, options, &hasher,),
-            Some(Inventory {
-                entries: vec![InventoryEntry {
-                    path: PathBuf::from("src/lib.rs"),
-                    kind: InventoryKind::File,
-                    size_bytes: None,
-                }],
-                skipped: Vec::new(),
+            Some(CachedInventory {
+                inventory: Inventory {
+                    entries: vec![InventoryEntry {
+                        path: PathBuf::from("src/lib.rs"),
+                        kind: InventoryKind::File,
+                        size_bytes: None,
+                    }],
+                    skipped: Vec::new(),
+                },
+                file_set: GitFileSet::new(vec![RepoRelativePath::new("src/lib.rs")?], Vec::new(),),
             })
         );
         assert!(
@@ -1148,12 +1063,11 @@ mod tests {
             .ok_or("valid inventory did not produce a publication")?
             .bytes;
         let index = ordinary_index(&["src/lib.rs"])?;
-        let absolute_path = encode_hex(
-            &native_path_bytes(&std::env::current_dir()?)
-                .map_err(|_| io::Error::other("current directory has no native path encoding"))?,
-        );
 
         let mut invalid = Vec::new();
+        invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
+            envelope.schema = String::from("forge.inventory-cache/v2");
+        })?);
         invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
             envelope.key = String::from("wrong-key");
         })?);
@@ -1167,21 +1081,6 @@ mod tests {
             envelope.payload.eligibility.rule = String::from("wrong-rule");
         })?);
         invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
-            envelope.payload.eligibility.entry_count = 2;
-        })?);
-        invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
-            envelope.payload.entries[0].path_hex = encode_hex(b"../escape");
-        })?);
-        invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
-            envelope.payload.entries[0].path_hex = absolute_path;
-        })?);
-        invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
-            envelope.payload.entries[0].path_hex = String::new();
-        })?);
-        invalid.push(rewrite_cache_envelope(&valid, &hasher, |envelope| {
-            envelope.payload.entries.push(CacheEntry {
-                path_hex: encode_hex(b"src/lib.rs"),
-            });
             envelope.payload.eligibility.entry_count = 2;
         })?);
         let mut wrong_digest = valid.clone();
@@ -1219,6 +1118,222 @@ mod tests {
                 )
                 .is_none(),
                 "malformed cache case {case} was reused"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn path_bearing_older_schema_and_oversized_v2_are_always_misses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hasher = TestHasher;
+        let key = hasher.digest(&[b"cache-key"]);
+        let projection = hasher.digest(&[b"index-projection"]);
+        let inventory = Inventory {
+            entries: vec![InventoryEntry {
+                path: PathBuf::from("src/lib.rs"),
+                kind: InventoryKind::File,
+                size_bytes: Some(7),
+            }],
+            skipped: Vec::new(),
+        };
+        let current = prepare_cached_inventory(&key, &projection, &inventory, &hasher)
+            .ok_or("valid inventory did not produce a publication")?
+            .bytes;
+        let mut old: serde_json::Value = serde_json::from_slice(&current)?;
+        old["schema"] = serde_json::Value::String(String::from("forge.inventory-cache/v2"));
+        old["payload"]["entries"] = serde_json::json!([{ "path_hex": "7372632f6c69622e7273" }]);
+        let small_v2 = serde_json::to_vec(&old)?;
+        old["payload"]["entries"] = serde_json::Value::Array(vec![
+            serde_json::json!({ "path_hex": "61".repeat(128) });
+            32
+        ]);
+        let oversized_v2 = serde_json::to_vec(&old)?;
+        assert!(oversized_v2.len() > MAX_INVENTORY_CACHE_BYTES);
+
+        for bytes in [small_v2, oversized_v2] {
+            assert!(
+                load_cached_inventory(
+                    &cache_with(&key, bytes),
+                    &key,
+                    &projection,
+                    &ordinary_index(&["src/lib.rs"])?,
+                    InventoryOptions::default(),
+                    &hasher,
+                )
+                .is_none(),
+                "an older path-bearing schema must not be accepted under a current key"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_attestation_size_does_not_scale_with_repository_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hasher = TestHasher;
+        let key = hasher.digest(&[b"cache-key"]);
+        let projection = hasher.digest(&[b"index-projection"]);
+        let inventory = |count: usize| Inventory {
+            entries: (0..count)
+                .map(|index| InventoryEntry {
+                    path: PathBuf::from(format!("private/source/{index:06}.rs")),
+                    kind: InventoryKind::File,
+                    size_bytes: Some(7),
+                })
+                .collect(),
+            skipped: Vec::new(),
+        };
+
+        let one = prepare_cached_inventory(&key, &projection, &inventory(1), &hasher)
+            .ok_or("one-entry inventory did not produce a cache publication")?;
+        let large = prepare_cached_inventory(&key, &projection, &inventory(100_000), &hasher)
+            .ok_or("large inventory did not produce a cache publication")?;
+
+        assert!(large.bytes.len() < 1024, "attestation unexpectedly grew");
+        assert!(
+            one.bytes.len().abs_diff(large.bytes.len()) <= 6,
+            "only the decimal entry count may vary with repository size"
+        );
+        assert!(
+            !large
+                .bytes
+                .windows(b"private/source".len())
+                .any(|window| window == b"private/source")
+        );
+        assert!(
+            !large
+                .bytes
+                .windows(b"path_hex".len())
+                .any(|window| window == b"path_hex")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_bytes_cannot_inject_paths_into_the_current_index_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hasher = TestHasher;
+        let key = hasher.digest(&[b"cache-key"]);
+        let index = ordinary_index(&["src/lib.rs"])?;
+        let projection = index_projection_digest(&index, &hasher)
+            .ok_or("ordinary index did not produce a semantic projection")?;
+        let forged_inventory = Inventory {
+            entries: vec![InventoryEntry {
+                path: PathBuf::from("OTHER.md"),
+                kind: InventoryKind::File,
+                size_bytes: Some(7),
+            }],
+            skipped: Vec::new(),
+        };
+        let publication = prepare_cached_inventory(&key, &projection, &forged_inventory, &hasher)
+            .ok_or("forged fixture did not produce an attestation")?;
+        let cache = cache_with(&key, publication.bytes);
+
+        let cached = load_cached_inventory(
+            &cache,
+            &key,
+            &projection,
+            &index,
+            InventoryOptions::default(),
+            &hasher,
+        )
+        .ok_or("valid attestation was not reused")?;
+
+        assert_eq!(
+            cached.inventory.entries[0].path,
+            PathBuf::from("src/lib.rs")
+        );
+        assert_eq!(
+            cached.file_set.tracked,
+            vec![RepoRelativePath::new("src/lib.rs")?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsorted_duplicate_and_nonordinary_current_indexes_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hasher = TestHasher;
+        let key = hasher.digest(&[b"cache-key"]);
+        let mut index = ordinary_index(&["a.rs", "z.rs"])?;
+        index.reverse();
+        let projection = index_projection_digest(&index, &hasher)
+            .ok_or("ordinary index did not produce a semantic projection")?;
+        let inventory = Inventory {
+            entries: vec![
+                InventoryEntry {
+                    path: PathBuf::from("a.rs"),
+                    kind: InventoryKind::File,
+                    size_bytes: Some(1),
+                },
+                InventoryEntry {
+                    path: PathBuf::from("z.rs"),
+                    kind: InventoryKind::File,
+                    size_bytes: Some(1),
+                },
+            ],
+            skipped: Vec::new(),
+        };
+        let publication = prepare_cached_inventory(&key, &projection, &inventory, &hasher)
+            .ok_or("fixture did not produce an attestation")?;
+        let duplicate_entry = ordinary_index(&["a.rs"])?
+            .into_iter()
+            .next()
+            .ok_or("ordinary fixture omitted its entry")?;
+        let duplicate = vec![duplicate_entry.clone(), duplicate_entry];
+        for (label, current) in [("unsorted", index), ("duplicate", duplicate)] {
+            assert!(
+                load_cached_inventory(
+                    &cache_with(&key, publication.bytes.clone()),
+                    &key,
+                    &projection,
+                    &current,
+                    InventoryOptions::default(),
+                    &hasher,
+                )
+                .is_none(),
+                "{label} typed index was reused"
+            );
+        }
+
+        let one_entry_inventory = Inventory {
+            entries: vec![InventoryEntry {
+                path: PathBuf::from("a.rs"),
+                kind: InventoryKind::File,
+                size_bytes: Some(1),
+            }],
+            skipped: Vec::new(),
+        };
+        let one_entry_publication =
+            prepare_cached_inventory(&key, &projection, &one_entry_inventory, &hasher)
+                .ok_or("one-entry fixture did not produce an attestation")?;
+        let parse = |tag: &str, mode: &str, stage: u8| {
+            let record = format!("{tag} {mode} {} {stage}\ta.rs\0", "1".repeat(40));
+            parse_git_index_reader(
+                Cursor::new(record.into_bytes()),
+                GitObjectFormat::Sha1,
+                1024,
+                1,
+            )
+        };
+        let nonordinary = [
+            ("gitlink", parse("H", "160000", 0)?),
+            ("skip-worktree", parse("S", "100644", 0)?),
+            ("non-zero stage", parse("H", "100644", 1)?),
+        ];
+        for (label, current) in nonordinary {
+            assert!(
+                load_cached_inventory(
+                    &cache_with(&key, one_entry_publication.bytes.clone()),
+                    &key,
+                    &projection,
+                    &current,
+                    InventoryOptions::default(),
+                    &hasher,
+                )
+                .is_none(),
+                "{label} typed index was reused"
             );
         }
         Ok(())

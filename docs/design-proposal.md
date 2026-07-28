@@ -992,8 +992,10 @@ v0 的 shared inventory cache 采用更窄的专用键：repository identity、H
 边界、effective policy、平台、Forge behavior，加上当前普通 Git index 的语义投影
 `(mode, blob object id, native relative path)`。raw index bytes 只用于在 status/index 读取前后
 检测竞态，不进入跨 linked-worktree 的共享键，因为其中含 checkout 本地 stat 数据。缓存值只含
-有序普通文件路径，不含 worktree 本地 size；命中时必须用当前 stage-zero index 重新核对全部路径，
-并再次确认 raw index 未变化。split index、`index.lock`、symlink/reparse、非普通 index、
+固定形状的资格证明（Schema、包含 behavior 的 key、平台、规则、index 语义投影、条目数和 payload digest），
+不含路径或 worktree 本地 size；命中时 inventory 与 file set 必须完全由当前 typed stage-zero index
+在同一趟校验中重建，并再次确认 raw index 未变化。旧 Schema/behavior 的缓存自然 miss。split index、
+`index.lock`、symlink/reparse、未严格排序或重复路径的 typed index、非普通 index、
 Gitlink、unmerged、sparse/skip-worktree、assume-unchanged、untracked，或 bounded Git 读取所暴露的
 状态不在明确允许的普通 stage-zero 子集内，均回退到权威 inventory。只读命令的 miss 不发布；
 只有已成功的授权状态写入才能顺带发布不可变条目。
