@@ -50,7 +50,7 @@ pub use inventory::{
     BoundedText, Inventory, InventoryEntry, InventoryError, InventoryKind, InventoryOptions,
     InventorySkip, PathKind, PathMetadata,
 };
-pub use path::{RelativePathError, RepoRelativePath};
+pub use path::{RelativePathError, RepoRelativePath, portable_relative_utf8_path};
 pub use policy::{
     EffectivePolicyContent, EvidenceRequirements, PathPattern, PolicyError, RiskLevel, RiskRule,
 };

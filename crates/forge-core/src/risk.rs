@@ -7,6 +7,7 @@ use forge_schema::WirePath;
 use crate::policy::{
     EffectivePolicyContent, EvidenceRequirements, PathPattern, PolicyError, RiskLevel, RiskRule,
 };
+use crate::portable_relative_utf8_path;
 use crate::{Assumption, Confidence, Provenance, RepoRelativePath};
 
 /// Every path match for one effective risk rule.
@@ -214,14 +215,14 @@ pub fn assess_risk(
     for rule in policy.rules() {
         let mut rule_paths = Vec::new();
         for path in &paths {
-            let Some(path_text) = path.as_path().to_str() else {
+            let Some(path_text) = portable_relative_utf8_path(path.as_path()) else {
                 unknown_paths.insert(path.clone());
                 continue;
             };
             if rule
                 .paths()
                 .iter()
-                .any(|pattern| pattern.matches(path_text))
+                .any(|pattern| pattern.matches(&path_text))
             {
                 matched_path_set.insert(path.clone());
                 rule_paths.push(path.clone());
@@ -595,8 +596,9 @@ mod tests {
             assumption.provenance[0]
                 .source_path
                 .as_ref()
-                .map(|path| path.display.as_str()),
-            Some("docs/guide.md")
+                .ok_or("docs-only assumption had no source path")?
+                .to_path_buf()?,
+            Path::new("docs/guide.md")
         );
         Ok(())
     }

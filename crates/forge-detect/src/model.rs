@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use forge_core::ports::{FileSystemPort, GitPort, Hasher, ProcessPort};
@@ -14,7 +14,7 @@ use forge_core::{
     GitFileSet, GitIndexEntry, Intent, InvalidCommandResolution, Inventory, InventoryError,
     InventoryKind, InventoryOptions, OperationControl, OperationControlError, ProjectModel,
     ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance, RelativePathError,
-    RepoRelativePath, Severity, UnlimitedOperationControl,
+    RepoRelativePath, Severity, UnlimitedOperationControl, portable_relative_utf8_path,
 };
 
 use crate::assets::{AssetDiscoveryError, StandardAssetDiscovery, discover_standard_assets};
@@ -782,27 +782,12 @@ fn project_detection_inventory<'a>(
 }
 
 fn project_path_selected(path: &Path, project: &ProjectConfig) -> bool {
-    let Some(path) = portable_relative_path(path) else {
+    let Some(path) = portable_relative_utf8_path(path).filter(|path| path != ".") else {
         return project.include.is_empty();
     };
     let included =
         project.include.is_empty() || project.include.iter().any(|pattern| pattern.matches(&path));
     included && !project.exclude.iter().any(|pattern| pattern.matches(&path))
-}
-
-fn portable_relative_path(path: &Path) -> Option<String> {
-    let mut rendered = String::new();
-    for component in path.components() {
-        let Component::Normal(component) = component else {
-            return None;
-        };
-        let component = component.to_str()?;
-        if !rendered.is_empty() {
-            rendered.push('/');
-        }
-        rendered.push_str(component);
-    }
-    (!rendered.is_empty()).then_some(rendered)
 }
 
 #[derive(Debug)]
