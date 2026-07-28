@@ -1138,7 +1138,19 @@ fn configure_lock_open_options(options: &mut OpenOptions) {
 fn configure_lock_open_options(_options: &mut OpenOptions) {}
 
 fn is_lock_contention(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::WouldBlock
+    #[cfg(windows)]
+    let native_contention = {
+        use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+
+        // `fs2` exposes the native `LockFileEx` failure unchanged. Rust does not map Win32
+        // `ERROR_LOCK_VIOLATION` to `WouldBlock`, so normalize that one documented contention
+        // result at this portability boundary rather than leaking `Uncategorized` to callers.
+        error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32)
+    };
+    #[cfg(not(windows))]
+    let native_contention = false;
+
+    error.kind() == io::ErrorKind::WouldBlock || native_contention
 }
 
 #[cfg(windows)]
