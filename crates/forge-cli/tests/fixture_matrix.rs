@@ -1168,6 +1168,7 @@ fn every_available_native_command_survives_fixture_install_and_uninstall()
 #[ignore = "opt-in v0 latency benchmark over a committed 100000-file repository"]
 fn large_repository_v0_latency_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     const FILE_COUNT: usize = 100_000;
+    const INVENTORY_SAMPLES: usize = 20;
     const WARM_SAMPLES: usize = 20;
 
     require_release_benchmark()?;
@@ -1193,17 +1194,20 @@ fn large_repository_v0_latency_benchmark() -> Result<(), Box<dyn std::error::Err
         "materialize 100000-file performance fixture",
     )?;
 
-    let started = Instant::now();
-    let output = fixture.run_forge(&["explain", "--json"])?;
-    let first_inventory = started.elapsed();
-
-    assert_eq!(output.status.code(), Some(0), "{}", display_output(&output));
-    let _: Value = serde_json::from_slice(&output.stdout)?;
     let private_root = fixture.git_dir(&fixture.worktree)?.join("forge");
-    assert!(
-        !private_root.exists(),
-        "the cold read-only inventory measurement must not publish a cache"
-    );
+    let mut uncached_inventory = Vec::with_capacity(INVENTORY_SAMPLES);
+    for _ in 0..INVENTORY_SAMPLES {
+        let started = Instant::now();
+        let output = fixture.run_forge(&["explain", "--json"])?;
+        uncached_inventory.push(started.elapsed());
+        assert_eq!(output.status.code(), Some(0), "{}", display_output(&output));
+        let _: Value = serde_json::from_slice(&output.stdout)?;
+        assert!(
+            !private_root.exists(),
+            "an uncached read-only inventory measurement must not publish a cache"
+        );
+    }
+    let first_inventory = uncached_inventory[0];
     let cold_inventory_peak_rss = benchmark_peak_rss_bytes(&fixture, &["explain", "--json"], 0)?;
 
     let primed = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
@@ -1279,8 +1283,10 @@ fn large_repository_v0_latency_benchmark() -> Result<(), Box<dyn std::error::Err
         },
     );
     eprintln!(
-        "v0 release benchmark ({FILE_COUNT} committed files, {WARM_SAMPLES} warm samples):\n  first inventory: {} ms (target < 5000 ms)\n  cold inventory forge peak RSS: {peak_rss}\n  version p95: {} ms (target < 50 ms)\n  next p95: {} ms (target < 200 ms)\n  adapters check p95: {} ms (target < 300 ms)\n  doctor p95: {} ms (target < 3000 ms)\n  git status p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git diff-files p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git diff-index --cached p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git ls-files --others p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git ls-files --stage -v p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git hash-object index p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)",
+        "v0 release benchmark ({FILE_COUNT} committed files, {INVENTORY_SAMPLES} uncached inventory samples, {WARM_SAMPLES} warm samples):\n  first inventory cold observation: {} ms\n  uncached inventory p50/p95: {}/{} ms (target p95 < 5000 ms)\n  cold inventory forge peak RSS: {peak_rss}\n  version p95: {} ms (target < 50 ms)\n  next p95: {} ms (target < 200 ms)\n  adapters check p95: {} ms (target < 300 ms)\n  doctor p95: {} ms (target < 3000 ms)\n  git status p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git diff-files p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git diff-index --cached p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git ls-files --others p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git ls-files --stage -v p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)\n  git hash-object index p50/p95: {}/{} ms (stdout {} bytes, stderr {} bytes)",
         first_inventory.as_millis(),
+        percentile(&uncached_inventory, 50).as_millis(),
+        percentile_95(&uncached_inventory).as_millis(),
         percentile_95(&version).as_millis(),
         percentile_95(&next).as_millis(),
         percentile_95(&adapters).as_millis(),
