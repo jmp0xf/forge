@@ -728,11 +728,14 @@ fn materialize_isolated_checkout(
         separate_git_directory,
         template_directory,
         OsString::from("--"),
-        repository.as_os_str().to_owned(),
+        // Rust canonicalizes Windows paths to a verbatim spelling such as `\\?\C:\...`, which
+        // Git can reinterpret as scp-style SSH. The runner pins this repository as its cwd, so
+        // `.` names the same local source without translating native path bytes.
+        OsString::from("."),
         checkout.as_os_str().to_owned(),
     ]);
     let clone = run_bounded_process(
-        checkout_directory.path(),
+        repository,
         OsString::from("git"),
         clone_arguments,
         environment.clone(),
@@ -3522,13 +3525,20 @@ mod tests {
         .map_err(|error| ReleaseError::internal(error.to_string()))?;
         fs::write(&config, b"[build]\nrustc-wrapper = \"false\"\n")
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let canonical_config =
+            fs::canonicalize(&config).map_err(|error| ReleaseError::internal(error.to_string()))?;
 
         let error = super::require_no_external_cargo_configuration(&source)
             .err()
             .ok_or_else(|| {
                 ReleaseError::internal("external Cargo configuration was unexpectedly accepted")
             })?;
-        assert!(error.to_string().contains(&config.display().to_string()));
+        assert_eq!(error.kind(), ReleaseErrorKind::Environment);
+        assert!(
+            error
+                .to_string()
+                .contains(&canonical_config.display().to_string())
+        );
         Ok(())
     }
 
