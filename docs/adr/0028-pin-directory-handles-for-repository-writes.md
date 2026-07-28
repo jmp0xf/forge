@@ -1,10 +1,10 @@
 # ADR-0028：仓库写入固定目录句柄
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-07-28
 - Deciders: Forge maintainers
 - Supersedes: None
-- Superseded by: None
+- Superseded by: ADR-0031
 
 ## Context
 

@@ -519,7 +519,8 @@ mod platform {
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+        FileRenameInformation, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
@@ -529,10 +530,10 @@ mod platform {
         BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo,
-        FileIdInfo, FileRenameInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+        FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
+        SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -740,7 +741,6 @@ mod platform {
                 hook(WriteEvent::BeforeCommit)?;
                 rename_handle_relative(
                     &temporary,
-                    &parent,
                     leaf,
                     matches!(commit_mode, CommitMode::Replace),
                 )?;
@@ -1103,12 +1103,7 @@ mod platform {
         Ok(unsafe { File::from_raw_handle(handle) })
     }
 
-    fn rename_handle_relative(
-        source: &File,
-        parent: &File,
-        target: &OsStr,
-        replace: bool,
-    ) -> io::Result<()> {
+    fn rename_handle_relative(source: &File, target: &OsStr, replace: bool) -> io::Result<()> {
         let name: Vec<u16> = target.encode_wide().collect();
         if name.contains(&0) {
             return Err(io::Error::new(
@@ -1120,23 +1115,26 @@ mod platform {
             .len()
             .checked_mul(size_of::<u16>())
             .ok_or_else(|| io::Error::other("Windows rename buffer length overflowed"))?;
-        // FILE_RENAME_INFO has a variable-width trailing name. Windows requires the
+        // FILE_RENAME_INFORMATION has a variable-width trailing name. Windows requires the
         // complete fixed structure in addition to the counted UTF-16 bytes; using
         // `offset_of!(..., FileName)` leaves the buffer short because of the tail
         // member and its alignment padding.
-        let total = size_of::<FILE_RENAME_INFO>()
+        let total = size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(name_bytes)
             .ok_or_else(|| io::Error::other("Windows rename buffer length overflowed"))?;
         let words = total.div_ceil(size_of::<usize>());
         let mut storage = vec![0usize; words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         // SAFETY: `storage` is suitably aligned and sized for the fixed header plus counted UTF-16
-        // name. Every pointer remains live for the synchronous SetFileInformationByHandle call.
+        // name. The temporary handle uses synchronous I/O, and every pointer remains live for the
+        // NtSetInformationFile call.
         unsafe {
             // `storage` is zero-filled, so the reserved union bytes remain zero while
-            // FileRenameInfo reads the boolean member.
+            // FileRenameInformation reads the boolean member. A NULL RootDirectory plus a simple
+            // leaf is the native same-directory form, so the source file's already-pinned parent
+            // remains the destination capability even if its visible path is concurrently moved.
             (*info).Anonymous.ReplaceIfExists = replace;
-            (*info).RootDirectory = parent.as_raw_handle();
+            (*info).RootDirectory = ptr::null_mut();
             (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1148,12 +1146,13 @@ mod platform {
                 storage
                     .as_mut_ptr()
                     .cast::<u8>()
-                    .add(offset_of!(FILE_RENAME_INFO, FileName)),
+                    .add(offset_of!(FILE_RENAME_INFORMATION, FileName)),
                 name_bytes,
             );
-            if SetFileInformationByHandle(
+            let mut status_block = IO_STATUS_BLOCK::default();
+            let status = NtSetInformationFile(
                 source.as_raw_handle(),
-                FileRenameInfo,
+                &mut status_block,
                 storage.as_ptr().cast::<c_void>(),
                 u32::try_from(total).map_err(|_| {
                     io::Error::new(
@@ -1161,9 +1160,11 @@ mod platform {
                         "Windows rename buffer exceeds API limits",
                     )
                 })?,
-            ) == 0
-            {
-                return Err(io::Error::last_os_error());
+                FileRenameInformation,
+            );
+            if status < 0 {
+                let code = RtlNtStatusToDosError(status);
+                return Err(io::Error::from_raw_os_error(code as i32));
             }
         }
         Ok(())
