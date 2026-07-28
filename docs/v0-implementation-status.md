@@ -74,9 +74,11 @@ Clean, stable, eligible repositories can reuse a content-addressed inventory ent
 inventory options, platform, Forge behavior, and a worktree-independent semantic Git-index
 projection of mode, blob identity, and native path. Raw index bytes bracket status/index reads only
 to reject concurrent changes; they do not enter the shared key because checkout-local stat data
-differs across linked worktrees. A cache payload retains only sorted regular-file paths, never live
-worktree byte sizes. Before reuse, Forge requires clean status, matches every cached path against
-the current bounded stage-zero index projection, and rechecks the raw index snapshot. Malformed,
+differs across linked worktrees. A cache entry is a fixed-shape eligibility attestation over the
+schema, key, platform, rules, semantic-index projection, entry count, and payload digest; it retains
+neither paths nor live worktree byte sizes. Before reuse, Forge requires clean status, validates the
+attestation, rebuilds the complete inventory and file set solely from the current bounded typed
+stage-zero index entries, and rechecks the raw index snapshot. Malformed,
 unsafe, dirty, untracked, unmerged, split-index, locked-index, symlink/reparse, Gitlink,
 assume-unchanged, skip-worktree, or any exposed index state outside the explicitly accepted
 ordinary stage-zero subset falls back to authoritative inventory.
@@ -118,15 +120,19 @@ containment; it fails closed on Windows rather than pretending equivalent Job Ob
 
 ## Current-candidate local verification
 
-Against commit `7e9b559` on macOS 26.5.2 arm64:
+Against current code commit `655b42b` on macOS 26.5.2 arm64:
 
 - the stable root format, check, `clippy -D warnings`, and isolated full test suite, plus the fuzz
   workspace format, check, `clippy -D warnings`, and full test suite, exited zero; schema drift
-  checking, fixture regeneration (0 written, 102 unchanged), and `forge version` also exited zero;
+  checking, fixture regeneration (0 written, 105 unchanged), `forge version`, and the repository's
+  zero-diff `init --dry-run --json` dogfood also exited zero;
 - locked Rust 1.85 root workspace check/test and fuzz workspace check/test exited zero;
-- all four checked-in fuzz targets completed 60-second `cargo-fuzz 0.13.2` campaigns with checked-in
-  seeds, exited zero, and produced no crash artifacts; and
-- cross-target checks with `-D warnings` passed for `x86_64-apple-darwin`,
+- the strict release fixture gate accounted for all 28 fixtures, ran all 27 declared native
+  commands after install and uninstall, recorded four scenario-only fixtures as not applicable,
+  and exited zero; and
+- against the earlier code commit `7e9b559`, all four checked-in fuzz targets completed
+  60-second `cargo-fuzz 0.13.2` campaigns with checked-in seeds, exited zero, and produced no crash
+  artifacts. Cross-target checks with `-D warnings` also passed for `x86_64-apple-darwin`,
   `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-gnu`. The
   `aarch64-unknown-linux-musl` check stopped in the `blake3` C build because
   `aarch64-linux-musl-gcc` was unavailable; this is a builder-toolchain gap, not a successful
@@ -139,22 +145,22 @@ concurrency evidence rather than treated as a waived failure.
 
 ## Current local calibration
 
-On 2026-07-28, the ignored release benchmark completed outside the sandbox against commit
-`d6ae7b8` on macOS 26.5.2 arm64 with Rust/Cargo 1.96.0 and Git 2.51.0. It used the generated
+On 2026-07-28, the ignored release benchmark completed against current code commit `655b42b` on
+macOS 26.5.2 arm64 with Rust/Cargo 1.96.0 and Git 2.51.0. It used the generated
 100,000-committed-file fixture. This is one local observation, not a portable performance
 qualification:
 
 | Measurement | Observed | Design target | Result |
 |---|---:|---:|---|
-| First uncached inventory | 3,447 ms | single observation | not classified |
-| Uncached inventory p50/p95 (20 samples) | 2,387 / 3,447 ms | p95 < 5,000 ms | met locally |
-| Cold Forge peak RSS | 132.12 MiB | < 150 MiB | met locally |
+| First uncached inventory | 3,052 ms | single observation | not classified |
+| Uncached inventory p50/p95 (20 samples) | 2,389 / 2,469 ms | p95 < 5,000 ms | met locally |
+| Cold Forge peak RSS | unavailable | < 150 MiB | not measured |
 | `version` p95 | 4 ms | < 50 ms | met locally |
-| warm `next` p95 | 1,559 ms | < 200 ms | not met |
-| warm `adapters check` p95 | 610 ms | < 300 ms | not met |
-| warm `doctor` p95 | 716 ms | < 3,000 ms | met locally |
+| warm `next` p95 | 1,043 ms | < 200 ms | not met |
+| warm `adapters check` p95 | 561 ms | < 300 ms | not met |
+| warm `doctor` p95 | 651 ms | < 3,000 ms | met locally |
 
-The same fixture measured bare `git status` at 270 ms p95. That host-level baseline does not weaken
+The same fixture measured bare `git status` at 278 ms p95. That host-level baseline does not weaken
 or redefine Forge's targets; this machine still cannot qualify the 200 ms `next` target, and the
 remaining Forge overhead requires measurement and reduction on a calibrated runner and
 representative real repositories. Benchmark process success must not be described as every
@@ -187,7 +193,8 @@ The following boundaries are intentionally not inferred from local implementatio
    `891262207663bff1aa422dbe799a76deae4064eaa445f14eb28aef7a388222cd` and
    `a0330f0df20dd1187e323f284a7f365c0ea1f2f271c1e154811e9fc4724bed13` respectively. The strict
    ledger then recorded all 27 declared commands as passed, four explicitly named scenario-only
-   fixtures as not applicable, and exited zero. This is one local qualification; every release
+   fixtures as not applicable, and exited zero. The same complete gate passed again against
+   current code commit `655b42b`. This is one local qualification; every release
    candidate still needs the strict gate on its controlled, fully provisioned runner.
 2. **Filesystem threat model and security review.** Repository writes and release-asset reads/writes
    now pin root directory handles and revalidate the visible root identity. Native adversarial tests
