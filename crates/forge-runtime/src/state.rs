@@ -245,6 +245,13 @@ impl AtomicStateStore {
                 }));
             }
             if evidence::is_evidence_gc_quarantine_name(&entry.file_name()) {
+                if !metadata.is_file() {
+                    evidence::validate_legacy_evidence_gc_residue(&entry_path, &metadata)?;
+                    return Err(evidence::unsupported_legacy_evidence_gc_residue_error(
+                        &entry_path,
+                    ));
+                }
+                validate_private_state_file(&entry_path, &metadata)?;
                 return Err(StateError::InvalidLayout {
                     path: entry_path,
                     reason: "immutable evidence GC residue requires held-lock recovery".to_owned(),

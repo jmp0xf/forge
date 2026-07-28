@@ -65,8 +65,15 @@ const RECEIPTS_V2_DIRECTORY: &str = "receipts/v2";
 const EVIDENCE_V1_DIRECTORY: &str = "evidence/v1";
 const EVIDENCE_V2_DIRECTORY: &str = "evidence/v2";
 const LOGS_V1_DIRECTORY: &str = "logs/v1";
+const EVIDENCE_GC_CLASSES: [(&str, &str, usize); 3] = [
+    (EVIDENCE_V2_DIRECTORY, ".json", EVIDENCE_GC_MAX_EVIDENCE),
+    (RECEIPTS_V2_DIRECTORY, ".json", EVIDENCE_GC_MAX_RECEIPTS),
+    (LOGS_V1_DIRECTORY, ".log", EVIDENCE_GC_MAX_LOGS),
+];
 const GC_QUARANTINE_PREFIX: &str = ".forge-gc-quarantine-";
+#[cfg(all(test, unix))]
 const GC_QUARANTINE_OBJECT: &str = "object";
+const LEGACY_GC_RESIDUE_UNSUPPORTED: &str = "legacy directory-shaped evidence GC residue is unsupported; all bytes were preserved; back up the private state and recover the original object manually before retrying";
 const LOG_IDENTITY_DOMAIN: &[u8] = b"forge.log-identity/v1";
 const DIGEST_FRAMING_DOMAIN: &[u8] = b"forge.digest/v1\0";
 const MINIMUM_SUPPORTED_UTC_YEAR: u32 = 1970;
@@ -828,6 +835,7 @@ impl AtomicStateStore {
         control
             .checkpoint()
             .map_err(operation_control_state_error)?;
+        preflight_read_only_evidence_gc_residues(self, control)?;
         let state = scan_evidence_state_controlled(self, decoder, control)?;
         validate_evidence_references_controlled(
             &state.receipts,
@@ -2294,6 +2302,20 @@ pub(super) fn is_evidence_gc_quarantine_name(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|name| name.starts_with(GC_QUARANTINE_PREFIX))
 }
 
+pub(super) fn validate_legacy_evidence_gc_residue(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    validate_private_evidence_directory(path, metadata)
+}
+
+pub(super) fn unsupported_legacy_evidence_gc_residue_error(path: &Path) -> StateError {
+    StateError::InvalidLayout {
+        path: path.to_path_buf(),
+        reason: LEGACY_GC_RESIDUE_UNSUPPORTED.to_owned(),
+    }
+}
+
 fn validate_evidence_ancestor_permissions(root: &Path, relative: &Path) -> Result<(), StateError> {
     let mut candidate = root.to_path_buf();
     for component in relative.components() {
@@ -2721,29 +2743,6 @@ fn repository_gc_io_error(error: RepositoryGcError) -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, error)
 }
 
-fn remove_gc_quarantine(quarantine: &Path, object: Option<&Path>) -> Result<(), StateError> {
-    if let Some(object) = object {
-        fs::remove_file(object).map_err(|source| {
-            StateError::io(
-                "remove verified quarantined immutable state object",
-                object,
-                source,
-            )
-        })?;
-        sync_directory(quarantine)?;
-    }
-    fs::remove_dir(quarantine).map_err(|source| {
-        StateError::io("remove empty evidence GC quarantine", quarantine, source)
-    })?;
-    let parent = quarantine
-        .parent()
-        .ok_or_else(|| StateError::InvalidLayout {
-            path: quarantine.to_path_buf(),
-            reason: "evidence GC quarantine has no parent directory".to_owned(),
-        })?;
-    sync_directory(parent)
-}
-
 #[cfg(all(test, unix))]
 fn gc_quarantine_path(parent: &Path, key: &str) -> Result<PathBuf, StateError> {
     Ok(parent.join(gc_quarantine_leaf(key)?))
@@ -2771,7 +2770,6 @@ fn sync_evidence_gc_class(store: &AtomicStateStore, directory: &str) -> Result<(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvidenceGcRecoveryAction {
-    RemoveEmpty,
     RestoreObject,
     FinishRestore,
 }
@@ -2779,23 +2777,14 @@ enum EvidenceGcRecoveryAction {
 #[derive(Debug)]
 struct EvidenceGcResidue {
     key: String,
-    parent: PathBuf,
     quarantine: PathBuf,
-    object: PathBuf,
-    object_identity: Option<StateFileIdentity>,
-    action: EvidenceGcRecoveryAction,
-    same_directory_file: bool,
+    object_identity: StateFileIdentity,
 }
 
 fn recover_evidence_gc_quarantines(store: &AtomicStateStore) -> Result<(), StateError> {
     validate_evidence_root(store)?;
-    let classes = [
-        (EVIDENCE_V2_DIRECTORY, ".json", EVIDENCE_GC_MAX_EVIDENCE),
-        (RECEIPTS_V2_DIRECTORY, ".json", EVIDENCE_GC_MAX_RECEIPTS),
-        (LOGS_V1_DIRECTORY, ".log", EVIDENCE_GC_MAX_LOGS),
-    ];
     let mut residues = Vec::new();
-    for (directory, extension, max_objects) in classes {
+    for (directory, extension, max_objects) in EVIDENCE_GC_CLASSES {
         inspect_evidence_gc_residues(store, directory, extension, max_objects, &mut residues)?;
     }
 
@@ -2922,13 +2911,11 @@ fn inspect_evidence_gc_residues(
         let metadata = fs::symlink_metadata(&quarantine).map_err(|source| {
             StateError::io("inspect evidence GC recovery residue", &quarantine, source)
         })?;
-        let same_directory_file = if metadata.is_file() {
-            validate_private_regular_file(&quarantine, &metadata)?;
-            true
-        } else {
-            validate_private_evidence_directory(&quarantine, &metadata)?;
-            false
-        };
+        if !metadata.is_file() {
+            validate_legacy_evidence_gc_residue(&quarantine, &metadata)?;
+            return Err(unsupported_legacy_evidence_gc_residue_error(&quarantine));
+        }
+        validate_private_regular_file(&quarantine, &metadata)?;
         let name = entry
             .file_name()
             .into_string()
@@ -2950,76 +2937,72 @@ fn inspect_evidence_gc_residues(
         })?;
         let key = format!("{directory}/{}{extension}", object_name.as_str());
         let original = parent.join(format!("{}{extension}", object_name.as_str()));
-        let object = if same_directory_file {
-            quarantine.clone()
-        } else {
-            quarantine.join(GC_QUARANTINE_OBJECT)
-        };
-
-        if same_directory_file {
-            let object_identity = state_file_identity(&metadata);
-            let action = evidence_gc_recovery_action(&key, &original, &metadata)?;
-            residues.push(EvidenceGcResidue {
-                key,
-                parent: parent.clone(),
-                quarantine,
-                object,
-                object_identity: Some(object_identity),
-                action,
-                same_directory_file: true,
-            });
-            continue;
-        }
-
-        let mut contents = fs::read_dir(&quarantine)
-            .map_err(|source| StateError::io("list evidence GC quarantine", &quarantine, source))?;
-        let first = contents.next().transpose().map_err(|source| {
-            StateError::io("read evidence GC quarantine entry", &quarantine, source)
-        })?;
-        let second = contents.next().transpose().map_err(|source| {
-            StateError::io("read evidence GC quarantine entry", &quarantine, source)
-        })?;
-        if second.is_some() {
-            return Err(StateError::InvalidLayout {
-                path: quarantine,
-                reason: "evidence GC quarantine contains more than its single recovery object"
-                    .to_owned(),
-            });
-        }
-
-        let Some(first) = first else {
-            residues.push(EvidenceGcResidue {
-                key,
-                parent: parent.clone(),
-                quarantine,
-                object,
-                object_identity: None,
-                action: EvidenceGcRecoveryAction::RemoveEmpty,
-                same_directory_file: false,
-            });
-            continue;
-        };
-        if first.file_name() != std::ffi::OsStr::new(GC_QUARANTINE_OBJECT) {
-            return Err(StateError::InvalidLayout {
-                path: first.path(),
-                reason: "evidence GC quarantine contains an unknown recovery entry".to_owned(),
-            });
-        }
-        let object_metadata = fs::symlink_metadata(&object).map_err(|source| {
-            StateError::io("inspect quarantined recovery object", &object, source)
-        })?;
-        validate_private_regular_file(&object, &object_metadata)?;
-        let object_identity = state_file_identity(&object_metadata);
-        let action = evidence_gc_recovery_action(&key, &original, &object_metadata)?;
+        let object_identity = state_file_identity(&metadata);
+        evidence_gc_recovery_action(&key, &original, &metadata)?;
         residues.push(EvidenceGcResidue {
             key,
-            parent: parent.clone(),
             quarantine,
-            object,
-            object_identity: Some(object_identity),
-            action,
-            same_directory_file: false,
+            object_identity,
         });
+    }
+    Ok(())
+}
+
+fn preflight_read_only_evidence_gc_residues(
+    store: &AtomicStateStore,
+    control: &dyn OperationControl,
+) -> Result<(), StateError> {
+    validate_evidence_root(store)?;
+    for (directory, _, max_objects) in EVIDENCE_GC_CLASSES {
+        let relative = validate_state_key(directory)?;
+        let Some(parent) =
+            validate_existing_state_directory(store.layout.worktree_dir(), &relative)?
+        else {
+            continue;
+        };
+        validate_evidence_ancestor_permissions(store.layout.worktree_dir(), &relative)?;
+
+        let max_entries = max_objects
+            .checked_mul(2)
+            .ok_or(StateError::StateSizeOverflow)?;
+        let mut entries_seen = 0_usize;
+        for entry in fs::read_dir(&parent).map_err(|source| {
+            StateError::io(
+                "list read-only evidence GC recovery directory",
+                &parent,
+                source,
+            )
+        })? {
+            control
+                .checkpoint()
+                .map_err(operation_control_state_error)?;
+            let entry = entry.map_err(|source| {
+                StateError::io("read evidence GC recovery entry", &parent, source)
+            })?;
+            entries_seen = entries_seen
+                .checked_add(1)
+                .ok_or(StateError::StateSizeOverflow)?;
+            if entries_seen > max_entries {
+                return Err(StateError::EntryLimit {
+                    directory: directory.to_owned(),
+                    max_entries,
+                });
+            }
+            if !is_evidence_gc_quarantine_name(&entry.file_name()) {
+                continue;
+            }
+
+            let quarantine = entry.path();
+            let metadata = fs::symlink_metadata(&quarantine).map_err(|source| {
+                StateError::io("inspect evidence GC recovery residue", &quarantine, source)
+            })?;
+            if metadata.is_file() {
+                validate_private_regular_file(&quarantine, &metadata)?;
+                continue;
+            }
+            validate_legacy_evidence_gc_residue(&quarantine, &metadata)?;
+            return Err(unsupported_legacy_evidence_gc_residue_error(&quarantine));
+        }
     }
     Ok(())
 }
@@ -3057,89 +3040,7 @@ fn recover_evidence_gc_residue(
     store: &AtomicStateStore,
     residue: &EvidenceGcResidue,
 ) -> Result<(), StateError> {
-    if residue.same_directory_file {
-        return recover_same_directory_evidence_gc_residue(store, residue);
-    }
-    match residue.action {
-        EvidenceGcRecoveryAction::RemoveEmpty => remove_gc_quarantine(&residue.quarantine, None),
-        EvidenceGcRecoveryAction::RestoreObject => {
-            verify_gc_recovery_object(residue)?;
-            let original =
-                residue
-                    .parent
-                    .join(residue.key.rsplit('/').next().ok_or_else(|| {
-                        StateError::InvalidLayout {
-                            path: residue.parent.clone(),
-                            reason: "evidence GC recovery key has no filename".to_owned(),
-                        }
-                    })?);
-            match fs::hard_link(&residue.object, &original) {
-                Ok(()) => {}
-                Err(source) => {
-                    return Err(StateError::QuarantineRestore {
-                        key: residue.key.clone(),
-                        quarantine: residue.object.clone(),
-                        verification: "held-lock recovery could not restore the quarantined object"
-                            .to_owned(),
-                        source,
-                    });
-                }
-            }
-            sync_directory(&residue.parent)?;
-            let original_metadata = fs::symlink_metadata(&original).map_err(|source| {
-                StateError::io("verify restored immutable state object", &original, source)
-            })?;
-            let object_metadata = fs::symlink_metadata(&residue.object).map_err(|source| {
-                StateError::io(
-                    "reinspect quarantined immutable state object",
-                    &residue.object,
-                    source,
-                )
-            })?;
-            if !same_file_object(&original_metadata, &object_metadata) {
-                return Err(StateError::StateChanged {
-                    key: residue.key.clone(),
-                });
-            }
-            remove_gc_quarantine(&residue.quarantine, Some(&residue.object))
-        }
-        EvidenceGcRecoveryAction::FinishRestore => {
-            verify_gc_recovery_object(residue)?;
-            let original =
-                residue
-                    .parent
-                    .join(residue.key.rsplit('/').next().ok_or_else(|| {
-                        StateError::InvalidLayout {
-                            path: residue.parent.clone(),
-                            reason: "evidence GC recovery key has no filename".to_owned(),
-                        }
-                    })?);
-            let original_metadata = fs::symlink_metadata(&original).map_err(|source| {
-                StateError::io(
-                    "reinspect restored immutable state object",
-                    &original,
-                    source,
-                )
-            })?;
-            let object_metadata = fs::symlink_metadata(&residue.object).map_err(|source| {
-                StateError::io(
-                    "reinspect quarantined immutable state object",
-                    &residue.object,
-                    source,
-                )
-            })?;
-            if !same_file_object(&original_metadata, &object_metadata) {
-                return Err(StateError::InvalidLayout {
-                    path: original,
-                    reason: format!(
-                        "held-lock recovery found a conflicting original for quarantined `{}`; both objects were retained",
-                        residue.key
-                    ),
-                });
-            }
-            remove_gc_quarantine(&residue.quarantine, Some(&residue.object))
-        }
-    }
+    recover_same_directory_evidence_gc_residue(store, residue)
 }
 
 fn recover_same_directory_evidence_gc_residue(
@@ -3148,13 +3049,13 @@ fn recover_same_directory_evidence_gc_residue(
 ) -> Result<(), StateError> {
     let relative = validate_state_key(&residue.key)?;
     let directory = relative.parent().ok_or_else(|| StateError::InvalidLayout {
-        path: residue.parent.clone(),
+        path: residue.quarantine.clone(),
         reason: "evidence GC recovery key has no parent directory".to_owned(),
     })?;
     let original_leaf = relative
         .file_name()
         .ok_or_else(|| StateError::InvalidLayout {
-            path: residue.parent.clone(),
+            path: residue.quarantine.clone(),
             reason: "evidence GC recovery key has no filename".to_owned(),
         })?;
     let quarantine_leaf =
@@ -3191,10 +3092,6 @@ fn recover_same_directory_evidence_gc_residue(
     verify_private_quarantine_identity(residue, &mut quarantine)?;
 
     match current_action {
-        EvidenceGcRecoveryAction::RemoveEmpty => Err(StateError::InvalidLayout {
-            path: residue.quarantine.clone(),
-            reason: "same-directory evidence GC residue cannot be an empty directory".to_owned(),
-        }),
         EvidenceGcRecoveryAction::RestoreObject => quarantine.restore().map_err(|error| {
             repository_gc_state_error(
                 "restore quarantined immutable state object",
@@ -3220,29 +3117,12 @@ fn verify_private_quarantine_identity(
     let metadata = file.metadata().map_err(|source| {
         StateError::io(
             "reinspect evidence GC recovery object handle",
-            &residue.object,
+            &residue.quarantine,
             source,
         )
     })?;
-    validate_private_regular_file_handle(&residue.object, file, &metadata)?;
-    if residue.object_identity.as_ref() != Some(&state_file_identity(&metadata)) {
-        return Err(StateError::StateChanged {
-            key: residue.key.clone(),
-        });
-    }
-    Ok(())
-}
-
-fn verify_gc_recovery_object(residue: &EvidenceGcResidue) -> Result<(), StateError> {
-    let metadata = fs::symlink_metadata(&residue.object).map_err(|source| {
-        StateError::io(
-            "reinspect evidence GC recovery object",
-            &residue.object,
-            source,
-        )
-    })?;
-    validate_private_regular_file(&residue.object, &metadata)?;
-    if residue.object_identity.as_ref() != Some(&state_file_identity(&metadata)) {
+    validate_private_regular_file_handle(&residue.quarantine, file, &metadata)?;
+    if residue.object_identity != state_file_identity(&metadata) {
         return Err(StateError::StateChanged {
             key: residue.key.clone(),
         });
@@ -3613,15 +3493,51 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
-        EvidenceGcPlan, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX, PlannedDeletion,
-        ReferenceClosure, apply_evidence_gc_plan, gc_quarantine_path, preflight_deletions,
-        remove_regular_state_file_with_hook, snapshot_private_state_file,
+        EvidenceGcPlan, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX, LEGACY_GC_RESIDUE_UNSUPPORTED,
+        PlannedDeletion, ReferenceClosure, apply_evidence_gc_plan, gc_quarantine_path,
+        preflight_deletions, remove_regular_state_file_with_hook, snapshot_private_state_file,
         store_new_atomic_idempotent_evidence_with_hook,
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     use super::{validate_private_evidence_directory, validate_private_regular_file};
 
-    type FileSystemSnapshot = Vec<(PathBuf, u32, Option<Vec<u8>>)>;
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FileSystemSnapshotKind {
+        Directory,
+        File,
+        Symlink(PathBuf),
+        Other,
+    }
+
+    #[cfg(unix)]
+    type FileSystemSnapshotIdentity = (u64, u64, u64, u64, i64, i64);
+    #[cfg(not(unix))]
+    type FileSystemSnapshotIdentity = (u64, Option<SystemTime>);
+
+    #[cfg(unix)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PrivateStateSecuritySnapshotEntry {
+        path: PathBuf,
+        size: u64,
+        device: u64,
+        inode: u64,
+        hard_links: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    }
+
+    type FileSystemSnapshot = Vec<(
+        PathBuf,
+        FileSystemSnapshotKind,
+        u32,
+        FileSystemSnapshotIdentity,
+        Option<Vec<u8>>,
+    )>;
 
     #[derive(Debug, Default)]
     struct FixtureDecoder {
@@ -3779,6 +3695,62 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+
+    #[cfg(unix)]
+    fn assert_unsupported_legacy_gc_residue_fails_closed(
+        snapshot_root: &Path,
+        store: &AtomicStateStore,
+        now: SystemTime,
+        decoder: &FixtureDecoder,
+    ) -> Result<(), Box<dyn Error>> {
+        let before = filesystem_snapshot(snapshot_root)?;
+        let security_before = private_state_security_snapshot(store.layout().worktree_dir())?;
+
+        let read_error = match store.visit_evidence_state_snapshot(1_024, decoder, |_| Ok(())) {
+            Err(error) => error,
+            Ok(()) => {
+                return Err(io::Error::other(
+                    "read-only scan accepted an unsupported legacy GC residue",
+                )
+                .into());
+            }
+        };
+        assert!(matches!(
+            read_error,
+            StateError::InvalidLayout { ref reason, .. }
+                if reason == LEGACY_GC_RESIDUE_UNSUPPORTED
+        ));
+        assert_eq!(filesystem_snapshot(snapshot_root)?, before);
+        assert_eq!(
+            private_state_security_snapshot(store.layout().worktree_dir())?,
+            security_before
+        );
+
+        let lock = store.try_lock()?;
+        let locked_before = filesystem_snapshot(snapshot_root)?;
+        let locked_security_before =
+            private_state_security_snapshot(store.layout().worktree_dir())?;
+        let write_error = match store.collect_evidence_garbage(&lock, now, decoder) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "held-lock GC accepted an unsupported legacy GC residue",
+                )
+                .into());
+            }
+        };
+        assert!(matches!(
+            write_error,
+            StateError::InvalidLayout { ref reason, .. }
+                if reason == LEGACY_GC_RESIDUE_UNSUPPORTED
+        ));
+        assert_eq!(filesystem_snapshot(snapshot_root)?, locked_before);
+        assert_eq!(
+            private_state_security_snapshot(store.layout().worktree_dir())?,
+            locked_security_before
+        );
+        Ok(())
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -4311,7 +4283,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_only_fails_closed_and_locked_gc_recovers_a_quarantined_object()
+    fn read_only_and_locked_gc_preserve_an_object_only_legacy_quarantine()
     -> Result<(), Box<dyn Error>> {
         let (temporary, store) = temporary_store()?;
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
@@ -4334,36 +4306,19 @@ mod tests {
             version_directory.join(format!(".forge-gc-quarantine-{}", log_name.as_str()));
         fs::create_dir(&quarantine)?;
         set_private_test_directory_mode(&quarantine)?;
-        fs::rename(&log_path, quarantine.join("object"))?;
-        let before = filesystem_snapshot(temporary.path())?;
+        let quarantined_object = quarantine.join(GC_QUARANTINE_OBJECT);
+        fs::rename(&log_path, &quarantined_object)?;
 
-        let read_error = match store.visit_evidence_state_snapshot(1_024, &decoder, |_| Ok(())) {
-            Err(error) => error,
-            Ok(()) => {
-                return Err(
-                    io::Error::other("read-only scan accepted recoverable GC residue").into(),
-                );
-            }
-        };
-        assert!(matches!(
-            read_error,
-            StateError::InvalidLayout { ref reason, .. }
-                if reason.contains("held-lock recovery")
-        ));
-        assert_eq!(filesystem_snapshot(temporary.path())?, before);
-
-        let lock = store.try_lock()?;
-        store.collect_evidence_garbage(&lock, now, &decoder)?;
-        assert!(!quarantine.exists());
-        assert_eq!(fs::read(log_path)?, log_bytes);
+        assert_unsupported_legacy_gc_residue_fails_closed(temporary.path(), &store, now, &decoder)?;
+        assert!(!log_path.exists());
+        assert_eq!(fs::read(quarantined_object)?, log_bytes);
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn locked_gc_removes_an_empty_crash_quarantine_without_touching_the_object()
-    -> Result<(), Box<dyn Error>> {
-        let (_temporary, store) = temporary_store()?;
+    fn read_only_and_locked_gc_preserve_an_empty_legacy_quarantine() -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         let mut decoder = FixtureDecoder::default();
         let log_bytes = b"log retained across empty quarantine recovery";
@@ -4384,18 +4339,17 @@ mod tests {
         fs::create_dir(&quarantine)?;
         set_private_test_directory_mode(&quarantine)?;
 
-        let lock = store.try_lock()?;
-        store.collect_evidence_garbage(&lock, now, &decoder)?;
-
-        assert!(!quarantine.exists());
+        assert_unsupported_legacy_gc_residue_fails_closed(temporary.path(), &store, now, &decoder)?;
+        assert!(quarantine.is_dir());
         assert_eq!(fs::read(log_path)?, log_bytes);
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn locked_gc_finishes_a_durable_restore_link_after_crash() -> Result<(), Box<dyn Error>> {
-        let (_temporary, store) = temporary_store()?;
+    fn read_only_and_locked_gc_preserve_a_same_identity_legacy_quarantine()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         let mut decoder = FixtureDecoder::default();
         let log_bytes = b"log with both durable recovery links";
@@ -4415,19 +4369,21 @@ mod tests {
         let quarantine = parent.join(format!("{GC_QUARANTINE_PREFIX}{}", log_name.as_str()));
         fs::create_dir(&quarantine)?;
         set_private_test_directory_mode(&quarantine)?;
-        fs::hard_link(&log_path, quarantine.join(GC_QUARANTINE_OBJECT))?;
+        let quarantined_object = quarantine.join(GC_QUARANTINE_OBJECT);
+        fs::hard_link(&log_path, &quarantined_object)?;
 
-        let lock = store.try_lock()?;
-        store.collect_evidence_garbage(&lock, now, &decoder)?;
-
-        assert!(!quarantine.exists());
+        assert_unsupported_legacy_gc_residue_fails_closed(temporary.path(), &store, now, &decoder)?;
+        assert!(super::same_file_object(
+            &fs::symlink_metadata(&log_path)?,
+            &fs::symlink_metadata(&quarantined_object)?,
+        ));
         assert_eq!(fs::read(log_path)?, log_bytes);
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn locked_gc_fails_closed_on_conflicting_recovery_objects() -> Result<(), Box<dyn Error>> {
+    fn read_only_and_locked_gc_preserve_conflicting_legacy_objects() -> Result<(), Box<dyn Error>> {
         let (temporary, store) = temporary_store()?;
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         let log_bytes = b"original recovery object";
@@ -4443,27 +4399,192 @@ mod tests {
             &quarantine.join(GC_QUARANTINE_OBJECT),
             b"conflicting recovery object",
         )?;
-        let lock = store.try_lock()?;
-        let before = filesystem_snapshot(temporary.path())?;
 
-        let error = match store.collect_evidence_garbage(&lock, now, &FixtureDecoder::default()) {
-            Err(error) => error,
-            Ok(_) => {
-                return Err(io::Error::other("conflicting recovery paths were accepted").into());
-            }
-        };
-
-        assert!(matches!(
-            error,
-            StateError::InvalidLayout { ref reason, .. }
-                if reason.contains("conflicting original")
-        ));
-        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        assert_unsupported_legacy_gc_residue_fails_closed(
+            temporary.path(),
+            &store,
+            now,
+            &FixtureDecoder::default(),
+        )?;
         assert_eq!(fs::read(log_path)?, log_bytes);
         assert_eq!(
             fs::read(quarantine.join(GC_QUARANTINE_OBJECT))?,
             b"conflicting recovery object"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_and_locked_gc_preserve_same_bytes_with_a_different_legacy_identity()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let log_bytes = b"same bytes but a different file identity";
+        let (log_name, log_key, _) = store_fixture_log(&store, log_bytes)?;
+        let log_path = store.layout().worktree_dir().join(&log_key);
+        let parent = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?;
+        let quarantine = parent.join(format!("{GC_QUARANTINE_PREFIX}{}", log_name.as_str()));
+        fs::create_dir(&quarantine)?;
+        set_private_test_directory_mode(&quarantine)?;
+        let quarantined_object = quarantine.join(GC_QUARANTINE_OBJECT);
+        write_private_test_file(&quarantined_object, log_bytes)?;
+        assert!(!super::same_file_object(
+            &fs::symlink_metadata(&log_path)?,
+            &fs::symlink_metadata(&quarantined_object)?,
+        ));
+
+        assert_unsupported_legacy_gc_residue_fails_closed(
+            temporary.path(),
+            &store,
+            now,
+            &FixtureDecoder::default(),
+        )?;
+        assert_eq!(fs::read(log_path)?, log_bytes);
+        assert_eq!(fs::read(quarantined_object)?, log_bytes);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_and_locked_gc_preserve_a_legacy_quarantine_with_unknown_children()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut decoder = FixtureDecoder::default();
+        let evidence_name = object_name(11)?;
+        let (evidence_key, _) = store_fixture_evidence(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            evidence_name.clone(),
+            EvidenceRetentionTime::Current(now.into()),
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let evidence_path = store.layout().worktree_dir().join(evidence_key);
+        let parent = evidence_path
+            .parent()
+            .ok_or_else(|| io::Error::other("evidence fixture has no parent"))?;
+        let quarantine = parent.join(format!("{GC_QUARANTINE_PREFIX}{}", evidence_name.as_str()));
+        fs::create_dir(&quarantine)?;
+        set_private_test_directory_mode(&quarantine)?;
+        let unknown = quarantine.join("unexpected");
+        write_private_test_file(&unknown, b"preserve this unknown entry")?;
+
+        assert_unsupported_legacy_gc_residue_fails_closed(temporary.path(), &store, now, &decoder)?;
+        assert_eq!(fs::read(unknown)?, b"preserve this unknown entry");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_residue_preflight_precedes_all_current_quarantine_mutations()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut decoder = FixtureDecoder::default();
+
+        let evidence_name = object_name(12)?;
+        let (evidence_key, _) = store_fixture_evidence(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            evidence_name,
+            EvidenceRetentionTime::Current(now.into()),
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let evidence_path = store.layout().worktree_dir().join(&evidence_key);
+        let current_quarantine = evidence_path
+            .parent()
+            .ok_or_else(|| io::Error::other("evidence fixture has no parent"))?
+            .join(gc_quarantine_leaf(&evidence_key)?);
+        fs::rename(&evidence_path, &current_quarantine)?;
+
+        let receipt_name = object_name(13)?;
+        let (receipt_key, _) = store_fixture_receipt(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            receipt_name.clone(),
+            EvidenceRetentionTime::Current(now.into()),
+            Vec::new(),
+        )?;
+        let receipt_path = store.layout().worktree_dir().join(receipt_key);
+        let legacy_quarantine = receipt_path
+            .parent()
+            .ok_or_else(|| io::Error::other("receipt fixture has no parent"))?
+            .join(format!("{GC_QUARANTINE_PREFIX}{}", receipt_name.as_str()));
+        fs::create_dir(&legacy_quarantine)?;
+        set_private_test_directory_mode(&legacy_quarantine)?;
+
+        assert_unsupported_legacy_gc_residue_fails_closed(temporary.path(), &store, now, &decoder)?;
+        assert!(!evidence_path.exists());
+        assert!(current_quarantine.is_file());
+        assert!(legacy_quarantine.is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_and_locked_gc_reject_a_symlinked_legacy_quarantine_without_following_it()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let (log_name, log_key, _) = store_fixture_log(&store, b"symlink residue fixture")?;
+        let log_path = store.layout().worktree_dir().join(log_key);
+        let parent = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?;
+        let outside = temporary.path().join("outside-legacy-residue");
+        fs::create_dir(&outside)?;
+        let quarantine = parent.join(format!("{GC_QUARANTINE_PREFIX}{}", log_name.as_str()));
+        symlink(&outside, &quarantine)?;
+
+        let before = filesystem_snapshot(temporary.path())?;
+        let symlink_before = symlink_security_snapshot(&quarantine)?;
+        let read_error = match store.visit_evidence_state_snapshot(
+            1_024,
+            &FixtureDecoder::default(),
+            |_| Ok(()),
+        ) {
+            Err(error) => error,
+            Ok(()) => {
+                return Err(io::Error::other(
+                    "read-only scan followed a symlinked legacy GC residue",
+                )
+                .into());
+            }
+        };
+        assert!(matches!(read_error, StateError::PathSafety(_)));
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        assert_eq!(symlink_security_snapshot(&quarantine)?, symlink_before);
+
+        let lock = store.try_lock()?;
+        let locked_before = filesystem_snapshot(temporary.path())?;
+        let locked_symlink_before = symlink_security_snapshot(&quarantine)?;
+        let write_error =
+            match store.collect_evidence_garbage(&lock, now, &FixtureDecoder::default()) {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err(io::Error::other(
+                        "held-lock GC followed a symlinked legacy GC residue",
+                    )
+                    .into());
+                }
+            };
+        assert!(matches!(write_error, StateError::PathSafety(_)));
+        assert_eq!(filesystem_snapshot(temporary.path())?, locked_before);
+        assert_eq!(
+            symlink_security_snapshot(&quarantine)?,
+            locked_symlink_before
+        );
+        assert_eq!(fs::read_link(quarantine)?, outside);
         Ok(())
     }
 
@@ -6015,11 +6136,22 @@ mod tests {
                 } else {
                     None
                 };
+                let kind = if metadata.is_dir() {
+                    FileSystemSnapshotKind::Directory
+                } else if metadata.is_file() {
+                    FileSystemSnapshotKind::File
+                } else if metadata.file_type().is_symlink() {
+                    FileSystemSnapshotKind::Symlink(fs::read_link(&path)?)
+                } else {
+                    FileSystemSnapshotKind::Other
+                };
                 snapshot.push((
                     path.strip_prefix(root)
                         .map_err(|error| io::Error::other(error.to_string()))?
                         .to_path_buf(),
+                    kind,
                     permission_mode(&metadata),
+                    filesystem_snapshot_identity(&metadata),
                     contents,
                 ));
                 if metadata.is_dir() {
@@ -6029,6 +6161,100 @@ mod tests {
         }
         snapshot.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(snapshot)
+    }
+
+    #[cfg(unix)]
+    fn filesystem_snapshot_identity(metadata: &fs::Metadata) -> FileSystemSnapshotIdentity {
+        use std::os::unix::fs::MetadataExt as _;
+
+        (
+            metadata.size(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.nlink(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn private_state_security_snapshot(
+        root: &Path,
+    ) -> Result<Vec<PrivateStateSecuritySnapshotEntry>, Box<dyn Error>> {
+        let mut snapshot = Vec::new();
+        let mut paths = vec![root.to_path_buf()];
+        while let Some(path) = paths.pop() {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                validate_private_evidence_directory(&path, &metadata)?;
+                for entry in fs::read_dir(&path)? {
+                    paths.push(entry?.path());
+                }
+            } else if metadata.is_file() {
+                validate_private_regular_file(&path, &metadata)?;
+            } else {
+                return Err(io::Error::other(format!(
+                    "private state security snapshot rejected non-file entry `{}`",
+                    path.display()
+                ))
+                .into());
+            }
+
+            snapshot.push(private_state_security_snapshot_entry(
+                root, &path, &metadata,
+            )?);
+        }
+        snapshot.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(snapshot)
+    }
+
+    #[cfg(unix)]
+    fn private_state_security_snapshot_entry(
+        root: &Path,
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) -> Result<PrivateStateSecuritySnapshotEntry, Box<dyn Error>> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(PrivateStateSecuritySnapshotEntry {
+            path: path
+                .strip_prefix(root)
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .to_path_buf(),
+            size: metadata.size(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            hard_links: metadata.nlink(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn symlink_security_snapshot(
+        path: &Path,
+    ) -> Result<(PrivateStateSecuritySnapshotEntry, PathBuf), Box<dyn Error>> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_symlink() {
+            return Err(io::Error::other("security snapshot expected a symbolic link").into());
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("symbolic link has no parent"))?;
+        Ok((
+            private_state_security_snapshot_entry(parent, path, &metadata)?,
+            fs::read_link(path)?,
+        ))
+    }
+
+    #[cfg(not(unix))]
+    fn filesystem_snapshot_identity(metadata: &fs::Metadata) -> FileSystemSnapshotIdentity {
+        (metadata.len(), metadata.modified().ok())
     }
 
     #[cfg(unix)]
