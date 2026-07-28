@@ -151,6 +151,10 @@ Finalization requires all ten fixed staged files and writes, without replacing d
   binary and SBOM;
 - `SHA256SUMS`, covering those ten files and `release-manifest.json` in lexical order.
 
+The v1 compatibility reader ignores future optional object fields and maps future enum values to a non-authorizing
+`unknown` state. That makes same-major documents readable; it does not make them current candidates.
+`release-finalize` and `release-check` independently rebuild the canonical manifest and require exact bytes.
+
 `release-check` revalidates the fixed twelve-file candidate namespace, executable structures, source-bound locked
 dependency graphs, byte-for-byte SBOMs, manifest, and all SHA-256 values. A successful result means only that the
 candidate-controlled local assets are internally consistent. It does not claim that unrelated directory entries are

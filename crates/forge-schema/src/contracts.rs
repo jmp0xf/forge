@@ -1493,9 +1493,12 @@ pub struct AdaptersData {
 /// One immutable artifact described by a local release-candidate manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseArtifactKindData {
     Binary,
     CyclonedxSbom,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -1534,7 +1537,6 @@ impl<'de> Deserialize<'de> for ReleaseSha256Data {
 
 /// One immutable artifact described by a local release-candidate manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseArtifactData {
     pub name: String,
     pub kind: ReleaseArtifactKindData,
@@ -1545,25 +1547,33 @@ pub struct ReleaseArtifactData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseChannelData {
     ReleaseCandidate,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseDistributionData {
     GithubRelease,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseCandidateStatusData {
     LocalReviewCandidate,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Release identity and candidate-local status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseDescriptorData {
     pub version: String,
     pub channel: ReleaseChannelData,
@@ -1573,37 +1583,52 @@ pub struct ReleaseDescriptorData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseProvenanceStatusData {
     RequiredExternal,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleasePredicateTypeData {
     #[serde(rename = "https://slsa.dev/provenance/v1")]
     SlsaProvenanceV1,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseSigningData {
     SigstoreKeylessOidc,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseAuthorityStatusData {
     UnassignedExternal,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseSubjectSetData {
     ExactFinalizedLocalAssets,
+    #[serde(other)]
+    Unknown,
 }
 
 /// External provenance and signing work that remains outside the candidate write set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseProvenanceData {
     pub status: ReleaseProvenanceStatusData,
     pub predicate_type: ReleasePredicateTypeData,
@@ -1615,13 +1640,15 @@ pub struct ReleaseProvenanceData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ReleaseRollbackStatusData {
     FirstCandidateNoNMinusOne,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Retention and rollback state frozen for this candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseRollbackData {
     pub retain_published_releases: u8,
     pub previous_release: Option<String>,
@@ -1629,8 +1656,11 @@ pub struct ReleaseRollbackData {
 }
 
 /// Standalone `forge.release-manifest/v1` document shipped with release assets.
+///
+/// Same-major readers deliberately ignore unknown object fields and map unknown enum values to
+/// explicit non-authorizing `Unknown` states. Candidate creation and release checking remain exact,
+/// canonical procedures rather than relying on this compatibility reader for authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReleaseManifestData {
     pub schema: String,
     pub release: ReleaseDescriptorData,
@@ -1719,8 +1749,12 @@ mod tests {
         EvidenceDependencyV2Data, EvidenceV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
         GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
         ProcessErrorKindV2Data, ProjectModelData, ProjectUnitDetailData,
-        ReceiptValidityReasonV2Data, ReleaseSha256Data, SchemaIndexData, SchemaKind, SchemaVersion,
-        StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData, schema_json,
+        ReceiptValidityReasonV2Data, ReleaseArtifactKindData, ReleaseAuthorityStatusData,
+        ReleaseCandidateStatusData, ReleaseChannelData, ReleaseDistributionData,
+        ReleaseManifestData, ReleasePredicateTypeData, ReleaseProvenanceStatusData,
+        ReleaseRollbackStatusData, ReleaseSha256Data, ReleaseSigningData, ReleaseSubjectSetData,
+        SchemaIndexData, SchemaKind, SchemaVersion, StaleReceiptV2Data, SuccessPredicateData,
+        TaskAcceptanceV2Data, VersionData, schema_json,
     };
     use crate::Digest;
 
@@ -1799,6 +1833,131 @@ mod tests {
                 serde_json::from_value::<ReleaseSha256Data>(serde_json::json!(invalid)).is_err()
             );
         }
+        Ok(())
+    }
+
+    fn release_manifest_value() -> Value {
+        let artifacts = (0..10)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("artifact-{index}"),
+                    "kind": "binary",
+                    "target": "aarch64-apple-darwin",
+                    "length": 1,
+                    "sha256": "a".repeat(64)
+                })
+            })
+            .collect::<Vec<_>>();
+        let subjects = (0..12)
+            .map(|index| format!("subject-{index}"))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema": "forge.release-manifest/v1",
+            "release": {
+                "version": "0.1.0-rc.1",
+                "channel": "release-candidate",
+                "distribution": "github-release",
+                "status": "local-review-candidate"
+            },
+            "artifacts": artifacts,
+            "provenance": {
+                "status": "required-external",
+                "predicate_type": "https://slsa.dev/provenance/v1",
+                "signing": "sigstore-keyless-oidc",
+                "authority_status": "unassigned-external",
+                "subject_set": "exact-finalized-local-assets",
+                "subjects": subjects
+            },
+            "rollback": {
+                "retain_published_releases": 2,
+                "previous_release": null,
+                "status": "first-candidate-no-n-minus-one"
+            }
+        })
+    }
+
+    #[test]
+    fn release_manifest_v1_reader_accepts_same_major_optional_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = release_manifest_value();
+        value["future_root"] = serde_json::json!({"ignored": true});
+        value["release"]["future_release"] = serde_json::json!(1);
+        value["artifacts"][0]["future_artifact"] = serde_json::json!(2);
+        value["provenance"]["future_provenance"] = serde_json::json!(3);
+        value["rollback"]["future_rollback"] = serde_json::json!(4);
+
+        let manifest: ReleaseManifestData = serde_json::from_value(value)?;
+        assert_eq!(
+            manifest.release.channel,
+            ReleaseChannelData::ReleaseCandidate
+        );
+        assert_eq!(manifest.artifacts[0].kind, ReleaseArtifactKindData::Binary);
+
+        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::ReleaseManifest)?)?;
+        for pointer in [
+            "/additionalProperties",
+            "/$defs/ReleaseArtifactData/additionalProperties",
+            "/$defs/ReleaseDescriptorData/additionalProperties",
+            "/$defs/ReleaseProvenanceData/additionalProperties",
+            "/$defs/ReleaseRollbackData/additionalProperties",
+        ] {
+            assert_eq!(
+                schema.pointer(pointer),
+                None,
+                "release manifest schema unexpectedly closed `{pointer}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_manifest_v1_reader_maps_future_enums_to_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = release_manifest_value();
+        value["release"]["channel"] = serde_json::json!("future-channel");
+        value["release"]["distribution"] = serde_json::json!("future-distribution");
+        value["release"]["status"] = serde_json::json!("future-status");
+        value["artifacts"][0]["kind"] = serde_json::json!("future-artifact-kind");
+        value["provenance"]["status"] = serde_json::json!("future-provenance-status");
+        value["provenance"]["predicate_type"] = serde_json::json!("future-predicate");
+        value["provenance"]["signing"] = serde_json::json!("future-signing");
+        value["provenance"]["authority_status"] = serde_json::json!("future-authority");
+        value["provenance"]["subject_set"] = serde_json::json!("future-subject-set");
+        value["rollback"]["status"] = serde_json::json!("future-rollback-status");
+
+        let manifest: ReleaseManifestData = serde_json::from_value(value)?;
+        assert_eq!(manifest.release.channel, ReleaseChannelData::Unknown);
+        assert_eq!(
+            manifest.release.distribution,
+            ReleaseDistributionData::Unknown
+        );
+        assert_eq!(manifest.release.status, ReleaseCandidateStatusData::Unknown);
+        assert_eq!(manifest.artifacts[0].kind, ReleaseArtifactKindData::Unknown);
+        assert_eq!(
+            manifest.provenance.status,
+            ReleaseProvenanceStatusData::Unknown
+        );
+        assert_eq!(
+            manifest.provenance.predicate_type,
+            ReleasePredicateTypeData::Unknown
+        );
+        assert_eq!(manifest.provenance.signing, ReleaseSigningData::Unknown);
+        assert_eq!(
+            manifest.provenance.authority_status,
+            ReleaseAuthorityStatusData::Unknown
+        );
+        assert_eq!(
+            manifest.provenance.subject_set,
+            ReleaseSubjectSetData::Unknown
+        );
+        assert_eq!(manifest.rollback.status, ReleaseRollbackStatusData::Unknown);
+
+        let mut missing_required = release_manifest_value();
+        missing_required["rollback"]
+            .as_object_mut()
+            .ok_or_else(|| std::io::Error::other("test rollback was not an object"))?
+            .remove("status");
+        assert!(serde_json::from_value::<ReleaseManifestData>(missing_required).is_err());
         Ok(())
     }
 

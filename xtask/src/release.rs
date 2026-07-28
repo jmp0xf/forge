@@ -4005,6 +4005,21 @@ mod tests {
         );
         check(&output_writer, &snapshot)?;
 
+        let mut future_compatible_manifest = manifest_json;
+        future_compatible_manifest["future_optional_field"] = serde_json::json!(true);
+        let mut future_compatible_bytes = serde_json::to_vec_pretty(&future_compatible_manifest)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        future_compatible_bytes.push(b'\n');
+        fs::write(output.join(MANIFEST_FILE), future_compatible_bytes)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(
+            check(&output_writer, &snapshot).is_err(),
+            "the tolerant v1 reader must not weaken exact candidate checking"
+        );
+        fs::write(output.join(MANIFEST_FILE), &manifest)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        check(&output_writer, &snapshot)?;
+
         let tampered = output.join(binary_asset_name(&RELEASE_TARGETS[0]));
         let mut bytes =
             fs::read(&tampered).map_err(|error| ReleaseError::internal(error.to_string()))?;

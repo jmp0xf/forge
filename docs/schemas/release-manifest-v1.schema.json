@@ -2,7 +2,7 @@
   "$id": "forge.release-manifest/v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Forge release-manifest v1",
-  "description": "Standalone `forge.release-manifest/v1` document shipped with release assets.",
+  "description": "Standalone `forge.release-manifest/v1` document shipped with release assets.\n\nSame-major readers deliberately ignore unknown object fields and map unknown enum values to\nexplicit non-authorizing `Unknown` states. Candidate creation and release checking remain exact,\ncanonical procedures rather than relying on this compatibility reader for authorization.",
   "type": "object",
   "properties": {
     "artifacts": {
@@ -27,7 +27,6 @@
       "const": "forge.release-manifest/v1"
     }
   },
-  "additionalProperties": false,
   "required": [
     "schema",
     "release",
@@ -58,7 +57,6 @@
           "type": "string"
         }
       },
-      "additionalProperties": false,
       "required": [
         "name",
         "kind",
@@ -72,25 +70,29 @@
       "type": "string",
       "enum": [
         "binary",
-        "cyclonedx-sbom"
+        "cyclonedx-sbom",
+        "unknown"
       ]
     },
     "ReleaseAuthorityStatusData": {
       "type": "string",
       "enum": [
-        "unassigned-external"
+        "unassigned-external",
+        "unknown"
       ]
     },
     "ReleaseCandidateStatusData": {
       "type": "string",
       "enum": [
-        "local-review-candidate"
+        "local-review-candidate",
+        "unknown"
       ]
     },
     "ReleaseChannelData": {
       "type": "string",
       "enum": [
-        "release-candidate"
+        "release-candidate",
+        "unknown"
       ]
     },
     "ReleaseDescriptorData": {
@@ -110,7 +112,6 @@
           "type": "string"
         }
       },
-      "additionalProperties": false,
       "required": [
         "version",
         "channel",
@@ -121,13 +122,15 @@
     "ReleaseDistributionData": {
       "type": "string",
       "enum": [
-        "github-release"
+        "github-release",
+        "unknown"
       ]
     },
     "ReleasePredicateTypeData": {
       "type": "string",
       "enum": [
-        "https://slsa.dev/provenance/v1"
+        "https://slsa.dev/provenance/v1",
+        "unknown"
       ]
     },
     "ReleaseProvenanceData": {
@@ -158,7 +161,6 @@
           "minItems": 12
         }
       },
-      "additionalProperties": false,
       "required": [
         "status",
         "predicate_type",
@@ -171,7 +173,8 @@
     "ReleaseProvenanceStatusData": {
       "type": "string",
       "enum": [
-        "required-external"
+        "required-external",
+        "unknown"
       ]
     },
     "ReleaseRollbackData": {
@@ -194,7 +197,6 @@
           "$ref": "#/$defs/ReleaseRollbackStatusData"
         }
       },
-      "additionalProperties": false,
       "required": [
         "retain_published_releases",
         "status"
@@ -203,7 +205,8 @@
     "ReleaseRollbackStatusData": {
       "type": "string",
       "enum": [
-        "first-candidate-no-n-minus-one"
+        "first-candidate-no-n-minus-one",
+        "unknown"
       ]
     },
     "ReleaseSha256Data": {
@@ -213,13 +216,15 @@
     "ReleaseSigningData": {
       "type": "string",
       "enum": [
-        "sigstore-keyless-oidc"
+        "sigstore-keyless-oidc",
+        "unknown"
       ]
     },
     "ReleaseSubjectSetData": {
       "type": "string",
       "enum": [
-        "exact-finalized-local-assets"
+        "exact-finalized-local-assets",
+        "unknown"
       ]
     }
   }
