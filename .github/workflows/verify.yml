@@ -124,15 +124,6 @@ jobs:
         run: cargo +stable clippy --locked --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Test root workspace
         run: cargo +stable test --locked --workspace --target ${{ matrix.target }} --no-fail-fast
-      - name: Check fuzz workspace
-        working-directory: fuzz
-        run: cargo +stable check --locked --all-targets --target ${{ matrix.target }}
-      - name: Lint fuzz workspace
-        working-directory: fuzz
-        run: cargo +stable clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
-      - name: Test fuzz workspace
-        working-directory: fuzz
-        run: cargo +stable test --locked --target ${{ matrix.target }} --no-fail-fast
       - name: Build release assembler
         run: cargo +stable build --locked --offline -p xtask
       - name: Build and execute release candidate

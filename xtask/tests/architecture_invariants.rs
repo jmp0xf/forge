@@ -923,6 +923,15 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
             "missing native runner `{required_runner}`"
         );
     }
+    let native_job = workflow
+        .split_once("\n  native:\n")
+        .and_then(|(_, jobs)| jobs.split_once("\n  strict-exitability:\n"))
+        .map(|(native, _)| native)
+        .ok_or("primary verification workflow lacks bounded native job markers")?;
+    assert!(
+        !native_job.contains("working-directory: fuzz"),
+        "native product targets must not imply a musl C++ fuzz toolchain; the pinned nightly campaign owns fuzz execution"
+    );
     Ok(())
 }
 
