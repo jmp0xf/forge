@@ -112,6 +112,7 @@ pub const INDEX_PATH_ARGS: &[&str] = &[
 pub const OBJECT_FORMAT_ARGS: &[&str] = &["rev-parse", "--show-object-format=output"];
 
 /// Global Git arguments used before every non-interactive Forge operation.
+/// `core.longpaths` is ignored outside Git for Windows and opts its Win32 layer into extended paths.
 pub const HARDENED_GIT_GLOBAL_ARGS: &[&str] = &[
     "--no-pager",
     "--no-optional-locks",
@@ -119,6 +120,8 @@ pub const HARDENED_GIT_GLOBAL_ARGS: &[&str] = &[
     "--literal-pathspecs",
     "-c",
     "core.fsmonitor=false",
+    "-c",
+    "core.longpaths=true",
 ];
 
 /// Environment overrides required for non-interactive Git operations.
@@ -1405,6 +1408,11 @@ mod tests {
             HARDENED_GIT_GLOBAL_ARGS
                 .windows(2)
                 .any(|args| args == ["-c", "core.fsmonitor=false"])
+        );
+        assert!(
+            HARDENED_GIT_GLOBAL_ARGS
+                .windows(2)
+                .any(|args| args == ["-c", "core.longpaths=true"])
         );
         assert!(STATUS_PORCELAIN_V2_ARGS.contains(&"--porcelain=v2"));
         assert!(STATUS_PORCELAIN_V2_ARGS.contains(&"-z"));

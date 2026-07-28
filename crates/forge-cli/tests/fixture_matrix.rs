@@ -544,6 +544,185 @@ fn unix_non_utf8_git_path_survives_detection_and_init_without_loss()
     Ok(())
 }
 
+#[cfg(windows)]
+mod windows_wide_path_fixture {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    use serde_json::Value;
+
+    use super::{FixtureWorkspace, display_output, required_array};
+
+    const CLASSIC_MAX_PATH_UNITS: usize = 260;
+    const MIN_TEST_PATH_UNITS: usize = CLASSIC_MAX_PATH_UNITS + 64;
+    const MAX_TEST_PATH_UNITS: usize = 1_024;
+    const WIDE_TRACKED_NAME: &str = "tracked path-路径-🧪.txt";
+
+    #[test]
+    fn windows_long_utf16_path_survives_detection_init_and_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parent = std::env::temp_dir().join("forge-fixture-matrix-tests");
+        fs::create_dir_all(&parent)?;
+        let fixture = long_fixture_at("non-utf8-path", &parent)?;
+        exercise_wide_fixture(fixture)
+    }
+
+    fn exercise_wide_fixture(fixture: FixtureWorkspace) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical_worktree = fs::canonicalize(&fixture.worktree)?;
+        let measured_path = canonical_worktree.join("Cargo.toml");
+        let measured_units = wide_units(&measured_path);
+        assert!(
+            (MIN_TEST_PATH_UNITS..MAX_TEST_PATH_UNITS).contains(&measured_units),
+            "fixture path has {measured_units} UTF-16 units; expected {MIN_TEST_PATH_UNITS}..{MAX_TEST_PATH_UNITS}"
+        );
+
+        let tracked_units = WIDE_TRACKED_NAME.encode_utf16().collect::<Vec<_>>();
+        let tracked_name = OsString::from_wide(&tracked_units);
+        assert_eq!(
+            tracked_name.encode_wide().collect::<Vec<_>>(),
+            tracked_units
+        );
+        let tracked_path = fixture.worktree.join(&tracked_name);
+        let tracked_contents = b"Windows native path content must survive\n";
+        fs::write(&tracked_path, tracked_contents)?;
+
+        let human_agents = b"# Human guidance\r\n\r\nKeep this byte-for-byte.\r\n";
+        fs::write(fixture.worktree.join("AGENTS.md"), human_agents)?;
+        fixture.initialize_git()?;
+
+        let tracked =
+            fixture.git_stdout_in(&fixture.worktree, &["ls-files", "--cached", "-z", "--"])?;
+        assert!(
+            tracked
+                .split(|byte| *byte == 0)
+                .any(|path| path == WIDE_TRACKED_NAME.as_bytes()),
+            "Git did not preserve the UTF-8 index spelling of the native wide path"
+        );
+
+        let before_preview = fixture.snapshot_worktree()?;
+        let preview =
+            run_forge_with_explicit_dir(&fixture, &["init", "--adapter", "claude", "--json"])?;
+        assert_eq!(
+            preview.status.code(),
+            Some(0),
+            "{}",
+            display_output(&preview)
+        );
+        assert_eq!(fixture.snapshot_worktree()?, before_preview);
+
+        let applied = run_forge_with_explicit_dir(
+            &fixture,
+            &["init", "--apply", "--adapter", "claude", "--json"],
+        )?;
+        assert_eq!(
+            applied.status.code(),
+            Some(0),
+            "{}",
+            display_output(&applied)
+        );
+        let agents_after = fs::read(fixture.worktree.join("AGENTS.md"))?;
+        assert!(agents_after.starts_with(human_agents));
+        assert!(String::from_utf8_lossy(&agents_after).contains("forge:begin block=project-index"));
+        let claude_after = fs::read(fixture.worktree.join("CLAUDE.md"))?;
+        assert!(
+            String::from_utf8_lossy(&claude_after).contains("forge:begin block=claude-pointer")
+        );
+        assert_eq!(fs::read(&tracked_path)?, tracked_contents);
+        assert!(!fixture.worktree.join(".forge").exists());
+        assert!(fixture.git_dir(&fixture.worktree)?.join("forge").is_dir());
+
+        let converged =
+            run_forge_with_explicit_dir(&fixture, &["init", "--adapter", "claude", "--json"])?;
+        assert_eq!(
+            converged.status.code(),
+            Some(0),
+            "{}",
+            display_output(&converged)
+        );
+        let converged_document: Value = serde_json::from_slice(&converged.stdout)?;
+        assert!(required_array(&converged_document["data"], "edits")?.is_empty());
+
+        let after_first_apply = fixture.snapshot_worktree()?;
+        let second_apply = run_forge_with_explicit_dir(
+            &fixture,
+            &[
+                "init",
+                "--apply",
+                "--allow-dirty",
+                "--adapter",
+                "claude",
+                "--json",
+            ],
+        )?;
+        assert_eq!(
+            second_apply.status.code(),
+            Some(0),
+            "{}",
+            display_output(&second_apply)
+        );
+        let second_document: Value = serde_json::from_slice(&second_apply.stdout)?;
+        assert!(required_array(&second_document["data"], "edits")?.is_empty());
+        assert_eq!(fixture.snapshot_worktree()?, after_first_apply);
+        Ok(())
+    }
+
+    fn long_fixture_at(
+        id: &str,
+        existing_parent: &Path,
+    ) -> Result<FixtureWorkspace, Box<dyn std::error::Error>> {
+        let parent = fs::canonicalize(existing_parent)?;
+        if !parent.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows fixture parent did not canonicalize to an absolute path",
+            )
+            .into());
+        }
+        FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())
+    }
+
+    fn long_worktree_relative() -> PathBuf {
+        let mut relative = PathBuf::from("windows-wide");
+        for index in 0..4 {
+            relative.push(wide_component(index));
+        }
+        relative.push("worktree");
+        relative
+    }
+
+    fn wide_component(index: usize) -> OsString {
+        let mut units = format!("forge-wide-{index:02}-")
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        units.extend(std::iter::repeat_n(u16::from(b'w'), 64));
+        units.extend("路径-🧪".encode_utf16());
+        assert!(units.len() < 240);
+        OsString::from_wide(&units)
+    }
+
+    fn wide_units(path: &Path) -> usize {
+        path.as_os_str().encode_wide().count()
+    }
+
+    fn run_forge_with_explicit_dir(
+        fixture: &FixtureWorkspace,
+        arguments: &[&str],
+    ) -> Result<Output, Box<dyn std::error::Error>> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
+        command
+            .current_dir(&fixture.root)
+            .arg("--dir")
+            .arg(&fixture.worktree)
+            .args(arguments);
+        fixture.configure_environment(&mut command);
+        Ok(command.output()?)
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_adapter_target_cannot_escape_the_repository() -> Result<(), Box<dyn std::error::Error>> {
@@ -1289,11 +1468,30 @@ struct FixtureWorkspace {
 impl FixtureWorkspace {
     fn from_generated(id: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let parent = std::env::temp_dir().join("forge-fixture-matrix-tests");
-        fs::create_dir_all(&parent)?;
+        Self::from_generated_with_layout(id, &parent, Path::new("worktree"))
+    }
+
+    fn from_generated_with_layout(
+        id: &str,
+        parent: &Path,
+        worktree_relative: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if worktree_relative.as_os_str().is_empty()
+            || worktree_relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fixture worktree layout must contain only normal relative components",
+            )
+            .into());
+        }
+        fs::create_dir_all(parent)?;
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let root = parent.join(format!("{id}-{}-{nonce}-{sequence}", std::process::id()));
-        let worktree = root.join("worktree");
+        let worktree = root.join(worktree_relative);
         let support = root.join("support");
         let xdg_config_home = support.join("xdg");
         fs::create_dir_all(&worktree)?;
@@ -1360,7 +1558,10 @@ impl FixtureWorkspace {
         command
             .current_dir(cwd)
             .arg("--no-pager")
-            .arg("--no-optional-locks")
+            .arg("--no-optional-locks");
+        #[cfg(windows)]
+        command.arg("-c").arg("core.longpaths=true");
+        command
             .arg("-c")
             .arg("core.fsmonitor=false")
             .arg("-c")
