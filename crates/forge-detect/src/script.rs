@@ -214,7 +214,10 @@ fn parse_shebang(bytes: &[u8]) -> Option<ParsedShebang> {
             let (program, remainder) = line.split_at(split);
             (program, Some(remainder.trim()))
         });
-    if !Path::new(program).is_absolute()
+    // A shebang is a POSIX text protocol even when Forge inspects the repository on Windows.
+    // Host-native path parsing would reject `/usr/bin/env` there before the portable-invocation
+    // policy below can classify it.
+    if !program.starts_with('/')
         || argument.is_some_and(|argument| {
             argument.is_empty()
                 || argument.bytes().any(|byte| byte.is_ascii_control())
