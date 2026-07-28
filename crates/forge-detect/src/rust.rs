@@ -1176,6 +1176,7 @@ fn rust_plans_for_scopes(
     [
         Intent::FormatCheck,
         Intent::Format,
+        Intent::Fix,
         Intent::Check,
         Intent::Test,
     ]
@@ -1195,6 +1196,7 @@ fn rust_plans_for_scopes_controlled(
     for intent in [
         Intent::FormatCheck,
         Intent::Format,
+        Intent::Fix,
         Intent::Check,
         Intent::Test,
     ] {
@@ -1522,7 +1524,7 @@ fn rust_plan_for_intent(
 ) -> Result<CommandPlanCandidate, InvalidCommandPlanCandidate> {
     let phases: &[RustCommandPhase] = match intent {
         Intent::FormatCheck => &[RustCommandPhase::FormatCheck],
-        Intent::Format => &[RustCommandPhase::Format],
+        Intent::Format | Intent::Fix => &[RustCommandPhase::Format],
         Intent::Check => &[
             RustCommandPhase::FormatCheck,
             RustCommandPhase::Check,
@@ -1534,7 +1536,7 @@ fn rust_plan_for_intent(
             RustCommandPhase::Clippy,
             RustCommandPhase::Test,
         ],
-        Intent::Setup | Intent::Fix | Intent::Verify | Intent::Build => &[],
+        Intent::Setup | Intent::Verify | Intent::Build => &[],
     };
     let commands = scopes
         .iter()
@@ -1588,7 +1590,7 @@ fn rust_plan_for_intent_controlled(
 ) -> Result<CommandPlanCandidate, RustPlanBuildError> {
     let phases: &[RustCommandPhase] = match intent {
         Intent::FormatCheck => &[RustCommandPhase::FormatCheck],
-        Intent::Format => &[RustCommandPhase::Format],
+        Intent::Format | Intent::Fix => &[RustCommandPhase::Format],
         Intent::Check => &[
             RustCommandPhase::FormatCheck,
             RustCommandPhase::Check,
@@ -1600,7 +1602,7 @@ fn rust_plan_for_intent_controlled(
             RustCommandPhase::Clippy,
             RustCommandPhase::Test,
         ],
-        Intent::Setup | Intent::Fix | Intent::Verify | Intent::Build => &[],
+        Intent::Setup | Intent::Verify | Intent::Build => &[],
     };
     let mut commands = Vec::new();
     let mut provenance = Vec::new();
@@ -2131,7 +2133,7 @@ mod tests {
             result.metadata_completions[0].outcome,
             CargoMetadataOutcome::Succeeded
         );
-        assert_eq!(result.command_plan_fragments.len(), 4);
+        assert_eq!(result.command_plan_fragments.len(), 5);
 
         let specs = process.specs.borrow();
         assert_eq!(specs.len(), 1);
@@ -2161,6 +2163,22 @@ mod tests {
         assert_eq!(
             specs[0].env.overrides.get(OsStr::new("CARGO_NET_OFFLINE")),
             Some(&OsString::from("true"))
+        );
+
+        let fix = result
+            .command_plan_fragments
+            .iter()
+            .find(|plan| plan.intent() == Intent::Fix)
+            .ok_or("missing fix plan")?;
+        assert_eq!(fix.commands().len(), 1);
+        assert_eq!(fix.commands()[0].args, ["fmt", "--all"]);
+        assert_eq!(fix.commands()[0].mutability, Mutability::WorkingTreeWrite);
+        assert_eq!(
+            fix.commands()[0].coverage,
+            BTreeSet::from([
+                CoverageDimension::Format,
+                CoverageDimension::Custom(String::from(RUST_FORMAT_COVERAGE)),
+            ])
         );
 
         let check = result
@@ -2275,6 +2293,16 @@ mod tests {
                 .provenance()
                 .iter()
                 .any(|source| { source.rule_id == "rust.clippy-signal.compatibility-advisory.v1" })
+        );
+        let compatibility_fix = compatibility
+            .iter()
+            .find(|plan| plan.intent() == Intent::Fix)
+            .ok_or("missing compatibility fix plan")?;
+        assert_eq!(compatibility_fix.commands().len(), 1);
+        assert_eq!(compatibility_fix.commands()[0].args, ["fmt", "--all"]);
+        assert_eq!(
+            compatibility_fix.commands()[0].mutability,
+            Mutability::WorkingTreeWrite
         );
         Ok(())
     }
