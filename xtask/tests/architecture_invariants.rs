@@ -358,7 +358,7 @@ const AUTHORIZED_PRODUCT_IDENTITY_USES: &[AuthorizedProductIdentityUse] = &[
     authorize_identity!("crates/forge-core/src/control.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-core/src/evidence.rs", MachineNamespace, 2, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-core/src/evidence.rs", ProductNamespace, 1, MACHINE_PROTOCOL),
-    authorize_identity!("crates/forge-core/src/fingerprint.rs", MachineNamespace, 26, MACHINE_PROTOCOL),
+    authorize_identity!("crates/forge-core/src/fingerprint.rs", MachineNamespace, 25, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-core/src/policy.rs", MachineNamespace, 2, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-core/src/risk.rs", ConfigFile, 1, CONFIG_COMPATIBILITY),
     authorize_identity!("crates/forge-core/src/scope.rs", MachineNamespace, 2, MACHINE_PROTOCOL),
