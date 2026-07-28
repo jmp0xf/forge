@@ -449,6 +449,7 @@ name = "forge-cli"
 version = "0.1.0-rc.1"
 dependencies = [
  "base64",
+ "blake3",
  "clap",
  "clap_complete",
  "forge-core",

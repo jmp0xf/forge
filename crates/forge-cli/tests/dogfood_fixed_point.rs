@@ -1,11 +1,15 @@
 //! Repository-level dogfood invariant: the checked-in adapter projection is a fixed point.
 
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+
+const PRIVATE_TREE_MAX_ENTRIES: usize = 32_768;
+const PRIVATE_TREE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const SNAPSHOT_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -27,8 +31,10 @@ struct GitSemanticSnapshot {
 #[derive(Debug, PartialEq, Eq)]
 struct FileTreeSnapshot {
     exists: bool,
-    directories: Vec<PathBuf>,
-    files: Vec<(PathBuf, Vec<u8>)>,
+    directories: usize,
+    files: usize,
+    total_bytes: u64,
+    digest: [u8; 32],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -116,10 +122,43 @@ fn git_semantic_snapshot(root: &Path) -> io::Result<GitSemanticSnapshot> {
 }
 
 fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
-    fn visit(root: &Path, current: &Path, snapshot: &mut FileTreeSnapshot) -> io::Result<()> {
-        let mut children = current.read_dir()?.collect::<Result<Vec<_>, _>>()?;
+    fn visit(
+        root: &Path,
+        current: &Path,
+        snapshot: &mut FileTreeSnapshot,
+        hasher: &mut blake3::Hasher,
+    ) -> io::Result<()> {
+        let existing_entries = snapshot
+            .directories
+            .checked_add(snapshot.files)
+            .ok_or_else(|| io::Error::other("Forge private-state entry count overflowed"))?;
+        let mut children = Vec::new();
+        for child in current.read_dir()? {
+            if existing_entries
+                .checked_add(children.len())
+                .and_then(|entries| entries.checked_add(1))
+                .is_none_or(|entries| entries > PRIVATE_TREE_MAX_ENTRIES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Forge private state exceeds the bounded dogfood snapshot entry count",
+                ));
+            }
+            children.push(child?);
+        }
         children.sort_by_key(fs::DirEntry::file_name);
         for child in children {
+            let entries = snapshot
+                .directories
+                .checked_add(snapshot.files)
+                .and_then(|entries| entries.checked_add(1))
+                .ok_or_else(|| io::Error::other("Forge private-state entry count overflowed"))?;
+            if entries > PRIVATE_TREE_MAX_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Forge private state exceeds the bounded dogfood snapshot entry count",
+                ));
+            }
             let path = child.path();
             let relative = path
                 .strip_prefix(root)
@@ -127,10 +166,48 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
                 .to_path_buf();
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.is_dir() {
-                snapshot.directories.push(relative);
-                visit(root, &path, snapshot)?;
+                snapshot.directories += 1;
+                update_snapshot_path(hasher, b"directory", &relative)?;
+                visit(root, &path, snapshot, hasher)?;
             } else if metadata.is_file() {
-                snapshot.files.push((relative, fs::read(&path)?));
+                snapshot.files += 1;
+                snapshot.total_bytes = snapshot
+                    .total_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| io::Error::other("Forge private-state byte count overflowed"))?;
+                if snapshot.total_bytes > PRIVATE_TREE_MAX_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Forge private state exceeds the bounded dogfood snapshot byte count",
+                    ));
+                }
+                update_snapshot_path(hasher, b"file", &relative)?;
+                hasher.update(&metadata.len().to_le_bytes());
+                let mut file = File::open(&path)?;
+                let mut observed = 0_u64;
+                let mut buffer = [0_u8; SNAPSHOT_READ_BUFFER_BYTES];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    observed = observed
+                        .checked_add(read as u64)
+                        .ok_or_else(|| io::Error::other("private-state read size overflowed"))?;
+                    if observed > metadata.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Forge private-state file grew during dogfood snapshot",
+                        ));
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                if observed != metadata.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Forge private-state file changed during dogfood snapshot",
+                    ));
+                }
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -146,12 +223,17 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
 
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"forge.dogfood-private-tree/v1\0");
             let mut snapshot = FileTreeSnapshot {
                 exists: true,
-                directories: Vec::new(),
-                files: Vec::new(),
+                directories: 0,
+                files: 0,
+                total_bytes: 0,
+                digest: [0; 32],
             };
-            visit(root, root, &mut snapshot)?;
+            visit(root, root, &mut snapshot, &mut hasher)?;
+            snapshot.digest = *hasher.finalize().as_bytes();
             Ok(snapshot)
         }
         Ok(_) => Err(io::Error::new(
@@ -163,11 +245,56 @@ fn file_tree_snapshot(root: &Path) -> io::Result<FileTreeSnapshot> {
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(FileTreeSnapshot {
             exists: false,
-            directories: Vec::new(),
-            files: Vec::new(),
+            directories: 0,
+            files: 0,
+            total_bytes: 0,
+            digest: [0; 32],
         }),
         Err(error) => Err(error),
     }
+}
+
+fn update_snapshot_path(
+    hasher: &mut blake3::Hasher,
+    kind: &[u8],
+    relative: &Path,
+) -> io::Result<()> {
+    let path = native_path_bytes(relative)?;
+    hasher.update(&(kind.len() as u64).to_le_bytes());
+    hasher.update(kind);
+    hasher.update(&(path.len() as u64).to_le_bytes());
+    hasher.update(&path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn native_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    Ok(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn native_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut bytes = Vec::new();
+    for unit in path.as_os_str().encode_wide() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    path.to_str()
+        .map(|path| path.as_bytes().to_vec())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Forge private-state path is not representable on this platform",
+            )
+        })
 }
 
 fn repository_snapshot(root: &Path) -> Result<RepositorySnapshot, Box<dyn std::error::Error>> {

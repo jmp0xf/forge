@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+blake3.workspace = true
 jsonschema.workspace = true
 tempfile.workspace = true
 
