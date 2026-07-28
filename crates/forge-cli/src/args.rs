@@ -117,7 +117,7 @@ pub struct InitArgs {
     #[arg(long, value_enum, value_name = "RUNNER")]
     pub with_runner: Option<RunnerChoice>,
 
-    /// Request a CI draft; unavailable in v0 and rejected with an explicit diagnostic.
+    /// Generate an explicitly selected create-only CI workflow when the target is absent.
     #[arg(long, value_enum, value_name = "PROVIDER")]
     pub with_ci: Option<CiChoice>,
 
@@ -270,13 +270,13 @@ mod tests {
     }
 
     #[test]
-    fn init_help_does_not_promise_unavailable_ci_generation() {
+    fn init_help_describes_create_only_ci_generation() {
         let help = Cli::command()
             .find_subcommand("init")
             .map(|command| command.clone().render_long_help().to_string())
             .unwrap_or_default();
 
-        assert!(help.contains("unavailable in v0 and rejected with an explicit diagnostic"));
+        assert!(help.contains("explicitly selected create-only CI workflow"));
     }
 
     #[test]

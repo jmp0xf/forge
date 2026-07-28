@@ -21,7 +21,8 @@ All notable changes will be documented here.
   HEAD policy comparison, risk provenance, and a content-addressed inventory cache with live index confirmation.
 - M3 Rust, Go, mixed-workspace, dependency-edge, toolchain, offline-probe, and command-resolution providers.
 - M4 dry-run-first `init`, transactional managed-block application, private adoption manifests, explicit
-  make/just/task runner generation, adapter drift inspection, and adapter synchronization.
+  make/just/task runner generation, create-only GitHub Actions generation, adapter drift inspection, and adapter
+  synchronization.
 - M5 `explain`, fixed-registry `doctor`, and deterministic `next`, including environment blockers, exact changed
   paths, manifests, named tests, dependency edges, CODEOWNERS matches, and bounded exact document matches.
 - M6 Receipt and Evidence v2 execution, validation, immutable storage, bounded logs and retention, read-only

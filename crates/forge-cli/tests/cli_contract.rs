@@ -893,6 +893,123 @@ fn init_defaults_to_a_deterministic_read_only_plan() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn explicit_github_ci_apply_is_create_only_active_and_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("init-github-ci")?;
+
+    let applied = fixture.run_forge(&["init", "--with-ci", "github", "--apply", "--json"])?;
+
+    assert_eq!(
+        applied.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(applied.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&applied.stdout)?;
+    let edits = required_array(&document["data"], "edits")?;
+    let workflow_edit = edits
+        .iter()
+        .find(|edit| edit["path"]["display"] == ".github/workflows/verify.yml")
+        .ok_or("missing GitHub workflow create edit")?;
+    assert_eq!(workflow_edit["kind"], "create");
+
+    let workflow_path = fixture.worktree.join(".github/workflows/verify.yml");
+    let workflow = fs::read_to_string(&workflow_path)?;
+    assert!(workflow.contains("on:\n  workflow_dispatch:"));
+    assert!(workflow.contains("runs-on: ubuntu-24.04"));
+    assert!(
+        workflow.contains("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2")
+    );
+    assert!(workflow.contains("persist-credentials: false"));
+    for forbidden in [
+        "pull_request:",
+        "push:",
+        "matrix:",
+        "cache",
+        "secrets:",
+        "release",
+        "forge evidence",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "unexpected `{forbidden}` in {workflow}"
+        );
+    }
+
+    let second = fixture.run_forge(&["init", "--with-ci", "github", "--json"])?;
+    assert_eq!(second.status.code(), Some(0));
+    let second_document: Value = serde_json::from_slice(&second.stdout)?;
+    assert!(required_array(&second_document["data"], "edits")?.is_empty());
+    assert_eq!(fs::read_to_string(&workflow_path)?, workflow);
+
+    fs::write(
+        &workflow_path,
+        format!("# repository-owned comment\n{workflow}"),
+    )?;
+    let commented = fs::read(&workflow_path)?;
+    let semantic = fixture.run_forge(&["init", "--with-ci", "github", "--json"])?;
+    assert_eq!(semantic.status.code(), Some(0));
+    let semantic_document: Value = serde_json::from_slice(&semantic.stdout)?;
+    assert!(required_array(&semantic_document["data"], "edits")?.is_empty());
+    assert_eq!(fs::read(&workflow_path)?, commented);
+    Ok(())
+}
+
+#[test]
+fn explicit_github_ci_rejects_non_equivalent_and_unknown_existing_targets_without_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (label, content, expected_why) in [
+        (
+            "different",
+            "name: repository-ci\non: workflow_dispatch\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n",
+            "valid but not semantically equal",
+        ),
+        ("unknown", "jobs: [\n", "equivalence is unknown"),
+    ] {
+        let fixture = TestWorkspace::clean_runner_repository(&format!("init-github-ci-{label}"))?;
+        let workflow_directory = fixture.worktree.join(".github/workflows");
+        fs::create_dir_all(&workflow_directory)?;
+        fs::write(workflow_directory.join("verify.yml"), content)?;
+        fixture.run_git(&["add", "--", ".github/workflows/verify.yml"])?;
+        fixture.run_git(&[
+            "-c",
+            "user.name=Forge CLI tests",
+            "-c",
+            "user.email=forge-cli-tests@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "existing CI",
+        ])?;
+        let before = fixture.snapshot()?;
+
+        let output = fixture.run_forge(&["init", "--with-ci", "github", "--json"])?;
+
+        assert_eq!(
+            output.status.code(),
+            Some(65),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let diagnostic: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(structured_diagnostic_code(&diagnostic)?, "FGE1230");
+        assert!(
+            diagnostic["diagnostics"][0]["why"]
+                .as_str()
+                .is_some_and(|why| why.contains(expected_why))
+        );
+        assert_eq!(fixture.snapshot()?, before);
+        assert!(!fixture.worktree.join("AGENTS.md").exists());
+        fixture.assert_no_forge_artifacts();
+    }
+    Ok(())
+}
+
+#[test]
 fn init_reports_absent_project_commands_without_changing_the_plan_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = TestWorkspace::plain("init-missing-project-command")?;

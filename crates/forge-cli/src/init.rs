@@ -14,11 +14,11 @@ use forge_detect::model::ModelDetectionCompletion;
 use forge_render::managed_block::ManagedBlockError;
 use forge_render::{
     AdapterSelectionOverrides, AdapterTarget, ApplyError, ApplyErrorKind, ApplyReport, ChangePlan,
-    FileEditKind, GapKind, InitPlanOptions, ManagedBlockKind, PlanError, RunnerRenderError,
-    RunnerTarget, SkippedReason, apply_change_plan, plan_init,
+    CiEquivalence, CiTarget, DesiredFile, FileEditKind, GapKind, InitPlanOptions, ManagedBlockKind,
+    PlanError, RunnerRenderError, RunnerTarget, SkippedReason, apply_change_plan, plan_init,
 };
 use forge_runtime::control::OperationBudget;
-use forge_runtime::fs::NativeFileSystem;
+use forge_runtime::fs::{NativeFileSystem, RepositoryWriter};
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError};
 use forge_schema::{Diagnostic, DoctorData, InitPlanData, Severity};
@@ -245,8 +245,16 @@ pub(crate) fn execute_with_manifest_precondition_controlled(
         }
     }
     checkpoint(control, "init apply")?;
-    let report = apply_change_plan(&repository_root, &plan, &filesystem, &hasher)
-        .map_err(map_apply_error)?;
+    let apply_files = RepositoryWriter::new(&repository_root).map_err(|error| {
+        InitFailure::plain(AppError::environment_unmet(
+            "FGE2212",
+            "init could not open a stable repository root for confined writes",
+            display_repository_path(&repository_root),
+            sanitize_text(&error.to_string()),
+            "verify the repository root and its permissions, rerun a dry-run, then retry --apply",
+        ))
+    })?;
+    let report = apply_change_plan(&plan, &apply_files, &hasher).map_err(map_apply_error)?;
     checkpoint_after_apply(control, "init post-check", &report)?;
     let postcheck = explain::detect_controlled(cli, control)
         .map_err(|error| InitFailure::after_apply(error, report.clone()))?;
@@ -600,32 +608,7 @@ fn validate_request(args: &InitArgs) -> Result<(), InitFailure> {
             "select at most one mode; omitting both is a dry-run",
         )));
     }
-    if let Some(provider) = args.with_ci {
-        return Err(InitFailure::plain(unavailable_ci_error(provider)));
-    }
     Ok(())
-}
-
-fn unavailable_ci_error(provider: CiChoice) -> AppError {
-    AppError::environment_unmet(
-        "FGE2202",
-        format!(
-            "explicit `{}` CI draft generation is not available in this build",
-            ci_name(provider)
-        ),
-        "--with-ci",
-        "Forge cannot yet render and verify this opt-in asset, so it will not silently ignore the request",
-        format!(
-            "remove `--with-ci {}` or use a Forge build that implements explicit CI draft generation",
-            ci_name(provider)
-        ),
-    )
-}
-
-const fn ci_name(provider: CiChoice) -> &'static str {
-    match provider {
-        CiChoice::Github => "github",
-    }
 }
 
 fn init_plan_options(
@@ -651,6 +634,9 @@ fn init_plan_options(
             RunnerChoice::Make => RunnerTarget::Make,
             RunnerChoice::Just => RunnerTarget::Just,
             RunnerChoice::Task => RunnerTarget::Task,
+        }),
+        ci: args.with_ci.map(|provider| match provider {
+            CiChoice::Github => CiTarget::Github,
         }),
     })
 }
@@ -909,6 +895,32 @@ pub(crate) fn map_plan_error_app(error: PlanError, location: &str) -> AppError {
             sanitize_text(&detail),
             "keep the existing runner or verify command; remove the competing interface explicitly before selecting a different runner",
         ),
+        PlanError::CiRender { path, source } => AppError::environment_unmet(
+            "FGE2235",
+            "the explicit GitHub CI workflow cannot preserve the resolved project command contract",
+            display_repository_path(path.as_path()),
+            sanitize_text(&source.to_string()),
+            "keep using the reported project-native commands, or make their required argv, cwd, and environment portable before retrying --with-ci github",
+        ),
+        PlanError::CiConflict { path, equivalence } => AppError::data(
+            "FGE1230",
+            "the explicit GitHub CI target already exists and will not be overwritten",
+            display_repository_path(path.as_path()),
+            match equivalence {
+                CiEquivalence::Equivalent => String::from(
+                    "the target is equivalent; this state should have been planned as a no-op",
+                ),
+                CiEquivalence::NotEquivalent => format!(
+                    "the complete existing YAML is valid but not semantically equal to the reviewed {DISPLAY_NAME} template"
+                ),
+                CiEquivalence::Unknown => String::from(
+                    "equivalence is unknown because the complete existing target cannot be parsed safely as the expected YAML value",
+                ),
+            },
+            format!(
+                "keep the repository-owned workflow, or remove/rename it explicitly before retrying --with-ci github; {DISPLAY_NAME} never replaces this whole-file target"
+            ),
+        ),
         PlanError::InvalidTarget(_)
         | PlanError::DuplicateTarget(_)
         | PlanError::InvalidModel(_)
@@ -990,6 +1002,7 @@ fn map_apply_error(error: ApplyError) -> InitFailure {
         | ApplyErrorKind::ExistingFileTooLarge
         | ApplyErrorKind::ReadBeforeWrite
         | ApplyErrorKind::Write
+        | ApplyErrorKind::CommittedUnverified
         | ApplyErrorKind::ReadAfterWrite
         | ApplyErrorKind::PostwriteMissing
         | ApplyErrorKind::PostwriteMismatch => AppError::environment_unmet(
@@ -1094,12 +1107,16 @@ pub(crate) fn render_human(outcome: &InitOutcome) -> String {
     }
     let _ = writeln!(output, "planned edits: {}", outcome.plan.edits.len());
     for edit in &outcome.plan.edits {
+        let subject = match &edit.desired {
+            DesiredFile::ManagedBlock(_) => "block",
+            DesiredFile::WholeFile(_) => "asset",
+        };
         let _ = writeln!(
             output,
-            "  - {}: {} (block {}, preimage {}, postimage {})",
+            "  - {}: {} ({subject} {}, preimage {}, postimage {})",
             edit_kind_name(edit.kind),
             display_repository_path(edit.path.as_path()),
-            edit.desired.kind.id(),
+            edit.desired.id(),
             edit.expected_preimage
                 .as_ref()
                 .map_or("none", |digest| digest.as_str()),
@@ -1455,18 +1472,12 @@ mod tests {
     }
 
     #[test]
-    fn runner_is_available_while_unavailable_ci_is_not_ignored() -> Result<(), Box<dyn Error>> {
+    fn explicit_runner_and_ci_choices_pass_request_shape_validation() -> Result<(), Box<dyn Error>>
+    {
         let mut args = init_args();
         args.with_runner = Some(RunnerChoice::Just);
-        validate_request(&args)?;
-
         args.with_ci = Some(CiChoice::Github);
-        match validate_request(&args) {
-            Ok(()) => return Err("unavailable CI generation was ignored".into()),
-            Err(error) => {
-                assert_eq!(error.into_parts().0.exit_code(), ExitCode::EnvironmentUnmet);
-            }
-        }
+        validate_request(&args)?;
         Ok(())
     }
 

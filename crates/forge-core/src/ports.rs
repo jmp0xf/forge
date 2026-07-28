@@ -1,6 +1,7 @@
 //! Side-effect ports implemented by `forge-runtime`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
@@ -357,6 +358,105 @@ pub trait RepositoryFilePort {
         path: &RepoRelativePath,
         bytes: &[u8],
     ) -> io::Result<()>;
+}
+
+/// Whether a failed repository write reached its single-file commit point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryWriteCommit {
+    /// The target name was not changed by the failed operation.
+    NotCommitted,
+    /// The target name was committed, but durability or post-write verification did not finish.
+    CommittedUnverified,
+}
+
+/// A repository write failure that preserves whether the target was already committed.
+#[derive(Debug)]
+pub struct RepositoryWriteError {
+    commit: RepositoryWriteCommit,
+    source: io::Error,
+}
+
+impl RepositoryWriteError {
+    #[must_use]
+    pub const fn new(commit: RepositoryWriteCommit, source: io::Error) -> Self {
+        Self { commit, source }
+    }
+
+    #[must_use]
+    pub const fn commit(&self) -> RepositoryWriteCommit {
+        self.commit
+    }
+
+    #[must_use]
+    pub fn source_error(&self) -> &io::Error {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> io::Error {
+        self.source
+    }
+}
+
+impl fmt::Display for RepositoryWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.commit {
+            RepositoryWriteCommit::NotCommitted => {
+                write!(
+                    formatter,
+                    "repository write failed before commit: {}",
+                    self.source
+                )
+            }
+            RepositoryWriteCommit::CommittedUnverified => write!(
+                formatter,
+                "repository target was committed but could not be fully synchronized or verified: {}",
+                self.source
+            ),
+        }
+    }
+}
+
+impl Error for RepositoryWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Result of one compare-and-write operation through a pinned repository root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryWriteOutcome {
+    /// The target no longer matched the reviewed preimage, so nothing was committed.
+    PreconditionMismatch,
+    /// The target was committed and reread through the same pinned parent capability.
+    Written { observed: Option<Vec<u8>> },
+}
+
+/// One apply-scoped repository capability.
+///
+/// Implementations pin one repository root for the lifetime of the value. Reads and writes are
+/// handle-relative. A write must pin the target parent before its prewrite read and retain that
+/// same parent through commit and post-write read. A missing expected preimage is a no-clobber
+/// create; an existing expected preimage is rechecked after the temporary file is synchronized
+/// and immediately before an atomic replacement. Portable filesystems do not provide one syscall
+/// that compares arbitrary file bytes and renames, so a same-parent actor can still race the final
+/// recheck and replacement; callers must not treat replacement as cross-process compare-and-swap.
+pub trait RepositoryApplyPort {
+    /// Reads a safe repository-relative regular file through the pinned root.
+    fn read_confined_bounded(
+        &self,
+        path: &RepoRelativePath,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>>;
+
+    /// Commits `bytes` only when the parent-relative target still equals `expected`.
+    fn write_atomic_if_unchanged(
+        &self,
+        path: &RepoRelativePath,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+        max_postimage_bytes: usize,
+    ) -> Result<RepositoryWriteOutcome, RepositoryWriteError>;
 }
 
 pub trait GitPort {

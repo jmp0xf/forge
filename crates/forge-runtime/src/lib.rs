@@ -15,6 +15,7 @@ pub mod hash;
 pub mod interrupt;
 pub mod inventory;
 pub mod process;
+mod repository_write;
 pub mod scope;
 pub mod state;
 pub mod toolchain;

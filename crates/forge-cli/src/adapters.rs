@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use forge_core::ports::RepositoryFilePort as _;
-use forge_core::{AppError, Digest, ExitCode, OperationControl as _, RepoRelativePath};
+use forge_core::{
+    AppError, Digest, ExitCode, OperationControl as _, RepoRelativePath, branding::DISPLAY_NAME,
+};
 use forge_detect::config::ForgeConfig;
 use forge_detect::model::ModelDetectionCompletion;
 use forge_render::managed_block::ManagedBlockError;
@@ -333,7 +335,7 @@ pub(crate) fn execute_controlled(
         )
     })?;
     let statuses = certified_statuses(postcheck_plan, applied_manifest)?;
-    let previews = plan_previews(&applied.plan);
+    let previews = plan_previews(&applied.plan)?;
     Ok(AdaptersOutcome {
         wire: AdaptersData {
             adapters: statuses,
@@ -498,6 +500,7 @@ fn plan_options(
         adapter_selection: init::adapter_selection_overrides(config),
         force_blocks,
         runner: None,
+        ci: None,
     })
 }
 
@@ -677,17 +680,32 @@ fn inspection_previews(
         .collect()
 }
 
-fn plan_previews(plan: &ChangePlan) -> Vec<AdapterPreview> {
+fn plan_previews(plan: &ChangePlan) -> Result<Vec<AdapterPreview>, AppError> {
     plan.edits
         .iter()
-        .map(|edit| AdapterPreview {
-            kind: edit.kind,
-            reason: edit.reason,
-            path: edit.path.clone(),
-            block_id: ManagedBlockId::new(edit.desired.kind.id()),
-            expected_postimage: edit.expected_postimage.clone(),
-            postimage: edit.preview_postimage.clone(),
-            force_authorized: edit.reason != FileEditReason::UserEdited || edit.force,
+        .map(|edit| {
+            let desired = edit.desired.managed_block().ok_or_else(|| {
+                AppError::internal(
+                    "FGE0228",
+                    "adapter synchronization planned a non-adapter whole-file edit",
+                    "adapters sync --apply",
+                    format!(
+                        "unexpected `{}` target at `{}`",
+                        edit.desired.id(),
+                        edit.path.as_path().display()
+                    ),
+                    format!("report this as a {DISPLAY_NAME} implementation defect"),
+                )
+            })?;
+            Ok(AdapterPreview {
+                kind: edit.kind,
+                reason: edit.reason,
+                path: edit.path.clone(),
+                block_id: ManagedBlockId::new(desired.kind.id()),
+                expected_postimage: edit.expected_postimage.clone(),
+                postimage: edit.preview_postimage.clone(),
+                force_authorized: edit.reason != FileEditReason::UserEdited || edit.force,
+            })
         })
         .collect()
 }
@@ -761,10 +779,20 @@ fn ensure_manifest_is_migratable(
     };
     let mut planned = BTreeSet::new();
     for edit in &plan.edits {
-        planned.insert((
-            edit.path.clone(),
-            ManagedBlockId::new(edit.desired.kind.id()),
-        ));
+        let desired = edit.desired.managed_block().ok_or_else(|| {
+            AppError::internal(
+                "FGE0228",
+                "adapter synchronization planned a non-adapter whole-file edit",
+                "adapter manifest migration",
+                format!(
+                    "unexpected `{}` target at `{}`",
+                    edit.desired.id(),
+                    edit.path.as_path().display()
+                ),
+                format!("report this as a {DISPLAY_NAME} implementation defect"),
+            )
+        })?;
+        planned.insert((edit.path.clone(), ManagedBlockId::new(desired.kind.id())));
     }
     for skipped in &plan.skipped {
         if let Some(satisfied) = &skipped.satisfied_managed {
@@ -1097,6 +1125,7 @@ mod tests {
             assumptions: Vec::new(),
             gaps: Vec::new(),
             targets,
+            whole_file_targets: Vec::new(),
             reused_adapters: Vec::new(),
         };
         let manifest =

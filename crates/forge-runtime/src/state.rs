@@ -17,6 +17,8 @@ mod shared_cache;
 pub use shared_cache::*;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::PrivateSecurityDescriptor;
 #[cfg(any(windows, test))]
 mod windows_acl_policy;
 
@@ -685,6 +687,16 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn create_private_atomic_file(path: &Path) -> io::Result<File> {
     windows::create_private_file_new(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn harden_private_repository_file(file: &File, path: &Path) -> io::Result<()> {
+    windows::harden_repository_file_handle(file, path).map_err(StateError::into_io_error)
+}
+
+#[cfg(windows)]
+pub(crate) fn harden_private_repository_directory(directory: &File, path: &Path) -> io::Result<()> {
+    windows::harden_repository_directory_handle(directory, path).map_err(StateError::into_io_error)
 }
 
 #[cfg(not(any(unix, windows)))]

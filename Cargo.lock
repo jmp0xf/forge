@@ -450,6 +450,7 @@ name = "forge-render"
 version = "0.0.0"
 dependencies = [
  "forge-core",
+ "serde_yaml_ng",
 ]
 
 [[package]]

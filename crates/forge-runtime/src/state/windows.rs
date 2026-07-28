@@ -100,7 +100,7 @@ impl Drop for OwnedHandle {
     }
 }
 
-struct PrivateSecurityDescriptor {
+pub(crate) struct PrivateSecurityDescriptor {
     _acl_storage: Vec<usize>,
     descriptor: SECURITY_DESCRIPTOR,
 }
@@ -173,6 +173,18 @@ impl PrivateSecurityDescriptor {
             lpSecurityDescriptor: ptr::from_mut(&mut self.descriptor).cast(),
             bInheritHandle: 0,
         }
+    }
+
+    pub(crate) fn repository_file() -> io::Result<Self> {
+        Self::new(PrivateWindowsObjectKind::File)
+    }
+
+    pub(crate) fn repository_directory() -> io::Result<Self> {
+        Self::new(PrivateWindowsObjectKind::Directory)
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut c_void {
+        ptr::from_mut(&mut self.descriptor).cast()
     }
 
     fn dacl(&self) -> *const ACL {
@@ -294,6 +306,17 @@ pub(super) fn set_owner_only_acl(
         ));
     }
     validate_owner_only_handle(file, path, kind)
+}
+
+pub(super) fn harden_repository_file_handle(file: &File, path: &Path) -> Result<(), StateError> {
+    set_owner_only_acl(file, path, PrivateWindowsObjectKind::File)
+}
+
+pub(super) fn harden_repository_directory_handle(
+    directory: &File,
+    path: &Path,
+) -> Result<(), StateError> {
+    set_owner_only_acl(directory, path, PrivateWindowsObjectKind::Directory)
 }
 
 #[cfg(test)]

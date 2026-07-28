@@ -40,5 +40,7 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0024](0024-record-typed-process-boundary-failures.md) | Accepted | 进程边界失败写入类型化非证明 Receipt |
 | [0025](0025-use-one-operation-wide-time-budget.md) | Accepted | 每条命令使用一个操作级总预算 |
 | [0026](0026-declare-provider-namespaced-coverage-gaps.md) | Accepted | 声明 Provider 命名空间覆盖与缺口 |
+| [0027](0027-generate-github-ci-as-an-explicit-create-only-workflow.md) | Accepted | 显式生成只创建不覆盖的 GitHub CI 工作流 |
+| [0028](0028-pin-directory-handles-for-repository-writes.md) | Accepted | 仓库写入固定目录句柄 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。

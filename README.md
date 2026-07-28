@@ -28,8 +28,9 @@ Evidence always remains separate from CI, review, merge, deployment, and release
 
 `init` remains a dry-run by default and does not generate a runner unless explicitly requested. The implemented
 `--with-runner make|just|task` path adds only a reviewable managed `verify` target backed by already resolved native
-commands. CI generation remains unavailable, even when requested, and fails explicitly rather than guessing a provider
-contract.
+commands. `--with-ci github` explicitly plans a create-only `.github/workflows/verify.yml`: an active manual workflow
+that invokes those already resolved required commands directly. Forge preserves semantically equivalent YAML and fails
+closed on any non-equivalent or unknown existing target; it never overwrites or manages the complete workflow.
 
 The in-repository parts of M7 include the complete 28-fixture public matrix, checked-in schemas and instance validation,
 human-output goldens, a public two-binary compatibility harness that serves as the N-1 skeleton, four fuzz targets and
@@ -132,7 +133,7 @@ The stable interface of projects analyzed by Forge remains their own commands (`
 
 The implemented command surface is `init`, `doctor`, `next`, `evidence run|show|verify|export`,
 `adapters sync|check`, `explain`, `schema`, `version`, and `completions`. Explicit local runner generation is
-implemented; CI generation is not. `improve`, `evolve`, external-attestation import, release orchestration, and model
-integration are intentionally outside v0.
+implemented, as is explicit create-only GitHub CI generation. `improve`, `evolve`, external-attestation import,
+release orchestration, and model integration are intentionally outside v0.
 
 Do not add a feature that changes an accepted decision without an ADR that supersedes the relevant record.

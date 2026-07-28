@@ -14,15 +14,16 @@ acceptance is not complete.
 | Protocol and layering | Six-crate workspace, typed IDs/contracts/diagnostics, stable exit codes, dependency-direction and architecture checks |
 | Runtime | Bounded Git, native-path, filesystem, synchronous process, state, lock, timeout, cancellation, output-digest, and private-permission paths |
 | Detection | Strict `forge.toml`, repository/runner/Rust/Go/mixed discovery, deterministic command resolution, risk and policy provenance |
-| Integration | Default-dry-run `init`, managed `AGENTS.md`/host adapters, adapter drift/sync, and explicit make/just/task runner generation |
+| Integration | Default-dry-run `init`, managed `AGENTS.md`/host adapters, adapter drift/sync, explicit make/just/task runners, and create-only GitHub CI generation |
 | Navigation | `doctor`, deterministic read-only `next`, `explain`, schema/version/completion output |
 | Local evidence | Receipt/Evidence v2 run/show/verify/export, dependency invalidation, immutable state, bounded retention, and v1 historical readers |
 | In-repository hardening | 28 public fixtures, schema/golden/compatibility tests, dogfood fixed point, fuzz corpora, bounded mutation config, and opt-in large-repository benchmark |
 
 Default `init` still does not generate a runner, CI, configuration, ADR, runbook, or ownership file.
 Runner generation occurs only after an explicit choice and creates a project-native managed `verify`
-target from already resolved required commands. `init --with-ci github` remains deliberately
-unavailable and returns an explicit environment-unmet diagnostic.
+target from already resolved required commands. `init --with-ci github` explicitly creates only a
+missing `.github/workflows/verify.yml`; equivalent complete YAML is a no-op, while non-equivalent or
+unknown existing content fails without writes and is never overwritten.
 
 `improve`, `evolve`, model integration, external-attestation import, and release orchestration remain
 outside the v0 command surface.

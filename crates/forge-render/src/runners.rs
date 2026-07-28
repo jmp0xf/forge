@@ -240,7 +240,7 @@ pub fn project_runner_model(
         .map_err(|error| RunnerRenderError::InvalidProjectedModel(error.to_string()))
 }
 
-fn required_verify_commands(model: &ProjectModel) -> Vec<&CommandSpec> {
+pub(crate) fn required_verify_commands(model: &ProjectModel) -> Vec<&CommandSpec> {
     let mut commands = Vec::new();
     for intent in VERIFY_INTENTS {
         let Some(command_set) = model.commands.get(&intent) else {
@@ -259,6 +259,18 @@ fn required_verify_commands(model: &ProjectModel) -> Vec<&CommandSpec> {
         }));
     }
     commands
+}
+
+/// Renders one required project command for the POSIX shell used by the generated GitHub job.
+///
+/// GitHub expressions also use double braces, so the Just dialect's existing text validation is
+/// the conservative shared subset: it rejects both template injection and values that cannot be
+/// represented losslessly in the workflow's shell command.
+pub(crate) fn render_github_actions_shell_command(
+    model: &ProjectModel,
+    command: &CommandSpec,
+) -> Result<String, RunnerRenderError> {
+    render_shell_command(model, command, RunnerTarget::Just)
 }
 
 fn render_make(

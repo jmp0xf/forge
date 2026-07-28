@@ -6,14 +6,20 @@ use std::fmt;
 use std::io;
 
 use forge_core::domain::{
-    Assumption, CommandResolution, CommandSource, Confidence, Intent, ProjectModel,
+    AssetInfo, Assumption, CommandResolution, CommandSource, Confidence, Intent, ProjectModel,
     ProjectModelError, Provenance,
 };
 use forge_core::ports::{Hasher, RepositoryFilePort};
-use forge_core::{Digest, RelativePathError, RepoId, RepoRelativePath, branding::CONFIG_FILE};
+use forge_core::{
+    Digest, RelativePathError, RepoId, RepoRelativePath,
+    branding::{CONFIG_FILE, DISPLAY_NAME},
+};
 
 use crate::adapter_registry::{AdapterSelection, adapter_specs, managed_adapter_spec};
 use crate::adapters::{AGENTS_MAX_BYTES, AGENTS_MAX_LINES, AdapterRenderError};
+use crate::ci::{
+    CiEquivalence, CiRenderError, CiTarget, classify_github_workflow, render_github_workflow,
+};
 use crate::inspection::{
     AdapterInspectionError, AdapterInspectionKind, AdapterInspectionRequest,
     AdapterInspectionState, FileEditReason, inspect_adapter_targets,
@@ -21,6 +27,7 @@ use crate::inspection::{
 use crate::managed_block::{
     LineEnding, ManagedBlock, ManagedBlockError, ManagedBlockSyntax, contains_managed_block_begin,
 };
+use crate::repository_file_digest;
 use crate::runners::{RunnerRenderError, RunnerTarget, project_runner_model, render_runner_body};
 
 const PLAN_SCHEMA: u16 = 1;
@@ -64,6 +71,7 @@ pub struct InitPlanOptions {
     pub adapter_selection: AdapterSelectionOverrides,
     pub force_blocks: Vec<ManagedBlockKind>,
     pub runner: Option<RunnerTarget>,
+    pub ci: Option<CiTarget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,6 +112,32 @@ pub struct DesiredManagedBlock {
     pub body: String,
 }
 
+/// The generation strategy authorized for one planned file edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredFile {
+    ManagedBlock(DesiredManagedBlock),
+    /// A complete opt-in asset that can only be created, never replaced.
+    WholeFile(CiTarget),
+}
+
+impl DesiredFile {
+    #[must_use]
+    pub const fn id(&self) -> &'static str {
+        match self {
+            Self::ManagedBlock(block) => block.kind.id(),
+            Self::WholeFile(target) => target.id(),
+        }
+    }
+
+    #[must_use]
+    pub const fn managed_block(&self) -> Option<&DesiredManagedBlock> {
+        match self {
+            Self::ManagedBlock(block) => Some(block),
+            Self::WholeFile(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileEditKind {
     Create,
@@ -118,7 +152,7 @@ pub struct FileEdit {
     /// Reviewed fallback for a new file or an existing target with no reliable uniform style.
     pub fallback_line_ending: LineEnding,
     pub path: RepoRelativePath,
-    pub desired: DesiredManagedBlock,
+    pub desired: DesiredFile,
     pub expected_preimage: Option<Digest>,
     pub preview_postimage: Vec<u8>,
     pub expected_postimage: Digest,
@@ -177,7 +211,23 @@ pub struct InitAdapterInspection {
     pub assumptions: Vec<Assumption>,
     pub gaps: Vec<InitGap>,
     pub targets: Vec<InitAdapterTargetInspection>,
+    pub whole_file_targets: Vec<InitWholeFileTargetInspection>,
     pub reused_adapters: Vec<ReusedAdapter>,
+}
+
+/// One explicitly requested whole-file target after conservative equivalence inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitWholeFileTargetInspection {
+    pub path: RepoRelativePath,
+    pub target: CiTarget,
+    pub content: Vec<u8>,
+    pub state: WholeFileInspectionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WholeFileInspectionState {
+    Missing,
+    Equivalent,
 }
 
 /// A requested host that consumes an already planned canonical adapter path.
@@ -275,6 +325,14 @@ pub enum PlanError {
         path: RepoRelativePath,
         detail: String,
     },
+    CiRender {
+        path: RepoRelativePath,
+        source: CiRenderError,
+    },
+    CiConflict {
+        path: RepoRelativePath,
+        equivalence: CiEquivalence,
+    },
     InspectionInvariant {
         path: RepoRelativePath,
         detail: String,
@@ -358,6 +416,16 @@ impl fmt::Display for PlanError {
                 "cannot add explicit runner `{}` safely: {detail}",
                 path.as_path().display()
             ),
+            Self::CiRender { path, source } => write!(
+                formatter,
+                "cannot render explicit CI workflow `{}`: {source}",
+                path.as_path().display()
+            ),
+            Self::CiConflict { path, equivalence } => write!(
+                formatter,
+                "existing CI workflow `{}` is {equivalence}; create-only generation will not overwrite it",
+                path.as_path().display()
+            ),
             Self::InspectionInvariant { path, detail } => write!(
                 formatter,
                 "adapter inspection invariant failed for `{}`: {detail}",
@@ -375,6 +443,7 @@ impl Error for PlanError {
             Self::Read { source, .. } => Some(source),
             Self::ManagedBlock { source, .. } => Some(source),
             Self::RunnerRender { source, .. } => Some(source),
+            Self::CiRender { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -462,13 +531,44 @@ where
                     reason: observed_edit.reason,
                     fallback_line_ending: observed_edit.fallback_line_ending,
                     path: target.path,
-                    desired: target.desired,
+                    desired: DesiredFile::ManagedBlock(target.desired),
                     expected_preimage: observed_edit.expected_preimage,
                     expected_postimage: observed_edit.full_postimage_digest,
                     preview_postimage: observed_edit.preview_postimage,
                     force,
                 });
             }
+        }
+    }
+    for target in inspection.whole_file_targets {
+        match target.state {
+            WholeFileInspectionState::Missing => {
+                if target_gaps.get(&target.path) != Some(&GapKind::OptionalCiDraft) {
+                    return Err(PlanError::InspectionInvariant {
+                        path: target.path,
+                        detail: String::from(
+                            "an editable whole-file target has no matching classified init gap",
+                        ),
+                    });
+                }
+                let expected_postimage = repository_file_digest(hasher, &target.content);
+                edits.push(FileEdit {
+                    kind: FileEditKind::Create,
+                    reason: FileEditReason::MissingFile,
+                    fallback_line_ending: LineEnding::Lf,
+                    path: target.path,
+                    desired: DesiredFile::WholeFile(target.target),
+                    expected_preimage: None,
+                    preview_postimage: target.content,
+                    expected_postimage,
+                    force: false,
+                });
+            }
+            WholeFileInspectionState::Equivalent => skipped.push(SkippedChange {
+                path: target.path,
+                reason: SkippedReason::EquivalentUnmanaged,
+                satisfied_managed: None,
+            }),
         }
     }
     edits.sort_by(|left, right| left.path.cmp(&right.path));
@@ -506,7 +606,13 @@ where
     let expanded_requests = expand_explicit_requests(&requested);
     let _ = unique_forced_blocks(options)?;
     let runner = plan_runner_target(&model, filesystem, options.runner)?;
-    let render_model = runner.projected_model.as_ref().unwrap_or(&model);
+    let runner_model = runner.projected_model.as_ref().unwrap_or(&model);
+    let whole_file_targets = inspect_ci_target(runner_model, filesystem, options.ci)?;
+    let ci_model = options
+        .ci
+        .map(|target| project_ci_model(runner_model, target))
+        .transpose()?;
+    let render_model = ci_model.as_ref().unwrap_or(runner_model);
     let mut desired_targets = Vec::new();
     let mut reused_adapters = Vec::new();
     let mut selected = adapter_specs()
@@ -603,10 +709,24 @@ where
             state: observed.state,
         });
     }
-    let gaps = classify_init_gaps(&model, &targets);
+    let mut gaps = classify_init_gaps(&model, &targets);
+    for target in &whole_file_targets {
+        if target.state == WholeFileInspectionState::Missing {
+            gaps.push(InitGap {
+                kind: GapKind::OptionalCiDraft,
+                path: Some(target.path.clone()),
+                intent: None,
+            });
+        }
+    }
+    gaps.sort();
+    gaps.dedup();
     let mut assumptions = model.assumptions;
     if let Some(assumption) = runner.assumption {
         assumptions.push(assumption);
+    }
+    if let Some(target) = options.ci {
+        assumptions.push(ci_assumption(target)?);
     }
     for gap in gaps
         .iter()
@@ -640,8 +760,110 @@ where
         assumptions,
         gaps,
         targets,
+        whole_file_targets,
         reused_adapters,
     })
+}
+
+fn inspect_ci_target<F>(
+    model: &ProjectModel,
+    filesystem: &F,
+    target: Option<CiTarget>,
+) -> Result<Vec<InitWholeFileTargetInspection>, PlanError>
+where
+    F: RepositoryFilePort + ?Sized,
+{
+    let Some(target) = target else {
+        return Ok(Vec::new());
+    };
+    let path = target_path(target.path())?;
+    let content = match target {
+        CiTarget::Github => render_github_workflow(model),
+    }
+    .map_err(|source| PlanError::CiRender {
+        path: path.clone(),
+        source,
+    })?;
+    let existing = filesystem
+        .read_confined_bounded(
+            &model.repository.root,
+            &path,
+            crate::inspection::ADAPTER_FILE_MAX_BYTES,
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::InvalidData {
+                PlanError::CiConflict {
+                    path: path.clone(),
+                    equivalence: CiEquivalence::Unknown,
+                }
+            } else {
+                PlanError::Read {
+                    path: path.clone(),
+                    source,
+                }
+            }
+        })?;
+    let state = match existing {
+        None => WholeFileInspectionState::Missing,
+        Some(existing) => match classify_github_workflow(&existing, &content) {
+            CiEquivalence::Equivalent => WholeFileInspectionState::Equivalent,
+            equivalence @ (CiEquivalence::NotEquivalent | CiEquivalence::Unknown) => {
+                return Err(PlanError::CiConflict { path, equivalence });
+            }
+        },
+    };
+    Ok(vec![InitWholeFileTargetInspection {
+        path,
+        target,
+        content,
+        state,
+    }])
+}
+
+fn ci_assumption(target: CiTarget) -> Result<Assumption, PlanError> {
+    let path = target_path(target.path())?;
+    Ok(Assumption::new(
+        format!(
+            "`{}` is an explicit opt-in, create-only GitHub Actions workflow; delete the complete file to remove it, and {DISPLAY_NAME} will never replace an existing non-equivalent or unknown workflow.",
+            target.path(),
+        ),
+        vec![ci_provenance(
+            &path,
+            "the CI provider came from the explicit --with-ci github request",
+        )],
+        Confidence::High,
+    ))
+}
+
+fn project_ci_model(model: &ProjectModel, target: CiTarget) -> Result<ProjectModel, PlanError> {
+    let path = target_path(target.path())?;
+    let mut projected = model.clone();
+    if !projected
+        .assets
+        .entries
+        .iter()
+        .any(|asset| asset.kind == "ci.github-actions" && asset.path == path)
+    {
+        projected.assets.entries.push(AssetInfo::new(
+            "ci.github-actions",
+            path.clone(),
+            vec![ci_provenance(
+                &path,
+                "the explicitly selected workflow will exist after the reviewed init plan",
+            )],
+            Confidence::Medium,
+        ));
+    }
+    projected.finalize().map_err(PlanError::InvalidModel)
+}
+
+fn ci_provenance(path: &RepoRelativePath, detail: &str) -> Provenance {
+    Provenance {
+        rule_id: String::from("init.ci.github.explicit-opt-in.v1"),
+        source_path: Some(path.as_path().into()),
+        source_range: None,
+        detail: detail.to_owned(),
+    }
 }
 
 /// Purely classifies model and target observations; it never chooses or writes a file.
@@ -1340,12 +1562,13 @@ mod tests {
     use forge_core::{Digest, RelativePathError, RepoId, RepoRelativePath};
 
     use crate::adapter_registry::{AdapterSelection, adapter_specs};
+    use crate::ci::{CiEquivalence, CiTarget, GITHUB_WORKFLOW_PATH};
     use crate::inspection::{ADAPTER_FILE_MAX_BYTES, AdapterInspectionKind, FileEditReason};
     use crate::managed_block::{LineEnding, ManagedBlock, ManagedBlockError};
     use crate::runners::{RunnerTarget, project_runner_model};
 
     use super::{
-        AdapterFileLimitStage, AdapterSelectionOverrides, AdapterTarget, FileEditKind,
+        AdapterFileLimitStage, AdapterSelectionOverrides, AdapterTarget, DesiredFile, FileEditKind,
         GITATTRIBUTES_MAX_BYTES, GapKind, InitPlanOptions, ManagedBlockKind, PlanError,
         SkippedReason, inspect_init_targets, plan_init,
     };
@@ -1777,6 +2000,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: Some(RunnerTarget::Task),
+            ci: None,
         };
         let first = plan_init(&model, &MemoryFiles::default(), &FixtureHasher, &options)?;
         assert_eq!(
@@ -1816,6 +2040,87 @@ mod tests {
     }
 
     #[test]
+    fn explicit_github_ci_is_create_only_and_semantically_idempotent() -> Result<(), Box<dyn Error>>
+    {
+        let model = model_with_command()?;
+        let options = InitPlanOptions {
+            ci: Some(CiTarget::Github),
+            ..InitPlanOptions::default()
+        };
+        let first = plan_init(&model, &MemoryFiles::default(), &FixtureHasher, &options)?;
+        let workflow = first
+            .edits
+            .iter()
+            .find(|edit| edit.path.as_path() == Path::new(GITHUB_WORKFLOW_PATH))
+            .ok_or_else(|| io::Error::other("missing GitHub workflow edit"))?;
+        assert_eq!(workflow.kind, FileEditKind::Create);
+        assert!(matches!(
+            &workflow.desired,
+            DesiredFile::WholeFile(CiTarget::Github)
+        ));
+        let workflow_bytes = workflow.preview_postimage.clone();
+        let agents_bytes = first
+            .edits
+            .iter()
+            .find(|edit| edit.path.as_path() == Path::new("AGENTS.md"))
+            .ok_or_else(|| io::Error::other("missing AGENTS.md edit"))?
+            .preview_postimage
+            .clone();
+
+        let exact = MemoryFiles::from_files([
+            ("AGENTS.md", agents_bytes.clone()),
+            (GITHUB_WORKFLOW_PATH, workflow_bytes.clone()),
+        ]);
+        let second = plan_init(&model, &exact, &FixtureHasher, &options)?;
+        assert!(second.edits.is_empty());
+        assert!(second.skipped.iter().any(|skipped| {
+            skipped.path.as_path() == Path::new(GITHUB_WORKFLOW_PATH)
+                && skipped.reason == SkippedReason::EquivalentUnmanaged
+        }));
+
+        let mut commented = b"# repository-owned comment\n".to_vec();
+        commented.extend_from_slice(&workflow_bytes);
+        let semantic = MemoryFiles::from_files([
+            ("AGENTS.md", agents_bytes),
+            (GITHUB_WORKFLOW_PATH, commented),
+        ]);
+        let third = plan_init(&model, &semantic, &FixtureHasher, &options)?;
+        assert!(third.edits.is_empty());
+        assert_eq!(semantic.writes.get(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_non_equivalent_or_unknown_ci_is_never_overwritten() -> Result<(), Box<dyn Error>> {
+        let model = model_with_command()?;
+        let options = InitPlanOptions {
+            ci: Some(CiTarget::Github),
+            ..InitPlanOptions::default()
+        };
+        let first = plan_init(&model, &MemoryFiles::default(), &FixtureHasher, &options)?;
+        let workflow = first
+            .edits
+            .iter()
+            .find(|edit| edit.path.as_path() == Path::new(GITHUB_WORKFLOW_PATH))
+            .ok_or_else(|| io::Error::other("missing GitHub workflow edit"))?;
+        let different = String::from_utf8(workflow.preview_postimage.clone())?
+            .replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest");
+
+        for (content, expected) in [
+            (different.into_bytes(), CiEquivalence::NotEquivalent),
+            (b"jobs: [\n".to_vec(), CiEquivalence::Unknown),
+        ] {
+            let files = MemoryFiles::with(GITHUB_WORKFLOW_PATH, content);
+            assert!(matches!(
+                plan_init(&model, &files, &FixtureHasher, &options),
+                Err(PlanError::CiConflict { equivalence, .. }) if equivalence == expected
+            ));
+            assert_eq!(files.writes.get(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn explicit_runner_preserves_an_existing_human_owned_file() -> Result<(), Box<dyn Error>> {
         let existing = b"# human runner\nverify:\n    cargo test\n".to_vec();
         let options = InitPlanOptions {
@@ -1824,6 +2129,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: Some(RunnerTarget::Task),
+            ci: None,
         };
         let plan = plan_init(
             &model_with_command()?,
@@ -1858,6 +2164,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: Some(RunnerTarget::Task),
+            ci: None,
         };
         let plan = plan_init(
             &model_with_command()?,
@@ -1883,6 +2190,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: Some(RunnerTarget::Task),
+            ci: None,
         };
         let first = plan_init(&model, &MemoryFiles::default(), &FixtureHasher, &options)?;
         let files = MemoryFiles::from_files(first.edits.iter().map(|edit| {
@@ -1941,6 +2249,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: Some(RunnerTarget::Task),
+            ci: None,
         };
         let first = plan_init(&model, &MemoryFiles::default(), &FixtureHasher, &options)?;
         let mut files = first
@@ -2037,6 +2346,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: None,
+            ci: None,
         };
         let initial = plan_init(
             &model,
@@ -2093,6 +2403,7 @@ mod tests {
                 ManagedBlockKind::ClaudePointer,
             ],
             runner: None,
+            ci: None,
         };
         let forced_inspection =
             inspect_init_targets(&model, &files, &FixtureHasher, &forced_options)?;
@@ -2121,6 +2432,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: None,
+            ci: None,
         };
         let plan = plan_init(
             &model_with_command()?,
@@ -2152,7 +2464,11 @@ mod tests {
         for spec in adapter_specs() {
             if spec.owns_managed_projection() {
                 assert!(plan.edits.iter().any(|edit| {
-                    edit.path.as_path() == Path::new(spec.path) && edit.desired.kind == spec.block
+                    edit.path.as_path() == Path::new(spec.path)
+                        && edit
+                            .desired
+                            .managed_block()
+                            .is_some_and(|desired| desired.kind == spec.block)
                 }));
             }
             if let AdapterSelection::ExplicitReuse { source } = spec.selection {
@@ -2195,7 +2511,11 @@ mod tests {
 
         assert_eq!(plan.edits.len(), 2);
         assert!(plan.edits.iter().any(|edit| {
-            edit.path.as_path() == Path::new("CLAUDE.md") && edit.desired.body == "@AGENTS.md"
+            edit.path.as_path() == Path::new("CLAUDE.md")
+                && edit
+                    .desired
+                    .managed_block()
+                    .is_some_and(|desired| desired.body == "@AGENTS.md")
         }));
         Ok(())
     }
@@ -2286,11 +2606,17 @@ mod tests {
         assert_eq!(explicit_plan.edits.len(), 2);
         assert!(explicit_plan.edits.iter().any(|edit| {
             edit.path.as_path() == Path::new("AGENTS.md")
-                && edit.desired.kind == ManagedBlockKind::ProjectIndex
+                && edit
+                    .desired
+                    .managed_block()
+                    .is_some_and(|desired| desired.kind == ManagedBlockKind::ProjectIndex)
         }));
         assert!(explicit_plan.edits.iter().any(|edit| {
             edit.path.as_path() == Path::new("CLAUDE.md")
-                && edit.desired.kind == ManagedBlockKind::ClaudePointer
+                && edit
+                    .desired
+                    .managed_block()
+                    .is_some_and(|desired| desired.kind == ManagedBlockKind::ClaudePointer)
         }));
         Ok(())
     }
@@ -2330,6 +2656,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: None,
+            ci: None,
         };
         let plan = plan_init(
             &model_with_command()?,
@@ -2468,6 +2795,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: Vec::new(),
             runner: None,
+            ci: None,
         };
         assert!(matches!(
             plan_init(
@@ -2589,6 +2917,7 @@ mod tests {
             adapter_selection: AdapterSelectionOverrides::default(),
             force_blocks: vec![ManagedBlockKind::ProjectIndex],
             runner: None,
+            ci: None,
         };
         let forced = plan_init(&model, &files, &FixtureHasher, &options)?;
 
