@@ -104,8 +104,9 @@ The repository contains, without claiming that every campaign passed for the cur
 - four fuzz targets/corpora for porcelain v2, managed blocks, strict config, and native paths;
 - a checked-in bounded `cargo-mutants` surface for evidence, navigation, risk, validity, and policy
   anti-weakening decisions; and
-- an ignored 100,000-file benchmark that reports first-inventory and warm-command p95 values without
-  converting performance goals into platform-independent assertions.
+- an ignored 100,000-file benchmark that reports one first-inventory observation, repeated
+  uncached-inventory p50/p95, warm-command p95, and Git-plumbing p50/p95 without converting
+  performance goals into platform-independent assertions.
 
 The public fixture and N-1 harness are candidate-controlled self-checks. Specialized platform state
 is constructed by integration tests and the harness currently uses reviewed Unix process-group
@@ -113,30 +114,37 @@ containment; it fails closed on Windows rather than pretending equivalent Job Ob
 
 ## Current local calibration
 
-On 2026-07-27, the ignored release benchmark completed on macOS 26.5.2 arm64 with Rust/Cargo
-1.96.0 against its generated 100,000-committed-file fixture. This is one local observation, not a
-portable performance qualification:
+On 2026-07-28, the ignored release benchmark completed outside the sandbox against commit
+`d6ae7b8` on macOS 26.5.2 arm64 with Rust/Cargo 1.96.0 and Git 2.51.0. It used the generated
+100,000-committed-file fixture. This is one local observation, not a portable performance
+qualification:
 
-| Measurement | Observed p95 or cold value | Design target | Result |
+| Measurement | Observed | Design target | Result |
 |---|---:|---:|---|
-| First inventory | 2,886 ms | < 5,000 ms | met |
-| Cold Forge peak RSS | 129.62 MiB | < 150 MiB | met |
-| `version` | 3 ms | < 50 ms | met |
-| warm `next` | 1,687 ms | < 200 ms | not met |
-| warm `adapters check` | 616 ms | < 300 ms | not met |
-| warm `doctor` | 691 ms | < 3,000 ms | met |
+| First uncached inventory | 3,447 ms | single observation | not classified |
+| Uncached inventory p50/p95 (20 samples) | 2,387 / 3,447 ms | p95 < 5,000 ms | met locally |
+| Cold Forge peak RSS | 132.12 MiB | < 150 MiB | met locally |
+| `version` p95 | 4 ms | < 50 ms | met locally |
+| warm `next` p95 | 1,559 ms | < 200 ms | not met |
+| warm `adapters check` p95 | 610 ms | < 300 ms | not met |
+| warm `doctor` p95 | 716 ms | < 3,000 ms | met locally |
 
-The same fixture measured bare `git status` at 271 ms p95. That host-level lower bound does not
-weaken or redefine Forge's targets; it means this machine cannot qualify the 200 ms `next` target
-and the remaining Forge overhead still requires measurement and reduction on a calibrated runner
-and representative real repositories. The benchmark intentionally reports instead of asserting, so
-its process success must not be described as every performance target passing.
+The same fixture measured bare `git status` at 270 ms p95. That host-level baseline does not weaken
+or redefine Forge's targets; this machine still cannot qualify the 200 ms `next` target, and the
+remaining Forge overhead requires measurement and reduction on a calibrated runner and
+representative real repositories. Benchmark process success must not be described as every
+performance target passing. When the host blocks `/usr/bin/time` from collecting resource usage,
+the benchmark reports RSS as unavailable rather than claiming a result, while retaining the
+independent latency samples.
 
-The pre-hardening bounded mutation campaign tested 309 mutants: 272 were caught, 11 survived, 26
-were unviable, and none timed out. Review classified eight survivors as real test gaps and three as
-equivalent or redundant expressions. After the fixes, exact reruns caught all eight real mutants and
-the other three mutation sites were no longer generated. The complete 309-mutant campaign was not
-rerun after those fixes, so this is not a claim that every mutant of the final candidate is caught.
+A bounded full mutation campaign against commit `8d26435` tested 300 mutants: 275 were caught, one
+was missed, 24 were unviable, and none timed out. The sole survivor deleted the `risk/docs-only`
+arm in `add_content_uncertainty` and was a real test gap. Commit `e51837c` added an exact regression
+test, and an exact one-mutant rerun caught that mutant. Subsequent changes through `d6ae7b8` are
+tests, the Windows long-path Git argument, and performance-harness work outside the configured
+bounded production mutation surface. The complete campaign was not rerun after the fix or against
+the current candidate, so this is composite bounded evidence rather than a claim that every
+current-candidate mutant was caught.
 
 ## Work still required before v0 release
 

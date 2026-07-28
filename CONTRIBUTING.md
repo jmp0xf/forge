@@ -72,8 +72,10 @@ The benchmark refuses a debug build. It preserves the first inventory as a cold 
 reports p50/p95 across repeated uncached read-only inventories; each sample verifies that no Forge
 cache was published. On macOS and Linux it also wraps a separate cold-process inventory invocation
 with `/usr/bin/time` and reports that process's peak RSS; this excludes the Cargo test driver and
-fixture-materialization memory. It reports warm p50/p95 for the Git plumbing used to interpret the
-large repository so a slow Forge result can be separated from host Git cost.
+fixture-materialization memory. If the host denies resource-usage telemetry, RSS is explicitly
+reported as unavailable and does not qualify that target, while the independent latency samples
+continue. The benchmark reports warm p50/p95 for the Git plumbing used to interpret the large
+repository so a slow Forge result can be separated from host Git cost.
 
 For changes to critical parsers, paths, evidence state, validity, risk, or anti-weakening rules, also run the applicable
 fuzz targets from [`fuzz/README.md`](fuzz/README.md) and the checked-in bounded mutation surface:

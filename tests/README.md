@@ -1,9 +1,9 @@
 # Cross-crate tests
 
-The implementation will add:
+The repository's implemented cross-crate verification surface includes:
 
 - invariant tests for dependency direction, uninstallability, read-only commands, idempotence, determinism, output
   contracts, and authority separation;
 - end-to-end tests over generated fixture repositories;
-- N-1 compatibility tests for schemas and init plans;
+- tests for the explicit N-1 schema and init-plan compatibility harness;
 - fuzz targets for Git porcelain, managed blocks, configuration, and native path handling.
