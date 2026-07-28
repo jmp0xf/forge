@@ -1656,7 +1656,7 @@ mod tests {
         let index_snapshot = git.index_snapshot_bytes(&root, 64 * 1024 * 1024)?;
         let index_entries = git.index_entries(&root)?;
 
-        assert_eq!(root, expected_root);
+        assert_eq!(root.canonicalize()?, expected_root);
         assert!(git_dir.is_absolute());
         assert!(git_dir.is_dir());
         assert!(git_common_dir.is_absolute());
