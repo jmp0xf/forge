@@ -883,6 +883,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error;
     use std::fs;
     use std::io;
@@ -896,6 +897,32 @@ mod tests {
 
     use super::{FileSystemError, NativeFileSystem, RepositoryWriter};
     use crate::repository_write::WriteEvent;
+
+    #[cfg(windows)]
+    fn assert_no_repository_temporary_files(directory: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".forge-tmp-"),
+                "temporary file remains at {:?}",
+                entry.path()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn assert_file_missing_or_exact(path: &Path, expected: &[u8]) -> io::Result<()> {
+        match fs::read(path) {
+            Ok(bytes) => assert_eq!(bytes, expected, "partial content at {path:?}"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_filesystem_reads_and_replaces_atomically() -> Result<(), Box<dyn Error>> {
@@ -1441,8 +1468,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn intermediate_parent_swap_after_prewrite_uses_pinned_descendant() -> Result<(), Box<dyn Error>>
-    {
+    fn intermediate_parent_swap_never_writes_replacement_tree() -> Result<(), Box<dyn Error>> {
         let repository = tempdir()?;
         let intermediate = repository.path().join("a");
         let saved_intermediate = repository.path().join("saved-a");
@@ -1473,9 +1499,23 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
         assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"replacement");
+
+        #[cfg(unix)]
+        assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
+        #[cfg(unix)]
         assert_eq!(fs::read(saved_intermediate.join("b/target.txt"))?, b"forge");
+
+        #[cfg(windows)]
+        {
+            assert_eq!(error.commit(), RepositoryWriteCommit::NotCommitted);
+            assert_eq!(
+                fs::read(saved_intermediate.join("b/target.txt"))?,
+                b"reviewed"
+            );
+            assert_no_repository_temporary_files(&intermediate.join("b"))?;
+            assert_no_repository_temporary_files(&saved_intermediate.join("b"))?;
+        }
         Ok(())
     }
 
@@ -1528,19 +1568,41 @@ mod tests {
         fs::create_dir(&repository)?;
         fs::create_dir(&parent)?;
         let writer = RepositoryWriter::new(&repository)?;
+        let swap_completed = Cell::new(false);
 
         let result = writer.write_atomic_with_before_commit(
             Path::new("parent/target.txt"),
             b"pinned parent",
             || {
                 fs::rename(&parent, &saved_parent)?;
-                fs::create_dir(&parent)
+                fs::create_dir(&parent)?;
+                swap_completed.set(true);
+                Ok(())
             },
         );
 
-        assert!(matches!(result, Err(FileSystemError::Io { .. })));
+        assert!(matches!(&result, Err(FileSystemError::Io { .. })));
         assert!(!parent.join("target.txt").exists());
+
+        #[cfg(unix)]
+        assert!(swap_completed.get());
+        #[cfg(unix)]
         assert_eq!(fs::read(saved_parent.join("target.txt"))?, b"pinned parent");
+
+        #[cfg(windows)]
+        {
+            if swap_completed.get() {
+                assert!(parent.is_dir());
+                assert!(saved_parent.is_dir());
+                assert_file_missing_or_exact(&saved_parent.join("target.txt"), b"pinned parent")?;
+                assert_no_repository_temporary_files(&parent)?;
+                assert_no_repository_temporary_files(&saved_parent)?;
+            } else {
+                assert!(parent.is_dir());
+                assert!(!saved_parent.exists());
+                assert_no_repository_temporary_files(&parent)?;
+            }
+        }
         Ok(())
     }
 
@@ -1552,19 +1614,41 @@ mod tests {
         let saved_repository = container.path().join("saved-repository");
         fs::create_dir(&repository)?;
         let writer = RepositoryWriter::new(&repository)?;
+        let swap_completed = Cell::new(false);
 
         let result =
             writer.write_atomic_with_before_commit(Path::new("target.txt"), b"pinned root", || {
                 fs::rename(&repository, &saved_repository)?;
-                fs::create_dir(&repository)
+                fs::create_dir(&repository)?;
+                swap_completed.set(true);
+                Ok(())
             });
 
-        assert!(matches!(result, Err(FileSystemError::Io { .. })));
+        assert!(matches!(&result, Err(FileSystemError::Io { .. })));
         assert!(!repository.join("target.txt").exists());
+
+        #[cfg(unix)]
+        assert!(swap_completed.get());
+        #[cfg(unix)]
         assert_eq!(
             fs::read(saved_repository.join("target.txt"))?,
             b"pinned root"
         );
+
+        #[cfg(windows)]
+        {
+            if swap_completed.get() {
+                assert!(repository.is_dir());
+                assert!(saved_repository.is_dir());
+                assert_file_missing_or_exact(&saved_repository.join("target.txt"), b"pinned root")?;
+                assert_no_repository_temporary_files(&repository)?;
+                assert_no_repository_temporary_files(&saved_repository)?;
+            } else {
+                assert!(repository.is_dir());
+                assert!(!saved_repository.exists());
+                assert_no_repository_temporary_files(&repository)?;
+            }
+        }
         Ok(())
     }
 }

@@ -1,10 +1,10 @@
 # ADR-0033：Windows 重命名显式使用固定目标目录句柄
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-07-28
 - Deciders: Forge maintainers
 - Supersedes: ADR-0031
-- Superseded by: None
+- Superseded by: ADR-0034
 
 ## Context
 
