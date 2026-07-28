@@ -13,7 +13,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use std::process::Stdio;
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MODEL_INTENTS: [&str; 8] = [
     "setup",
@@ -3252,10 +3252,23 @@ fn evidence_run_checks_the_state_lock_before_a_project_command_can_start()
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     fixture.configure_git_environment(&mut first_command);
-    let first = first_command.spawn()?;
+    let mut first = first_command.spawn()?;
 
-    for _ in 0..200 {
+    let start_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
         if first_started.exists() {
+            break;
+        }
+        if let Some(status) = first.try_wait()? {
+            let output = first.wait_with_output()?;
+            return Err(io::Error::other(format!(
+                "first evidence command exited with {status} before its project command started: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        if Instant::now() >= start_deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -3264,7 +3277,7 @@ fn evidence_run_checks_the_state_lock_before_a_project_command_can_start()
         fs::write(&release_first, b"release\n")?;
         let output = first.wait_with_output()?;
         return Err(io::Error::other(format!(
-            "first evidence command never started: stdout={} stderr={}",
+            "first evidence command did not start within 30 seconds: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
