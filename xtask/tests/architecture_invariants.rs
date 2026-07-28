@@ -833,6 +833,99 @@ fn primary_verification_workflow_does_not_depend_on_forge() -> Result<(), Box<dy
     Ok(())
 }
 
+#[test]
+fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immutable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = repository_root()?;
+    let workflow = fs::read_to_string(root.join(".github/workflows/verify.yml"))?;
+
+    assert!(workflow.contains("permissions:\n  contents: read\n"));
+    assert!(
+        !workflow
+            .lines()
+            .any(|line| line.trim_end().ends_with(": write"))
+    );
+    for forbidden in [
+        "write-all",
+        "pull_request_target:",
+        "id-token:",
+        "secrets:",
+        "actions/upload-artifact",
+        "release-finalize",
+        "release-check",
+        "gh release",
+        "git tag",
+        "cosign",
+        "sigstore",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "primary verification must not gain authority through `{forbidden}`"
+        );
+    }
+    assert_eq!(
+        workflow
+            .matches("uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
+            .count(),
+        6,
+        "every checkout must use the ADR-0027 immutable v4.2.2 commit"
+    );
+    assert_eq!(
+        workflow.matches("persist-credentials: false").count(),
+        6,
+        "every checkout must discard its credential helper"
+    );
+    for line in workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("uses:"))
+    {
+        let reference = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.rsplit_once('@').map(|(_, revision)| revision))
+            .ok_or_else(|| format!("external action lacks a revision: {line}"))?;
+        assert_eq!(
+            reference.len(),
+            40,
+            "external action is not commit-pinned: {line}"
+        );
+        assert!(
+            reference.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "external action is not commit-pinned: {line}"
+        );
+    }
+
+    for required in [
+        "cargo +stable fmt --all -- --check",
+        "cargo +1.85.0 check --locked --workspace --all-targets",
+        "cargo +1.85.0 test --locked --workspace --no-fail-fast",
+        "cargo +stable check --locked --workspace --all-targets --target",
+        "cargo +stable clippy --locked --workspace --all-targets --target",
+        "cargo +stable test --locked --workspace --target",
+        "cargo +stable run --locked -p xtask -- check-schemas",
+        "every_declared_native_command_survives_fixture_install_and_uninstall_for_release",
+        "release-build --target",
+        "cargo +nightly-2026-07-26 fuzz run",
+        "cargo +stable mutants",
+    ] {
+        assert!(workflow.contains(required), "missing CI gate `{required}`");
+    }
+    for required_runner in [
+        "ubuntu-24.04",
+        "ubuntu-24.04-arm",
+        "macos-15-intel",
+        "macos-15",
+        "windows-2025",
+    ] {
+        assert!(
+            workflow.contains(required_runner),
+            "missing native runner `{required_runner}`"
+        );
+    }
+    Ok(())
+}
+
 fn rust_source_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     visit_files(root, &mut |path| {

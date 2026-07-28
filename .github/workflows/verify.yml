@@ -4,37 +4,241 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      mutation:
+        description: Run the bounded cargo-mutants campaign
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_AUTO_INSTALL: "0"
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Rust ${{ matrix.toolchain }} / ${{ matrix.os }}
+  contracts:
+    name: Contracts / generated drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Check root formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Check fuzz formatting
+        working-directory: fuzz
+        run: cargo +stable fmt --all -- --check
+      - name: Check checked-in schemas
+        run: cargo +stable run --locked -p xtask -- check-schemas
+      - name: Regenerate fixtures
+        run: cargo +stable run --locked -p xtask -- generate-fixtures
+      - name: Reject generated or untracked drift
+        shell: bash
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Smoke bootstrap CLI
+        run: cargo +stable run --locked -p forge-cli -- version
+
+  msrv:
+    name: Rust 1.85 (MSRV)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Check root workspace
+        run: cargo +1.85.0 check --locked --workspace --all-targets
+      - name: Test root workspace
+        run: cargo +1.85.0 test --locked --workspace --no-fail-fast
+      - name: Check schemas on MSRV
+        run: cargo +1.85.0 run --locked -p xtask -- check-schemas
+      - name: Check fuzz workspace on MSRV
+        working-directory: fuzz
+        run: cargo +1.85.0 check --locked --all-targets
+      - name: Test fuzz workspace on MSRV
+        working-directory: fuzz
+        run: cargo +1.85.0 test --locked --no-fail-fast
+
+  native:
+    name: Native stable / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            toolchain: "1.85.0"
-          - os: ubuntu-latest
-            toolchain: stable
-          - os: macos-latest
-            toolchain: stable
-          - os: windows-latest
-            toolchain: stable
-    runs-on: ${{ matrix.os }}
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: forge-0.1.0-rc.1-x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: forge-0.1.0-rc.1-aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: forge-0.1.0-rc.1-x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: forge-0.1.0-rc.1-aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset: forge-0.1.0-rc.1-x86_64-pc-windows-msvc.exe
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Install target
+        run: rustup target add ${{ matrix.target }} --toolchain stable
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Check root workspace
+        run: cargo +stable check --locked --workspace --all-targets --target ${{ matrix.target }}
+      - name: Lint root workspace
+        run: cargo +stable clippy --locked --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Test root workspace
+        run: cargo +stable test --locked --workspace --target ${{ matrix.target }} --no-fail-fast
+      - name: Check fuzz workspace
+        working-directory: fuzz
+        run: cargo +stable check --locked --all-targets --target ${{ matrix.target }}
+      - name: Lint fuzz workspace
+        working-directory: fuzz
+        run: cargo +stable clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Test fuzz workspace
+        working-directory: fuzz
+        run: cargo +stable test --locked --target ${{ matrix.target }} --no-fail-fast
+      - name: Build release assembler
+        run: cargo +stable build --locked --offline -p xtask
+      - name: Build and execute release candidate
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/forge-dist"
+          mkdir -p "$dist"
+          target/debug/xtask release-build --target "${{ matrix.target }}" --output-dir "$dist"
+          chmod +x "$dist/${{ matrix.asset }}"
+          "$dist/${{ matrix.asset }}" version
+      - name: Build and execute Windows release candidate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP "forge-dist"
+          New-Item -ItemType Directory -Path $dist | Out-Null
+          .\target\debug\xtask.exe release-build --target "${{ matrix.target }}" --output-dir $dist
+          & (Join-Path $dist "${{ matrix.asset }}") version
+
+  strict-exitability:
+    name: Strict fixture exitability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install fixed Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+      - name: Install fixed fixture runners
+        shell: bash
+        run: |
+          cargo +stable install --locked just --version 1.50.0
+          go install github.com/go-task/task/v3/cmd/task@v3.51.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Record fixture runner versions
+        shell: bash
+        run: |
+          rustc +stable --version --verbose
+          cargo +stable --version --verbose
+          go version
+          just --version
+          task --version
+          make --version
+      - name: Run strict release fixture matrix
+        run: >-
+          cargo +stable test --locked -p forge-cli --test fixture_matrix
+          every_declared_native_command_survives_fixture_install_and_uninstall_for_release
+          -- --ignored --exact --nocapture
+
+  fuzz:
+    name: Fuzz critical boundaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly Rust
+        run: rustup toolchain install nightly-2026-07-26 --profile minimal --component rust-src
+      - name: Install cargo-fuzz
+        run: cargo +nightly-2026-07-26 install --locked cargo-fuzz --version 0.13.2
+      - name: Fuzz critical boundaries for 60 seconds each
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            parse_status_porcelain_v2 \
+            merge_managed_block \
+            parse_forge_config \
+            roundtrip_native_path
+          do
+            output="$RUNNER_TEMP/fuzz-corpus/$target"
+            mkdir -p "$output"
+            cargo +nightly-2026-07-26 fuzz run "$target" \
+              "$output" "$GITHUB_WORKSPACE/fuzz/corpus/$target" -- \
+              -max_total_time=60 -timeout=10 -print_final_stats=1 -verbosity=0
+          done
+          if [[ -d fuzz/artifacts ]] && find fuzz/artifacts -type f -print -quit | grep -q .
+          then
+            echo "fuzz campaign produced a crash artifact" >&2
+            exit 1
+          fi
+
+  mutation:
+    name: Bounded mutation campaign
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mutation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-mutants
+        run: cargo +stable install --locked cargo-mutants --version 27.0.0
+      - name: Run checked-in mutation surface
+        run: cargo +stable mutants
