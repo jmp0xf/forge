@@ -2,7 +2,7 @@
   "schema": 1,
   "generator_protocol": 1,
   "source_manifest": "../definitions/manifest-v1.json",
-  "source_manifest_identity": "blake3:4d76ce45968b2bdb9794d2f87bb3b2e739cdb2d1541e43691b1b0718cd9d475a",
+  "source_manifest_identity": "blake3:f3cc138f2912bbb4134b343929b2e1d5f5c8a756d2d3d2168af28ceb005fe930",
   "fixtures": [
     {
       "id": "brownfield-adapters",
@@ -546,15 +546,26 @@
       "id": "missing-tools",
       "commands": [
         {
-          "intent": "check",
-          "program": "forge-fixture-tool-does-not-exist",
+          "intent": "test",
+          "program": "cargo",
           "args": [
-            "check"
+            "test",
+            "--offline"
           ],
           "cwd": "."
         }
       ],
       "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 165,
+          "blake3": "blake3:cb2a27e75e4fe344a1b4848eb239e4fa240148c418ee16b8340a1be1eef51a19"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 92,
+          "blake3": "blake3:5e53bc35d26d82e02a6ba436a03519012e0df032b963d2684ed3450d9c060f83"
+        },
         {
           "path": "forge.toml",
           "bytes": 243,
@@ -564,6 +575,11 @@
           "path": "seed.txt",
           "bytes": 59,
           "blake3": "blake3:732c96b05b1fb3822fb080b53de9f2d4810bf4f4b93e42080da411721e4cf39e"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 334,
+          "blake3": "blake3:f4da413bc1252ed8682512d5129ba665af4e88b5cd093620dcbf204f22657cc6"
         }
       ]
     },

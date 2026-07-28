@@ -222,13 +222,13 @@
       "id": "missing-tools",
       "commands": [
         {
-          "intent": "check",
-          "program": "forge-fixture-tool-does-not-exist",
-          "args": ["check"],
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
           "cwd": "."
         }
       ],
-      "files": ["forge.toml", "seed.txt"]
+      "files": ["Cargo.lock", "Cargo.toml", "forge.toml", "seed.txt", "src/lib.rs"]
     },
     {
       "id": "mixed-rust-go",
