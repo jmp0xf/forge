@@ -20,8 +20,8 @@ use forge_render::{
 use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::{NativeFileSystem, RepositoryWriter};
 use forge_runtime::hash::Blake3Hasher;
-use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError};
-use forge_schema::{Diagnostic, DoctorData, InitPlanData, Severity};
+use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError, StateLock};
+use forge_schema::{Diagnostic, DoctorData, InitPlanData, RepoId, Severity};
 
 use crate::adapter_manifest::{
     AdapterManifest, AdapterManifestError, GeneratedManifestError, load_adapter_manifest,
@@ -49,6 +49,23 @@ pub(crate) struct InitOutcome {
 pub(crate) enum AdapterManifestPrecondition {
     Unchecked,
     Expected(Option<AdapterManifest>),
+}
+
+/// Private state prepared before repository writes without creating an absent state directory.
+enum InitApplyState {
+    Existing {
+        store: AtomicStateStore,
+        _lock: StateLock,
+    },
+    Absent {
+        layout: GitStateLayout,
+    },
+}
+
+/// A normalized state store whose lock remains held through all post-apply validation.
+struct LockedInitState {
+    _store: AtomicStateStore,
+    _lock: StateLock,
 }
 
 /// An init failure coupled to any writes that completed before the failure was observed.
@@ -216,34 +233,15 @@ pub(crate) fn execute_with_manifest_precondition_controlled(
     }
 
     checkpoint(control, "init apply state")?;
-    let state_store = AtomicStateStore::new(GitStateLayout::new(
-        &preapply.model.repository.git_dir,
-        &preapply.model.repository.git_common_dir,
-    ))
-    .map_err(|error| InitFailure::plain(map_state_error(error, "init apply state")))?;
-    let _state_lock = state_store
-        .try_lock()
-        .map_err(|error| InitFailure::plain(map_state_error(error, "init apply lock")))?;
-    if let AdapterManifestPrecondition::Expected(expected) = &manifest_precondition {
-        let current = load_adapter_manifest(&state_store, &preapply.model.repository.id).map_err(
-            |error| {
-                InitFailure::plain(map_manifest_read_error(error, "init manifest precondition"))
-            },
-        )?;
-        if &current != expected {
-            return Err(InitFailure::plain(AppError::new(
-                ExitCode::Temporary,
-                Diagnostic::new(
-                    "FGE2224",
-                    Severity::Error,
-                    "adapter manifest changed before synchronization",
-                    "init manifest precondition",
-                    "the locked private manifest no longer matches the state used to select adapter targets",
-                    "rerun adapters sync, review the fresh preview, then request --apply again",
-                ),
-            )));
-        }
-    }
+    let apply_state = prepare_init_apply_state(
+        GitStateLayout::new(
+            &preapply.model.repository.git_dir,
+            &preapply.model.repository.git_common_dir,
+        ),
+        &preapply.model.repository.id,
+        &manifest_precondition,
+    )
+    .map_err(InitFailure::plain)?;
     checkpoint(control, "init apply")?;
     let apply_files = RepositoryWriter::new(&repository_root).map_err(|error| {
         InitFailure::plain(AppError::environment_unmet(
@@ -333,13 +331,8 @@ pub(crate) fn execute_with_manifest_precondition_controlled(
                 report.clone(),
             )
         })?;
-    store_adapter_manifest(&state_store, &post_plan.repository, &manifest).map_err(|error| {
-        InitFailure::after_apply(
-            map_manifest_error(error, "init adapter manifest"),
-            report.clone(),
-        )
-    })?;
-    drop(_state_lock);
+    let locked_state = persist_init_adapter_manifest(apply_state, &post_plan.repository, &manifest)
+        .map_err(|error| InitFailure::after_apply(error, report.clone()))?;
     checkpoint_after_apply(control, "init post-apply doctor", &report)?;
     let postdoctor = doctor::execute_postcheck_controlled(cli, &postcheck, control)
         .map_err(|error| InitFailure::after_apply(error, report.clone()))?;
@@ -347,6 +340,7 @@ pub(crate) fn execute_with_manifest_precondition_controlled(
     if control.checkpoint().is_ok() {
         explain::publish_inventory_cache_after_state_write(&preapply);
     }
+    drop(locked_state);
 
     Ok(InitOutcome {
         plan,
@@ -359,6 +353,96 @@ pub(crate) fn execute_with_manifest_precondition_controlled(
         postcheck_plan: Some(post_plan),
         manifest: Some(manifest),
     })
+}
+
+fn prepare_init_apply_state(
+    layout: GitStateLayout,
+    repository: &RepoId,
+    precondition: &AdapterManifestPrecondition,
+) -> Result<InitApplyState, AppError> {
+    let store = AtomicStateStore::open_existing_read_only(layout.clone())
+        .map_err(|error| map_state_error(error, "init apply state"))?;
+    let Some(store) = store else {
+        ensure_adapter_manifest_precondition(None, repository, precondition)?;
+        return Ok(InitApplyState::Absent { layout });
+    };
+
+    let state_lock = store
+        .try_lock()
+        .map_err(|error| map_state_error(error, "init apply lock"))?;
+    ensure_adapter_manifest_precondition(Some(&store), repository, precondition)?;
+    Ok(InitApplyState::Existing {
+        store,
+        _lock: state_lock,
+    })
+}
+
+fn persist_init_adapter_manifest(
+    state: InitApplyState,
+    repository: &RepoId,
+    manifest: &AdapterManifest,
+) -> Result<LockedInitState, AppError> {
+    match state {
+        InitApplyState::Existing { store, _lock } => {
+            store_adapter_manifest(&store, repository, manifest)
+                .map_err(|error| map_manifest_error(error, "init adapter manifest"))?;
+            Ok(LockedInitState {
+                _store: store,
+                _lock,
+            })
+        }
+        InitApplyState::Absent { layout } => {
+            let store = AtomicStateStore::new(layout)
+                .map_err(|error| map_state_error(error, "init adapter manifest"))?;
+            let state_lock = store
+                .try_lock()
+                .map_err(|error| map_state_error(error, "init adapter manifest lock"))?;
+
+            // No private state existed when the reviewed apply began, so a manifest here can only
+            // have been published by a concurrent operation. Never overwrite that new authority.
+            ensure_adapter_manifest_precondition(
+                Some(&store),
+                repository,
+                &AdapterManifestPrecondition::Expected(None),
+            )?;
+            store_adapter_manifest(&store, repository, manifest)
+                .map_err(|error| map_manifest_error(error, "init adapter manifest"))?;
+            Ok(LockedInitState {
+                _store: store,
+                _lock: state_lock,
+            })
+        }
+    }
+}
+
+fn ensure_adapter_manifest_precondition(
+    store: Option<&AtomicStateStore>,
+    repository: &RepoId,
+    precondition: &AdapterManifestPrecondition,
+) -> Result<(), AppError> {
+    let AdapterManifestPrecondition::Expected(expected) = precondition else {
+        return Ok(());
+    };
+    let current = store
+        .map(|store| load_adapter_manifest(store, repository))
+        .transpose()
+        .map_err(|error| map_manifest_read_error(error, "init manifest precondition"))?
+        .flatten();
+    if &current == expected {
+        return Ok(());
+    }
+
+    Err(AppError::new(
+        ExitCode::Temporary,
+        Diagnostic::new(
+            "FGE2224",
+            Severity::Error,
+            "adapter manifest changed before synchronization",
+            "init manifest precondition",
+            "the locked private manifest no longer matches the state used to select adapter targets",
+            "rerun adapters sync, review the fresh preview, then request --apply again",
+        ),
+    ))
 }
 
 fn checkpoint(control: &OperationBudget, location: &str) -> Result<(), InitFailure> {

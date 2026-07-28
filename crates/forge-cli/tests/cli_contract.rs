@@ -957,6 +957,35 @@ fn explicit_github_ci_apply_is_create_only_active_and_idempotent()
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn init_apply_write_failure_does_not_create_private_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = TestWorkspace::clean_runner_repository("init-write-failure-no-state")?;
+    let workflow_directory = fixture.worktree.join(".github/workflows");
+    fs::create_dir_all(&workflow_directory)?;
+    let original_permissions = fs::metadata(&workflow_directory)?.permissions();
+    fs::set_permissions(&workflow_directory, fs::Permissions::from_mode(0o500))?;
+
+    let output = fixture.run_forge(&["init", "--with-ci", "github", "--apply", "--json"]);
+    fs::set_permissions(&workflow_directory, original_permissions)?;
+    let output = output?;
+
+    assert_json_diagnostic_failure(&output, 2, "FGE2212")?;
+    assert!(
+        !fixture.private_forge_state_dir()?.exists(),
+        "a failed repository write must not create Git-private Forge state"
+    );
+    assert!(
+        !fixture.worktree.join("AGENTS.md").exists(),
+        "the lexically first blocked CI target must fail before later edits"
+    );
+    assert!(!workflow_directory.join("verify.yml").exists());
+    Ok(())
+}
+
 #[test]
 fn explicit_github_ci_rejects_non_equivalent_and_unknown_existing_targets_without_writes()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1373,6 +1402,10 @@ fn init_postcheck_rejects_changed_repository_layout_after_verified_apply()
         !fixture.generated_manifest_path()?.exists(),
         "repository-layout failure must precede adapter-manifest persistence"
     );
+    assert!(
+        !fixture.private_forge_state_dir()?.exists(),
+        "post-check failure must not leave a newly created private state directory"
+    );
     Ok(())
 }
 
@@ -1425,6 +1458,10 @@ fn init_postcheck_rejects_nonconvergent_output_after_verified_apply()
     assert!(
         !fixture.generated_manifest_path()?.exists(),
         "convergence failure must precede adapter-manifest persistence"
+    );
+    assert!(
+        !fixture.private_forge_state_dir()?.exists(),
+        "convergence failure must not leave a newly created private state directory"
     );
     Ok(())
 }
