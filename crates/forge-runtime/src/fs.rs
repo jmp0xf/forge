@@ -1164,6 +1164,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn repository_writer_replace_preserves_existing_permissions() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repository = tempdir()?;
+        let target = repository.path().join("executable.sh");
+        fs::write(&target, b"old")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o750))?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        writer.write_atomic("executable.sh", b"new")?;
+
+        assert_eq!(fs::read(&target)?, b"new");
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o750);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn private_atomic_replace_does_not_inherit_permissive_permissions() -> Result<(), Box<dyn Error>>
     {
         use std::os::unix::fs::PermissionsExt as _;

@@ -451,7 +451,7 @@ mod platform {
                     ));
                 }
                 Ok(match file_mode {
-                    NewFileMode::Default => Some(u32::from(status.st_mode & 0o7777)),
+                    NewFileMode::Default => Some((u64::from(status.st_mode) & 0o7777) as u32),
                     NewFileMode::Private => None,
                 })
             }
