@@ -3199,6 +3199,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::Write as _;
+    #[cfg(unix)]
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::Duration;
