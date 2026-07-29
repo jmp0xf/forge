@@ -1,15 +1,29 @@
 //! Repository-level dogfood invariant: the checked-in adapter projection is a fixed point.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
+use forge_core::domain::{Mutability, NetworkIntent};
+use forge_core::path::RepoRelativePath;
+use forge_core::ports::{
+    EnvPolicy, ExecSpec, OutputPolicy, ProcessError, ProcessObservation, ProcessPort as _,
+    StdinPolicy,
+};
+use forge_runtime::git::{HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
+use forge_runtime::process::SynchronousProcessRunner;
 use serde_json::Value;
 
 const PRIVATE_TREE_MAX_ENTRIES: usize = 32_768;
 const PRIVATE_TREE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const SNAPSHOT_READ_BUFFER_BYTES: usize = 64 * 1024;
+const GIT_SNAPSHOT_OUTPUT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const GIT_PATH_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -20,12 +34,30 @@ fn repository_root() -> PathBuf {
 
 #[derive(Debug, PartialEq, Eq)]
 struct GitSemanticSnapshot {
-    head: Vec<u8>,
-    status: Vec<u8>,
-    index_entries: Vec<u8>,
-    index_diff: Vec<u8>,
-    worktree_diff: Vec<u8>,
-    untracked_paths: Vec<u8>,
+    head: GitCommandSnapshot,
+    status: GitCommandSnapshot,
+    index_entries: GitCommandSnapshot,
+    index_diff: GitCommandSnapshot,
+    worktree_diff: GitCommandSnapshot,
+    untracked_paths: GitCommandSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitStreamSnapshot {
+    bytes: u64,
+    digest: [u8; 32],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GitCommandSnapshot {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stdout: GitStreamSnapshot,
+}
+
+struct GitOutputBudget {
+    observed: u64,
+    max_bytes: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,38 +100,245 @@ fn configure_repository_environment(command: &mut Command) {
         .env("LC_ALL", "C");
 }
 
-fn successful_git_stdout(root: &Path, arguments: &[&str]) -> io::Result<Vec<u8>> {
-    let mut command = Command::new("git");
-    command
-        .current_dir(root)
-        .arg("--no-optional-locks")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-c")
-        .arg("core.autocrlf=false")
-        .args(arguments);
-    configure_repository_environment(&mut command);
-    let output = command.output()?;
-    if output.status.success() {
-        return Ok(output.stdout);
+impl GitOutputBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            observed: 0,
+            max_bytes,
+        }
     }
-    Err(io::Error::other(format!(
-        "git {arguments:?} failed with status {:?}: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim_end()
-    )))
+
+    fn charge(&mut self, label: &str, observation: &ProcessObservation) -> io::Result<()> {
+        // The process runner has already drained both streams without retaining their bytes. This
+        // is an acceptance bound over the completed semantic snapshot; the runner's timeout is the
+        // independent bound for a child that does not finish.
+        let command_bytes = observation
+            .stdout_total_bytes
+            .checked_add(observation.stderr_total_bytes)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "Git command `{label}` output byte count overflowed"
+                ))
+            })?;
+        let observed = self.observed.checked_add(command_bytes).ok_or_else(|| {
+            io::Error::other(format!(
+                "Git command `{label}` cumulative output byte count overflowed"
+            ))
+        })?;
+        if observed > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Git command `{label}` exceeded the bounded Git snapshot output budget"),
+            ));
+        }
+        self.observed = observed;
+        Ok(())
+    }
 }
 
-fn absolute_git_path(root: &Path, selector: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output = successful_git_stdout(root, &["rev-parse", "--path-format=absolute", selector])?;
-    Ok(PathBuf::from(String::from_utf8(output)?.trim_end()))
+fn git_environment() -> EnvPolicy {
+    let mut overrides = HARDENED_GIT_ENV
+        .iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect::<BTreeMap<_, _>>();
+    overrides.insert(OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1"));
+    overrides.insert(
+        OsString::from("GIT_CONFIG_GLOBAL"),
+        OsString::from(git_null_device()),
+    );
+    overrides.insert(OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1"));
+    EnvPolicy::minimal_with_overrides(overrides)
 }
 
-fn git_semantic_snapshot(root: &Path) -> io::Result<GitSemanticSnapshot> {
+#[cfg(windows)]
+fn git_null_device() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+fn git_null_device() -> &'static str {
+    "/dev/null"
+}
+
+fn git_exec_spec(arguments: &[&str], stdout: OutputPolicy) -> ExecSpec {
+    let args = HARDENED_GIT_GLOBAL_ARGS
+        .iter()
+        .copied()
+        .chain(["-c", "core.autocrlf=false"])
+        .chain(arguments.iter().copied())
+        .map(OsString::from)
+        .collect();
+    ExecSpec {
+        program: OsString::from("git"),
+        args,
+        cwd: RepoRelativePath::root(),
+        env: git_environment(),
+        timeout: GIT_COMMAND_TIMEOUT,
+        stdin: StdinPolicy::Closed,
+        stdout,
+        stderr: OutputPolicy::Discard,
+        mutability: Mutability::ReadOnly,
+        network: NetworkIntent::OfflineRequested,
+        concurrency_key: None,
+    }
+}
+
+fn git_process_error(label: &str, error: &ProcessError) -> io::Error {
+    io::Error::new(
+        error.io_kind(),
+        format!(
+            "Git command `{label}` execution failed: category={} io={:?}",
+            error.kind().as_str(),
+            error.io_kind()
+        ),
+    )
+}
+
+fn git_failure_message(label: &str, observation: &ProcessObservation) -> String {
+    format!(
+        "Git command `{label}` failed: exit_code={:?} signal={:?} timed_out={} interrupted={} stdout_bytes={} stdout_digest={} stderr_bytes={} stderr_digest={}",
+        observation.exit_code,
+        observation.signal,
+        observation.timed_out,
+        observation.interrupted,
+        observation.stdout_total_bytes,
+        observation.stdout_digest,
+        observation.stderr_total_bytes,
+        observation.stderr_digest,
+    )
+}
+
+fn successful_git_observation(
+    runner: &SynchronousProcessRunner,
+    label: &str,
+    arguments: &[&str],
+    stdout: OutputPolicy,
+) -> io::Result<ProcessObservation> {
+    let observation = runner
+        .run(&git_exec_spec(arguments, stdout))
+        .map_err(|error| git_process_error(label, &error))?;
+    let succeeded = observation.exit_code == Some(0)
+        && observation.signal.is_none()
+        && !observation.timed_out
+        && !observation.interrupted;
+    if !succeeded {
+        return Err(io::Error::other(git_failure_message(label, &observation)));
+    }
+    Ok(observation)
+}
+
+fn git_stream_snapshot(
+    label: &str,
+    stream_name: &str,
+    total_bytes: u64,
+    digest: &forge_schema::Digest,
+) -> GitStreamSnapshot {
+    fn update_framed(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"forge.dogfood-git-stream/v1\0");
+    update_framed(&mut hasher, label.as_bytes());
+    update_framed(&mut hasher, stream_name.as_bytes());
+    hasher.update(&total_bytes.to_le_bytes());
+    update_framed(&mut hasher, digest.as_str().as_bytes());
+    GitStreamSnapshot {
+        bytes: total_bytes,
+        digest: *hasher.finalize().as_bytes(),
+    }
+}
+
+fn git_command_snapshot(label: &str, observation: &ProcessObservation) -> GitCommandSnapshot {
+    GitCommandSnapshot {
+        exit_code: observation.exit_code,
+        signal: observation.signal,
+        stdout: git_stream_snapshot(
+            label,
+            "stdout",
+            observation.stdout_total_bytes,
+            &observation.stdout_digest,
+        ),
+    }
+}
+
+fn successful_git_snapshot(
+    runner: &SynchronousProcessRunner,
+    label: &str,
+    arguments: &[&str],
+    budget: &mut GitOutputBudget,
+) -> io::Result<GitCommandSnapshot> {
+    let observation = successful_git_observation(runner, label, arguments, OutputPolicy::Discard)?;
+    budget.charge(label, &observation)?;
+    Ok(git_command_snapshot(label, &observation))
+}
+
+fn successful_git_stdout_bounded(
+    runner: &SynchronousProcessRunner,
+    label: &str,
+    arguments: &[&str],
+) -> io::Result<Vec<u8>> {
+    let observation = successful_git_observation(
+        runner,
+        label,
+        arguments,
+        OutputPolicy::CaptureBounded {
+            max_bytes: GIT_PATH_OUTPUT_MAX_BYTES as usize,
+        },
+    )?;
+    let mut budget = GitOutputBudget::new(GIT_PATH_OUTPUT_MAX_BYTES);
+    budget.charge(label, &observation)?;
+    if observation.stdout_truncated
+        || observation.stdout.len() as u64 != observation.stdout_total_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Git command `{label}` exceeded its bounded stdout capture"),
+        ));
+    }
+    Ok(observation.stdout)
+}
+
+fn absolute_git_path(
+    runner: &SynchronousProcessRunner,
+    selector: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let label = match selector {
+        "--git-dir" => "resolve absolute Git directory",
+        "--git-common-dir" => "resolve absolute Git common directory",
+        _ => "resolve absolute Git path",
+    };
+    let output = successful_git_stdout_bounded(
+        runner,
+        label,
+        &["rev-parse", "--path-format=absolute", selector],
+    )?;
+    let output = String::from_utf8(output).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "absolute Git path is not valid UTF-8",
+        )
+    })?;
+    let output = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(&output);
+    Ok(PathBuf::from(output))
+}
+
+fn git_semantic_snapshot(runner: &SynchronousProcessRunner) -> io::Result<GitSemanticSnapshot> {
+    let mut budget = GitOutputBudget::new(GIT_SNAPSHOT_OUTPUT_MAX_BYTES);
     Ok(GitSemanticSnapshot {
-        head: successful_git_stdout(root, &["rev-parse", "--verify", "HEAD"])?,
-        status: successful_git_stdout(
-            root,
+        head: successful_git_snapshot(
+            runner,
+            "resolve HEAD",
+            &["rev-parse", "--verify", "HEAD"],
+            &mut budget,
+        )?,
+        status: successful_git_snapshot(
+            runner,
+            "snapshot porcelain status",
             &[
                 "status",
                 "--porcelain=v2",
@@ -107,16 +346,38 @@ fn git_semantic_snapshot(root: &Path) -> io::Result<GitSemanticSnapshot> {
                 "--branch",
                 "--untracked-files=all",
             ],
+            &mut budget,
         )?,
-        index_entries: successful_git_stdout(root, &["ls-files", "--stage", "-v", "-z", "--"])?,
-        index_diff: successful_git_stdout(
-            root,
-            &["diff", "--cached", "--no-ext-diff", "--binary", "--"],
+        index_entries: successful_git_snapshot(
+            runner,
+            "snapshot index entries",
+            &["ls-files", "--stage", "-v", "-z", "--"],
+            &mut budget,
         )?,
-        worktree_diff: successful_git_stdout(root, &["diff", "--no-ext-diff", "--binary", "--"])?,
-        untracked_paths: successful_git_stdout(
-            root,
+        index_diff: successful_git_snapshot(
+            runner,
+            "snapshot index diff",
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                "--",
+            ],
+            &mut budget,
+        )?,
+        worktree_diff: successful_git_snapshot(
+            runner,
+            "snapshot worktree diff",
+            &["diff", "--no-ext-diff", "--no-textconv", "--binary", "--"],
+            &mut budget,
+        )?,
+        untracked_paths: successful_git_snapshot(
+            runner,
+            "snapshot untracked paths",
             &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+            &mut budget,
         )?,
     })
 }
@@ -306,13 +567,102 @@ fn native_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn repository_snapshot(root: &Path) -> Result<RepositorySnapshot, Box<dyn std::error::Error>> {
-    let git_dir = absolute_git_path(root, "--git-dir")?;
-    let common_dir = absolute_git_path(root, "--git-common-dir")?;
+    let runner = SynchronousProcessRunner::new(root)?;
+    let git_dir = absolute_git_path(&runner, "--git-dir")?;
+    let common_dir = absolute_git_path(&runner, "--git-common-dir")?;
     Ok(RepositorySnapshot {
-        git: git_semantic_snapshot(root)?,
+        git: git_semantic_snapshot(&runner)?,
         forge_private_state: file_tree_snapshot(&git_dir.join("forge"))?,
         forge_shared_cache: file_tree_snapshot(&common_dir.join("forge/cache"))?,
     })
+}
+
+#[test]
+fn git_snapshot_and_failure_diagnostic_do_not_retain_output() {
+    let stdout_secret = b"private-source-token\n";
+    let stderr_secret = b"stderr-private-token";
+    let observation = process_observation(7, stdout_secret, stderr_secret);
+    let snapshot = git_command_snapshot("large-output fixture", &observation);
+    let debug = format!("{snapshot:?}");
+    let diagnostic = git_failure_message("large-output fixture", &observation);
+    for forbidden in [
+        String::from_utf8_lossy(stdout_secret),
+        String::from_utf8_lossy(stderr_secret),
+    ] {
+        assert!(!debug.contains(forbidden.as_ref()));
+        assert!(!diagnostic.contains(forbidden.as_ref()));
+    }
+    assert_eq!(snapshot.exit_code, Some(7));
+    assert_eq!(snapshot.stdout.bytes, stdout_secret.len() as u64);
+    assert!(diagnostic.contains("exit_code=Some(7)"));
+    assert!(diagnostic.contains("stdout_bytes="));
+    assert!(diagnostic.contains("stdout_digest="));
+    assert!(diagnostic.contains("stderr_bytes="));
+    assert!(diagnostic.contains("stderr_digest="));
+}
+
+#[test]
+fn git_commands_share_one_stdout_and_stderr_budget() -> Result<(), Box<dyn std::error::Error>> {
+    let mut budget = GitOutputBudget::new(8);
+    budget.charge("first command", &process_observation(0, b"123", b"45"))?;
+    assert_eq!(budget.observed, 5);
+
+    let error = match budget.charge("second command", &process_observation(0, b"6789", b"")) {
+        Err(error) => error,
+        Ok(()) => return Err(io::Error::other("combined Git output exceeded its budget").into()),
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        budget.observed, 5,
+        "a rejected charge must not be committed"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("bounded Git snapshot output budget")
+    );
+    Ok(())
+}
+
+#[test]
+fn git_output_budget_rejects_byte_count_overflow() -> Result<(), Box<dyn std::error::Error>> {
+    let mut budget = GitOutputBudget::new(u64::MAX);
+    let error = match budget.charge(
+        "overflow fixture",
+        &process_observation_with_sizes(u64::MAX, 1),
+    ) {
+        Err(error) => error,
+        Ok(()) => return Err(io::Error::other("Git output byte count overflowed").into()),
+    };
+
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(error.to_string().contains("byte count overflowed"));
+    Ok(())
+}
+
+fn process_observation(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> ProcessObservation {
+    ProcessObservation {
+        exit_code: Some(exit_code),
+        signal: None,
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+        stdout_digest: forge_schema::Digest::new("blake3:stdout-fixture"),
+        stderr_digest: forge_schema::Digest::new("blake3:stderr-fixture"),
+        stdout_total_bytes: stdout.len() as u64,
+        stderr_total_bytes: stderr.len() as u64,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        duration: Duration::from_millis(1),
+        timed_out: false,
+        interrupted: false,
+    }
+}
+
+fn process_observation_with_sizes(stdout: u64, stderr: u64) -> ProcessObservation {
+    let mut observation = process_observation(0, b"", b"");
+    observation.stdout_total_bytes = stdout;
+    observation.stderr_total_bytes = stderr;
+    observation
 }
 
 #[test]
