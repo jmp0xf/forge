@@ -119,6 +119,10 @@ enum ParsedEvidence {
 pub(crate) struct ValidatedReceipt {
     version: EvidenceStateVersion,
     object_name: EvidenceStateObjectName,
+    // Typed `unknown` dependencies remain safe to project into the pure validity evaluator even
+    // though they can never make the Receipt proving. Future/opaque contract content does not.
+    can_evaluate_current_validity: bool,
+    // This stronger predicate also guards persisted `valid_receipts` bindings.
     can_support_current_evidence: bool,
     parsed: ParsedReceipt,
 }
@@ -180,7 +184,7 @@ impl ValidatedReceipt {
                 let started_at = parse_utc_rfc3339(&receipt.started_at)
                     .map_err(|_| EvidenceStateDecodeError::InvalidTimestamp)?;
                 let current = self
-                    .can_support_current_evidence
+                    .can_evaluate_current_validity
                     .then(|| current_receipt_projection(receipt))
                     .transpose()?;
                 Ok(ReceiptEvaluationProjection {
@@ -308,6 +312,12 @@ pub(crate) struct ReceiptBindingFact {
     intent: IntentData,
     outcome: OutcomeData,
     coverage_digest: Option<Digest>,
+}
+
+impl ReceiptBindingFact {
+    pub(crate) const fn can_support_current_evidence(&self) -> bool {
+        self.can_support_current_evidence
+    }
 }
 
 /// Compact facts copied from one identity-validated Receipt while visiting immutable state.
@@ -482,6 +492,7 @@ pub(crate) fn load_receipt(
     Ok(ValidatedReceipt {
         version,
         object_name: decoded.object_name,
+        can_evaluate_current_validity: decoded.can_evaluate_current_validity,
         can_support_current_evidence: decoded.can_support_current_evidence,
         parsed: decoded.document,
     })
@@ -586,6 +597,7 @@ fn validate_writable_envelope(
 struct DecodedReceipt {
     object_name: EvidenceStateObjectName,
     metadata: ReceiptRetentionMetadata,
+    can_evaluate_current_validity: bool,
     can_support_current_evidence: bool,
     document: ParsedReceipt,
 }
@@ -632,6 +644,7 @@ fn decode_receipt(
                     log_references,
                 ),
                 object_name,
+                can_evaluate_current_validity: false,
                 can_support_current_evidence: false,
                 document: ParsedReceipt::V1(envelope),
             })
@@ -646,6 +659,7 @@ fn decode_receipt(
             let ReceiptV2SemanticValidation {
                 log_references: known_log_references,
                 log_references_complete,
+                can_evaluate_current_validity,
                 can_support_current_evidence,
                 diagnostic_summaries_are_current: _,
             } = validate_receipt_v2_semantics(&envelope.data, has_unknown_contract_content)?;
@@ -661,6 +675,7 @@ fn decode_receipt(
                     log_references,
                 ),
                 object_name,
+                can_evaluate_current_validity,
                 can_support_current_evidence,
                 document: ParsedReceipt::V2(envelope),
             })
@@ -1026,6 +1041,7 @@ fn receipt_v1_log_references(
 struct ReceiptV2SemanticValidation {
     log_references: BTreeSet<EvidenceStateObjectName>,
     log_references_complete: bool,
+    can_evaluate_current_validity: bool,
     can_support_current_evidence: bool,
     diagnostic_summaries_are_current: bool,
 }
@@ -1038,12 +1054,13 @@ fn validate_receipt_v2_semantics(
     if receipt.observations.is_empty() {
         return Err(EvidenceStateDecodeError::Malformed);
     }
-    let mut can_support_current_evidence = !has_unknown_contract_content
+    let mut can_evaluate_current_validity = !has_unknown_contract_content
         && top_intent.is_some()
         && receipt_command_set_confidence_is_complete(receipt)
         && !matches!(receipt.outcome, OutcomeData::Unknown)
-        && validate_comparison_basis(&receipt.comparison_basis)?
-        && receipt_dependencies_are_complete(&receipt.dependencies);
+        && validate_comparison_basis(&receipt.comparison_basis)?;
+    let mut can_support_current_evidence =
+        can_evaluate_current_validity && receipt_dependencies_are_complete(&receipt.dependencies);
 
     let mut command_ids = BTreeSet::new();
     let mut aggregate_inputs = Vec::with_capacity(receipt.observations.len());
@@ -1071,15 +1088,17 @@ fn validate_receipt_v2_semantics(
         let logs = decode_log_references(&observation.log_refs)?;
         observation_logs_are_complete &= logs.complete;
         observation_logs.extend(logs.references);
-        let command_is_complete = command_intent.is_some()
+        let command_is_evaluable = command_intent.is_some()
             && native_is_complete
             && enforcement.is_some()
             && command_semantics_are_complete(command)
             && coverage.complete
             && !coverage.dimensions.is_empty()
             && logs.complete
-            && observation_outcome_validation.can_support_current_evidence;
-        can_support_current_evidence &= command_is_complete;
+            && observation_outcome_validation.can_evaluate_current_validity;
+        can_evaluate_current_validity &= command_is_evaluable;
+        can_support_current_evidence &=
+            command_is_evaluable && observation_outcome_validation.can_support_current_evidence;
         match enforcement {
             Some(enforcement)
                 if coverage.complete && observation_outcome_validation.aggregate_is_known =>
@@ -1108,6 +1127,7 @@ fn validate_receipt_v2_semantics(
             return Err(EvidenceStateDecodeError::Malformed);
         }
     } else {
+        can_evaluate_current_validity = false;
         can_support_current_evidence = false;
     }
 
@@ -1116,10 +1136,13 @@ fn validate_receipt_v2_semantics(
     {
         return Err(EvidenceStateDecodeError::InvalidReference);
     }
-    can_support_current_evidence &= top_logs.complete && observation_logs_are_complete;
+    let log_references_are_complete = top_logs.complete && observation_logs_are_complete;
+    can_evaluate_current_validity &= log_references_are_complete;
+    can_support_current_evidence &= log_references_are_complete;
     Ok(ReceiptV2SemanticValidation {
         log_references: top_logs.references,
-        log_references_complete: top_logs.complete && observation_logs_are_complete,
+        log_references_complete: log_references_are_complete,
+        can_evaluate_current_validity,
         can_support_current_evidence,
         diagnostic_summaries_are_current,
     })
@@ -1186,6 +1209,7 @@ fn success_predicate_contains_unknown(predicate: &forge_schema::SuccessPredicate
 
 struct ObservationOutcomeValidation {
     aggregate_is_known: bool,
+    can_evaluate_current_validity: bool,
     can_support_current_evidence: bool,
     diagnostic_summary_is_current: bool,
 }
@@ -1261,13 +1285,15 @@ fn validate_observation_outcome(
         {
             return Err(EvidenceStateDecodeError::Malformed);
         }
+        let diagnostic_summary_is_current =
+            diagnostic_summary == DiagnosticSummaryValidation::Unavailable;
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: true,
+            can_evaluate_current_validity: diagnostic_summary_is_current,
             // An infrastructure observation is explicit and aggregatable, but it can never prove
             // that the selected command satisfied its declared success predicate.
             can_support_current_evidence: false,
-            diagnostic_summary_is_current: diagnostic_summary
-                == DiagnosticSummaryValidation::Unavailable,
+            diagnostic_summary_is_current,
         });
     }
     // Current unavailable markers are sentinels, not output digests. Removing the typed kind must
@@ -1291,6 +1317,7 @@ fn validate_observation_outcome(
     if matches!(recorded, EvidenceOutcome::Unknown) {
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: false,
+            can_evaluate_current_validity: false,
             can_support_current_evidence: false,
             diagnostic_summary_is_current: diagnostic_summary
                 == DiagnosticSummaryValidation::Observed,
@@ -1306,6 +1333,7 @@ fn validate_observation_outcome(
         // they remain useful historical facts but cannot support current Evidence.
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: true,
+            can_evaluate_current_validity: false,
             can_support_current_evidence: false,
             diagnostic_summary_is_current: false,
         });
@@ -1338,6 +1366,7 @@ fn validate_observation_outcome(
     let Some(expected) = expected else {
         return Ok(ObservationOutcomeValidation {
             aggregate_is_known: false,
+            can_evaluate_current_validity: false,
             can_support_current_evidence: false,
             diagnostic_summary_is_current: diagnostic_summary
                 == DiagnosticSummaryValidation::Observed,
@@ -1348,11 +1377,13 @@ fn validate_observation_outcome(
     }
     // Early v2 writers did not record complete stdout length. Keep those receipts readable, but
     // do not let an unreplayable output/truncation boundary satisfy current Evidence.
+    let complete_current_observation = observation.stdout_total_bytes.is_some()
+        && stream_truncation_is_complete
+        && diagnostic_summary == DiagnosticSummaryValidation::Observed;
     Ok(ObservationOutcomeValidation {
         aggregate_is_known: true,
-        can_support_current_evidence: observation.stdout_total_bytes.is_some()
-            && stream_truncation_is_complete
-            && diagnostic_summary == DiagnosticSummaryValidation::Observed,
+        can_evaluate_current_validity: complete_current_observation,
+        can_support_current_evidence: complete_current_observation,
         diagnostic_summary_is_current: diagnostic_summary == DiagnosticSummaryValidation::Observed,
     })
 }
@@ -2734,6 +2765,38 @@ mod tests {
         let loaded = load_v2_receipt_fixture(&receipt)?;
 
         assert!(!loaded.can_support_current_evidence);
+        assert!(loaded.can_evaluate_current_validity);
+        assert!(loaded.evaluation_projection()?.current.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn advisory_process_failure_with_required_pass_is_projectable_but_not_supporting() -> TestResult
+    {
+        let passing = receipt_value(json!([]))?;
+        let mut receipt = typed_infrastructure_receipt("spawn")?;
+        receipt["data"]["observations"][0]["command"]["enforcement"] = json!("advisory");
+        let mut required = passing["data"]["observations"][0].clone();
+        required["command"]["command"]["id"] = json!("rust.test.required");
+        receipt["data"]["observations"]
+            .as_array_mut()
+            .ok_or_else(|| std::io::Error::other("observations are not an array"))?
+            .push(required);
+        receipt["data"]["outcome"] = json!("pass");
+        receipt["data"]["coverage"] = json!(["unit-test"]);
+        receipt = sign(receipt, DocumentKind::Receipt)?;
+
+        let loaded = load_v2_receipt_fixture(&receipt)?;
+        assert!(loaded.can_evaluate_current_validity);
+        assert!(!loaded.can_support_current_evidence);
+        let projection = loaded
+            .evaluation_projection()?
+            .current
+            .ok_or_else(|| std::io::Error::other("current projection is missing"))?;
+        assert_eq!(
+            projection.recorded.outcome(),
+            forge_core::evidence::EvidenceOutcome::Pass
+        );
         Ok(())
     }
 
@@ -2841,6 +2904,8 @@ mod tests {
         let loaded = load_v2_receipt_fixture(&receipt)?;
 
         assert!(!loaded.can_support_current_evidence);
+        assert!(!loaded.can_evaluate_current_validity);
+        assert!(loaded.evaluation_projection()?.current.is_none());
         let ParsedReceipt::V2(parsed) = loaded.parsed() else {
             return Err("v2 Receipt loaded as the wrong schema generation".into());
         };
@@ -3330,6 +3395,8 @@ mod tests {
 
         let loaded = load_receipt(EvidenceStateVersion::V2, &object_name, &original)?;
         assert!(!loaded.can_support_current_evidence);
+        assert!(!loaded.can_evaluate_current_validity);
+        assert!(loaded.evaluation_projection()?.current.is_none());
         assert_eq!(
             receipt.pointer("/future_same_major/nested/reference"),
             Some(&json!("logs/v1/future.log"))
@@ -3777,17 +3844,49 @@ mod tests {
     }
 
     #[test]
-    fn every_unknown_v2_dependency_prevents_current_evidence() -> TestResult {
-        for pointer in [
-            "/data/dependencies/repository",
-            "/data/dependencies/scope_before",
-            "/data/dependencies/scope_after",
-            "/data/dependencies/command",
-            "/data/dependencies/toolchain",
-            "/data/dependencies/environment",
-            "/data/dependencies/policy",
-            "/data/dependencies/base_task",
-            "/data/dependencies/forge_behavior",
+    fn every_typed_unknown_v2_dependency_is_projectable_but_never_proving() -> TestResult {
+        let baseline = load_v2_receipt_fixture(&receipt_value(json!([]))?)?
+            .evaluation_projection()?
+            .current
+            .ok_or_else(|| std::io::Error::other("baseline current projection is missing"))?;
+        let current = baseline.recorded.dependencies().clone();
+        for (pointer, dependency) in [
+            (
+                "/data/dependencies/repository",
+                forge_core::evidence::EvidenceDependency::Repository,
+            ),
+            (
+                "/data/dependencies/scope_before",
+                forge_core::evidence::EvidenceDependency::Scope,
+            ),
+            (
+                "/data/dependencies/scope_after",
+                forge_core::evidence::EvidenceDependency::Scope,
+            ),
+            (
+                "/data/dependencies/command",
+                forge_core::evidence::EvidenceDependency::Command,
+            ),
+            (
+                "/data/dependencies/toolchain",
+                forge_core::evidence::EvidenceDependency::Toolchain,
+            ),
+            (
+                "/data/dependencies/environment",
+                forge_core::evidence::EvidenceDependency::Environment,
+            ),
+            (
+                "/data/dependencies/policy",
+                forge_core::evidence::EvidenceDependency::Policy,
+            ),
+            (
+                "/data/dependencies/base_task",
+                forge_core::evidence::EvidenceDependency::BaseTask,
+            ),
+            (
+                "/data/dependencies/forge_behavior",
+                forge_core::evidence::EvidenceDependency::ForgeBehavior,
+            ),
         ] {
             let mut receipt = receipt_value(json!([]))?;
             *receipt
@@ -3799,6 +3898,25 @@ mod tests {
             assert!(
                 !loaded.can_support_current_evidence,
                 "unknown dependency remained proving: {pointer}",
+            );
+            assert!(
+                loaded.can_evaluate_current_validity,
+                "typed unknown dependency erased the current projection: {pointer}",
+            );
+            let projected = loaded
+                .evaluation_projection()?
+                .current
+                .ok_or_else(|| std::io::Error::other("current projection is missing"))?;
+            let validity =
+                forge_core::evidence::evaluate_receipt_validity(&projected.recorded, &current);
+            assert_eq!(
+                validity.dependency_reasons(),
+                &[forge_core::evidence::DependencyReason::Unknown(dependency)],
+                "typed unknown dependency produced unrelated reasons: {pointer}",
+            );
+            assert!(
+                validity.applicability_reasons().is_empty(),
+                "typed unknown dependency erased known applicability: {pointer}",
             );
         }
         Ok(())
@@ -3837,9 +3955,14 @@ mod tests {
                 .pointer_mut(pointer)
                 .ok_or_else(|| std::io::Error::other("command pointer is missing"))? = value;
             receipt = sign(receipt, DocumentKind::Receipt)?;
+            let loaded = load_v2_receipt_fixture(&receipt)?;
             assert!(
-                !load_v2_receipt_fixture(&receipt)?.can_support_current_evidence,
+                !loaded.can_support_current_evidence,
                 "unknown command semantic remained proving: {pointer}",
+            );
+            assert!(
+                !loaded.can_evaluate_current_validity,
+                "unknown command semantic became projectable: {pointer}",
             );
         }
         Ok(())

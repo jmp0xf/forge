@@ -3029,6 +3029,7 @@ ADR 全部位于 `docs/adr/`：
 | 0036 | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
 | 0037 | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
 | 0038 | v0 不持久化任意项目命令的 stdout/stderr 内容 |
+| 0039 | 保留当前 Receipt 的 typed unknown 事实 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 

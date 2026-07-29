@@ -143,6 +143,13 @@ struct EvaluatedReceipt {
     newest_candidate: Option<NewestReceiptCandidate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentReceiptDisposition {
+    Valid,
+    EvaluatedNonPassing,
+    OpaqueNonProving,
+}
+
 #[derive(Debug)]
 struct NewestReceiptCandidate {
     intent: Intent,
@@ -694,7 +701,7 @@ impl ReceiptEvaluator<'_> {
         let Some(intent) = projection.domain_intent else {
             return self.non_proving_current(projection);
         };
-        let Some(current_projection) = projection.current else {
+        let Some(current_projection) = projection.current.as_ref() else {
             return self.non_proving_current(projection);
         };
         let current_execution = self.current_execution(
@@ -711,10 +718,22 @@ impl ReceiptEvaluator<'_> {
             self.common.forge_behavior.clone(),
         );
         let validity = evaluate_receipt_validity(&current_projection.recorded, &current);
+        let advisory = current_projection.advisory.clone();
+        let not_verified = current_projection.not_verified.clone();
         let Some(started_at) = projection.started_at else {
             return Err(EvidenceStateDecodeError::InvalidTimestamp);
         };
-        let is_current_pass = validity.is_current_passing_local_observation();
+        let disposition = current_receipt_disposition(
+            projection.binding.can_support_current_evidence(),
+            &validity,
+        );
+        if disposition == CurrentReceiptDisposition::OpaqueNonProving {
+            // A semantically non-supporting Receipt whose pure facts otherwise look passing has no
+            // stable public reason that could represent the support failure. Preserve the existing
+            // fail-closed projection instead of admitting it as valid or a passing newest receipt.
+            return self.non_proving_current(projection);
+        }
+        let is_current_pass = disposition == CurrentReceiptDisposition::Valid;
         let newest_candidate = (validity.dependency_validity() == DependencyValidity::Current)
             .then(|| NewestReceiptCandidate {
                 intent,
@@ -726,8 +745,8 @@ impl ReceiptEvaluator<'_> {
                 } else {
                     Vec::new()
                 },
-                advisory: current_projection.advisory.clone(),
-                not_verified: current_projection.not_verified.clone(),
+                advisory,
+                not_verified,
             });
         if is_current_pass {
             return Ok(EvaluatedReceipt {
@@ -869,6 +888,20 @@ impl ReceiptEvaluator<'_> {
                 )
             });
         ExecutionDependencyFingerprint::new(command_dependency, toolchain, environment)
+    }
+}
+
+fn current_receipt_disposition(
+    can_support_current_evidence: bool,
+    validity: &ReceiptValidity,
+) -> CurrentReceiptDisposition {
+    if !validity.is_current_passing_local_observation() {
+        return CurrentReceiptDisposition::EvaluatedNonPassing;
+    }
+    if can_support_current_evidence {
+        CurrentReceiptDisposition::Valid
+    } else {
+        CurrentReceiptDisposition::OpaqueNonProving
     }
 }
 
@@ -1588,13 +1621,16 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use forge_core::evidence::{DependencyValue, EvidenceOutcome};
+    use forge_core::evidence::{
+        BaseTaskDependency, DependencyValue, EvidenceDependencyFingerprint, EvidenceOutcome,
+        ExecutionDependencyFingerprint, ReceiptValidityInput, evaluate_receipt_validity,
+    };
     use forge_core::scope::{PreparedScope, ScopeHead, scope_dependency_digest};
     use forge_core::{
-        AdapterInventory, AssetInventory, Assumption, Confidence, EffectivePolicy, ExitCode,
-        GitError, GitErrorKind, GitObjectFormat, InventorySkip, OperationControlError,
-        ProjectModel, ProjectModelInputs, Provenance, RepoFacts, RepoRelativePath, RiskAssessment,
-        RiskLevel, WorkState,
+        AdapterInventory, AssetInventory, Assumption, Confidence, Digest, EffectivePolicy,
+        ExitCode, GitError, GitErrorKind, GitObjectFormat, InventorySkip, Mutability,
+        OperationControlError, ProjectModel, ProjectModelInputs, Provenance, RepoFacts,
+        RepoRelativePath, RiskAssessment, RiskLevel, WorkState,
     };
     use forge_detect::model::ModelDetectionCompletion;
     use forge_detect::policy::PolicyBaseCompleteness;
@@ -1604,10 +1640,11 @@ mod tests {
     use forge_schema::RepoId;
 
     use super::{
-        add_missing_coverage_expectations, map_scope_confirmation_error,
-        navigation_receipts_are_validation_only, partition_coverage, receipt_order_is_newer,
-        require_same_detection_baseline, require_stable_detection, require_stable_scope,
-        requirements_are_complete, selected_command_count, with_persisted_evidence,
+        CurrentReceiptDisposition, add_missing_coverage_expectations, current_receipt_disposition,
+        map_scope_confirmation_error, navigation_receipts_are_validation_only, partition_coverage,
+        receipt_order_is_newer, require_same_detection_baseline, require_stable_detection,
+        require_stable_scope, requirements_are_complete, selected_command_count,
+        with_persisted_evidence,
     };
     use crate::explain::DetectedProject;
 
@@ -1685,6 +1722,45 @@ mod tests {
             external_requirements: Vec::new(),
             uncertain_assumptions: Vec::new(),
         }
+    }
+
+    fn current_validity(outcome: EvidenceOutcome) -> forge_core::evidence::ReceiptValidity {
+        let known = |value: &str| DependencyValue::Known(Digest::new(value));
+        let scope = known("blake3:scope");
+        let dependencies = EvidenceDependencyFingerprint::new(
+            DependencyValue::Known(RepoId::from("local:fixture")),
+            scope.clone(),
+            ExecutionDependencyFingerprint::new(
+                known("blake3:command"),
+                known("blake3:toolchain"),
+                known("blake3:environment"),
+            ),
+            known("blake3:policy"),
+            BaseTaskDependency::Known(Digest::new("blake3:base-task")),
+            known("blake3:behavior"),
+        );
+        let receipt =
+            ReceiptValidityInput::new(dependencies.clone(), scope, Mutability::ReadOnly, outcome);
+        evaluate_receipt_validity(&receipt, &dependencies)
+    }
+
+    #[test]
+    fn semantic_support_is_required_before_a_pure_current_pass_can_be_valid() {
+        let passing = current_validity(EvidenceOutcome::Pass);
+        assert_eq!(
+            current_receipt_disposition(true, &passing),
+            CurrentReceiptDisposition::Valid
+        );
+        assert_eq!(
+            current_receipt_disposition(false, &passing),
+            CurrentReceiptDisposition::OpaqueNonProving
+        );
+
+        let infrastructure_failure = current_validity(EvidenceOutcome::InfrastructureFailure);
+        assert_eq!(
+            current_receipt_disposition(false, &infrastructure_failure),
+            CurrentReceiptDisposition::EvaluatedNonPassing
+        );
     }
 
     #[test]

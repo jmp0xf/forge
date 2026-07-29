@@ -44,8 +44,8 @@ pub const PROCESS_OUTPUT_UNAVAILABLE_PROTOCOL_VERSION: &str = "forge.process-out
 /// Fixed-size, content-free diagnostic summary recorded for each command observation.
 pub const COMMAND_DIAGNOSTIC_SUMMARY_PROTOCOL_VERSION: &str = "forge.command-diagnostic-summary/v1";
 
-/// Complete local-evidence behavior composition frozen by ADR-0020 and extended by ADR-0032.
-pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v7";
+/// Complete local-evidence behavior composition frozen by ADR-0020 and extended by ADR-0039.
+pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v8";
 
 // Existing behavior identifiers are repeated here as composition inputs because their defining
 // modules deliberately keep implementation domains private. A change to any implementation must
@@ -2001,10 +2001,14 @@ mod tests {
     }
 
     #[test]
-    fn evidence_behavior_digest_is_pinned_to_diagnostic_summary_and_coverage_v2() {
+    fn evidence_behavior_digest_is_pinned_to_typed_unknown_projection_and_coverage_v2() {
         assert_eq!(
             EVIDENCE_BEHAVIOR_PROTOCOL_VERSION,
-            "forge.evidence-behavior/v7"
+            "forge.evidence-behavior/v8"
+        );
+        assert_eq!(
+            RECEIPT_VALIDITY_PROTOCOL_VERSION,
+            "forge.receipt-validity/v2"
         );
         assert_eq!(
             COMMAND_DIAGNOSTIC_SUMMARY_PROTOCOL_VERSION,
@@ -2020,7 +2024,7 @@ mod tests {
         );
         assert_eq!(
             evidence_behavior_digest(&FixtureHasher).as_str(),
-            "fixture:55d288e3d97b3fb1"
+            "fixture:bbeb4658e06b862d"
         );
     }
 

@@ -16,7 +16,7 @@ pub const SUCCESS_NORMALIZATION_PROTOCOL_VERSION: &str = "forge.success-normaliz
 
 /// Receipt dependency and applicability comparison behavior bound into the Forge behavior
 /// dependency.
-pub const RECEIPT_VALIDITY_PROTOCOL_VERSION: &str = "forge.receipt-validity/v1";
+pub const RECEIPT_VALIDITY_PROTOCOL_VERSION: &str = "forge.receipt-validity/v2";
 
 /// A dependency value whose absence cannot be confused with a real identifier or digest.
 ///

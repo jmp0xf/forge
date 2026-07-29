@@ -3028,6 +3028,94 @@ fn evidence_run_json_is_the_exact_persisted_receipt_and_contains_no_child_output
 }
 
 #[test]
+fn typed_unknown_dependency_round_trips_without_erasing_known_receipt_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_runner_repository("evidence-typed-unknown-roundtrip")?;
+    fs::write(
+        fixture.worktree.join("forge.toml"),
+        b"schema = 1\n\n[commands.check]\nprogram = \"git\"\nargs = [\"--version\"]\ninputs = [\"**\"]\nmutability = \"read-only\"\nnetwork = \"offline-requested\"\nsuccess = \"exit-zero\"\ncoverage = [\"compile\"]\nenforcement = \"required\"\n",
+    )?;
+    fixture.run_git(&["add", "--", "forge.toml"])?;
+    fixture.run_git(&[
+        "-c",
+        "user.name=Forge CLI tests",
+        "-c",
+        "user.email=forge-cli-tests@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "configure check",
+    ])?;
+    let run = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&run.stdout)?;
+    assert_eq!(
+        receipt["data"]["dependencies"]["toolchain"]["state"],
+        "unknown"
+    );
+    for dependency in [
+        "repository",
+        "scope_before",
+        "scope_after",
+        "command",
+        "environment",
+        "policy",
+        "base_task",
+        "forge_behavior",
+    ] {
+        assert_eq!(
+            receipt["data"]["dependencies"][dependency]["state"], "known",
+            "unexpected recorded dependency: {dependency}"
+        );
+    }
+
+    let show = fixture.run_forge(&["evidence", "show", "--json"])?;
+    assert_eq!(
+        show.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&show.stdout),
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown: Value = serde_json::from_slice(&show.stdout)?;
+    assert!(required_array(&shown["data"], "valid_receipts")?.is_empty());
+    let stale = required_array(&shown["data"], "stale_receipts")?;
+    assert_eq!(stale.len(), 1);
+    let validity = &stale[0]["validity"];
+    assert_eq!(validity["dependency_validity"], "unknown");
+    assert_eq!(validity["applicability"], "eligible");
+    assert_eq!(
+        validity["reasons"],
+        serde_json::json!([{
+            "code": "dependency-unknown",
+            "dependency": "toolchain"
+        }])
+    );
+
+    let verify = fixture.run_forge(&["evidence", "verify", "--json"])?;
+    assert_eq!(
+        verify.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let verified: Value = serde_json::from_slice(&verify.stdout)?;
+    assert_eq!(verified["data"]["local_state"], "unknown");
+    assert_eq!(
+        verified["data"]["stale_receipts"][0]["validity"]["reasons"],
+        validity["reasons"]
+    );
+    Ok(())
+}
+
+#[test]
 fn missing_executable_persists_a_typed_infrastructure_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = TestWorkspace::clean_runner_repository("evidence-missing-executable")?;
