@@ -16,7 +16,7 @@ acceptance is not complete.
 | Detection | Strict `forge.toml`, repository/runner/Rust/Go/mixed discovery, deterministic command resolution, risk and policy provenance |
 | Integration | Default-dry-run `init`, managed `AGENTS.md`/host adapters, adapter drift/sync, explicit make/just/task runners, and create-only GitHub CI generation |
 | Navigation | `doctor`, deterministic read-only `next`, `explain`, schema/version/completion output |
-| Local evidence | Receipt/Evidence v2 run/show/verify/export, content-free dual-stream diagnostic summaries, dependency invalidation, immutable state, bounded retention, and v1 historical readers |
+| Local evidence | Receipt/Evidence v2 run/show/verify/export, content-free dual-stream diagnostic summaries, dependency invalidation with typed-unknown fact preservation, immutable state, bounded retention, and v1 historical readers |
 | In-repository hardening | Direct project-native CI gates plus a bounded unified verifier, an exact 20-invariant executable-test/CI/external-required marker ledger, 28 public fixtures, schema/golden/compatibility tests, dogfood fixed point, fuzz corpora, bounded mutation config, and opt-in large-repository benchmark |
 | Local release candidates | Create-only `0.1.0-rc.1` five-target assembler, exact-commit isolated source binding, executable checks, CycloneDX SBOMs, release manifest, SHA-256 checksums, and explicit external authority/rollback gates |
 
@@ -47,9 +47,17 @@ migration. ADR-0038 fixes the v0 production boundary: arbitrary project stdout/s
 persisted, current `log_refs` are empty, and the existing log-store primitive is reserved for a future
 typed producer that has already enforced its content policy.
 
+ADR-0039 separates a current Receipt's validity projection from the stronger proving predicate.
+An explicit typed unknown dependency now affects only its actual validity axis; known dependency and
+mutability facts remain visible, while the Receipt still cannot satisfy Evidence or bind as valid.
+Unknown command semantics and future/opaque contract content remain wholly non-proving. A current
+typed infrastructure failure may affect local state, but a semantically non-supporting Receipt that
+otherwise looks passing falls back to the opaque non-proving representation rather than becoming a
+valid or passing newest Receipt.
+
 ## Receipt and Evidence v2
 
-ADRs 0019-0026 and 0032 resolve and extend the earlier M6 decisions:
+ADRs 0019-0026, 0032, and 0039 resolve and extend the earlier M6 decisions:
 
 - `forge.worktree-comparison/v1` uses the invocation's immutable `HEAD` as the local worktree
   baseline, never guesses an upstream, default branch, PR target, or merge authority;
@@ -71,6 +79,10 @@ ADRs 0019-0026 and 0032 resolve and extend the earlier M6 decisions:
   `unavailable` without counts. Early-v2 missing summaries and future states remain readable but
   non-proving. Receipt schema and identity remain v2, while `forge.evidence-behavior/v7` makes v6
   receipts stale instead of rewriting them.
+- Receipt validity projection uses `forge.receipt-validity/v2`: explicit typed unknown dependencies
+  remain accurately projectable but never proving. Receipt/Evidence schemas and identities remain
+  unchanged; `forge.evidence-behavior/v8` makes v7 receipts stale rather than silently applying the
+  new reader behavior to them.
 - Detected Rust projects add both generic and `custom:rust-*` coverage expectations. Missing
   expectations are projected as gaps after Receipt evaluation, while policy-driven local
   sufficiency remains unchanged; `cargo check --all-targets` does not claim that
@@ -82,6 +94,11 @@ state read-only and recompute current applicability from a stable detection/scop
 creates Forge directories, locks, or cache entries, though the host filesystem may still update
 host-managed access times. `export` performs the same recomputation and explicitly
 persists only the canonical Evidence object it emits.
+
+This repository's resolved `verify` command is `cargo run --locked -p xtask -- verify`. The v0
+toolchain classifier deliberately does not infer nested toolchains through `cargo run`, so that
+command records an explicit unknown toolchain dependency and remains observation-only. ADR-0039
+makes the resulting reason precise; it does not promote that unknown dependency to proving.
 
 Receipt, Evidence, and optional log objects use content-derived names, atomic no-clobber writes,
 worktree isolation, reference-aware retention, bounded streaming scans, owner-private permissions,
@@ -157,33 +174,31 @@ including Windows Job Object behavior when run on Windows. Cross-compilation is 
 
 ### Local verification
 
-The most recent complete executable gate was run against code/CI commit `fc7fc49`, before subsequent
-documentation-only acceptance/status updates. On macOS 26.5.2 arm64 with Rust/Cargo 1.96.0 and Git
-2.51.0, the project-owned normal local gate
+On 2026-07-30, the complete executable gate ran against the exact code/CI tree subsequently
+committed as `f7c1adf`; the only concurrent uncommitted change was this status-only handoff. On
+macOS 26.5.2 arm64 with Rust/Cargo 1.96.0 and Git 2.51.0, the project-owned normal local gate
 `env RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify` exited 0. It checked 13 checked-in
 schemas and 28 deterministic fixtures/105 generated files without writing, then passed all eight
 required child steps and the final advisory fuzz Clippy step:
 
 | Child step | Result | Observed duration |
 |---|---|---:|
-| root format check | passed | 596 ms |
-| root workspace check | passed | 78,722 ms |
-| root strict Clippy | passed | 3,019 ms |
-| root workspace tests | passed | 525,310 ms |
-| fuzz format check | passed | 649 ms |
-| fuzz workspace check | passed | 169 ms |
-| fuzz workspace tests | passed | 40 ms |
-| bootstrap `forge version` | passed | 10,371 ms |
-| fuzz Clippy (advisory) | passed | 131 ms |
+| root format check | passed | 603 ms |
+| root workspace check | passed | 86,346 ms |
+| root strict Clippy | passed | 12,322 ms |
+| root workspace tests | passed | 308,176 ms |
+| fuzz format check | passed | 674 ms |
+| fuzz workspace check | passed | 769 ms |
+| fuzz workspace tests | passed | 42 ms |
+| bootstrap `forge version` | passed | 52,477 ms |
+| fuzz Clippy (advisory) | passed | 226 ms |
 
-The same candidate also passed the focused log-reference outcome matrix, the persisted-Receipt
-privacy E2E, all 10 architecture-invariant test cases (including the exact 20-ID coverage ledger,
-whose authority-separation entry routes to an explicit external-required marker),
-strict Clippy for `forge-cli` and `xtask`, and the 74 immutable Evidence-state tests. Stable and Rust
-1.85.0 invocations of
-`cargo run --locked -p xtask -- check-fixtures` both exited 0 with 28 fixtures/105 generated files.
-Ruby/Psych parsed `.github/workflows/verify.yml`, and `git diff --check` exited 0. These checks do not
-qualify a different OS, target, filesystem, CI control plane, or release authority.
+Before the unified gate, the same code tree separately passed all 163 `forge-cli` binary unit tests,
+the typed-unknown run/show/verify round-trip, the v8 behavior fixed vector, strict `forge-cli`
+Clippy, and `git diff --check`. The workspace gate then reran the complete root test and strict lint
+surfaces, including the architecture-invariant ledger and state tests. These checks do not qualify a
+different OS, target, filesystem, CI control plane, or release authority. Rust 1.85.0 and stable
+fixture checks previously passed at `fc7fc49`, but that older result does not qualify `f7c1adf`.
 
 ### GitHub Actions
 
