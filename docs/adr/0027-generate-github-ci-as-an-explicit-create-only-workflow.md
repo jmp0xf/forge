@@ -1,10 +1,10 @@
 # ADR-0027：显式生成只创建不覆盖的 GitHub CI 工作流
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-07-28
 - Deciders: Forge maintainers
 - Supersedes: None
-- Superseded by: None
+- Superseded by: ADR-0037
 
 ## Context
 

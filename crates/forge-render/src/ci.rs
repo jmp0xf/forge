@@ -17,8 +17,10 @@ use crate::runners::{
 /// The only v0 GitHub Actions destination.
 pub const GITHUB_WORKFLOW_PATH: &str = ".github/workflows/verify.yml";
 
-/// `actions/checkout` v4.2.2, pinned to the immutable upstream commit rather than a tag.
-pub const CHECKOUT_COMMIT: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+/// `actions/checkout` v7.0.1, pinned to the immutable upstream commit rather than a tag.
+pub const CHECKOUT_COMMIT: &str = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+/// Human-readable release paired with [`CHECKOUT_COMMIT`] in generated review diffs.
+pub const CHECKOUT_VERSION: &str = "v7.0.1";
 
 /// One explicitly selected v0 CI provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -95,7 +97,7 @@ pub fn render_github_workflow(model: &ProjectModel) -> Result<Vec<u8>, CiRenderE
     }
 
     let mut output = format!(
-        "name: verify\n\non:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\njobs:\n  verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Check out repository\n        uses: actions/checkout@{CHECKOUT_COMMIT} # v4.2.2\n        with:\n          persist-credentials: false\n"
+        "name: verify\n\non:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n\njobs:\n  verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Check out repository\n        uses: actions/checkout@{CHECKOUT_COMMIT} # {CHECKOUT_VERSION}\n        with:\n          persist-credentials: false\n"
     );
     for (index, command) in commands.into_iter().enumerate() {
         let shell_command = render_github_actions_shell_command(model, command)?;
@@ -169,7 +171,10 @@ mod tests {
     };
     use forge_core::{RepoId, RepoRelativePath, ResolvedCommandSet};
 
-    use super::{CHECKOUT_COMMIT, CiEquivalence, classify_github_workflow, render_github_workflow};
+    use super::{
+        CHECKOUT_COMMIT, CHECKOUT_VERSION, CiEquivalence, classify_github_workflow,
+        render_github_workflow,
+    };
 
     fn model() -> Result<ProjectModel, Box<dyn Error>> {
         let provenance = vec![Provenance {
@@ -239,8 +244,11 @@ mod tests {
         let text = String::from_utf8(first)?;
         let _: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)?;
         assert!(text.contains("on:\n  workflow_dispatch:"));
+        assert!(text.contains("permissions:\n  contents: read\n"));
         assert!(text.contains("runs-on: ubuntu-24.04"));
-        assert!(text.contains(&format!("actions/checkout@{CHECKOUT_COMMIT}")));
+        assert!(text.contains(&format!(
+            "actions/checkout@{CHECKOUT_COMMIT} # {CHECKOUT_VERSION}"
+        )));
         assert!(text.contains("persist-credentials: false"));
         assert!(!text.contains("forge:begin"));
         assert!(text.contains(

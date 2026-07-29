@@ -40,7 +40,7 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0024](0024-record-typed-process-boundary-failures.md) | Accepted | 进程边界失败写入类型化非证明 Receipt |
 | [0025](0025-use-one-operation-wide-time-budget.md) | Accepted | 每条命令使用一个操作级总预算 |
 | [0026](0026-declare-provider-namespaced-coverage-gaps.md) | Accepted | 声明 Provider 命名空间覆盖与缺口 |
-| [0027](0027-generate-github-ci-as-an-explicit-create-only-workflow.md) | Accepted | 显式生成只创建不覆盖的 GitHub CI 工作流 |
+| [0027](0027-generate-github-ci-as-an-explicit-create-only-workflow.md) | Superseded | 显式生成只创建不覆盖的 GitHub CI 工作流 |
 | [0028](0028-pin-directory-handles-for-repository-writes.md) | Superseded | 仓库写入固定目录句柄 |
 | [0029](0029-publish-reviewable-v0-release-candidates.md) | Accepted | 发布可审查、可回滚的 v0 候选版本 |
 | [0030](0030-separate-release-manifest-compatibility-reading-from-candidate-acceptance.md) | Accepted | 分离 release manifest 的兼容读取与候选验收 |
@@ -50,5 +50,6 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0034](0034-fail-closed-when-windows-rejects-directory-swap-renames.md) | Accepted | Windows 拒绝目录交换提交时安全失败 |
 | [0035](0035-confine-evidence-gc-to-pinned-class-directories.md) | Accepted | Evidence GC 固定类目录并使用同目录隔离名 |
 | [0036](0036-fail-closed-on-unreleased-legacy-evidence-gc-residues.md) | Accepted | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
+| [0037](0037-pin-github-checkout-v7-on-node24.md) | Accepted | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。

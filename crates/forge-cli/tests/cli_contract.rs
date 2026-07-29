@@ -927,9 +927,10 @@ fn explicit_github_ci_apply_is_create_only_active_and_idempotent()
     let workflow_path = fixture.worktree.join(".github/workflows/verify.yml");
     let workflow = fs::read_to_string(&workflow_path)?;
     assert!(workflow.contains("on:\n  workflow_dispatch:"));
+    assert!(workflow.contains("permissions:\n  contents: read\n"));
     assert!(workflow.contains("runs-on: ubuntu-24.04"));
     assert!(
-        workflow.contains("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2")
+        workflow.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1")
     );
     assert!(workflow.contains("persist-credentials: false"));
     for forbidden in [
