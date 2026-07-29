@@ -5,14 +5,12 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use forge_core::domain::{Mutability, NetworkIntent};
 use forge_core::path::RepoRelativePath;
 use forge_core::ports::{
-    EnvPolicy, ExecSpec, OutputPolicy, ProcessError, ProcessObservation, ProcessPort as _,
-    StdinPolicy,
+    EnvPolicy, ExecSpec, OutputPolicy, ProcessError, ProcessObservation, StdinPolicy,
 };
 use forge_runtime::git::{HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
 use forge_runtime::process::SynchronousProcessRunner;
@@ -24,6 +22,11 @@ const SNAPSHOT_READ_BUFFER_BYTES: usize = 64 * 1024;
 const GIT_SNAPSHOT_OUTPUT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const GIT_PATH_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const FORGE_INIT_STDOUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const FORGE_INIT_STDERR_MAX_BYTES: usize = 256 * 1024;
+const FORGE_INIT_OUTPUT_HARD_LIMIT_BYTES: u64 =
+    (FORGE_INIT_STDOUT_MAX_BYTES + FORGE_INIT_STDERR_MAX_BYTES) as u64;
+const FORGE_INIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -76,30 +79,6 @@ struct RepositorySnapshot {
     forge_shared_cache: FileTreeSnapshot,
 }
 
-fn configure_repository_environment(command: &mut Command) {
-    for name in [
-        "GIT_CONFIG",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_EXEC_PATH",
-        "GIT_EXTERNAL_DIFF",
-    ] {
-        command.env_remove(name);
-    }
-    command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_PAGER", "cat")
-        .env("LC_ALL", "C");
-}
-
 impl GitOutputBudget {
     fn new(max_bytes: u64) -> Self {
         Self {
@@ -109,9 +88,8 @@ impl GitOutputBudget {
     }
 
     fn charge(&mut self, label: &str, observation: &ProcessObservation) -> io::Result<()> {
-        // The process runner has already drained both streams without retaining their bytes. This
-        // is an acceptance bound over the completed semantic snapshot; the runner's timeout is the
-        // independent bound for a child that does not finish.
+        // Each command was already subject to the remaining execution-time budget. Retain this
+        // second check as an independent acceptance bound over the complete six-command snapshot.
         let command_bytes = observation
             .stdout_total_bytes
             .checked_add(observation.stderr_total_bytes)
@@ -133,6 +111,10 @@ impl GitOutputBudget {
         }
         self.observed = observed;
         Ok(())
+    }
+
+    fn remaining(&self) -> u64 {
+        self.max_bytes.saturating_sub(self.observed)
     }
 }
 
@@ -184,10 +166,11 @@ fn git_exec_spec(arguments: &[&str], stdout: OutputPolicy) -> ExecSpec {
 }
 
 fn git_process_error(label: &str, error: &ProcessError) -> io::Error {
+    let reason = error.reason().map_or("none", |reason| reason.as_str());
     io::Error::new(
         error.io_kind(),
         format!(
-            "Git command `{label}` execution failed: category={} io={:?}",
+            "Git command `{label}` execution failed: category={} reason={reason} io={:?}",
             error.kind().as_str(),
             error.io_kind()
         ),
@@ -213,9 +196,10 @@ fn successful_git_observation(
     label: &str,
     arguments: &[&str],
     stdout: OutputPolicy,
+    output_hard_limit_bytes: u64,
 ) -> io::Result<ProcessObservation> {
     let observation = runner
-        .run(&git_exec_spec(arguments, stdout))
+        .run_with_output_hard_limit(&git_exec_spec(arguments, stdout), output_hard_limit_bytes)
         .map_err(|error| git_process_error(label, &error))?;
     let succeeded = observation.exit_code == Some(0)
         && observation.signal.is_none()
@@ -269,7 +253,13 @@ fn successful_git_snapshot(
     arguments: &[&str],
     budget: &mut GitOutputBudget,
 ) -> io::Result<GitCommandSnapshot> {
-    let observation = successful_git_observation(runner, label, arguments, OutputPolicy::Discard)?;
+    let observation = successful_git_observation(
+        runner,
+        label,
+        arguments,
+        OutputPolicy::Discard,
+        budget.remaining(),
+    )?;
     budget.charge(label, &observation)?;
     Ok(git_command_snapshot(label, &observation))
 }
@@ -286,6 +276,7 @@ fn successful_git_stdout_bounded(
         OutputPolicy::CaptureBounded {
             max_bytes: GIT_PATH_OUTPUT_MAX_BYTES as usize,
         },
+        GIT_PATH_OUTPUT_MAX_BYTES,
     )?;
     let mut budget = GitOutputBudget::new(GIT_PATH_OUTPUT_MAX_BYTES);
     budget.charge(label, &observation)?;
@@ -578,6 +569,55 @@ fn repository_snapshot(root: &Path) -> Result<RepositorySnapshot, Box<dyn std::e
     })
 }
 
+fn forge_init_exec_spec() -> ExecSpec {
+    ExecSpec {
+        program: OsString::from(env!("CARGO_BIN_EXE_forge")),
+        args: ["init", "--dry-run", "--json"]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        cwd: RepoRelativePath::root(),
+        env: git_environment(),
+        timeout: FORGE_INIT_TIMEOUT,
+        stdin: StdinPolicy::Closed,
+        stdout: OutputPolicy::CaptureBounded {
+            max_bytes: FORGE_INIT_STDOUT_MAX_BYTES,
+        },
+        stderr: OutputPolicy::CaptureBounded {
+            max_bytes: FORGE_INIT_STDERR_MAX_BYTES,
+        },
+        mutability: Mutability::ReadOnly,
+        network: NetworkIntent::OfflineRequested,
+        concurrency_key: None,
+    }
+}
+
+fn forge_init_process_error(error: &ProcessError) -> io::Error {
+    let reason = error.reason().map_or("none", |reason| reason.as_str());
+    io::Error::new(
+        error.io_kind(),
+        format!(
+            "Forge init execution failed: category={} reason={reason} io={:?}",
+            error.kind().as_str(),
+            error.io_kind()
+        ),
+    )
+}
+
+fn forge_init_failure_message(observation: &ProcessObservation) -> String {
+    format!(
+        "Forge init dry-run failed: exit_code={:?} signal={:?} timed_out={} interrupted={} stdout_bytes={} stdout_digest={} stderr_bytes={} stderr_digest={}",
+        observation.exit_code,
+        observation.signal,
+        observation.timed_out,
+        observation.interrupted,
+        observation.stdout_total_bytes,
+        observation.stdout_digest,
+        observation.stderr_total_bytes,
+        observation.stderr_digest,
+    )
+}
+
 #[test]
 fn git_snapshot_and_failure_diagnostic_do_not_retain_output() {
     let stdout_secret = b"private-source-token\n";
@@ -637,6 +677,29 @@ fn git_snapshot_environment_does_not_inherit_trace_controls() {
             .overrides
             .get(&OsString::from("GIT_CONFIG_NOSYSTEM")),
         Some(&OsString::from("1"))
+    );
+}
+
+#[test]
+fn forge_init_dogfood_execution_is_bounded_and_noninteractive() {
+    let spec = forge_init_exec_spec();
+    assert_eq!(spec.timeout, FORGE_INIT_TIMEOUT);
+    assert_eq!(spec.stdin, StdinPolicy::Closed);
+    assert_eq!(
+        spec.stdout,
+        OutputPolicy::CaptureBounded {
+            max_bytes: FORGE_INIT_STDOUT_MAX_BYTES
+        }
+    );
+    assert_eq!(
+        spec.stderr,
+        OutputPolicy::CaptureBounded {
+            max_bytes: FORGE_INIT_STDERR_MAX_BYTES
+        }
+    );
+    assert_eq!(
+        FORGE_INIT_OUTPUT_HARD_LIMIT_BYTES,
+        (FORGE_INIT_STDOUT_MAX_BYTES + FORGE_INIT_STDERR_MAX_BYTES) as u64
     );
 }
 
@@ -717,22 +780,31 @@ fn forge_init_dry_run_is_a_zero_diff_on_its_own_repository()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = repository_root();
     let before = repository_snapshot(&root)?;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
-    command
-        .current_dir(&root)
-        .args(["init", "--dry-run", "--json"]);
-    configure_repository_environment(&mut command);
-
-    let output = command.output()?;
+    let runner =
+        SynchronousProcessRunner::new(&root).map_err(|error| forge_init_process_error(&error))?;
+    let output = runner
+        .run_with_output_hard_limit(&forge_init_exec_spec(), FORGE_INIT_OUTPUT_HARD_LIMIT_BYTES)
+        .map_err(|error| forge_init_process_error(&error))?;
     let after = repository_snapshot(&root)?;
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    assert!(
+        output.exit_code == Some(0)
+            && output.signal.is_none()
+            && !output.timed_out
+            && !output.interrupted,
+        "{}",
+        forge_init_failure_message(&output)
     );
-    assert!(output.stderr.is_empty());
+    assert!(
+        output.stderr.is_empty() && output.stderr_total_bytes == 0 && !output.stderr_truncated,
+        "{}",
+        forge_init_failure_message(&output)
+    );
+    assert!(
+        !output.stdout_truncated && output.stdout.len() as u64 == output.stdout_total_bytes,
+        "Forge init JSON exceeded its bounded stdout capture: stdout_bytes={} stdout_digest={}",
+        output.stdout_total_bytes,
+        output.stdout_digest
+    );
     let envelope: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(envelope["schema"], "forge.init-plan/v1");
     assert_eq!(

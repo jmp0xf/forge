@@ -6,8 +6,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -249,12 +249,36 @@ impl SynchronousProcessRunner {
             spool,
             spec.stdout.retention_limit(),
             spec.stderr.retention_limit(),
+            None,
         )?;
         let (observation, stdout_file) = execution.into_spooled_observation();
         Ok(SpooledProcessObservation {
             observation,
             stdout_file,
         })
+    }
+
+    /// Runs one command while enforcing a shared execution-time hard limit over complete stdout
+    /// and stderr.
+    ///
+    /// Both pipes are drained concurrently. The reader that would cross `max_output_bytes` marks
+    /// the execution for cancellation, and the normal process-tree lifecycle terminates the child
+    /// and every descendant before returning a typed, content-free error. This is distinct from
+    /// [`forge_core::ports::OutputPolicy`], which only bounds retained bytes. [`ProcessPort::run`]
+    /// remains unlimited for callers that do not opt in.
+    pub fn run_with_output_hard_limit(
+        &self,
+        spec: &ExecSpec,
+        max_output_bytes: u64,
+    ) -> Result<ProcessObservation, ProcessError> {
+        self.execute(
+            spec,
+            Vec::with_capacity(spec.stdout.retention_limit().min(8 * 1024)),
+            spec.stdout.retention_limit(),
+            spec.stderr.retention_limit(),
+            Some(max_output_bytes),
+        )
+        .map(ExecutionObservation::into_process_observation)
     }
 
     fn resolve_cwd(&self, relative: &Path) -> Result<PathBuf, ProcessError> {
@@ -298,6 +322,7 @@ impl SynchronousProcessRunner {
         stdout_sink: W,
         stdout_limit_bytes: usize,
         stderr_limit_bytes: usize,
+        output_hard_limit_bytes: Option<u64>,
     ) -> Result<ExecutionObservation<W>, ProcessError>
     where
         W: Write + Send + 'static,
@@ -383,12 +408,17 @@ impl SynchronousProcessRunner {
             }
         };
 
+        let output_hard_limit = output_hard_limit_bytes
+            .map(SharedOutputHardLimit::new)
+            .map(Arc::new);
+
         let stdout_reader = match spawn_reader(
             "forge-stdout-drain",
             OutputStream::Stdout,
             stdout,
             stdout_sink,
             stdout_limit_bytes,
+            output_hard_limit.clone(),
         ) {
             Ok(reader) => reader,
             Err(error) => {
@@ -406,6 +436,7 @@ impl SynchronousProcessRunner {
             stderr,
             Vec::with_capacity(stderr_limit_bytes.min(8 * 1024)),
             stderr_limit_bytes,
+            output_hard_limit.clone(),
         ) {
             Ok(reader) => reader,
             Err(error) => {
@@ -425,12 +456,19 @@ impl SynchronousProcessRunner {
             spec.timeout,
             self.termination_grace,
             &self.cancellation,
+            output_hard_limit.as_deref(),
         );
         let stdout_result = join_reader(stdout_reader);
         let stderr_result = join_reader(stderr_reader);
         let (status, timed_out, interrupted) = wait_result.map_err(|error| {
             ProcessError::new(ProcessErrorKind::Wait, "wait for child process tree", error)
         })?;
+        if output_hard_limit
+            .as_deref()
+            .is_some_and(SharedOutputHardLimit::is_exceeded)
+        {
+            return Err(ProcessError::output_limit_exceeded());
+        }
         let mut stdout = stdout_result.map_err(|error| {
             ProcessError::new(ProcessErrorKind::Output, "drain child stdout", error)
         })?;
@@ -573,6 +611,7 @@ impl ProcessPort for SynchronousProcessRunner {
             Vec::with_capacity(spec.stdout.retention_limit().min(8 * 1024)),
             spec.stdout.retention_limit(),
             spec.stderr.retention_limit(),
+            None,
         )
         .map(ExecutionObservation::into_process_observation)
     }
@@ -660,6 +699,7 @@ fn wait_for_child(
     timeout: Duration,
     termination_grace: Duration,
     cancellation: &AtomicBool,
+    output_hard_limit: Option<&SharedOutputHardLimit>,
 ) -> io::Result<(ExitStatus, bool, bool)> {
     let wait_started = Instant::now();
     loop {
@@ -672,6 +712,11 @@ fn wait_for_child(
         };
         if exited {
             let status = kill_tree_and_reap(child, tree)?;
+            return Ok((status, false, false));
+        }
+
+        if output_hard_limit.is_some_and(SharedOutputHardLimit::is_exceeded) {
+            let status = terminate_and_reap(child, tree, termination_grace)?;
             return Ok((status, false, false));
         }
 
@@ -807,6 +852,61 @@ struct DrainedOutput<W> {
     sink_error: Option<io::Error>,
 }
 
+/// One execution-local budget shared by both pipe readers.
+///
+/// The mutex makes the charge exact even on targets without 64-bit atomics. The separate atomic
+/// flag lets the process-tree watcher observe a crossing without waiting on either reader.
+#[derive(Debug)]
+struct SharedOutputHardLimit {
+    max_bytes: u64,
+    observed_bytes: Mutex<u64>,
+    exceeded: AtomicBool,
+}
+
+impl SharedOutputHardLimit {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            observed_bytes: Mutex::new(0),
+            exceeded: AtomicBool::new(false),
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> bool {
+        if self.is_exceeded() {
+            return false;
+        }
+        let Ok(bytes) = u64::try_from(bytes) else {
+            self.exceeded.store(true, Ordering::Release);
+            return false;
+        };
+        let Ok(mut observed_bytes) = self.observed_bytes.lock() else {
+            self.exceeded.store(true, Ordering::Release);
+            return false;
+        };
+        // A peer can cross the limit between the optimistic check above and this lock. Once the
+        // failure is sticky, neither stream may resume hashing or retaining bytes while the
+        // process-tree watcher is terminating the child.
+        if self.is_exceeded() {
+            return false;
+        }
+        let Some(next) = observed_bytes.checked_add(bytes) else {
+            self.exceeded.store(true, Ordering::Release);
+            return false;
+        };
+        if next > self.max_bytes {
+            self.exceeded.store(true, Ordering::Release);
+            return false;
+        }
+        *observed_bytes = next;
+        true
+    }
+
+    fn is_exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+}
+
 impl<W> DrainedOutput<W> {
     fn empty(stream: OutputStream, sink: W) -> Self {
         Self {
@@ -878,14 +978,15 @@ fn spawn_reader<R, W>(
     reader: R,
     sink: W,
     limit: usize,
+    output_hard_limit: Option<Arc<SharedOutputHardLimit>>,
 ) -> io::Result<JoinHandle<io::Result<DrainedOutput<W>>>>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    thread::Builder::new()
-        .name(name.into())
-        .spawn(move || drain_bounded(stream, reader, sink, limit))
+    thread::Builder::new().name(name.into()).spawn(move || {
+        drain_bounded_with_hard_limit(stream, reader, sink, limit, output_hard_limit.as_deref())
+    })
 }
 
 fn join_reader<W>(
@@ -897,11 +998,25 @@ fn join_reader<W>(
     }
 }
 
+#[cfg(test)]
 fn drain_bounded<W>(
+    stream: OutputStream,
+    reader: impl Read,
+    sink: W,
+    limit: usize,
+) -> io::Result<DrainedOutput<W>>
+where
+    W: Write,
+{
+    drain_bounded_with_hard_limit(stream, reader, sink, limit, None)
+}
+
+fn drain_bounded_with_hard_limit<W>(
     stream: OutputStream,
     mut reader: impl Read,
     mut sink: W,
     limit: usize,
+    output_hard_limit: Option<&SharedOutputHardLimit>,
 ) -> io::Result<DrainedOutput<W>>
 where
     W: Write,
@@ -917,6 +1032,13 @@ where
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
+        }
+
+        if output_hard_limit.is_some_and(|hard_limit| !hard_limit.charge(read)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "combined child output exceeded its hard limit",
+            ));
         }
 
         hasher.update(&buffer[..read]);
@@ -1706,8 +1828,8 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
     use std::process::Command as ProcessCommand;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1715,16 +1837,16 @@ mod tests {
     use forge_core::domain::{CommandSource, CommandSpec, Intent};
     use forge_core::evidence::DependencyValue;
     use forge_core::ports::{
-        EnvPolicy, ExecSpec, OutputPolicy, ProcessErrorKind, ProcessPort as _,
+        EnvPolicy, ExecSpec, OutputPolicy, ProcessErrorKind, ProcessErrorReason, ProcessPort as _,
     };
     use tempfile::tempdir;
 
     #[cfg(target_vendor = "apple")]
     use super::platform;
     use super::{
-        DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SynchronousProcessRunner, TerminationMode,
-        drain_bounded, is_windows_batch_program, private_anonymous_tempfile,
-        process_environment_dependency_digest, sanitized_environment,
+        DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SharedOutputHardLimit, SynchronousProcessRunner,
+        TerminationMode, drain_bounded, drain_bounded_with_hard_limit, is_windows_batch_program,
+        private_anonymous_tempfile, process_environment_dependency_digest, sanitized_environment,
     };
     use crate::hash::Blake3Hasher;
 
@@ -1808,6 +1930,57 @@ mod tests {
         let heartbeat = std::env::var_os(PROCESS_TREE_FIXTURE_HEARTBEAT)
             .ok_or_else(|| io::Error::other("process-tree fixture heartbeat is missing"))?;
 
+        if mode == OsStr::new("dual-output-parent") {
+            let requested = std::env::var(PROCESS_TREE_FIXTURE_OUTPUT_BYTES)?.parse::<usize>()?;
+            let executable = std::env::current_exe()?;
+            let mut child = ProcessCommand::new(executable)
+                .args(["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"])
+                .env(PROCESS_TREE_FIXTURE_MODE, "child")
+                .env(PROCESS_TREE_FIXTURE_HEARTBEAT, &heartbeat)
+                .spawn()?;
+
+            let heartbeat_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match fs::metadata(&heartbeat) {
+                    Ok(metadata) if metadata.len() > 0 => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                if Instant::now() >= heartbeat_deadline {
+                    return Err(
+                        io::Error::other("fixture descendant did not start before output").into(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let start = Arc::new(Barrier::new(3));
+            let stdout_start = Arc::clone(&start);
+            let stdout_writer = thread::spawn(move || -> io::Result<()> {
+                stdout_start.wait();
+                write_repeated_output(io::stdout().lock(), requested)
+            });
+            let stderr_start = Arc::clone(&start);
+            let stderr_writer = thread::spawn(move || -> io::Result<()> {
+                stderr_start.wait();
+                write_repeated_output(io::stderr().lock(), requested)
+            });
+            start.wait();
+            stdout_writer
+                .join()
+                .map_err(|_| io::Error::other("stdout fixture writer panicked"))??;
+            stderr_writer
+                .join()
+                .map_err(|_| io::Error::other("stderr fixture writer panicked"))??;
+
+            let status = child.wait()?;
+            return Err(io::Error::other(format!(
+                "process-tree fixture child exited before termination: {status}"
+            ))
+            .into());
+        }
+
         if mode == OsStr::new("parent") || mode == OsStr::new("orphan-parent") {
             let executable = std::env::current_exe()?;
             let mut child = ProcessCommand::new(executable)
@@ -1857,6 +2030,17 @@ mod tests {
         Err(io::Error::other("unknown process-tree fixture mode").into())
     }
 
+    fn write_repeated_output(mut writer: impl io::Write, bytes: usize) -> io::Result<()> {
+        let chunk = [b'x'; 8 * 1024];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let write = remaining.min(chunk.len());
+            writer.write_all(&chunk[..write])?;
+            remaining -= write;
+        }
+        writer.flush()
+    }
+
     fn output_fixture_command(bytes: usize) -> Result<ExecSpec, Box<dyn Error>> {
         let executable = std::env::current_exe()?;
         let mut command = spec(
@@ -1873,6 +2057,73 @@ mod tests {
         );
         command.timeout = Duration::from_secs(5);
         Ok(command)
+    }
+
+    #[test]
+    fn combined_output_hard_limit_interrupts_dual_pipes_and_reaps_descendants()
+    -> Result<(), Box<dyn Error>> {
+        const PER_STREAM_BYTES: usize = 384 * 1024;
+        const SHARED_HARD_LIMIT_BYTES: u64 = 512 * 1024;
+
+        let root = tempdir()?;
+        let heartbeat = root.path().join("output-limit-heartbeat");
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let executable = std::env::current_exe()?;
+        let mut command = spec(
+            executable,
+            &["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"],
+        );
+        command.env.overrides.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_MODE),
+            OsString::from("dual-output-parent"),
+        );
+        command.env.overrides.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_HEARTBEAT),
+            heartbeat.as_os_str().to_owned(),
+        );
+        command.env.overrides.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_OUTPUT_BYTES),
+            OsString::from(PER_STREAM_BYTES.to_string()),
+        );
+        command.stdout = OutputPolicy::Discard;
+        command.stderr = OutputPolicy::Discard;
+        command.timeout = Duration::from_secs(30);
+
+        let started_at = Instant::now();
+        let error = runner
+            .run_with_output_hard_limit(&command, SHARED_HARD_LIMIT_BYTES)
+            .err()
+            .ok_or_else(|| io::Error::other("combined output hard limit was not enforced"))?;
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(error.kind(), ProcessErrorKind::Output);
+        assert_eq!(
+            error.reason(),
+            Some(ProcessErrorReason::OutputLimitExceeded)
+        );
+        assert_eq!(
+            error.reason().map(ProcessErrorReason::as_str),
+            Some("output-limit-exceeded")
+        );
+        assert_eq!(error.io_kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "enforce combined child output hard limit: combined child output exceeded its hard limit"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "output-limit cancellation waited for the 30 second command timeout: {elapsed:?}"
+        );
+
+        let before = fs::metadata(&heartbeat)?.len();
+        assert!(before > 0, "fixture descendant never became observable");
+        thread::sleep(Duration::from_millis(250));
+        let after = fs::metadata(&heartbeat)?.len();
+        assert_eq!(
+            before, after,
+            "a descendant continued writing after output-limit termination"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2027,6 +2278,51 @@ mod tests {
     }
 
     #[test]
+    fn output_hard_limit_is_exact_and_shared_between_streams() -> Result<(), Box<dyn Error>> {
+        let hard_limit = SharedOutputHardLimit::new(8);
+        let stdout = drain_bounded_with_hard_limit(
+            OutputStream::Stdout,
+            io::Cursor::new(b"123"),
+            io::sink(),
+            0,
+            Some(&hard_limit),
+        )?;
+        let stderr = drain_bounded_with_hard_limit(
+            OutputStream::Stderr,
+            io::Cursor::new(b"45678"),
+            io::sink(),
+            0,
+            Some(&hard_limit),
+        )?;
+
+        assert_eq!(stdout.total_bytes, 3);
+        assert_eq!(stderr.total_bytes, 5);
+        assert!(!hard_limit.is_exceeded());
+
+        let error = drain_bounded_with_hard_limit(
+            OutputStream::Stdout,
+            io::Cursor::new(b"9"),
+            io::sink(),
+            0,
+            Some(&hard_limit),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("shared hard limit accepted a ninth byte"))?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(hard_limit.is_exceeded());
+
+        let sticky_limit = SharedOutputHardLimit::new(8);
+        assert!(sticky_limit.charge(3));
+        assert!(!sticky_limit.charge(6));
+        assert!(sticky_limit.is_exceeded());
+        assert!(
+            !sticky_limit.charge(1),
+            "a peer reader resumed after another stream crossed the hard limit"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn process_output_digest_has_fixed_vectors() -> Result<(), Box<dyn Error>> {
         let empty_stdout =
             drain_bounded(OutputStream::Stdout, io::Cursor::new(b""), io::sink(), 0)?;
@@ -2088,6 +2384,7 @@ mod tests {
                 FailingSink,
                 2 * 1024 * 1024,
                 DEFAULT_OUTPUT_LIMIT_BYTES,
+                None,
             )
             .err()
             .ok_or("failing process sink unexpectedly succeeded")?;

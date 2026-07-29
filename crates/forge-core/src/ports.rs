@@ -216,10 +216,33 @@ impl ProcessErrorKind {
     }
 }
 
+/// Stable detail for process-boundary failures that share one wire-level category.
+///
+/// The v2 Receipt contract records [`ProcessErrorKind`]. Additive runtime details stay separate so
+/// a caller can distinguish a local enforcement decision without changing that versioned wire
+/// enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessErrorReason {
+    /// The combined complete stdout and stderr streams crossed an execution-time hard limit.
+    OutputLimitExceeded,
+}
+
+impl ProcessErrorReason {
+    /// Stable machine spelling for content-free diagnostics outside versioned Receipt schemas.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutputLimitExceeded => "output-limit-exceeded",
+        }
+    }
+}
+
 /// A typed process-boundary failure with its original operating-system error retained.
 #[derive(Debug)]
 pub struct ProcessError {
     kind: ProcessErrorKind,
+    reason: Option<ProcessErrorReason>,
     action: &'static str,
     source: io::Error,
 }
@@ -229,14 +252,36 @@ impl ProcessError {
     pub fn new(kind: ProcessErrorKind, action: &'static str, source: io::Error) -> Self {
         Self {
             kind,
+            reason: None,
             action,
             source,
+        }
+    }
+
+    /// Constructs the content-free failure returned after an output hard limit terminates a child
+    /// process tree.
+    #[must_use]
+    pub fn output_limit_exceeded() -> Self {
+        Self {
+            kind: ProcessErrorKind::Output,
+            reason: Some(ProcessErrorReason::OutputLimitExceeded),
+            action: "enforce combined child output hard limit",
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "combined child output exceeded its hard limit",
+            ),
         }
     }
 
     #[must_use]
     pub const fn kind(&self) -> ProcessErrorKind {
         self.kind
+    }
+
+    /// Returns an additive stable reason when the broad process category has one.
+    #[must_use]
+    pub const fn reason(&self) -> Option<ProcessErrorReason> {
+        self.reason
     }
 
     #[must_use]
@@ -547,7 +592,8 @@ mod tests {
     use crate::{GitError, GitErrorKind, GitFileSet, PorcelainV2Status};
 
     use super::{
-        DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, GitPort, OutputPolicy, StdinPolicy,
+        DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, GitPort, OutputPolicy, ProcessError,
+        ProcessErrorKind, ProcessErrorReason, StdinPolicy,
     };
     use crate::path::RepoRelativePath;
 
@@ -661,6 +707,30 @@ mod tests {
     #[test]
     fn discarded_output_has_a_zero_retention_bound() {
         assert_eq!(OutputPolicy::Discard.retention_limit(), 0);
+    }
+
+    #[test]
+    fn output_limit_failure_is_typed_stable_and_content_free() {
+        let error = ProcessError::output_limit_exceeded();
+
+        assert_eq!(error.kind(), ProcessErrorKind::Output);
+        assert_eq!(
+            error.reason(),
+            Some(ProcessErrorReason::OutputLimitExceeded)
+        );
+        assert_eq!(
+            error.reason().map(ProcessErrorReason::as_str),
+            Some("output-limit-exceeded")
+        );
+        assert_eq!(error.io_kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            crate::wire::process_error_kind_to_wire(error.kind()),
+            forge_schema::ProcessErrorKindV2Data::Output
+        );
+        assert_eq!(
+            error.to_string(),
+            "enforce combined child output hard limit: combined child output exceeded its hard limit"
+        );
     }
 
     #[test]
