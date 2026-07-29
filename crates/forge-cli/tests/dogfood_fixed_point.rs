@@ -567,7 +567,8 @@ fn native_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn repository_snapshot(root: &Path) -> Result<RepositorySnapshot, Box<dyn std::error::Error>> {
-    let runner = SynchronousProcessRunner::new(root)?;
+    let runner = SynchronousProcessRunner::new(root)
+        .map_err(|error| git_process_error("initialize Git snapshot runner", &error))?;
     let git_dir = absolute_git_path(&runner, "--git-dir")?;
     let common_dir = absolute_git_path(&runner, "--git-common-dir")?;
     Ok(RepositorySnapshot {
@@ -599,6 +600,44 @@ fn git_snapshot_and_failure_diagnostic_do_not_retain_output() {
     assert!(diagnostic.contains("stdout_digest="));
     assert!(diagnostic.contains("stderr_bytes="));
     assert!(diagnostic.contains("stderr_digest="));
+}
+
+#[test]
+fn successful_git_snapshot_ignores_stderr_and_duration() {
+    let first = process_observation(0, b"stable-stdout", b"first-trace");
+    let mut second = process_observation(0, b"stable-stdout", b"second-trace");
+    second.stderr_digest = forge_schema::Digest::new("blake3:different-stderr-fixture");
+    second.duration = Duration::from_secs(2);
+
+    assert_eq!(
+        git_command_snapshot("success fixture", &first),
+        git_command_snapshot("success fixture", &second),
+        "successful stderr diagnostics and timing are not repository semantics"
+    );
+}
+
+#[test]
+fn git_snapshot_environment_does_not_inherit_trace_controls() {
+    let environment = git_environment();
+    assert!(
+        environment
+            .inherit
+            .iter()
+            .chain(environment.overrides.keys())
+            .all(|name| !name.to_string_lossy().starts_with("GIT_TRACE"))
+    );
+    assert_eq!(
+        environment
+            .overrides
+            .get(&OsString::from("GIT_TERMINAL_PROMPT")),
+        Some(&OsString::from("0"))
+    );
+    assert_eq!(
+        environment
+            .overrides
+            .get(&OsString::from("GIT_CONFIG_NOSYSTEM")),
+        Some(&OsString::from("1"))
+    );
 }
 
 #[test]
