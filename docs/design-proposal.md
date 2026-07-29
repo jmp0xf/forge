@@ -2968,7 +2968,7 @@ N-1 public compatibility harness skeleton
 
 ## 30. ADR 索引
 
-起始 ADR 全部位于 `docs/adr/`：
+ADR 全部位于 `docs/adr/`：
 
 | ADR | 决策 |
 |---|---|
@@ -3002,6 +3002,12 @@ N-1 public compatibility harness skeleton
 | 0028 | 仓库写入固定目录句柄 |
 | 0029 | 发布可审查、可回滚的 v0 候选版本 |
 | 0030 | 分离 release manifest 的兼容读取与候选验收 |
+| 0031 | Windows 使用原生同目录句柄重命名（已由 0033 取代） |
+| 0032 | 记录不含输出内容的命令诊断摘要 |
+| 0033 | Windows 重命名显式使用固定目标目录句柄（已由 0034 取代） |
+| 0034 | Windows 拒绝目录交换提交时安全失败 |
+| 0035 | Evidence GC 固定类目录并使用同目录隔离名 |
+| 0036 | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 
