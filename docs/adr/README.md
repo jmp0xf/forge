@@ -51,5 +51,6 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0035](0035-confine-evidence-gc-to-pinned-class-directories.md) | Accepted | Evidence GC 固定类目录并使用同目录隔离名 |
 | [0036](0036-fail-closed-on-unreleased-legacy-evidence-gc-residues.md) | Accepted | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
 | [0037](0037-pin-github-checkout-v7-on-node24.md) | Accepted | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
+| [0038](0038-do-not-persist-arbitrary-project-command-output-in-v0.md) | Accepted | v0 不持久化任意项目命令的完整输出 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。

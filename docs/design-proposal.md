@@ -229,7 +229,7 @@ Forge 成功不是“功能越来越多”，而是：
 | `INV-NO-SELF-WEAKENING` | 策略变更不得用修改后的宽松策略评价自己 | base/candidate policy 测试 |
 | `INV-NATIVE-PATHS` | Git 路径不得因非 UTF-8、空格或换行丢失 | Unix 原始字节 fixture；Windows wide path fixture |
 | `INV-PROCESS-TREE-TERMINATION` | 超时和取消后无遗留子孙进程 | 跨平台进程树测试 |
-| `INV-BOUNDED-OUTPUT` | 内存和终端输出有上限；完整日志外置并可引用 | huge-output fixture |
+| `INV-BOUNDED-OUTPUT` | 内存和终端输出有上限；v0 Evidence 不持久化任意项目命令输出 | huge-output 与隐私哨兵 fixture |
 | `INV-UNKNOWN-IS-NOT-PASS` | 证据不足必须标记 unknown/not-verified，不得冒充通过 | doctor/evidence 测试 |
 
 这些不变量比某个性能数字、文件行数或风险阈值更稳定。实现冲突时，优先保护不变量。
@@ -581,7 +581,7 @@ forge improve   # v0 不实现
 - stderr 放进度、警告和面向人的诊断；
 - `--json` 时 stdout 不得混入日志、颜色、进度或子进程噪声；
 - 成功的只读命令尽量安静；
-- 子进程输出有界，完整日志外置并返回引用；
+- 子进程输出有界；v0 只持久化完整 digest、字节数和无内容摘要，原始日志由调用者或 CI 自行保留；
 - human 与 JSON 由同一份结构化 `Diagnostic` 渲染，语义一致。
 
 ### 8.2 JSON 信封
@@ -2049,10 +2049,10 @@ duration
 timed_out / interrupted
 stdout/stderr digest
 有界摘要或 finding 计数
-完整日志引用（若存在）
+日志引用（为兼容和未来 typed producer 保留；v0 current writer 为空）
 ```
 
-默认不保存完整 stdout、环境变量值、对话或模型输出。
+v0 生产命令不保存完整 stdout/stderr、环境变量值、对话或模型输出，`log_refs` 保持为空。
 
 ### 21.5 Receipt 有效性
 
@@ -2185,7 +2185,7 @@ pub struct ExecSpec {
 - cwd canonicalize 且位于仓库内；
 - stdin 默认关闭，交互命令必须显式；
 - stdout/stderr 分开流式读取；
-- 内存有界，完整日志按策略落盘；
+- 内存和临时 spool 有界；v0 不把任意项目命令输出持久化为 Forge Evidence；
 - 记录 wall time、raw exit、signal、timeout、cancel；
 - 子进程 timeout 取命令声明上限与 operation remaining budget 的较小值，不重置总预算；
 - 捕获 SIGINT 并终止整个进程树；
@@ -2766,7 +2766,7 @@ GC and log references
 - local evidence 与 external authority 分离；
 - worktree 不串扰；
 - mutating command after-digest 语义正确；
-- full logs/secret 不进入默认 Evidence。
+- full logs/secret 不进入 v0 Evidence，current writer 的 `log_refs` 为空。
 
 ### M7：Hardening 与 v0 发布
 
@@ -2804,7 +2804,7 @@ N-1 public compatibility harness skeleton
 11. 实现原子 JSON/文件写入。
 12. 实现 native path / symlink 防逃逸。
 13. 实现同步 ProcessPort、超时和 kill tree。
-14. 实现有界输出、日志引用和脱敏。
+14. 实现有界输出、完整 digest/字节数和无内容诊断摘要；日志引用仅保留兼容字段。
 15. 实现 config v1 与 unknown-field rejection。
 16. 实现 RepoFacts、AssetInventory、ProjectModel。
 17. 实现 runner 发现和 CommandSource/Confidence。
@@ -2999,16 +2999,17 @@ ADR 全部位于 `docs/adr/`：
 | 0025 | 每条命令使用一个操作级总预算 |
 | 0026 | 声明 Provider 命名空间覆盖与缺口 |
 | 0027 | 显式生成只创建不覆盖的 GitHub CI 工作流（已由 0037 取代） |
-| 0028 | 仓库写入固定目录句柄 |
+| 0028 | 仓库写入固定目录句柄（通用能力保留；Windows 细节沿 0031、0033、0034 演进） |
 | 0029 | 发布可审查、可回滚的 v0 候选版本 |
 | 0030 | 分离 release manifest 的兼容读取与候选验收 |
 | 0031 | Windows 使用原生同目录句柄重命名（已由 0033 取代） |
 | 0032 | 记录不含输出内容的命令诊断摘要 |
 | 0033 | Windows 重命名显式使用固定目标目录句柄（已由 0034 取代） |
 | 0034 | Windows 拒绝目录交换提交时安全失败 |
-| 0035 | Evidence GC 固定类目录并使用同目录隔离名 |
+| 0035 | Evidence GC 固定类目录并使用同目录隔离名（旧目录迁移部分由 0036 取代） |
 | 0036 | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
 | 0037 | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
+| 0038 | v0 不持久化任意项目命令的完整输出 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 

@@ -275,6 +275,10 @@ const V0_INVARIANT_COVERAGE: &[InvariantCoverage] = &[
                 "crates/forge-runtime/src/process.rs",
                 "huge_output_is_drained_but_retained_within_each_limit"
             ),
+            anchor!(
+                "crates/forge-cli/src/evidence.rs",
+                "diagnostic_summary_never_persists_captured_output_or_process_error_text"
+            ),
         ],
         ci_jobs: &["contracts", "native"],
         external_required: false,
