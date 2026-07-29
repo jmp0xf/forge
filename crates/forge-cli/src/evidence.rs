@@ -1388,6 +1388,12 @@ mod tests {
         assert_eq!(chain.observations.len(), 2);
         assert!(!chain.observations[0].timed_out);
         assert!(chain.observations[1].timed_out);
+        assert!(
+            chain
+                .observations
+                .iter()
+                .all(|observation| observation.log_refs.is_empty())
+        );
         assert_eq!(
             chain.observations[1]
                 .diagnostic_summary
@@ -1502,6 +1508,7 @@ mod tests {
             assert!(process.seen.borrow().is_empty());
             assert_eq!(chain.observations.len(), 1);
             assert!(chain.observations[0].interrupted);
+            assert!(chain.observations[0].log_refs.is_empty());
             assert_eq!(
                 chain.observations[0].diagnostic_summary,
                 Some(forge_schema::CommandDiagnosticSummaryV2Data {
@@ -1624,6 +1631,96 @@ mod tests {
             aggregate_command_evidence(&chain.aggregate_inputs).outcome(),
             EvidenceOutcome::ProductFailure
         );
+        Ok(())
+    }
+
+    #[test]
+    fn current_command_observation_paths_never_attach_log_refs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut timed_out = observation(0);
+        timed_out.timed_out = true;
+        let mut interrupted = observation(0);
+        interrupted.interrupted = true;
+        let permits = || {
+            vec![
+                Ok(OperationPermit::unlimited()),
+                Ok(OperationPermit::unlimited()),
+            ]
+        };
+        let cases = vec![
+            (
+                "success",
+                Some(Ok(observation(0))),
+                permits(),
+                forge_schema::OutcomeData::Pass,
+            ),
+            (
+                "product-failure",
+                Some(Ok(observation(7))),
+                permits(),
+                forge_schema::OutcomeData::ProductFailure,
+            ),
+            (
+                "process-timeout",
+                Some(Ok(timed_out)),
+                permits(),
+                forge_schema::OutcomeData::TimedOut,
+            ),
+            (
+                "process-interruption",
+                Some(Ok(interrupted)),
+                permits(),
+                forge_schema::OutcomeData::Interrupted,
+            ),
+            (
+                "control-timeout",
+                None,
+                vec![Err(OperationControlError::TimedOut)],
+                forge_schema::OutcomeData::TimedOut,
+            ),
+            (
+                "control-interruption",
+                None,
+                vec![
+                    Ok(OperationPermit::unlimited()),
+                    Err(OperationControlError::Interrupted),
+                ],
+                forge_schema::OutcomeData::Interrupted,
+            ),
+            (
+                "process-boundary failure",
+                Some(Err(ProcessError::new(
+                    ProcessErrorKind::ExecutableUnavailable,
+                    "start fake command",
+                    io::Error::new(io::ErrorKind::NotFound, "missing"),
+                ))),
+                permits(),
+                forge_schema::OutcomeData::InfrastructureFailure,
+            ),
+        ];
+
+        for (name, process_result, checkpoints, expected_outcome) in cases {
+            let process = FakeProcess::new(process_result.into_iter().collect());
+            let control = ScriptedControl::new(checkpoints);
+            let chain = run_command_chain_with_policy_controlled(
+                &process,
+                &Blake3Hasher,
+                &[command(
+                    name,
+                    CommandEnforcement::Required,
+                    SuccessPredicate::ExitZero,
+                    CoverageDimension::Compile,
+                )],
+                CommandExecutionPolicy::default(),
+                &control,
+                known_dependencies,
+            )
+            .map_err(|error| io::Error::other(format!("{name}: {error:?}")))?;
+
+            assert_eq!(chain.observations.len(), 1, "{name}");
+            assert_eq!(chain.observations[0].outcome, expected_outcome, "{name}");
+            assert!(chain.observations[0].log_refs.is_empty(), "{name}");
+        }
         Ok(())
     }
 

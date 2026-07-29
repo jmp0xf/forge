@@ -229,7 +229,7 @@ Forge 成功不是“功能越来越多”，而是：
 | `INV-NO-SELF-WEAKENING` | 策略变更不得用修改后的宽松策略评价自己 | base/candidate policy 测试 |
 | `INV-NATIVE-PATHS` | Git 路径不得因非 UTF-8、空格或换行丢失 | Unix 原始字节 fixture；Windows wide path fixture |
 | `INV-PROCESS-TREE-TERMINATION` | 超时和取消后无遗留子孙进程 | 跨平台进程树测试 |
-| `INV-BOUNDED-OUTPUT` | 内存和终端输出有上限；v0 Evidence 不持久化任意项目命令输出 | huge-output 与隐私哨兵 fixture |
+| `INV-BOUNDED-OUTPUT` | 内存保留、spool 和终端呈现有上限；v0 Forge-managed 状态不持久化 stdout/stderr 内容 | huge-output 与隐私哨兵 fixture |
 | `INV-UNKNOWN-IS-NOT-PASS` | 证据不足必须标记 unknown/not-verified，不得冒充通过 | doctor/evidence 测试 |
 
 这些不变量比某个性能数字、文件行数或风险阈值更稳定。实现冲突时，优先保护不变量。
@@ -364,7 +364,7 @@ pub const SCHEMA_NAMESPACE: &str = "forge";
 | worktree 私有状态 | `git rev-parse --git-dir` 返回目录下的 `forge/` |
 | 可共享只读缓存 | `git rev-parse --git-common-dir` 下的 `forge/cache/` |
 | 用户级语言包或默认 | XDG/平台标准配置目录 |
-| 完整本地日志 | worktree 私有 Git 目录；CI 使用 artifact 系统 |
+| 可选 typed 日志对象 | 调用前已按 typed 策略脱敏后进入 worktree 私有 Git 目录；v0 无生产 writer |
 | 保留测试、签名与最终晋升 | 候选不可修改的外部系统 |
 
 不得生成：
@@ -581,7 +581,7 @@ forge improve   # v0 不实现
 - stderr 放进度、警告和面向人的诊断；
 - `--json` 时 stdout 不得混入日志、颜色、进度或子进程噪声；
 - 成功的只读命令尽量安静；
-- 子进程输出有界；v0 只持久化完整 digest、字节数和无内容摘要，原始日志由调用者或 CI 自行保留；
+- 子进程双流并发排空；内存保留、临时 spool 和终端呈现有界，并记录完整观察事实或 unavailable；
 - human 与 JSON 由同一份结构化 `Diagnostic` 渲染，语义一致。
 
 ### 8.2 JSON 信封
@@ -931,6 +931,9 @@ external = ["owner-review", "protected-ci"]
 - 配置变化使相关 ProjectModel、Receipt 和 Evidence 失效；
 - 配置本身属于高风险路径，因为它能影响评价策略。
 
+`max_log_file_bytes` 只限制可选、调用前已脱敏日志对象的读取、写入和 GC，不启用日志捕获；v0 没有
+生产日志 writer。
+
 ### 11.2 私有状态布局
 
 ```text
@@ -940,11 +943,12 @@ external = ["owner-review", "protected-ci"]
 ├── generated-v1.json
 ├── doctor-v1.json
 ├── receipts/
-│   └── <ulid>.json
+│   ├── v1/<digest>.json         # legacy read-only
+│   └── v2/<digest>.json         # current immutable
 ├── evidence/
-│   └── <evidence-id>.json
-└── logs/
-    └── <run-id>/
+│   ├── v1/<digest>.json         # legacy read-only
+│   └── v2/<digest>.json         # current immutable
+└── logs/v1/<digest>.log         # optional typed object; v0 无生产 writer
 
 <git-common-dir>/forge/cache/
 ├── inventory/
@@ -955,14 +959,16 @@ external = ["owner-review", "protected-ci"]
 
 状态要求：
 
-- 全部带 Schema；
+- Receipt、Evidence 和其他结构化状态带 Schema；日志对象以完整内容寻址，不伪装成 JSON 信封；
 - 使用独占文件锁；
 - 临时文件 + fsync + 原子 rename；
 - 读取未来 Schema 时返回 65 或 2，并给出升级/删除可再生状态的指引；
-- 损坏状态可以安全删除重建，不影响项目；
+- malformed、冲突或未知状态安全失败并保留字节；只有确认可再生且已备份时才按诊断指引恢复，不把
+  损坏状态当成不存在；
 - state 不进入 Git，不成为权威资产；
-- 日志和 Receipt 有数量、时间和总字节 GC 策略；
-- GC 不删除仍被 Evidence 引用的对象。
+- Receipt、Evidence 和可选 typed 日志对象有扫描、对象与总字节上限；current Receipt/Evidence 按数量
+  和时间保留，日志按引用闭包保留，legacy Receipt/Evidence 永不由 GC 删除；
+- GC 不删除仍被保留 Evidence 引用的 Receipt，或仍被保留 Receipt/Evidence 引用的日志。
 
 ### 11.3 缓存键
 
@@ -2047,12 +2053,12 @@ raw exit code / signal
 normalized outcome
 duration
 timed_out / interrupted
-stdout/stderr digest
-有界摘要或 finding 计数
+已观察输出：覆盖完整双流的分流 digest、总字节数、截断状态和无内容诊断摘要
+进程边界失败：分流 unavailable marker digest，无字节数和单流截断状态
 日志引用（为兼容和未来 typed producer 保留；v0 current writer 为空）
 ```
 
-v0 生产命令不保存完整 stdout/stderr、环境变量值、对话或模型输出，`log_refs` 保持为空。
+v0 生产命令不保存 stdout/stderr 内容、环境变量值、对话或模型输出，`log_refs` 保持为空。
 
 ### 21.5 Receipt 有效性
 
@@ -2185,7 +2191,8 @@ pub struct ExecSpec {
 - cwd canonicalize 且位于仓库内；
 - stdin 默认关闭，交互命令必须显式；
 - stdout/stderr 分开流式读取；
-- 内存和临时 spool 有界；v0 不把任意项目命令输出持久化为 Forge Evidence；
+- 双流并发排空；内存保留和临时 spool 有界，显式策略可另设总输出 hard limit；
+- v0 不把任意项目命令的 stdout/stderr 内容持久化为 Forge Receipt/Evidence；
 - 记录 wall time、raw exit、signal、timeout、cancel；
 - 子进程 timeout 取命令声明上限与 operation remaining budget 的较小值，不重置总预算；
 - 捕获 SIGINT 并终止整个进程树；
@@ -2268,12 +2275,14 @@ Forge 不把仓库任意文本自动当作命令或策略：
 全量聊天
 全部环境变量
 凭证
-无限 stdout/stderr
+任意原始 stdout/stderr 内容，无论完整或截断
 可由 Git 重建的源码副本
 主机名明文
 ```
 
-日志引用应使用仓库相对/状态相对路径；导出前再次脱敏。v0 不发送遥测。未来遥测必须 opt-in、单独 ADR、可检查字段、可删除历史。
+`evidence export` 只持久化并输出 canonical Evidence object；v0 不读取、脱敏或打包日志字节，current
+`log_refs` 为空。未来 typed 日志生产或导出必须先完成内容策略，再使用状态相对引用并新增 ADR。v0 不
+发送遥测。未来遥测必须 opt-in、单独 ADR、可检查字段、可删除历史。
 
 ---
 
@@ -2766,7 +2775,8 @@ GC and log references
 - local evidence 与 external authority 分离；
 - worktree 不串扰；
 - mutating command after-digest 语义正确；
-- full logs/secret 不进入 v0 Evidence，current writer 的 `log_refs` 为空。
+- stdout/stderr 内容和 secret 不进入 v0 Forge-managed Receipt/Evidence 状态，current writer 的
+  `log_refs` 为空。
 
 ### M7：Hardening 与 v0 发布
 
@@ -2804,7 +2814,8 @@ N-1 public compatibility harness skeleton
 11. 实现原子 JSON/文件写入。
 12. 实现 native path / symlink 防逃逸。
 13. 实现同步 ProcessPort、超时和 kill tree。
-14. 实现有界输出、完整 digest/字节数和无内容诊断摘要；日志引用仅保留兼容字段。
+14. 实现有界输出保留、完整观察 digest/字节数和无内容诊断摘要；日志引用保留为 versioned 字段与
+    future typed producer/状态校验/GC 接口。
 15. 实现 config v1 与 unknown-field rejection。
 16. 实现 RepoFacts、AssetInventory、ProjectModel。
 17. 实现 runner 发现和 CommandSource/Confidence。
@@ -2951,7 +2962,7 @@ N-1 public compatibility harness skeleton
 |---|---:|---|
 | AGENTS 受管块上限 | 120 行 / 8 KiB | 观察删除率、上下文占用、漏指引与人工撤销 |
 | 单流内存输出 | 256 KiB | huge-output 和真实工具分布 |
-| 单日志文件 | 10 MiB | 排障需求与磁盘成本 |
+| 可选已脱敏日志对象（v0 无生产 writer） | 10 MiB | future typed producer 的排障需求与磁盘成本 |
 | doctor 元数据默认子阶段上限 | 30–60 s | p95、总预算余量与超时原因 |
 | check/test 默认子进程上限 | 5/15 min | 仓库实际耗时分布；不得重置命令总预算 |
 | Receipt GC | 最近 200 条或 14 天取宽 | Evidence 引用、磁盘占用、排障需要 |
@@ -3009,7 +3020,7 @@ ADR 全部位于 `docs/adr/`：
 | 0035 | Evidence GC 固定类目录并使用同目录隔离名（旧目录迁移部分由 0036 取代） |
 | 0036 | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
 | 0037 | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
-| 0038 | v0 不持久化任意项目命令的完整输出 |
+| 0038 | v0 不持久化任意项目命令的 stdout/stderr 内容 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 

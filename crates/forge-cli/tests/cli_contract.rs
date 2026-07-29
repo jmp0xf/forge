@@ -2979,6 +2979,11 @@ fn evidence_run_json_is_the_exact_persisted_receipt_and_contains_no_child_output
     assert_eq!(document["ok"], true);
     assert_eq!(document["data"]["intent"], "check");
     assert_eq!(document["data"]["outcome"], "pass");
+    assert!(
+        document["data"]["log_refs"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
     let observations = required_array(&document["data"], "observations")?;
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0]["raw_exit_code"], 0);

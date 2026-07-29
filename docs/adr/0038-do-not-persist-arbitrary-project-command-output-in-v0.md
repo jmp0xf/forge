@@ -1,16 +1,17 @@
-# ADR-0038：v0 不持久化任意项目命令的完整输出
+# ADR-0038：v0 不持久化任意项目命令的 stdout/stderr 内容
 
 - Status: Accepted
 - Date: 2026-07-29
 - Deciders: Forge maintainers
 - Supersedes: None
 - Superseded by: None
-- Depends on: ADR-0020, ADR-0021, ADR-0032
+- Depends on: ADR-0020, ADR-0021, ADR-0024, ADR-0032
 
 ## Context
 
-Forge 会执行项目原生命令。它能对 stdout/stderr 做有界捕获、计算覆盖完整字节流的摘要并记录字节
-数，但无法理解所有项目工具可能输出的源码、凭据、环境值或其他敏感内容。截断前缀仍可能恰好包含
+Forge 会执行项目原生命令。进程形成输出观察时，它能有界保留 stdout/stderr、计算覆盖本次完整双流
+的摘要并记录字节数；ADR-0024 的进程边界失败没有输出观察，只能记录 typed unavailable marker。
+Forge 无法理解所有项目工具可能输出的源码、凭据、环境值或其他敏感内容。截断前缀仍可能恰好包含
 secret；通用正则脱敏也不能对任意二进制和文本输出给出无泄漏保证。
 
 ADR-0021 为可选的不可变日志对象定义了状态布局和保留边界，ADR-0032 则明确拒绝把任意输出内容
@@ -19,15 +20,17 @@ ADR-0021 为可选的不可变日志对象定义了状态布局和保留边界�
 
 ## Decision
 
-v0 的生产 CLI 不持久化任意项目命令的完整 stdout/stderr，也不提供通用 `--save-logs` 开关：
+v0 的生产 CLI 不持久化任意项目命令的 stdout/stderr 内容，也不提供通用 `--save-logs` 开关：
 
-- Receipt 只保存覆盖完整输出的 digest、完整字节数、截断状态和 ADR-0032 定义的无内容诊断摘要；
+- `observed` observation 只保存覆盖本次完整双流的分流 digest、总字节数、截断状态和 ADR-0032
+  定义的无内容诊断摘要；ADR-0024 的 process-boundary failure 保存分流的 typed unavailable marker
+  digest，省略字节数和单流截断状态。两者都不保存 stdout/stderr 内容；
 - current Receipt/Evidence writer 的 `log_refs` 始终为空；该 versioned 字段保留用于兼容读取和未来
   typed producer，不构成 v0 可用能力；
-- `EvidenceStore::persist_current_log` 只作为受 ADR-0021 约束的运行时基础原语存在；v0 生产 CLI
+- `AtomicStateStore::persist_current_log` 只作为受 ADR-0021 约束的运行时基础原语存在；v0 生产 CLI
   不调用它，且它自身不声称会脱敏调用者提供的字节；
-- CI、终端宿主或直接调用者可以按各自既有权限和保留策略持有原始日志，但这些日志不进入 Forge
-  Evidence，也不由 Forge 返回状态引用；
+- 在 Forge 之外独立执行项目命令的 CI 或调用者可以按自己的权限和保留策略持有原始日志；Forge
+  执行路径不返回原始流，这些外部日志也不进入 Forge Evidence 或获得 Forge 状态引用；
 - 不以正则、变量名、UTF-8 清洗或模型摘要声称任意命令输出已经安全脱敏。
 
 未来只有拥有完整 typed parser 的 provider 或其他能在进入日志存储边界前证明内容策略的生产者，才
@@ -38,13 +41,15 @@ v0 的生产 CLI 不持久化任意项目命令的完整 stdout/stderr，也不�
 ### Positive
 
 - v0 不会为了排障便利而扩大任意项目输出的持久化和泄漏面。
-- Receipt 仍可通过完整 digest、双流字节数和截断状态诊断输出规模与身份。
+- 对已经形成输出观察的进程，Receipt 仍可通过完整 digest、双流字节数和截断状态诊断输出规模与
+  身份；进程边界失败保持明确 unavailable。
 - versioned `log_refs` 和受约束存储原语保留未来演进空间，无需破坏机器契约。
 
 ### Negative / trade-offs
 
 - Forge Evidence 不能独立还原失败命令的原始输出；深度排障依赖调用者日志或重新执行。
 - 运行时已有日志原语在 v0 没有生产调用者，必须避免被误读为已交付 CLI 能力。
+- digest 和字节数仍会暴露输出相等性与规模，也可能确认低熵猜测；无内容摘要不等于零信息或已脱敏。
 
 ### Implementation constraints
 

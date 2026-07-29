@@ -269,15 +269,27 @@ const V0_INVARIANT_COVERAGE: &[InvariantCoverage] = &[
         tests: &[
             anchor!(
                 "crates/forge-runtime/src/process.rs",
-                "combined_output_hard_limit_interrupts_dual_pipes_and_reaps_descendants"
+                "bounded_drain_digest_covers_bytes_beyond_the_retained_prefix"
             ),
             anchor!(
-                "crates/forge-runtime/src/process.rs",
-                "huge_output_is_drained_but_retained_within_each_limit"
+                "crates/forge-cli/tests/fixture_matrix.rs",
+                "huge_output_fixture_drains_complete_stream_but_bounds_the_receipt"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "evidence_run_json_is_the_exact_persisted_receipt_and_contains_no_child_output"
             ),
             anchor!(
                 "crates/forge-cli/src/evidence.rs",
                 "diagnostic_summary_never_persists_captured_output_or_process_error_text"
+            ),
+            anchor!(
+                "crates/forge-cli/src/evidence.rs",
+                "current_command_observation_paths_never_attach_log_refs"
+            ),
+            anchor!(
+                "crates/forge-runtime/src/state/evidence.rs",
+                "typed_persistence_keeps_log_receipt_evidence_chain_and_read_only_visit_is_stable"
             ),
         ],
         ci_jobs: &["contracts", "native"],
