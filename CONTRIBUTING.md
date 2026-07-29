@@ -15,16 +15,16 @@ cargo install --locked --path crates/forge-cli
 forge version
 ```
 
-Installation does not replace verification. Run the complete local gates from the repository root and preserve their
-exact exit codes:
+Installation does not replace verification. Run the normal full local code gate from the repository root and preserve
+its exact exit code:
 
 ```bash
 RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify
 ```
 
-This project-owned entry point checks schemas and generated fixtures without writing them, then runs the following
-bounded argv-only command set. It gives all required children one 44-minute shared budget, limits complete output per
-child, and leaves the fuzz Clippy result advisory:
+This project-owned entry point is the normal local verification contract, not complete release qualification. It first
+checks checked-in schemas and required generated fixtures in-process without writing them, then runs the following
+eight required argv-only child steps in order and leaves fuzz Clippy advisory and last:
 
 ```bash
 RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check
@@ -35,22 +35,27 @@ RUSTUP_AUTO_INSTALL=0 cargo test --locked --workspace --no-fail-fast
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check)
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --locked --all-targets)
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --locked --no-fail-fast)
-(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --all-targets) # advisory
-
-RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-schemas
-RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-fixtures
 RUSTUP_AUTO_INSTALL=0 cargo run --locked -p forge-cli -- version
+
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --all-targets) # advisory, always last
 ```
 
+The child phase has one shared 44-minute budget. Each child has closed stdin, at most 256 KiB retained per stream, an
+8 MiB combined complete-output hard limit, and at most 16 KiB escaped failure display per stream. Compiling/starting
+`xtask` and its in-process checks are outside that child budget. Cargo build scripts and tests execute repository code,
+inherit network intent, and may have external side effects; this entry point is not an OS sandbox.
+
 `forge evidence run verify` executes the same entry point and records a scope-bound local Receipt. The project override
-allows 45 minutes so Forge retains time around the 44-minute child budget for repository discovery and Receipt
-persistence. That Receipt is optional local evidence, not CI, review, approval, signing, or release authority.
+allows 45 minutes total, including Forge discovery, `xtask` startup and in-process checks, the 44-minute child phase,
+and Receipt persistence. The one-minute difference is a bounded reserve, not a guarantee that every host can finish
+the pre/post work in time. That Receipt is optional local evidence, not CI, review, approval, signing, or release
+authority.
 
 The repository intentionally dogfoods its Cargo commands directly; it does not need a generated Makefile, justfile, or
 Taskfile to build itself. `forge init --with-runner make|just|task` is an explicit product feature for repositories that
 choose a common `verify` entry point, not a reason to introduce a redundant runner here by default.
 
-Focused checks are useful while iterating, but do not replace the complete gates:
+Focused checks are useful while iterating, but do not replace the normal full local gate:
 
 ```bash
 cargo test -p forge-cli --test json_schema_contract

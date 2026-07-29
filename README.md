@@ -97,13 +97,15 @@ working-tree directory.
 
 ## Verify a checkout
 
-Run the required local Cargo gates from the repository root and report their exact exit codes:
+Run the normal full local code gate from the repository root and report its exact exit code:
 
 ```bash
 RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify
 ```
 
-That is the project-owned complete local entry point. Its required steps expand to:
+This is the project-owned local verification entry point, not complete release qualification. Before starting child
+processes it checks all checked-in schemas and required generated fixtures in-process and without rewriting them. It
+then runs these eight required child steps in order, followed by one advisory step:
 
 ```bash
 RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check
@@ -114,12 +116,16 @@ RUSTUP_AUTO_INSTALL=0 cargo test --locked --workspace --no-fail-fast
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check)
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --locked --all-targets)
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --locked --no-fail-fast)
-(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --all-targets) # advisory
-
-RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-schemas
-RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-fixtures
 RUSTUP_AUTO_INSTALL=0 cargo run --locked -p forge-cli -- version
+
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --all-targets) # advisory, always last
 ```
+
+The child phase has one shared 44-minute budget. Each child runs as argv with closed stdin, retains at most 256 KiB
+per stream, and is terminated if combined stdout/stderr exceeds 8 MiB; failed output display is escaped and capped at
+16 KiB per stream. Compiling/starting `xtask` and the in-process schema/fixture checks occur before that child budget.
+Cargo build scripts and tests are repository code: network access and external side effects are inherited, so this
+entry point is not an OS sandbox.
 
 `forge evidence run verify` runs the same command and records optional worktree-local evidence; it does not replace
 independent CI, review, approval, signing, or release authority.
