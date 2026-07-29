@@ -36,7 +36,8 @@ use crate::inventory_cache::{index_projection_digest, prepare_cached_inventory};
 use crate::policy::{PolicyBaseCompleteness, PolicyResolutionError, resolve_effective_policy};
 use crate::repository::{
     RepositoryDetection, RepositoryDetectionError, RepositoryTopology,
-    detect_repository_controlled, detect_repository_from_topology_controlled,
+    confirm_repository_topology_controlled, detect_repository_controlled,
+    detect_repository_from_topology_controlled,
 };
 use crate::resolution::{
     CommandLayer, CommandLayerKind, CommandPlanCandidate, CommandResolutionLayers,
@@ -361,8 +362,10 @@ pub fn detect_project_model_with_cache_controlled(
 
 /// Detects with an already resolved repository topology and the same cache correctness checks.
 ///
-/// The raw index still brackets status and is reconfirmed before accepting or publishing cached
-/// inventory. Only the three immutable topology queries are reused.
+/// The repository root is reused, while both Git state directories are confirmed after status and
+/// again before returning the outcome. A change at either boundary fails closed, so intermediate
+/// cache work cannot be accepted under a stale repository identity. The raw index still brackets
+/// status and is reconfirmed before accepting or publishing cached inventory.
 pub fn detect_project_model_with_cache_from_topology_controlled(
     topology: RepositoryTopology,
     git: &dyn GitPort,
@@ -411,6 +414,10 @@ fn detect_project_model_with_repository_input_controlled(
         control,
     } = execution;
     let start = repository_input.start();
+    let retained_topology = match &repository_input {
+        RepositoryDetectionInput::Resolve(_) => None,
+        RepositoryDetectionInput::Resolved(topology) => Some(topology.clone()),
+    };
     control.checkpoint()?;
     let index_snapshot_before = if inventory_cache.is_some() {
         control.checkpoint()?;
@@ -424,9 +431,17 @@ fn detect_project_model_with_repository_input_controlled(
         RepositoryDetectionInput::Resolve(start) => {
             detect_repository_controlled(start, git, filesystem, hasher, control)
         }
-        RepositoryDetectionInput::Resolved(topology) => {
-            detect_repository_from_topology_controlled(topology, git, filesystem, hasher, control)
-        }
+        RepositoryDetectionInput::Resolved(topology) => detect_repository_from_topology_controlled(
+            topology.clone(),
+            git,
+            filesystem,
+            hasher,
+            control,
+        )
+        .and_then(|repository| {
+            confirm_repository_topology_controlled(&topology, git, control)?;
+            Ok(repository)
+        }),
     }
     .map_err(ModelDetectionError::Repository)?;
     control.checkpoint()?;
@@ -646,7 +661,7 @@ fn detect_project_model_with_repository_input_controlled(
         language.confidence = Confidence::Unknown;
     }
 
-    assemble_project_model(
+    let outcome = assemble_project_model(
         repository,
         inventory,
         standard_assets,
@@ -665,7 +680,12 @@ fn detect_project_model_with_repository_input_controlled(
             publication: inventory_cache_publication,
             navigation_scope_seed,
         },
-    )
+    )?;
+    if let Some(topology) = retained_topology.as_ref() {
+        confirm_repository_topology_controlled(topology, git, control)
+            .map_err(ModelDetectionError::Repository)?;
+    }
+    Ok(outcome)
 }
 
 #[derive(Debug)]
@@ -1874,6 +1894,8 @@ mod tests {
     struct ModelGit {
         git_dir: Result<PathBuf, GitError>,
         git_common_dir: Result<PathBuf, GitError>,
+        git_dir_responses: RefCell<VecDeque<Result<PathBuf, GitError>>>,
+        git_common_dir_responses: RefCell<VecDeque<Result<PathBuf, GitError>>>,
         file_set: GitFileSet,
         index_entries: Vec<GitIndexEntry>,
         index_snapshot: Vec<u8>,
@@ -1894,12 +1916,18 @@ mod tests {
 
         fn git_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
             self.events.borrow_mut().push(ModelGitEvent::GitDir);
-            self.git_dir.clone()
+            self.git_dir_responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| self.git_dir.clone())
         }
 
         fn git_common_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
             self.events.borrow_mut().push(ModelGitEvent::GitCommonDir);
-            self.git_common_dir.clone()
+            self.git_common_dir_responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| self.git_common_dir.clone())
         }
 
         fn status(&self, _root: &Path) -> Result<PorcelainV2Status, GitError> {
@@ -2244,6 +2272,8 @@ mod tests {
         Ok(ModelGit {
             git_dir: Ok(repository_path(".git")),
             git_common_dir: Ok(repository_path(".git")),
+            git_dir_responses: RefCell::new(VecDeque::new()),
+            git_common_dir_responses: RefCell::new(VecDeque::new()),
             file_set,
             index_entries,
             index_snapshot: b"model-index-v1".to_vec(),
@@ -2411,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_resolved_topology_is_reused_without_moving_cache_hit_snapshot_checks()
+    fn pre_resolved_topology_is_confirmed_without_moving_cache_hit_snapshot_checks()
     -> Result<(), Box<dyn std::error::Error>> {
         let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
         let mut git = model_git(&inventory)?;
@@ -2469,11 +2499,172 @@ mod tests {
             [
                 ModelGitEvent::IndexSnapshot,
                 ModelGitEvent::Status,
+                ModelGitEvent::GitDir,
+                ModelGitEvent::GitCommonDir,
                 ModelGitEvent::IndexSnapshot,
                 ModelGitEvent::IndexEntries,
                 ModelGitEvent::IndexSnapshot,
+                ModelGitEvent::GitDir,
+                ModelGitEvent::GitCommonDir,
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_pre_resolved_topology_fails_before_cache_or_inventory_use()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (field, expected_step) in [
+            ("git-dir", "worktree Git directory"),
+            ("git-common-dir", "common Git directory"),
+        ] {
+            let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
+            let mut git = model_git(&inventory)?;
+            git.status = committed_status()?;
+            let control = UnlimitedOperationControl;
+            let topology =
+                resolve_repository_topology_controlled(repository_root(), &git, &control)?;
+            match field {
+                "git-dir" => git.git_dir = Ok(repository_path("replacement.git")),
+                "git-common-dir" => {
+                    git.git_common_dir = Ok(repository_path("replacement-common.git"));
+                }
+                _ => unreachable!(),
+            }
+            git.events.borrow_mut().clear();
+            git.index_snapshot_reads.set(0);
+            git.status_reads.set(0);
+            let filesystem = ModelFileSystem::new(inventory);
+            let process = ModelProcess::default();
+            let cache = ModelInventoryCache::default();
+
+            let result = detect_project_model_with_cache_from_topology_controlled(
+                topology,
+                &git,
+                &filesystem,
+                &process,
+                &ModelHasher,
+                &ModelDetectionOptions::default(),
+                ModelDetectionExecution::new(&control).with_inventory_cache(&cache),
+            );
+
+            let error = match result {
+                Err(ModelDetectionError::Repository(error)) => error,
+                Err(other) => {
+                    return Err(io::Error::other(format!(
+                        "changed {field} returned the wrong error: {other}"
+                    ))
+                    .into());
+                }
+                Ok(_) => {
+                    return Err(io::Error::other(format!(
+                        "changed {field} unexpectedly produced a model"
+                    ))
+                    .into());
+                }
+            };
+            assert_eq!(error.step(), expected_step);
+            assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
+            assert_eq!(
+                git.events.borrow().as_slice(),
+                [
+                    ModelGitEvent::IndexSnapshot,
+                    ModelGitEvent::Status,
+                    ModelGitEvent::GitDir,
+                    ModelGitEvent::GitCommonDir,
+                ]
+            );
+            assert_eq!(git.index_snapshot_reads.get(), 1);
+            assert_eq!(git.status_reads.get(), 1);
+            assert_eq!(cache.loads.get(), 0);
+            assert_eq!(filesystem.inventory_calls.get(), 0);
+            assert!(process.calls.borrow().is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn topology_change_after_cache_work_discards_the_model()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = model_inventory(&[("README.md", InventoryKind::File)]);
+        let mut git = model_git(&inventory)?;
+        git.status = committed_status()?;
+        let filesystem = ModelFileSystem::new(inventory);
+        let process = ModelProcess::default();
+        let cache = ModelInventoryCache::default();
+        let control = UnlimitedOperationControl;
+        let topology = resolve_repository_topology_controlled(repository_root(), &git, &control)?;
+
+        let first = detect_project_model_with_cache_from_topology_controlled(
+            topology.clone(),
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+            ModelDetectionExecution::new(&control).with_inventory_cache(&cache),
+        )?;
+        publish_cached_inventory(
+            &cache,
+            first
+                .inventory_cache_publication
+                .as_ref()
+                .ok_or("stable cache miss did not retain a publication")?,
+        )?;
+        assert_eq!(cache.loads.get(), 1);
+        assert_eq!(filesystem.inventory_calls.get(), 1);
+
+        git.events.borrow_mut().clear();
+        git.index_snapshot_reads.set(0);
+        git.status_reads.set(0);
+        git.git_dir_responses.borrow_mut().extend([
+            Ok(repository_path(".git")),
+            Ok(repository_path("replacement.git")),
+        ]);
+        git.git_common_dir_responses
+            .borrow_mut()
+            .extend([Ok(repository_path(".git")), Ok(repository_path(".git"))]);
+
+        let result = detect_project_model_with_cache_from_topology_controlled(
+            topology,
+            &git,
+            &filesystem,
+            &process,
+            &ModelHasher,
+            &ModelDetectionOptions::default(),
+            ModelDetectionExecution::new(&control).with_inventory_cache(&cache),
+        );
+
+        let error = match result {
+            Err(ModelDetectionError::Repository(error)) => error,
+            Err(other) => {
+                return Err(io::Error::other(format!(
+                    "late topology change returned the wrong error: {other}"
+                ))
+                .into());
+            }
+            Ok(_) => return Err("late topology change unexpectedly produced a model".into()),
+        };
+        assert_eq!(error.step(), "worktree Git directory");
+        assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
+        assert!(!error.to_string().contains("replacement.git"));
+        assert_eq!(
+            cache.loads.get(),
+            2,
+            "the second detection reached cache lookup"
+        );
+        assert_eq!(
+            filesystem.inventory_calls.get(),
+            1,
+            "the second detection reached a cache hit rather than rescanning"
+        );
+        assert!(
+            git.events
+                .borrow()
+                .ends_with(&[ModelGitEvent::GitDir, ModelGitEvent::GitCommonDir])
+        );
+        assert!(git.git_dir_responses.borrow().is_empty());
+        assert!(git.git_common_dir_responses.borrow().is_empty());
         Ok(())
     }
 
@@ -2531,6 +2722,8 @@ mod tests {
         assert!(git.events.borrow().starts_with(&[
             ModelGitEvent::IndexSnapshot,
             ModelGitEvent::Status,
+            ModelGitEvent::GitDir,
+            ModelGitEvent::GitCommonDir,
             ModelGitEvent::IndexSnapshot,
             ModelGitEvent::IndexEntries,
             ModelGitEvent::IndexSnapshot,

@@ -196,6 +196,45 @@ where
     })
 }
 
+/// Confirms that an earlier topology observation still names the same Git state directories.
+///
+/// Callers that retain a topology while establishing process or cache boundaries must perform
+/// this confirmation after observing repository state and before accepting a model or using that
+/// cache. The repository root is deliberately reused; only the two Git-owned locations are
+/// queried again, and either changing fails closed without exposing either path in diagnostics.
+pub(crate) fn confirm_repository_topology_controlled<G>(
+    expected: &RepositoryTopology,
+    git: &G,
+    control: &dyn OperationControl,
+) -> Result<(), RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+{
+    let observed =
+        resolve_repository_topology_from_root_controlled(expected.root.clone(), git, control)?;
+    if observed.git_dir != expected.git_dir {
+        return Err(changed_topology_error("worktree Git directory", "git-dir"));
+    }
+    if observed.git_common_dir != expected.git_common_dir {
+        return Err(changed_topology_error(
+            "common Git directory",
+            "git-common-dir",
+        ));
+    }
+    Ok(())
+}
+
+fn changed_topology_error(step: &'static str, command: &'static str) -> RepositoryDetectionError {
+    RepositoryDetectionError {
+        step,
+        source: GitError::new(
+            GitErrorKind::InvalidData,
+            command,
+            format!("Git returned a different {step} during repository topology confirmation"),
+        ),
+    }
+}
+
 fn require_absolute_topology_path(
     step: &'static str,
     command: &'static str,
