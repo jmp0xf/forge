@@ -1,11 +1,13 @@
 //! Immutable Receipt, Evidence, and log storage with bounded read-only scans and retention.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
@@ -13,15 +15,15 @@ use thiserror::Error;
 use forge_core::{OperationControl, OperationControlError, UnlimitedOperationControl};
 
 use super::{
-    AtomicStateStore, GitStateLayout, StateError, StateLock, ensure_private_directory,
-    metadata_is_link_or_reparse, validate_existing_state_directory, validate_private_directory,
-    validate_private_file_permissions, validate_required_private_state_file,
-    validate_resolved_directory, validate_state_key,
+    AtomicStateStore, GitStateLayout, PrivateStateEntry, StateError, StateLock,
+    ensure_private_directory, metadata_is_link_or_reparse, validate_existing_state_directory,
+    validate_private_directory, validate_private_file_permissions,
+    validate_required_private_state_file, validate_resolved_directory, validate_state_key,
 };
 use crate::fs::{FileSystemError, RepositoryWriter};
 use crate::repository_write::{
-    BeginPrivateQuarantine, OpenPrivateQuarantine, PrivateQuarantine, RepositoryGcCommit,
-    RepositoryGcError,
+    BeginPrivateQuarantine, OpenPrivateQuarantine, PrivateQuarantine, RepositoryDirectoryEntryKind,
+    RepositoryGcCommit, RepositoryGcError,
 };
 
 /// Maximum number of Receipt objects inspected across legacy v1 and current v2 state.
@@ -65,19 +67,54 @@ const RECEIPTS_V2_DIRECTORY: &str = "receipts/v2";
 const EVIDENCE_V1_DIRECTORY: &str = "evidence/v1";
 const EVIDENCE_V2_DIRECTORY: &str = "evidence/v2";
 const LOGS_V1_DIRECTORY: &str = "logs/v1";
-const EVIDENCE_GC_CLASSES: [(&str, &str, usize); 3] = [
-    (EVIDENCE_V2_DIRECTORY, ".json", EVIDENCE_GC_MAX_EVIDENCE),
-    (RECEIPTS_V2_DIRECTORY, ".json", EVIDENCE_GC_MAX_RECEIPTS),
-    (LOGS_V1_DIRECTORY, ".log", EVIDENCE_GC_MAX_LOGS),
+const EVIDENCE_VERSION_DIRECTORY_MAX_ENTRIES: usize = 16;
+const EVIDENCE_GC_CLASSES: [(&str, &str, usize, EvidenceGcResiduePolicy); 5] = [
+    (
+        EVIDENCE_V1_DIRECTORY,
+        ".json",
+        EVIDENCE_GC_MAX_EVIDENCE,
+        EvidenceGcResiduePolicy::LegacyUnsupported,
+    ),
+    (
+        EVIDENCE_V2_DIRECTORY,
+        ".json",
+        EVIDENCE_GC_MAX_EVIDENCE,
+        EvidenceGcResiduePolicy::CurrentRecoverable,
+    ),
+    (
+        RECEIPTS_V1_DIRECTORY,
+        ".json",
+        EVIDENCE_GC_MAX_RECEIPTS,
+        EvidenceGcResiduePolicy::LegacyUnsupported,
+    ),
+    (
+        RECEIPTS_V2_DIRECTORY,
+        ".json",
+        EVIDENCE_GC_MAX_RECEIPTS,
+        EvidenceGcResiduePolicy::CurrentRecoverable,
+    ),
+    (
+        LOGS_V1_DIRECTORY,
+        ".log",
+        EVIDENCE_GC_MAX_LOGS,
+        EvidenceGcResiduePolicy::CurrentRecoverable,
+    ),
 ];
 const GC_QUARANTINE_PREFIX: &str = ".forge-gc-quarantine-";
 #[cfg(all(test, unix))]
 const GC_QUARANTINE_OBJECT: &str = "object";
 const LEGACY_GC_RESIDUE_UNSUPPORTED: &str = "legacy directory-shaped evidence GC residue is unsupported; all bytes were preserved; back up the private state and recover the original object manually before retrying";
+const LEGACY_CLASS_FILE_GC_RESIDUE_UNSUPPORTED: &str = "same-directory evidence GC quarantine file in a legacy read-only class is unsupported; all bytes were preserved; back up the private state and recover the original object manually before retrying";
 const LOG_IDENTITY_DOMAIN: &[u8] = b"forge.log-identity/v1";
 const DIGEST_FRAMING_DOMAIN: &[u8] = b"forge.digest/v1\0";
 const MINIMUM_SUPPORTED_UTC_YEAR: u32 = 1970;
 const MAXIMUM_SUPPORTED_UTC_YEAR: u32 = 9_999;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceGcResiduePolicy {
+    LegacyUnsupported,
+    CurrentRecoverable,
+}
 
 /// A frozen immutable-object layout version understood by the v0 retention engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -772,7 +809,7 @@ impl AtomicStateStore {
     ) -> Result<EvidenceGcReport, StateError> {
         self.ensure_matching_lock(lock)?;
         ensure_evidence_state_mutation_supported()?;
-        recover_evidence_gc_quarantines(self)?;
+        recover_evidence_gc_quarantines(self, now, decoder)?;
 
         let key = pending.key();
         let relative = validate_state_key(&key)?;
@@ -785,7 +822,7 @@ impl AtomicStateStore {
             return self.collect_evidence_garbage_with_root(lock, now, decoder, Some(&key));
         }
 
-        let projected = build_evidence_gc_plan(self, now, decoder, Some(&pending), None)?;
+        let projected = build_evidence_gc_plan(self, now, decoder, Some(&pending), None, None)?;
         projected.ensure_prewrite_fits(&pending)?;
 
         store_new_atomic_idempotent_evidence(self, &key, &relative, pending.bytes())?;
@@ -866,6 +903,7 @@ impl AtomicStateStore {
                 &item.object_name,
                 item.size,
                 item.snapshot.as_ref(),
+                item.class_directory.as_ref(),
                 RECEIPT_OBJECT_MAX_BYTES,
                 &mut visit,
             )?;
@@ -881,6 +919,7 @@ impl AtomicStateStore {
                 &item.object_name,
                 item.size,
                 item.snapshot.as_ref(),
+                item.class_directory.as_ref(),
                 EVIDENCE_OBJECT_MAX_BYTES,
                 &mut visit,
             )?;
@@ -896,6 +935,7 @@ impl AtomicStateStore {
                 &item.object_name,
                 item.size,
                 item.snapshot.as_ref(),
+                item.class_directory.as_ref(),
                 configured_log_max_bytes,
                 &mut visit,
             )?;
@@ -932,8 +972,8 @@ impl AtomicStateStore {
     ) -> Result<EvidenceGcReport, StateError> {
         self.ensure_matching_lock(lock)?;
         ensure_evidence_state_mutation_supported()?;
-        recover_evidence_gc_quarantines(self)?;
-        let plan = build_evidence_gc_plan(self, now, decoder, None, forced_root)?;
+        recover_evidence_gc_quarantines(self, now, decoder)?;
+        let plan = build_evidence_gc_plan(self, now, decoder, None, forced_root, None)?;
         preflight_deletions(self, &plan)?;
         apply_evidence_gc_plan(self, &plan)
     }
@@ -1028,6 +1068,7 @@ struct StoredDocument<M> {
     size: u64,
     metadata: M,
     snapshot: Option<StateFileSnapshot>,
+    class_directory: Option<Arc<File>>,
     pending: bool,
 }
 
@@ -1037,6 +1078,7 @@ struct StoredLog {
     object_name: EvidenceStateObjectName,
     size: u64,
     snapshot: Option<StateFileSnapshot>,
+    class_directory: Option<Arc<File>>,
     pending: bool,
 }
 
@@ -1048,11 +1090,12 @@ struct ScannedEvidenceState {
     budget: EvidenceScanBudget,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PlannedDeletion {
     key: String,
     size: u64,
     snapshot: StateFileSnapshot,
+    class_directory: Arc<File>,
 }
 
 #[derive(Debug, Default)]
@@ -1144,7 +1187,7 @@ fn scan_evidence_state<D: EvidenceStateMetadataDecoder + ?Sized>(
     store: &AtomicStateStore,
     decoder: &D,
 ) -> Result<ScannedEvidenceState, StateError> {
-    scan_evidence_state_controlled(store, decoder, &UnlimitedOperationControl)
+    scan_evidence_state_controlled_with_overlay(store, decoder, &UnlimitedOperationControl, None)
 }
 
 fn scan_evidence_state_controlled<D: EvidenceStateMetadataDecoder + ?Sized>(
@@ -1152,18 +1195,41 @@ fn scan_evidence_state_controlled<D: EvidenceStateMetadataDecoder + ?Sized>(
     decoder: &D,
     control: &dyn OperationControl,
 ) -> Result<ScannedEvidenceState, StateError> {
+    scan_evidence_state_controlled_with_overlay(store, decoder, control, None)
+}
+
+fn scan_evidence_state_controlled_with_overlay<D: EvidenceStateMetadataDecoder + ?Sized>(
+    store: &AtomicStateStore,
+    decoder: &D,
+    control: &dyn OperationControl,
+    overlay: Option<&EvidenceGcOverlay<'_>>,
+) -> Result<ScannedEvidenceState, StateError> {
     control
         .checkpoint()
         .map_err(operation_control_state_error)?;
     validate_evidence_root(store)?;
-    validate_version_hierarchy(store, "receipts", &["v1", "v2"])?;
-    validate_version_hierarchy(store, "evidence", &["v1", "v2"])?;
-    validate_version_hierarchy(store, "logs", &["v1"])?;
+    let receipt_directories = validate_version_hierarchy(store, "receipts", &["v1", "v2"])?;
+    let evidence_directories = validate_version_hierarchy(store, "evidence", &["v1", "v2"])?;
+    let log_directories = validate_version_hierarchy(store, "logs", &["v1"])?;
 
     let mut budget = EvidenceScanBudget::default();
-    let receipts = scan_receipt_files(store, decoder, &mut budget, control)?;
-    let evidence = scan_evidence_files(store, decoder, &mut budget, control)?;
-    let logs = scan_log_files(store, &mut budget, control)?;
+    let receipts = scan_receipt_files(
+        store,
+        decoder,
+        &receipt_directories,
+        &mut budget,
+        control,
+        overlay,
+    )?;
+    let evidence = scan_evidence_files(
+        store,
+        decoder,
+        &evidence_directories,
+        &mut budget,
+        control,
+        overlay,
+    )?;
+    let logs = scan_log_files(store, &log_directories, &mut budget, control, overlay)?;
     charge_reference_budget(&mut budget, &receipts, &evidence, logs.len())?;
     Ok(ScannedEvidenceState {
         receipts,
@@ -1272,13 +1338,22 @@ fn build_evidence_gc_plan<D: EvidenceStateMetadataDecoder + ?Sized>(
     decoder: &D,
     pending: Option<&PendingEvidenceObject<'_>>,
     forced_root: Option<&str>,
+    overlay: Option<&EvidenceGcOverlay<'_>>,
 ) -> Result<EvidenceGcPlan, StateError> {
     let ScannedEvidenceState {
         mut receipts,
         mut evidence,
         mut logs,
         mut budget,
-    } = scan_evidence_state(store, decoder)?;
+    } = match overlay {
+        Some(overlay) => scan_evidence_state_controlled_with_overlay(
+            store,
+            decoder,
+            &UnlimitedOperationControl,
+            Some(overlay),
+        )?,
+        None => scan_evidence_state(store, decoder)?,
+    };
 
     if let Some(pending) = pending {
         let pending_size =
@@ -1300,6 +1375,7 @@ fn build_evidence_gc_plan<D: EvidenceStateMetadataDecoder + ?Sized>(
                     size: pending_size,
                     metadata: metadata.clone(),
                     snapshot: None,
+                    class_directory: None,
                     pending: true,
                 });
             }
@@ -1324,6 +1400,7 @@ fn build_evidence_gc_plan<D: EvidenceStateMetadataDecoder + ?Sized>(
                     size: pending_size,
                     metadata: metadata.clone(),
                     snapshot: None,
+                    class_directory: None,
                     pending: true,
                 });
             }
@@ -1332,6 +1409,7 @@ fn build_evidence_gc_plan<D: EvidenceStateMetadataDecoder + ?Sized>(
                 object_name: object_name.clone(),
                 size: pending_size,
                 snapshot: None,
+                class_directory: None,
                 pending: true,
             }),
         }
@@ -1474,20 +1552,240 @@ fn build_evidence_gc_plan<D: EvidenceStateMetadataDecoder + ?Sized>(
     })
 }
 
+#[derive(Debug)]
+struct ListedEvidenceObject {
+    version: EvidenceStateVersion,
+    key: String,
+    object_name: EvidenceStateObjectName,
+    source_relative: PathBuf,
+    expected_identity: Option<StateFileIdentity>,
+    class_directory: Arc<File>,
+    listed: PrivateStateEntry,
+}
+
+#[derive(Debug)]
+struct EvidenceVersionDirectory {
+    object: Arc<File>,
+}
+
+struct EvidenceGcOverlay<'a> {
+    residues: BTreeMap<&'a str, &'a EvidenceGcResidue>,
+    snapshots: RefCell<BTreeMap<String, StateFileSnapshot>>,
+}
+
+impl<'a> EvidenceGcOverlay<'a> {
+    fn new(residues: &'a [EvidenceGcResidue]) -> Result<Self, StateError> {
+        let mut by_key = BTreeMap::new();
+        for residue in residues {
+            if by_key.insert(residue.key.as_str(), residue).is_some() {
+                return Err(StateError::InvalidLayout {
+                    path: residue.quarantine.clone(),
+                    reason: "immutable evidence GC state contains duplicate logical residues"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            residues: by_key,
+            snapshots: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    fn get(&self, key: &str) -> Option<&'a EvidenceGcResidue> {
+        self.residues.get(key).copied()
+    }
+
+    fn record_snapshot(&self, key: &str, snapshot: &StateFileSnapshot) -> Result<(), StateError> {
+        if self
+            .snapshots
+            .borrow_mut()
+            .insert(key.to_owned(), snapshot.clone())
+            .is_some()
+        {
+            return Err(StateError::StateChanged {
+                key: key.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn into_snapshots(self) -> BTreeMap<String, StateFileSnapshot> {
+        self.snapshots.into_inner()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObservedEvidenceGcResidue {
+    original: bool,
+    quarantine: bool,
+}
+
+fn scan_class_keys(
+    store: &AtomicStateStore,
+    version: EvidenceStateVersion,
+    directory: &str,
+    extension: &str,
+    class_directory: &EvidenceVersionDirectory,
+    max_entries: usize,
+    overlay: Option<&EvidenceGcOverlay<'_>>,
+) -> Result<Vec<ListedEvidenceObject>, StateError> {
+    let physical_max_entries = max_entries
+        .checked_mul(2)
+        .ok_or(StateError::StateSizeOverflow)?;
+    let relative = validate_state_key(directory)?;
+    let entries = store
+        .list_private_entries_bounded_inner(
+            directory,
+            &relative,
+            Some(&class_directory.object),
+            physical_max_entries,
+        )?
+        .entries;
+    let mut files = Vec::new();
+    let mut observed = BTreeMap::<String, ObservedEvidenceGcResidue>::new();
+    for entry in entries {
+        let path = store.layout.worktree_dir().join(&entry.relative);
+        if is_evidence_gc_quarantine_name(entry.relative.file_name().unwrap_or_default()) {
+            if entry.kind == RepositoryDirectoryEntryKind::Directory {
+                return Err(unsupported_legacy_evidence_gc_residue_error(&path));
+            }
+            let (key, object_name) =
+                quarantine_logical_object_name(directory, extension, &entry.key, &path)?;
+            let Some(residue) = overlay.and_then(|overlay| overlay.get(&key)) else {
+                if overlay.is_some() {
+                    return Err(StateError::StateChanged { key });
+                }
+                return Err(StateError::InvalidLayout {
+                    path,
+                    reason: "immutable evidence GC residue requires held-lock recovery".to_owned(),
+                });
+            };
+            let state = observed.entry(key.clone()).or_default();
+            if state.quarantine {
+                return Err(StateError::StateChanged { key });
+            }
+            state.quarantine = true;
+            if residue.variant == EvidenceGcResidueVariant::QuarantineOnly {
+                files.push(listed_evidence_object(
+                    version,
+                    key,
+                    object_name,
+                    entry,
+                    Some(residue.initial_identity.clone()),
+                ));
+            }
+            continue;
+        }
+        if entry.kind != RepositoryDirectoryEntryKind::RegularFile {
+            return Err(StateError::InvalidLayout {
+                path,
+                reason: "listed state directory contains a non-regular entry".to_owned(),
+            });
+        }
+        let key = entry.key.clone();
+        let object_name = object_name_from_key(&key, extension)?;
+        let expected_identity = if let Some(residue) = overlay.and_then(|overlay| overlay.get(&key))
+        {
+            let state = observed.entry(key.clone()).or_default();
+            if state.original || residue.variant == EvidenceGcResidueVariant::QuarantineOnly {
+                return Err(StateError::StateChanged { key });
+            }
+            state.original = true;
+            Some(residue.initial_identity.clone())
+        } else {
+            None
+        };
+        files.push(listed_evidence_object(
+            version,
+            key,
+            object_name,
+            entry,
+            expected_identity,
+        ));
+    }
+
+    if let Some(overlay) = overlay {
+        for residue in overlay
+            .residues
+            .values()
+            .copied()
+            .filter(|residue| residue.directory == relative)
+        {
+            let state = observed.get(&residue.key);
+            let stable = matches!(
+                (residue.variant, state),
+                (
+                    EvidenceGcResidueVariant::QuarantineOnly,
+                    Some(ObservedEvidenceGcResidue {
+                        original: false,
+                        quarantine: true,
+                    }),
+                ) | (
+                    EvidenceGcResidueVariant::DuplicateSameIdentity,
+                    Some(ObservedEvidenceGcResidue {
+                        original: true,
+                        quarantine: true,
+                    }),
+                )
+            );
+            if !stable {
+                return Err(StateError::StateChanged {
+                    key: residue.key.clone(),
+                });
+            }
+        }
+    }
+    files.sort_by(|left, right| left.key.cmp(&right.key));
+    if files.len() > max_entries {
+        return Err(StateError::EntryLimit {
+            directory: directory.to_owned(),
+            max_entries,
+        });
+    }
+    Ok(files)
+}
+
+fn listed_evidence_object(
+    version: EvidenceStateVersion,
+    key: String,
+    object_name: EvidenceStateObjectName,
+    listed: PrivateStateEntry,
+    expected_identity: Option<StateFileIdentity>,
+) -> ListedEvidenceObject {
+    ListedEvidenceObject {
+        version,
+        key,
+        object_name,
+        source_relative: listed.relative.clone(),
+        expected_identity,
+        class_directory: Arc::clone(&listed.parent),
+        listed,
+    }
+}
+
 fn scan_document_keys(
     store: &AtomicStateStore,
     directories: &[(EvidenceStateVersion, &str)],
+    version_directories: &BTreeMap<String, EvidenceVersionDirectory>,
     max_entries: usize,
-) -> Result<Vec<(EvidenceStateVersion, String, EvidenceStateObjectName)>, StateError> {
+    overlay: Option<&EvidenceGcOverlay<'_>>,
+) -> Result<Vec<ListedEvidenceObject>, StateError> {
     let mut files = Vec::new();
     for (version, directory) in directories {
+        let version_name = format!("v{}", version.major());
+        let Some(version_directory) = version_directories.get(&version_name) else {
+            continue;
+        };
         let remaining = max_entries.saturating_sub(files.len());
-        let relative = validate_state_key(directory)?;
-        let keys = store.list_regular_keys_bounded_inner(directory, &relative, remaining)?;
-        for key in keys {
-            let object_name = object_name_from_key(&key, ".json")?;
-            files.push((*version, key, object_name));
-        }
+        files.extend(scan_class_keys(
+            store,
+            *version,
+            directory,
+            ".json",
+            version_directory,
+            remaining,
+            overlay,
+        )?);
     }
     Ok(files)
 }
@@ -1495,8 +1793,10 @@ fn scan_document_keys(
 fn scan_receipt_files<D: EvidenceStateMetadataDecoder + ?Sized>(
     store: &AtomicStateStore,
     decoder: &D,
+    version_directories: &BTreeMap<String, EvidenceVersionDirectory>,
     budget: &mut EvidenceScanBudget,
     control: &dyn OperationControl,
+    overlay: Option<&EvidenceGcOverlay<'_>>,
 ) -> Result<Vec<StoredDocument<ReceiptRetentionMetadata>>, StateError> {
     let files = scan_document_keys(
         store,
@@ -1504,14 +1804,35 @@ fn scan_receipt_files<D: EvidenceStateMetadataDecoder + ?Sized>(
             (EvidenceStateVersion::V1, RECEIPTS_V1_DIRECTORY),
             (EvidenceStateVersion::V2, RECEIPTS_V2_DIRECTORY),
         ],
+        version_directories,
         EVIDENCE_GC_MAX_RECEIPTS,
+        overlay,
     )?;
     let mut receipts = Vec::with_capacity(files.len());
-    for (version, key, object_name) in files {
+    for listed in files {
         control
             .checkpoint()
             .map_err(operation_control_state_error)?;
-        let file = read_private_state_file_bounded(store, &key, RECEIPT_OBJECT_MAX_BYTES, budget)?;
+        let key = listed.key;
+        let version = listed.version;
+        let object_name = listed.object_name;
+        let class_directory = listed.class_directory;
+        let file = read_private_state_file_bounded(
+            store,
+            &key,
+            &listed.source_relative,
+            store.open_listed_private_entry(&listed.listed)?,
+            &class_directory,
+            RECEIPT_OBJECT_MAX_BYTES,
+            budget,
+        )?;
+        if listed
+            .expected_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &file.snapshot.identity)
+        {
+            return Err(StateError::StateChanged { key });
+        }
         let metadata = decoder
             .decode_receipt(version, &file.bytes)
             .map_err(|reason| StateError::ObjectDecode {
@@ -1520,6 +1841,11 @@ fn scan_receipt_files<D: EvidenceStateMetadataDecoder + ?Sized>(
             })?;
         ensure_declared_identity(&key, &object_name, &metadata.object_name)?;
         validate_retention_time(version, metadata.started_at, &key)?;
+        if listed.expected_identity.is_some() {
+            overlay
+                .ok_or_else(|| StateError::StateChanged { key: key.clone() })?
+                .record_snapshot(&key, &file.snapshot)?;
+        }
         receipts.push(StoredDocument {
             key,
             version,
@@ -1527,6 +1853,7 @@ fn scan_receipt_files<D: EvidenceStateMetadataDecoder + ?Sized>(
             size: file.snapshot.identity.size,
             metadata,
             snapshot: Some(file.snapshot),
+            class_directory: Some(class_directory),
             pending: false,
         });
     }
@@ -1536,8 +1863,10 @@ fn scan_receipt_files<D: EvidenceStateMetadataDecoder + ?Sized>(
 fn scan_evidence_files<D: EvidenceStateMetadataDecoder + ?Sized>(
     store: &AtomicStateStore,
     decoder: &D,
+    version_directories: &BTreeMap<String, EvidenceVersionDirectory>,
     budget: &mut EvidenceScanBudget,
     control: &dyn OperationControl,
+    overlay: Option<&EvidenceGcOverlay<'_>>,
 ) -> Result<Vec<StoredDocument<EvidenceRetentionMetadata>>, StateError> {
     let files = scan_document_keys(
         store,
@@ -1545,14 +1874,35 @@ fn scan_evidence_files<D: EvidenceStateMetadataDecoder + ?Sized>(
             (EvidenceStateVersion::V1, EVIDENCE_V1_DIRECTORY),
             (EvidenceStateVersion::V2, EVIDENCE_V2_DIRECTORY),
         ],
+        version_directories,
         EVIDENCE_GC_MAX_EVIDENCE,
+        overlay,
     )?;
     let mut evidence = Vec::with_capacity(files.len());
-    for (version, key, object_name) in files {
+    for listed in files {
         control
             .checkpoint()
             .map_err(operation_control_state_error)?;
-        let file = read_private_state_file_bounded(store, &key, EVIDENCE_OBJECT_MAX_BYTES, budget)?;
+        let key = listed.key;
+        let version = listed.version;
+        let object_name = listed.object_name;
+        let class_directory = listed.class_directory;
+        let file = read_private_state_file_bounded(
+            store,
+            &key,
+            &listed.source_relative,
+            store.open_listed_private_entry(&listed.listed)?,
+            &class_directory,
+            EVIDENCE_OBJECT_MAX_BYTES,
+            budget,
+        )?;
+        if listed
+            .expected_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &file.snapshot.identity)
+        {
+            return Err(StateError::StateChanged { key });
+        }
         let metadata = decoder
             .decode_evidence(version, &file.bytes)
             .map_err(|reason| StateError::ObjectDecode {
@@ -1561,6 +1911,11 @@ fn scan_evidence_files<D: EvidenceStateMetadataDecoder + ?Sized>(
             })?;
         ensure_declared_identity(&key, &object_name, &metadata.object_name)?;
         validate_retention_time(version, metadata.created_at, &key)?;
+        if listed.expected_identity.is_some() {
+            overlay
+                .ok_or_else(|| StateError::StateChanged { key: key.clone() })?
+                .record_snapshot(&key, &file.snapshot)?;
+        }
         evidence.push(StoredDocument {
             key,
             version,
@@ -1568,6 +1923,7 @@ fn scan_evidence_files<D: EvidenceStateMetadataDecoder + ?Sized>(
             size: file.snapshot.identity.size,
             metadata,
             snapshot: Some(file.snapshot),
+            class_directory: Some(class_directory),
             pending: false,
         });
     }
@@ -1576,30 +1932,62 @@ fn scan_evidence_files<D: EvidenceStateMetadataDecoder + ?Sized>(
 
 fn scan_log_files(
     store: &AtomicStateStore,
+    version_directories: &BTreeMap<String, EvidenceVersionDirectory>,
     budget: &mut EvidenceScanBudget,
     control: &dyn OperationControl,
+    overlay: Option<&EvidenceGcOverlay<'_>>,
 ) -> Result<Vec<StoredLog>, StateError> {
-    let relative = validate_state_key(LOGS_V1_DIRECTORY)?;
-    let keys = store.list_regular_keys_bounded_inner(
+    let Some(version_directory) = version_directories.get("v1") else {
+        return Ok(Vec::new());
+    };
+    let entries = scan_class_keys(
+        store,
+        EvidenceStateVersion::V1,
         LOGS_V1_DIRECTORY,
-        &relative,
+        ".log",
+        version_directory,
         EVIDENCE_GC_MAX_LOGS,
+        overlay,
     )?;
-    let mut logs = Vec::with_capacity(keys.len());
-    for key in keys {
+    let mut logs = Vec::with_capacity(entries.len());
+    for listed in entries {
         control
             .checkpoint()
             .map_err(operation_control_state_error)?;
-        let object_name = object_name_from_key(&key, ".log")?;
-        let (snapshot, content_address) = stream_private_state_file(store, &key, budget, true)?;
+        let key = listed.key;
+        let object_name = listed.object_name;
+        let class_directory = listed.class_directory;
+        let object = store.open_listed_private_entry(&listed.listed)?;
+        let (snapshot, content_address) = stream_listed_private_state_file(
+            store,
+            &key,
+            &listed.source_relative,
+            object,
+            &class_directory,
+            budget,
+            true,
+        )?;
+        if listed
+            .expected_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &snapshot.identity)
+        {
+            return Err(StateError::StateChanged { key });
+        }
         if content_address.as_deref() != Some(object_name.as_str()) {
             return Err(StateError::ObjectContentAddressMismatch { key });
+        }
+        if listed.expected_identity.is_some() {
+            overlay
+                .ok_or_else(|| StateError::StateChanged { key: key.clone() })?
+                .record_snapshot(&key, &snapshot)?;
         }
         logs.push(StoredLog {
             key,
             object_name,
             size: snapshot.identity.size,
             snapshot: Some(snapshot),
+            class_directory: Some(class_directory),
             pending: false,
         });
     }
@@ -1610,48 +1998,61 @@ fn validate_version_hierarchy(
     store: &AtomicStateStore,
     parent: &str,
     allowed_versions: &[&str],
-) -> Result<(), StateError> {
+) -> Result<BTreeMap<String, EvidenceVersionDirectory>, StateError> {
     let relative = validate_state_key(parent)?;
-    let Some(path) = validate_existing_state_directory(store.layout.worktree_dir(), &relative)?
-    else {
-        return Ok(());
-    };
-    let parent_metadata = fs::symlink_metadata(&path)
-        .map_err(|source| StateError::io("inspect immutable state hierarchy", &path, source))?;
-    validate_private_evidence_directory(&path, &parent_metadata)?;
-    for entry in fs::read_dir(&path)
-        .map_err(|source| StateError::io("list immutable state hierarchy", &path, source))?
-    {
-        let entry = entry
-            .map_err(|source| StateError::io("read immutable state hierarchy", &path, source))?;
-        let entry_path = entry.path();
-        let metadata = fs::symlink_metadata(&entry_path).map_err(|source| {
-            StateError::io("inspect immutable state hierarchy", &entry_path, source)
+    let listing = store.list_private_entries_bounded_inner(
+        parent,
+        &relative,
+        None,
+        EVIDENCE_VERSION_DIRECTORY_MAX_ENTRIES,
+    )?;
+    if let Some(parent_directory) = &listing.directory {
+        let parent_path = store.layout.worktree_dir().join(&relative);
+        let metadata = parent_directory.metadata().map_err(|source| {
+            StateError::io(
+                "inspect opened immutable evidence kind directory",
+                &parent_path,
+                source,
+            )
         })?;
-        if metadata_is_link_or_reparse(&metadata) {
-            return Err(StateError::PathSafety(FileSystemError::SymlinkComponent {
-                path: entry_path,
-            }));
-        }
-        if !metadata.is_dir() {
+        validate_private_evidence_directory_handle(parent_directory, &parent_path, &metadata)?;
+    }
+    let entries = listing.entries;
+    let mut versions = BTreeMap::new();
+    for entry in entries {
+        let entry_path = store.layout.worktree_dir().join(&entry.relative);
+        if entry.kind != RepositoryDirectoryEntryKind::Directory {
             return Err(StateError::InvalidLayout {
                 path: entry_path,
                 reason: "immutable state kind contains a non-version directory entry".to_owned(),
             });
         }
         let version = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| StateError::InvalidLayout {
-                path: entry.path(),
-                reason: "immutable state versions must use portable ASCII names".to_owned(),
-            })?;
+            .key
+            .rsplit('/')
+            .next()
+            .unwrap_or(&entry.key)
+            .to_owned();
         if !allowed_versions.contains(&version.as_str()) {
-            return Err(StateError::UnsupportedEvidenceStateVersion { path: entry.path() });
+            return Err(StateError::UnsupportedEvidenceStateVersion { path: entry_path });
         }
-        validate_private_evidence_directory(&entry.path(), &metadata)?;
+        let object = store.open_listed_private_entry(&entry)?;
+        let metadata = object.metadata().map_err(|source| {
+            StateError::io(
+                "inspect opened immutable evidence version directory",
+                &entry_path,
+                source,
+            )
+        })?;
+        validate_private_evidence_directory_handle(&object, &entry_path, &metadata)?;
+        versions.insert(
+            version,
+            EvidenceVersionDirectory {
+                object: Arc::new(object),
+            },
+        );
     }
-    Ok(())
+    Ok(versions)
 }
 
 fn object_name_from_key(key: &str, extension: &str) -> Result<EvidenceStateObjectName, StateError> {
@@ -1668,6 +2069,28 @@ fn object_name_from_key(key: &str, extension: &str) -> Result<EvidenceStateObjec
     })
 }
 
+fn quarantine_logical_object_name(
+    directory: &str,
+    extension: &str,
+    quarantine_key: &str,
+    quarantine_path: &Path,
+) -> Result<(String, EvidenceStateObjectName), StateError> {
+    let name = quarantine_key.rsplit('/').next().unwrap_or(quarantine_key);
+    let digest =
+        name.strip_prefix(GC_QUARANTINE_PREFIX)
+            .ok_or_else(|| StateError::InvalidLayout {
+                path: quarantine_path.to_path_buf(),
+                reason: "evidence GC quarantine has an invalid deterministic name".to_owned(),
+            })?;
+    let object_name =
+        EvidenceStateObjectName::new(digest.to_owned()).map_err(|_| StateError::InvalidLayout {
+            path: quarantine_path.to_path_buf(),
+            reason: "evidence GC quarantine has a non-canonical object identity".to_owned(),
+        })?;
+    let key = format!("{directory}/{}{extension}", object_name.as_str());
+    Ok((key, object_name))
+}
+
 #[derive(Debug)]
 struct ReadStateFile {
     bytes: Vec<u8>,
@@ -1677,29 +2100,24 @@ struct ReadStateFile {
 fn read_private_state_file_bounded(
     store: &AtomicStateStore,
     key: &str,
+    source_relative: &Path,
+    mut file: File,
+    class_directory: &File,
     max_bytes: usize,
     budget: &mut EvidenceScanBudget,
 ) -> Result<ReadStateFile, StateError> {
-    let Some((path, path_metadata)) = resolve_existing_private_state_file(store, key)? else {
-        return Err(StateError::StateChanged {
-            key: key.to_owned(),
-        });
-    };
-    validate_private_regular_file(&path, &path_metadata)?;
-    if path_metadata.len() > max_bytes as u64 {
+    let path = store.layout.worktree_dir().join(source_relative);
+    let open_metadata = file
+        .metadata()
+        .map_err(|source| StateError::io("inspect opened immutable state object", &path, source))?;
+    validate_private_regular_file_handle(&path, &file, &open_metadata)?;
+    if open_metadata.len() > max_bytes as u64 {
         return Err(StateError::ObjectTooLarge {
             key: key.to_owned(),
             max_bytes,
         });
     }
-    budget.charge_bytes(key, path_metadata.len())?;
-
-    let mut file = open_private_state_file(&path)?;
-    let open_metadata = file
-        .metadata()
-        .map_err(|source| StateError::io("inspect opened immutable state object", &path, source))?;
-    validate_private_regular_file(&path, &open_metadata)?;
-    ensure_same_file_identity(key, &path_metadata, &open_metadata)?;
+    budget.charge_bytes(key, open_metadata.len())?;
 
     let capacity = usize::try_from(open_metadata.len())
         .map_err(|_| StateError::StateSizeOverflow)?
@@ -1726,7 +2144,15 @@ fn read_private_state_file_bounded(
         identity: state_file_identity(&open_metadata),
         content_digest: *blake3::hash(&bytes).as_bytes(),
     };
-    verify_open_file_still_names_path(key, &path, &file, &snapshot)?;
+    let final_metadata = file.metadata().map_err(|source| {
+        StateError::io("reinspect opened immutable state object", &path, source)
+    })?;
+    validate_private_regular_file_handle(&path, &file, &final_metadata)?;
+    ensure_same_file_identity(key, &open_metadata, &final_metadata)?;
+    store
+        .writer
+        .validate_open_regular_from(source_relative, class_directory, &file)
+        .map_err(StateError::PathSafety)?;
     Ok(ReadStateFile { bytes, snapshot })
 }
 
@@ -1803,22 +2229,70 @@ fn existing_private_file_matches_with_hook(
     Ok(Some(true))
 }
 
-fn stream_private_state_file(
+fn stream_listed_private_state_file(
     store: &AtomicStateStore,
     key: &str,
+    source_relative: &Path,
+    mut file: File,
+    class_directory: &File,
     budget: &mut EvidenceScanBudget,
     compute_log_identity: bool,
 ) -> Result<(StateFileSnapshot, Option<String>), StateError> {
-    let Some((path, path_metadata)) = resolve_existing_private_state_file(store, key)? else {
-        return Err(StateError::StateChanged {
-            key: key.to_owned(),
-        });
+    let path = store.layout.worktree_dir().join(source_relative);
+    let open_metadata = file
+        .metadata()
+        .map_err(|source| StateError::io("inspect opened immutable state object", &path, source))?;
+    validate_private_regular_file_handle(&path, &file, &open_metadata)?;
+    budget.charge_bytes(key, open_metadata.len())?;
+
+    let mut raw_hasher = blake3::Hasher::new();
+    let mut log_hasher = compute_log_identity.then(|| {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(DIGEST_FRAMING_DOMAIN);
+        update_framed_digest_chunk(&mut hasher, LOG_IDENTITY_DOMAIN);
+        hasher.update(&open_metadata.len().to_le_bytes());
+        hasher
+    });
+    let mut remaining = open_metadata.len();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| StateError::StateSizeOverflow)?;
+        let count = file
+            .read(&mut buffer[..limit])
+            .map_err(|source| StateError::io("read immutable state object", &path, source))?;
+        if count == 0 {
+            return Err(StateError::StateChanged {
+                key: key.to_owned(),
+            });
+        }
+        let chunk = &buffer[..count];
+        raw_hasher.update(chunk);
+        if let Some(hasher) = &mut log_hasher {
+            hasher.update(chunk);
+        }
+        remaining -= u64::try_from(count).map_err(|_| StateError::StateSizeOverflow)?;
+    }
+    let snapshot = StateFileSnapshot {
+        identity: state_file_identity(&open_metadata),
+        content_digest: *raw_hasher.finalize().as_bytes(),
     };
-    validate_private_regular_file(&path, &path_metadata)?;
-    budget.charge_bytes(key, path_metadata.len())?;
-    stream_opened_private_state_file(key, &path, &path_metadata, compute_log_identity)
+    let final_metadata = file.metadata().map_err(|source| {
+        StateError::io("reinspect opened immutable state object", &path, source)
+    })?;
+    validate_private_regular_file_handle(&path, &file, &final_metadata)?;
+    ensure_same_file_identity(key, &open_metadata, &final_metadata)?;
+    store
+        .writer
+        .validate_open_regular_from(source_relative, class_directory, &file)
+        .map_err(StateError::PathSafety)?;
+    Ok((
+        snapshot,
+        log_hasher.map(|hasher| hasher.finalize().to_hex().to_string()),
+    ))
 }
 
+#[cfg(all(test, unix))]
 fn snapshot_private_state_file(
     store: &AtomicStateStore,
     key: &str,
@@ -1831,6 +2305,59 @@ fn snapshot_private_state_file(
     validate_private_regular_file(&path, &path_metadata)?;
     stream_opened_private_state_file(key, &path, &path_metadata, false)
         .map(|(snapshot, _)| snapshot)
+}
+
+fn snapshot_planned_private_state_file(
+    store: &AtomicStateStore,
+    object: &PlannedDeletion,
+) -> Result<StateFileSnapshot, StateError> {
+    let relative = validate_state_key(&object.key)?;
+    let path = store.layout.worktree_dir().join(&relative);
+    let mut file = store
+        .writer
+        .open_regular_from(&relative, &object.class_directory)
+        .map_err(StateError::PathSafety)?
+        .ok_or_else(|| StateError::StateChanged {
+            key: object.key.clone(),
+        })?;
+    let open_metadata = file.metadata().map_err(|source| {
+        StateError::io(
+            "inspect planned immutable state object capability",
+            &path,
+            source,
+        )
+    })?;
+    validate_private_regular_file_handle(&path, &file, &open_metadata)?;
+    let digest = SnapshotReader {
+        file: &mut file,
+        remaining: open_metadata.len(),
+        hasher: blake3::Hasher::new(),
+    }
+    .finish()
+    .map_err(|source| {
+        StateError::io(
+            "read planned immutable state object capability",
+            &path,
+            source,
+        )
+    })?;
+    let final_metadata = file.metadata().map_err(|source| {
+        StateError::io(
+            "reinspect planned immutable state object capability",
+            &path,
+            source,
+        )
+    })?;
+    validate_private_regular_file_handle(&path, &file, &final_metadata)?;
+    ensure_same_file_identity(&object.key, &open_metadata, &final_metadata)?;
+    store
+        .writer
+        .validate_open_regular_from(&relative, &object.class_directory, &file)
+        .map_err(StateError::PathSafety)?;
+    Ok(StateFileSnapshot {
+        identity: state_file_identity(&open_metadata),
+        content_digest: digest,
+    })
 }
 
 struct SnapshotReader<'a> {
@@ -1877,6 +2404,7 @@ fn visit_scanned_object<F>(
     object_name: &EvidenceStateObjectName,
     size: u64,
     expected: Option<&StateFileSnapshot>,
+    class_directory: Option<&Arc<File>>,
     max_bytes: usize,
     visit: &mut F,
 ) -> Result<(), StateError>
@@ -1886,30 +2414,33 @@ where
     let expected = expected.ok_or_else(|| StateError::StateChanged {
         key: key.to_owned(),
     })?;
+    let class_directory = class_directory.ok_or_else(|| StateError::StateChanged {
+        key: key.to_owned(),
+    })?;
     if size > max_bytes as u64 {
         return Err(StateError::ObjectTooLarge {
             key: key.to_owned(),
             max_bytes,
         });
     }
-    let Some((path, path_metadata)) = resolve_existing_private_state_file(store, key)? else {
-        return Err(StateError::StateChanged {
+    let relative = validate_state_key(key)?;
+    let path = store.layout.worktree_dir().join(&relative);
+    let mut file = store
+        .writer
+        .open_regular_from(&relative, class_directory)
+        .map_err(StateError::PathSafety)?
+        .ok_or_else(|| StateError::StateChanged {
             key: key.to_owned(),
-        });
-    };
-    validate_private_regular_file(&path, &path_metadata)?;
-    if state_file_identity(&path_metadata) != expected.identity {
+        })?;
+    let open_metadata = file
+        .metadata()
+        .map_err(|source| StateError::io("inspect opened immutable state object", &path, source))?;
+    validate_private_regular_file_handle(&path, &file, &open_metadata)?;
+    if state_file_identity(&open_metadata) != expected.identity {
         return Err(StateError::StateChanged {
             key: key.to_owned(),
         });
     }
-
-    let mut file = open_private_state_file(&path)?;
-    let open_metadata = file
-        .metadata()
-        .map_err(|source| StateError::io("inspect opened immutable state object", &path, source))?;
-    validate_private_regular_file(&path, &open_metadata)?;
-    ensure_same_file_identity(key, &path_metadata, &open_metadata)?;
 
     let mut reader = SnapshotReader {
         file: &mut file,
@@ -1932,9 +2463,22 @@ where
             key: key.to_owned(),
         });
     }
-    verify_open_file_still_names_path(key, &path, &file, expected)
+    let final_metadata = file.metadata().map_err(|source| {
+        StateError::io("reinspect opened immutable state object", &path, source)
+    })?;
+    validate_private_regular_file_handle(&path, &file, &final_metadata)?;
+    if state_file_identity(&final_metadata) != expected.identity {
+        return Err(StateError::StateChanged {
+            key: key.to_owned(),
+        });
+    }
+    store
+        .writer
+        .validate_open_regular_from(&relative, class_directory, &file)
+        .map_err(StateError::PathSafety)
 }
 
+#[cfg(all(test, unix))]
 fn stream_opened_private_state_file(
     key: &str,
     path: &Path,
@@ -1950,6 +2494,7 @@ fn stream_opened_private_state_file(
     )
 }
 
+#[cfg(test)]
 fn stream_opened_private_state_file_with_hook(
     key: &str,
     path: &Path,
@@ -2302,13 +2847,6 @@ pub(super) fn is_evidence_gc_quarantine_name(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|name| name.starts_with(GC_QUARANTINE_PREFIX))
 }
 
-pub(super) fn validate_legacy_evidence_gc_residue(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), StateError> {
-    validate_private_evidence_directory(path, metadata)
-}
-
 pub(super) fn unsupported_legacy_evidence_gc_residue_error(path: &Path) -> StateError {
     StateError::InvalidLayout {
         path: path.to_path_buf(),
@@ -2428,10 +2966,16 @@ fn planned_deletions<M>(
                 .ok_or_else(|| StateError::StateChanged {
                     key: item.key.clone(),
                 })?;
+            let class_directory = Arc::clone(item.class_directory.as_ref().ok_or_else(|| {
+                StateError::StateChanged {
+                    key: item.key.clone(),
+                }
+            })?);
             Ok(PlannedDeletion {
                 key: item.key.clone(),
                 size: item.size,
                 snapshot,
+                class_directory,
             })
         })
         .collect()
@@ -2444,10 +2988,19 @@ fn planned_log_deletion(item: &StoredLog) -> Result<PlannedDeletion, StateError>
         .ok_or_else(|| StateError::StateChanged {
             key: item.key.clone(),
         })?;
+    let class_directory =
+        Arc::clone(
+            item.class_directory
+                .as_ref()
+                .ok_or_else(|| StateError::StateChanged {
+                    key: item.key.clone(),
+                })?,
+        );
     Ok(PlannedDeletion {
         key: item.key.clone(),
         size: item.size,
         snapshot,
+        class_directory,
     })
 }
 
@@ -2506,7 +3059,7 @@ fn preflight_deletions(store: &AtomicStateStore, plan: &EvidenceGcPlan) -> Resul
         .chain(&plan.delete_receipts)
         .chain(&plan.delete_logs)
     {
-        if snapshot_private_state_file(store, &object.key)? != object.snapshot {
+        if snapshot_planned_private_state_file(store, object)? != object.snapshot {
             return Err(StateError::StateChanged {
                 key: object.key.clone(),
             });
@@ -2558,28 +3111,13 @@ fn remove_regular_state_file_with_hook(
     object: &PlannedDeletion,
     before_quarantine: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), StateError> {
-    if snapshot_private_state_file(store, &object.key)? != object.snapshot {
+    if snapshot_planned_private_state_file(store, object)? != object.snapshot {
         return Err(StateError::StateChanged {
             key: object.key.clone(),
         });
     }
     let relative = validate_state_key(&object.key)?;
-    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    validate_evidence_ancestor_permissions(store.layout.worktree_dir(), parent)?;
     let path = store.layout.worktree_dir().join(&relative);
-    let final_metadata = fs::symlink_metadata(&path).map_err(|source| {
-        StateError::io(
-            "reinspect immutable state object before removal",
-            &path,
-            source,
-        )
-    })?;
-    validate_private_regular_file(&path, &final_metadata)?;
-    if state_file_identity(&final_metadata) != object.snapshot.identity {
-        return Err(StateError::StateChanged {
-            key: object.key.clone(),
-        });
-    }
 
     let parent_path = path.parent().ok_or_else(|| StateError::InvalidLayout {
         path: path.clone(),
@@ -2592,7 +3130,7 @@ fn remove_regular_state_file_with_hook(
         .map_err(|source| StateError::io("run evidence GC race hook", &path, source))?;
     let mut quarantine = match store
         .writer
-        .begin_private_quarantine(&relative, quarantine_leaf.as_ref())
+        .begin_private_quarantine_from(&relative, &object.class_directory, quarantine_leaf.as_ref())
         .map_err(|error| {
             repository_gc_state_error(
                 "atomically quarantine expired immutable state object",
@@ -2759,30 +3297,117 @@ fn gc_quarantine_leaf(key: &str) -> Result<String, StateError> {
     Ok(format!("{GC_QUARANTINE_PREFIX}{}", object_name.as_str()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvidenceGcRecoveryAction {
-    RestoreObject,
-    FinishRestore,
-}
-
 #[derive(Debug)]
 struct EvidenceGcResidue {
     key: String,
+    directory: PathBuf,
     quarantine: PathBuf,
-    object_identity: StateFileIdentity,
+    original_leaf: String,
+    quarantine_leaf: String,
+    variant: EvidenceGcResidueVariant,
+    initial_identity: StateFileIdentity,
+    validated_snapshot: Option<StateFileSnapshot>,
+    class_directory: Arc<File>,
 }
 
-fn recover_evidence_gc_quarantines(store: &AtomicStateStore) -> Result<(), StateError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceGcResidueVariant {
+    QuarantineOnly,
+    DuplicateSameIdentity,
+}
+
+#[derive(Debug, Default)]
+struct EvidenceGcRecoveryBudget {
+    bytes: u64,
+}
+
+impl EvidenceGcRecoveryBudget {
+    fn charge(&mut self, key: &str, bytes: u64) -> Result<(), StateError> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(StateError::StateSizeOverflow)?;
+        if self.bytes > EVIDENCE_GC_MAX_SCAN_BYTES {
+            return Err(StateError::ScanByteLimit {
+                key: key.to_owned(),
+                scanned_bytes: self.bytes,
+                max_bytes: EVIDENCE_GC_MAX_SCAN_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn recover_evidence_gc_quarantines<D: EvidenceStateMetadataDecoder + ?Sized>(
+    store: &AtomicStateStore,
+    now: SystemTime,
+    decoder: &D,
+) -> Result<(), StateError> {
     validate_evidence_root(store)?;
+    let receipt_directories = validate_version_hierarchy(store, "receipts", &["v1", "v2"])?;
+    let evidence_directories = validate_version_hierarchy(store, "evidence", &["v1", "v2"])?;
+    let log_directories = validate_version_hierarchy(store, "logs", &["v1"])?;
     let mut residues = Vec::new();
-    for (directory, extension, max_objects) in EVIDENCE_GC_CLASSES {
-        inspect_evidence_gc_residues(store, directory, extension, max_objects, &mut residues)?;
+    for (directory, extension, max_objects, policy) in EVIDENCE_GC_CLASSES {
+        let class_directory = match directory {
+            EVIDENCE_V1_DIRECTORY => evidence_directories.get("v1"),
+            EVIDENCE_V2_DIRECTORY => evidence_directories.get("v2"),
+            RECEIPTS_V1_DIRECTORY => receipt_directories.get("v1"),
+            RECEIPTS_V2_DIRECTORY => receipt_directories.get("v2"),
+            LOGS_V1_DIRECTORY => log_directories.get("v1"),
+            _ => None,
+        };
+        if let Some(class_directory) = class_directory {
+            inspect_evidence_gc_residues(
+                store,
+                directory,
+                extension,
+                max_objects,
+                policy,
+                &class_directory.object,
+                &mut residues,
+            )?;
+        }
     }
 
     // Validate every residue before the first recovery mutation. Stable ordering keeps failures
     // reproducible and prevents directory enumeration order from changing the recovered subset.
     residues.sort_by(|left, right| left.quarantine.cmp(&right.quarantine));
-    for residue in &residues {
+    let mut snapshots = {
+        let overlay = EvidenceGcOverlay::new(&residues)?;
+        let _logical_plan =
+            build_evidence_gc_plan(store, now, decoder, None, None, Some(&overlay))?;
+        overlay.into_snapshots()
+    };
+    for residue in &mut residues {
+        let snapshot = snapshots
+            .remove(&residue.key)
+            .ok_or_else(|| StateError::StateChanged {
+                key: residue.key.clone(),
+            })?;
+        if snapshot.identity != residue.initial_identity {
+            return Err(StateError::StateChanged {
+                key: residue.key.clone(),
+            });
+        }
+        residue.validated_snapshot = Some(snapshot);
+    }
+    if let Some((key, _)) = snapshots.pop_first() {
+        return Err(StateError::StateChanged { key });
+    }
+    let mut verification_budget = EvidenceGcRecoveryBudget::default();
+    for residue in residues {
+        verification_budget.charge(
+            &residue.key,
+            residue
+                .validated_snapshot
+                .as_ref()
+                .ok_or_else(|| StateError::StateChanged {
+                    key: residue.key.clone(),
+                })?
+                .identity
+                .size,
+        )?;
         recover_evidence_gc_residue(store, residue)?;
     }
     Ok(())
@@ -2867,73 +3492,87 @@ fn inspect_evidence_gc_residues(
     directory: &str,
     extension: &str,
     max_objects: usize,
+    policy: EvidenceGcResiduePolicy,
+    class_directory: &File,
     residues: &mut Vec<EvidenceGcResidue>,
 ) -> Result<(), StateError> {
     let relative = validate_state_key(directory)?;
-    let Some(parent) = validate_existing_state_directory(store.layout.worktree_dir(), &relative)?
-    else {
-        return Ok(());
-    };
-    validate_evidence_ancestor_permissions(store.layout.worktree_dir(), &relative)?;
-
     let max_entries = max_objects
         .checked_mul(2)
         .ok_or(StateError::StateSizeOverflow)?;
-    let mut entries_seen = 0_usize;
-    for entry in fs::read_dir(&parent)
-        .map_err(|source| StateError::io("list evidence GC recovery directory", &parent, source))?
-    {
-        let entry = entry
-            .map_err(|source| StateError::io("read evidence GC recovery entry", &parent, source))?;
-        entries_seen = entries_seen
-            .checked_add(1)
-            .ok_or(StateError::StateSizeOverflow)?;
-        if entries_seen > max_entries {
-            return Err(StateError::EntryLimit {
-                directory: directory.to_owned(),
-                max_entries,
-            });
-        }
-        if !is_evidence_gc_quarantine_name(&entry.file_name()) {
+    let entries = store
+        .list_private_entries_bounded_inner(
+            directory,
+            &relative,
+            Some(class_directory),
+            max_entries,
+        )?
+        .entries;
+    for entry in entries {
+        let path = store.layout.worktree_dir().join(&entry.relative);
+        if !is_evidence_gc_quarantine_name(entry.relative.file_name().unwrap_or_default()) {
+            if entry.kind != RepositoryDirectoryEntryKind::RegularFile {
+                return Err(StateError::InvalidLayout {
+                    path,
+                    reason: "listed state directory contains a non-regular entry".to_owned(),
+                });
+            }
+            object_name_from_key(&entry.key, extension)?;
             continue;
         }
 
-        let quarantine = entry.path();
-        let metadata = fs::symlink_metadata(&quarantine).map_err(|source| {
-            StateError::io("inspect evidence GC recovery residue", &quarantine, source)
-        })?;
-        if !metadata.is_file() {
-            validate_legacy_evidence_gc_residue(&quarantine, &metadata)?;
+        let quarantine = path;
+        if entry.kind != RepositoryDirectoryEntryKind::RegularFile {
             return Err(unsupported_legacy_evidence_gc_residue_error(&quarantine));
         }
-        validate_private_regular_file(&quarantine, &metadata)?;
-        let name = entry
+        if policy == EvidenceGcResiduePolicy::LegacyUnsupported {
+            return Err(StateError::InvalidLayout {
+                path: quarantine,
+                reason: LEGACY_CLASS_FILE_GC_RESIDUE_UNSUPPORTED.to_owned(),
+            });
+        }
+        let (key, object_name) =
+            quarantine_logical_object_name(directory, extension, &entry.key, &quarantine)?;
+        let original_leaf = format!("{}{extension}", object_name.as_str());
+        let quarantine_leaf = quarantine
             .file_name()
-            .into_string()
-            .map_err(|_| StateError::InvalidLayout {
+            .ok_or_else(|| StateError::InvalidLayout {
                 path: quarantine.clone(),
-                reason: "evidence GC quarantine name must use portable ASCII".to_owned(),
-            })?;
-        let digest =
-            name.strip_prefix(GC_QUARANTINE_PREFIX)
-                .ok_or_else(|| StateError::InvalidLayout {
-                    path: quarantine.clone(),
-                    reason: "evidence GC quarantine has an invalid deterministic name".to_owned(),
-                })?;
-        let object_name = EvidenceStateObjectName::new(digest.to_owned()).map_err(|_| {
-            StateError::InvalidLayout {
-                path: quarantine.clone(),
-                reason: "evidence GC quarantine has a non-canonical object identity".to_owned(),
+                reason: "evidence GC quarantine has no filename".to_owned(),
+            })?
+            .to_string_lossy()
+            .into_owned();
+        let class_directory = Arc::clone(&entry.parent);
+        let mut quarantine_state = open_evidence_gc_quarantine(
+            store,
+            &relative,
+            &class_directory,
+            &original_leaf,
+            &quarantine_leaf,
+            &key,
+            &quarantine,
+        )?;
+        let variant = match &quarantine_state {
+            OpenPrivateQuarantine::Missing => {
+                return Err(StateError::StateChanged { key });
             }
-        })?;
-        let key = format!("{directory}/{}{extension}", object_name.as_str());
-        let original = parent.join(format!("{}{extension}", object_name.as_str()));
-        let object_identity = state_file_identity(&metadata);
-        evidence_gc_recovery_action(&key, &original, &metadata)?;
+            OpenPrivateQuarantine::QuarantineOnly(_) => EvidenceGcResidueVariant::QuarantineOnly,
+            OpenPrivateQuarantine::DuplicateSameIdentity(_) => {
+                EvidenceGcResidueVariant::DuplicateSameIdentity
+            }
+        };
+        let initial_identity =
+            inspect_open_evidence_gc_quarantine_identity(&key, &quarantine, &mut quarantine_state)?;
         residues.push(EvidenceGcResidue {
             key,
+            directory: relative.clone(),
             quarantine,
-            object_identity,
+            original_leaf,
+            quarantine_leaf,
+            variant,
+            initial_identity,
+            validated_snapshot: None,
+            class_directory,
         });
     }
     Ok(())
@@ -2944,193 +3583,176 @@ fn preflight_read_only_evidence_gc_residues(
     control: &dyn OperationControl,
 ) -> Result<(), StateError> {
     validate_evidence_root(store)?;
-    for (directory, _, max_objects) in EVIDENCE_GC_CLASSES {
+    for (directory, extension, max_objects, policy) in EVIDENCE_GC_CLASSES {
         let relative = validate_state_key(directory)?;
-        let Some(parent) =
-            validate_existing_state_directory(store.layout.worktree_dir(), &relative)?
-        else {
-            continue;
-        };
-        validate_evidence_ancestor_permissions(store.layout.worktree_dir(), &relative)?;
-
         let max_entries = max_objects
             .checked_mul(2)
             .ok_or(StateError::StateSizeOverflow)?;
-        let mut entries_seen = 0_usize;
-        for entry in fs::read_dir(&parent).map_err(|source| {
-            StateError::io(
-                "list read-only evidence GC recovery directory",
-                &parent,
-                source,
-            )
-        })? {
+        let entries = store
+            .list_private_entries_bounded_inner(directory, &relative, None, max_entries)?
+            .entries;
+        for entry in entries {
             control
                 .checkpoint()
                 .map_err(operation_control_state_error)?;
-            let entry = entry.map_err(|source| {
-                StateError::io("read evidence GC recovery entry", &parent, source)
-            })?;
-            entries_seen = entries_seen
-                .checked_add(1)
-                .ok_or(StateError::StateSizeOverflow)?;
-            if entries_seen > max_entries {
-                return Err(StateError::EntryLimit {
-                    directory: directory.to_owned(),
-                    max_entries,
-                });
-            }
-            if !is_evidence_gc_quarantine_name(&entry.file_name()) {
+            let path = store.layout.worktree_dir().join(&entry.relative);
+            if !is_evidence_gc_quarantine_name(entry.relative.file_name().unwrap_or_default()) {
+                if entry.kind != RepositoryDirectoryEntryKind::RegularFile {
+                    return Err(StateError::InvalidLayout {
+                        path,
+                        reason: "listed state directory contains a non-regular entry".to_owned(),
+                    });
+                }
+                object_name_from_key(&entry.key, extension)?;
                 continue;
             }
 
-            let quarantine = entry.path();
-            let metadata = fs::symlink_metadata(&quarantine).map_err(|source| {
-                StateError::io("inspect evidence GC recovery residue", &quarantine, source)
-            })?;
-            if metadata.is_file() {
-                validate_private_regular_file(&quarantine, &metadata)?;
+            if entry.kind != RepositoryDirectoryEntryKind::RegularFile {
+                return Err(unsupported_legacy_evidence_gc_residue_error(&path));
+            }
+            if policy == EvidenceGcResiduePolicy::CurrentRecoverable {
                 continue;
             }
-            validate_legacy_evidence_gc_residue(&quarantine, &metadata)?;
-            return Err(unsupported_legacy_evidence_gc_residue_error(&quarantine));
+            return Err(StateError::InvalidLayout {
+                path,
+                reason: LEGACY_CLASS_FILE_GC_RESIDUE_UNSUPPORTED.to_owned(),
+            });
         }
     }
     Ok(())
-}
-
-fn evidence_gc_recovery_action(
-    key: &str,
-    original: &Path,
-    object_metadata: &fs::Metadata,
-) -> Result<EvidenceGcRecoveryAction, StateError> {
-    match fs::symlink_metadata(original) {
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            Ok(EvidenceGcRecoveryAction::RestoreObject)
-        }
-        Err(source) => Err(StateError::io(
-            "inspect original path during evidence GC recovery",
-            original,
-            source,
-        )),
-        Ok(original_metadata) => {
-            validate_private_regular_file(original, &original_metadata)?;
-            if !same_file_object(object_metadata, &original_metadata) {
-                return Err(StateError::InvalidLayout {
-                    path: original.to_path_buf(),
-                    reason: format!(
-                        "held-lock recovery found a conflicting original for quarantined `{key}`; both objects were retained"
-                    ),
-                });
-            }
-            Ok(EvidenceGcRecoveryAction::FinishRestore)
-        }
-    }
 }
 
 fn recover_evidence_gc_residue(
     store: &AtomicStateStore,
-    residue: &EvidenceGcResidue,
+    residue: EvidenceGcResidue,
 ) -> Result<(), StateError> {
-    recover_same_directory_evidence_gc_residue(store, residue)
-}
-
-fn recover_same_directory_evidence_gc_residue(
-    store: &AtomicStateStore,
-    residue: &EvidenceGcResidue,
-) -> Result<(), StateError> {
-    let relative = validate_state_key(&residue.key)?;
-    let directory = relative.parent().ok_or_else(|| StateError::InvalidLayout {
-        path: residue.quarantine.clone(),
-        reason: "evidence GC recovery key has no parent directory".to_owned(),
-    })?;
-    let original_leaf = relative
-        .file_name()
-        .ok_or_else(|| StateError::InvalidLayout {
-            path: residue.quarantine.clone(),
-            reason: "evidence GC recovery key has no filename".to_owned(),
-        })?;
-    let quarantine_leaf =
+    let validated_snapshot =
         residue
-            .quarantine
-            .file_name()
-            .ok_or_else(|| StateError::InvalidLayout {
-                path: residue.quarantine.clone(),
-                reason: "evidence GC quarantine has no filename".to_owned(),
-            })?;
-
-    let (mut quarantine, current_action) = match store
-        .writer
-        .open_private_quarantine(directory, original_leaf, quarantine_leaf)
-        .map_err(|error| {
-            repository_gc_state_error(
-                "open immutable evidence GC recovery residue",
-                &residue.quarantine,
-                error,
-            )
-        })? {
-        OpenPrivateQuarantine::Missing => {
-            return Err(StateError::StateChanged {
+            .validated_snapshot
+            .as_ref()
+            .ok_or_else(|| StateError::StateChanged {
                 key: residue.key.clone(),
-            });
-        }
+            })?;
+    let mut quarantine_state = open_evidence_gc_quarantine(
+        store,
+        &residue.directory,
+        &residue.class_directory,
+        &residue.original_leaf,
+        &residue.quarantine_leaf,
+        &residue.key,
+        &residue.quarantine,
+    )?;
+    let reopened = snapshot_open_evidence_gc_quarantine_with_size(
+        &residue.key,
+        &residue.quarantine,
+        &mut quarantine_state,
+        validated_snapshot.identity.size,
+    )?;
+    if &reopened != validated_snapshot {
+        return Err(StateError::StateChanged { key: residue.key });
+    }
+    match quarantine_state {
+        OpenPrivateQuarantine::Missing => Err(StateError::StateChanged { key: residue.key }),
         OpenPrivateQuarantine::QuarantineOnly(quarantine) => {
-            (quarantine, EvidenceGcRecoveryAction::RestoreObject)
+            quarantine.restore().map_err(|error| {
+                repository_gc_state_error(
+                    "restore quarantined immutable state object",
+                    &residue.quarantine,
+                    error,
+                )
+            })
         }
         OpenPrivateQuarantine::DuplicateSameIdentity(quarantine) => {
-            (quarantine, EvidenceGcRecoveryAction::FinishRestore)
+            quarantine.delete().map_err(|error| {
+                repository_gc_state_error(
+                    "remove duplicate immutable evidence GC residue",
+                    &residue.quarantine,
+                    error,
+                )
+            })
         }
-    };
-    verify_private_quarantine_identity(residue, &mut quarantine)?;
-
-    match current_action {
-        EvidenceGcRecoveryAction::RestoreObject => quarantine.restore().map_err(|error| {
-            repository_gc_state_error(
-                "restore quarantined immutable state object",
-                &residue.quarantine,
-                error,
-            )
-        }),
-        EvidenceGcRecoveryAction::FinishRestore => quarantine.delete().map_err(|error| {
-            repository_gc_state_error(
-                "remove duplicate immutable evidence GC residue",
-                &residue.quarantine,
-                error,
-            )
-        }),
     }
 }
 
-fn verify_private_quarantine_identity(
-    residue: &EvidenceGcResidue,
-    quarantine: &mut PrivateQuarantine,
-) -> Result<(), StateError> {
+fn open_evidence_gc_quarantine(
+    store: &AtomicStateStore,
+    directory: &Path,
+    class_directory: &File,
+    original_leaf: &str,
+    quarantine_leaf: &str,
+    key: &str,
+    quarantine: &Path,
+) -> Result<OpenPrivateQuarantine, StateError> {
+    let original = quarantine
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(original_leaf);
+    store
+        .writer
+        .open_private_quarantine_from(
+            directory,
+            class_directory,
+            original_leaf.as_ref(),
+            quarantine_leaf.as_ref(),
+        )
+        .map_err(|error| {
+            if error.commit() == RepositoryGcCommit::NotChanged
+                && error.io_kind() == io::ErrorKind::AlreadyExists
+            {
+                StateError::InvalidLayout {
+                    path: original,
+                    reason: format!(
+                        "held-lock recovery found a conflicting original for quarantined `{key}`; both objects were retained"
+                    ),
+                }
+            } else {
+                repository_gc_state_error(
+                    "open immutable evidence GC recovery residue",
+                    quarantine,
+                    error,
+                )
+            }
+        })
+}
+
+fn inspect_open_evidence_gc_quarantine_identity(
+    key: &str,
+    path: &Path,
+    quarantine_state: &mut OpenPrivateQuarantine,
+) -> Result<StateFileIdentity, StateError> {
+    let quarantine = match quarantine_state {
+        OpenPrivateQuarantine::Missing => {
+            return Err(StateError::StateChanged {
+                key: key.to_owned(),
+            });
+        }
+        OpenPrivateQuarantine::QuarantineOnly(quarantine)
+        | OpenPrivateQuarantine::DuplicateSameIdentity(quarantine) => quarantine,
+    };
     let file = quarantine.object_file();
     let metadata = file.metadata().map_err(|source| {
-        StateError::io(
-            "reinspect evidence GC recovery object handle",
-            &residue.quarantine,
-            source,
-        )
+        StateError::io("inspect evidence GC recovery object handle", path, source)
     })?;
-    validate_private_regular_file_handle(&residue.quarantine, file, &metadata)?;
-    if residue.object_identity != state_file_identity(&metadata) {
-        return Err(StateError::StateChanged {
-            key: residue.key.clone(),
-        });
-    }
-    Ok(())
+    validate_private_regular_file_handle(path, file, &metadata)?;
+    Ok(state_file_identity(&metadata))
 }
 
-#[cfg(unix)]
-fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    state_file_identity(left) == state_file_identity(right)
+fn snapshot_open_evidence_gc_quarantine_with_size(
+    key: &str,
+    path: &Path,
+    quarantine_state: &mut OpenPrivateQuarantine,
+    expected_size: u64,
+) -> Result<StateFileSnapshot, StateError> {
+    let quarantine = match quarantine_state {
+        OpenPrivateQuarantine::Missing => {
+            return Err(StateError::StateChanged {
+                key: key.to_owned(),
+            });
+        }
+        OpenPrivateQuarantine::QuarantineOnly(quarantine)
+        | OpenPrivateQuarantine::DuplicateSameIdentity(quarantine) => quarantine,
+    };
+    snapshot_private_quarantine_file(key, path, quarantine.object_file(), expected_size)
 }
 
 #[cfg(target_os = "macos")]
@@ -3245,6 +3867,13 @@ fn open_extended_acl_target(path: &Path) -> Result<File, StateError> {
     })
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
 #[cfg(target_os = "macos")]
 fn validate_no_extended_acl_path(path: &Path, expected: &fs::Metadata) -> Result<(), StateError> {
     let file = open_extended_acl_target(path)?;
@@ -3291,6 +3920,30 @@ pub(super) fn validate_private_directory_acl(
         expected,
         super::windows_acl_policy::PrivateWindowsObjectKind::Directory,
     )
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn validate_private_directory_handle_acl(
+    directory: &File,
+    path: &Path,
+) -> Result<(), StateError> {
+    macos_acl::reject_extended_acl(directory, path)
+}
+
+#[cfg(windows)]
+pub(super) fn validate_private_directory_handle_acl(
+    directory: &File,
+    path: &Path,
+) -> Result<(), StateError> {
+    super::windows::validate_owner_only_directory_handle(directory, path)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(super) fn validate_private_directory_handle_acl(
+    _directory: &File,
+    _path: &Path,
+) -> Result<(), StateError> {
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -3408,6 +4061,29 @@ fn validate_private_evidence_directory(
     validate_private_evidence_directory_permissions(path, metadata)
 }
 
+pub(super) fn validate_private_evidence_directory_handle(
+    directory: &File,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    validate_private_directory(path, metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 || mode & 0o700 != 0o700 {
+            return Err(StateError::InvalidLayout {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "private evidence directory mode {mode:o} must grant owner rwx and no group or other access"
+                ),
+            });
+        }
+    }
+    validate_private_directory_handle_acl(directory, path)
+}
+
 #[cfg(unix)]
 fn validate_private_evidence_directory_permissions(
     path: &Path,
@@ -3461,8 +4137,10 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     #[cfg(unix)]
@@ -3484,9 +4162,10 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
-        EvidenceGcPlan, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX, LEGACY_GC_RESIDUE_UNSUPPORTED,
-        PlannedDeletion, ReferenceClosure, apply_evidence_gc_plan, gc_quarantine_path,
-        preflight_deletions, remove_regular_state_file_with_hook, snapshot_private_state_file,
+        EvidenceGcPlan, GC_QUARANTINE_OBJECT, GC_QUARANTINE_PREFIX,
+        LEGACY_CLASS_FILE_GC_RESIDUE_UNSUPPORTED, LEGACY_GC_RESIDUE_UNSUPPORTED, PlannedDeletion,
+        ReferenceClosure, apply_evidence_gc_plan, gc_quarantine_path, preflight_deletions,
+        remove_regular_state_file_with_hook, snapshot_private_state_file,
         store_new_atomic_idempotent_evidence_with_hook,
     };
     #[cfg(unix)]
@@ -3572,6 +4251,33 @@ mod tests {
         fs::create_dir(&git_dir)?;
         let store = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir))?;
         Ok((temporary, store))
+    }
+
+    #[cfg(unix)]
+    fn planned_deletion_fixture(
+        store: &AtomicStateStore,
+        key: &str,
+        size: u64,
+    ) -> Result<PlannedDeletion, StateError> {
+        let relative = validate_state_key(key)?;
+        let path = store.layout().worktree_dir().join(&relative);
+        let parent = path.parent().ok_or_else(|| StateError::InvalidLayout {
+            path: path.clone(),
+            reason: "planned deletion fixture has no class directory".to_owned(),
+        })?;
+        let class_directory = fs::File::open(parent).map_err(|source| {
+            StateError::io(
+                "open planned deletion fixture class directory",
+                parent,
+                source,
+            )
+        })?;
+        Ok(PlannedDeletion {
+            key: key.to_owned(),
+            size,
+            snapshot: snapshot_private_state_file(store, key)?,
+            class_directory: Arc::new(class_directory),
+        })
     }
 
     fn object_name(value: u64) -> Result<EvidenceStateObjectName, Box<dyn Error>> {
@@ -3742,6 +4448,33 @@ mod tests {
             locked_security_before
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn locked_gc_error_preserves_complete_private_tree(
+        snapshot_root: &Path,
+        store: &AtomicStateStore,
+        now: SystemTime,
+        decoder: &FixtureDecoder,
+    ) -> Result<StateError, Box<dyn Error>> {
+        let lock = store.try_lock()?;
+        let before = filesystem_snapshot(snapshot_root)?;
+        let security_before = private_state_security_snapshot(store.layout().worktree_dir())?;
+        let error = match store.collect_evidence_garbage(&lock, now, decoder) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "held-lock GC accepted state that should fail before mutation",
+                )
+                .into());
+            }
+        };
+        assert_eq!(filesystem_snapshot(snapshot_root)?, before);
+        assert_eq!(
+            private_state_security_snapshot(store.layout().worktree_dir())?,
+            security_before
+        );
+        Ok(error)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -4234,6 +4967,131 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn current_quarantine_and_unexpected_entry_fail_before_any_recovery_mutation()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let (_, log_key, _) = store_fixture_log(&store, b"recover only after full preflight")?;
+        let log_path = store.layout().worktree_dir().join(&log_key);
+        let parent = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?;
+        let quarantine = parent.join(gc_quarantine_leaf(&log_key)?);
+        fs::rename(&log_path, &quarantine)?;
+        write_private_test_file(&parent.join("unexpected.log"), b"unknown state")?;
+
+        let error = locked_gc_error_preserves_complete_private_tree(
+            temporary.path(),
+            &store,
+            now,
+            &FixtureDecoder::default(),
+        )?;
+        assert!(matches!(error, StateError::InvalidLayout { .. }));
+        assert!(!log_path.exists());
+        assert!(quarantine.is_file());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_quarantine_and_malformed_document_fail_before_residue_deletion()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let (_, log_key, _) = store_fixture_log(&store, b"duplicate retained until decode")?;
+        let log_path = store.layout().worktree_dir().join(&log_key);
+        let quarantine = log_path
+            .parent()
+            .ok_or_else(|| io::Error::other("log fixture has no parent"))?
+            .join(gc_quarantine_leaf(&log_key)?);
+        fs::hard_link(&log_path, &quarantine)?;
+        let malformed_key = receipt_state_key(EvidenceStateVersion::V2, &object_name(90_001)?);
+        store_immutable_fixture(&store, &malformed_key, b"malformed")?;
+
+        let error = locked_gc_error_preserves_complete_private_tree(
+            temporary.path(),
+            &store,
+            now,
+            &FixtureDecoder::default(),
+        )?;
+        assert!(matches!(
+            error,
+            StateError::ObjectDecode {
+                reason: EvidenceStateDecodeError::Malformed,
+                ..
+            }
+        ));
+        assert!(quarantine.is_file());
+        assert!(super::same_file_object(
+            &fs::symlink_metadata(log_path)?,
+            &fs::symlink_metadata(quarantine)?,
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_sparse_quarantine_fails_before_content_read_or_namespace_mutation()
+    -> Result<(), Box<dyn Error>> {
+        const SPARSE_SIZE: u64 = 100 * 1024 * 1024 * 1024;
+
+        let (_temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut decoder = FixtureDecoder::default();
+        let evidence_name = object_name(90_002)?;
+        let (evidence_key, _) = store_fixture_evidence(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            evidence_name,
+            EvidenceRetentionTime::Current(now.into()),
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let evidence_path = store.layout().worktree_dir().join(&evidence_key);
+        let parent = evidence_path
+            .parent()
+            .ok_or_else(|| io::Error::other("evidence fixture has no parent"))?;
+        let quarantine = parent.join(gc_quarantine_leaf(&evidence_key)?);
+        fs::rename(&evidence_path, &quarantine)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&quarantine)?
+            .set_len(SPARSE_SIZE)?;
+        let lock = store.try_lock()?;
+        let names_before = directory_names(parent)?;
+        let identity_before = filesystem_snapshot_identity(&fs::symlink_metadata(&quarantine)?);
+        let security_before = private_state_security_snapshot(store.layout().worktree_dir())?;
+
+        let error = match store.collect_evidence_garbage(&lock, now, &decoder) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other("oversized sparse quarantine was accepted").into());
+            }
+        };
+        assert!(matches!(
+            error,
+            StateError::ObjectTooLarge {
+                max_bytes: EVIDENCE_OBJECT_MAX_BYTES,
+                ..
+            }
+        ));
+        assert_eq!(directory_names(parent)?, names_before);
+        assert_eq!(
+            filesystem_snapshot_identity(&fs::symlink_metadata(&quarantine)?),
+            identity_before
+        );
+        assert_eq!(
+            private_state_security_snapshot(store.layout().worktree_dir())?,
+            security_before
+        );
+        assert!(!evidence_path.exists());
+        assert_eq!(fs::metadata(quarantine)?.len(), SPARSE_SIZE);
+        Ok(())
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn locked_gc_preserves_conflicting_same_directory_recovery_objects()
@@ -4303,6 +5161,66 @@ mod tests {
         assert_unsupported_legacy_gc_residue_fails_closed(temporary.path(), &store, now, &decoder)?;
         assert!(!log_path.exists());
         assert_eq!(fs::read(quarantined_object)?, log_bytes);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_and_locked_gc_preserve_a_same_directory_legacy_v1_file_residue()
+    -> Result<(), Box<dyn Error>> {
+        let (temporary, store) = temporary_store()?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut decoder = FixtureDecoder::default();
+        let receipt_name = object_name(8_001)?;
+        let (receipt_key, _) = store_fixture_receipt(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V1,
+            receipt_name,
+            EvidenceRetentionTime::Legacy,
+            Vec::new(),
+        )?;
+        let receipt_path = store.layout().worktree_dir().join(&receipt_key);
+        let quarantine = receipt_path
+            .parent()
+            .ok_or_else(|| io::Error::other("legacy receipt fixture has no parent"))?
+            .join(gc_quarantine_leaf(&receipt_key)?);
+        fs::rename(&receipt_path, &quarantine)?;
+
+        let before = filesystem_snapshot(temporary.path())?;
+        let security_before = private_state_security_snapshot(store.layout().worktree_dir())?;
+        let read_error = match store.visit_evidence_state_snapshot(1_024, &decoder, |_| Ok(())) {
+            Err(error) => error,
+            Ok(()) => {
+                return Err(
+                    io::Error::other("read-only scan accepted a legacy v1 file residue").into(),
+                );
+            }
+        };
+        assert!(matches!(
+            read_error,
+            StateError::InvalidLayout { ref reason, .. }
+                if reason == LEGACY_CLASS_FILE_GC_RESIDUE_UNSUPPORTED
+        ));
+        assert_eq!(filesystem_snapshot(temporary.path())?, before);
+        assert_eq!(
+            private_state_security_snapshot(store.layout().worktree_dir())?,
+            security_before
+        );
+
+        let locked_error = locked_gc_error_preserves_complete_private_tree(
+            temporary.path(),
+            &store,
+            now,
+            &decoder,
+        )?;
+        assert!(matches!(
+            locked_error,
+            StateError::InvalidLayout { ref reason, .. }
+                if reason == LEGACY_CLASS_FILE_GC_RESIDUE_UNSUPPORTED
+        ));
+        assert!(!receipt_path.exists());
+        assert!(quarantine.is_file());
         Ok(())
     }
 
@@ -4472,7 +5390,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn legacy_residue_preflight_precedes_all_current_quarantine_mutations()
+    fn legacy_v1_directory_residue_precedes_all_current_v2_quarantine_mutations()
     -> Result<(), Box<dyn Error>> {
         let (temporary, store) = temporary_store()?;
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
@@ -4499,9 +5417,9 @@ mod tests {
         let (receipt_key, _) = store_fixture_receipt(
             &store,
             &mut decoder,
-            EvidenceStateVersion::V2,
+            EvidenceStateVersion::V1,
             receipt_name.clone(),
-            EvidenceRetentionTime::Current(now.into()),
+            EvidenceRetentionTime::Legacy,
             Vec::new(),
         )?;
         let receipt_path = store.layout().worktree_dir().join(receipt_key);
@@ -4874,6 +5792,93 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn read_only_visit_rejects_a_hardlink_replacement_class_after_scan()
+    -> Result<(), Box<dyn Error>> {
+        use std::cell::Cell;
+
+        struct ReplacingReceiptClassDecoder<'a> {
+            inner: &'a FixtureDecoder,
+            visible_class: &'a Path,
+            displaced_class: &'a Path,
+            object_leaf: &'a std::ffi::OsStr,
+            replaced: Cell<bool>,
+        }
+
+        impl EvidenceStateMetadataDecoder for ReplacingReceiptClassDecoder<'_> {
+            fn decode_receipt(
+                &self,
+                version: EvidenceStateVersion,
+                bytes: &[u8],
+            ) -> Result<ReceiptRetentionMetadata, EvidenceStateDecodeError> {
+                let metadata = self.inner.decode_receipt(version, bytes)?;
+                if !self.replaced.replace(true) {
+                    fs::rename(self.visible_class, self.displaced_class)
+                        .and_then(|()| fs::create_dir(self.visible_class))
+                        .and_then(|()| set_private_test_directory_mode(self.visible_class))
+                        .and_then(|()| {
+                            fs::hard_link(
+                                self.displaced_class.join(self.object_leaf),
+                                self.visible_class.join(self.object_leaf),
+                            )
+                        })
+                        .map_err(|_| EvidenceStateDecodeError::Malformed)?;
+                }
+                Ok(metadata)
+            }
+
+            fn decode_evidence(
+                &self,
+                version: EvidenceStateVersion,
+                bytes: &[u8],
+            ) -> Result<EvidenceRetentionMetadata, EvidenceStateDecodeError> {
+                self.inner.decode_evidence(version, bytes)
+            }
+        }
+
+        let (temporary, store) = temporary_store()?;
+        let mut decoder = FixtureDecoder::default();
+        let object = object_name(180_000)?;
+        let (key, _) = store_fixture_receipt(
+            &store,
+            &mut decoder,
+            EvidenceStateVersion::V2,
+            object,
+            EvidenceRetentionTime::Current(SystemTime::UNIX_EPOCH.into()),
+            Vec::new(),
+        )?;
+        let object_path = store.layout().worktree_dir().join(&key);
+        let object_leaf = object_path
+            .file_name()
+            .ok_or_else(|| io::Error::other("receipt fixture has no filename"))?;
+        let visible_class = object_path
+            .parent()
+            .ok_or_else(|| io::Error::other("receipt fixture has no class directory"))?;
+        let expected_bytes = fs::read(&object_path)?;
+        let displaced_class = temporary.path().join("displaced-receipts-v2");
+        let replacing = ReplacingReceiptClassDecoder {
+            inner: &decoder,
+            visible_class,
+            displaced_class: &displaced_class,
+            object_leaf,
+            replaced: Cell::new(false),
+        };
+        let visited = Cell::new(false);
+
+        let result = store.visit_evidence_state_snapshot(1_024, &replacing, |_| {
+            visited.set(true);
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert!(replacing.replaced.get());
+        assert!(!visited.get());
+        assert_eq!(fs::read(visible_class.join(object_leaf))?, expected_bytes);
+        assert_eq!(fs::read(displaced_class.join(object_leaf))?, expected_bytes);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn typed_persistence_rejects_wrong_lock_and_missing_reference_before_writing()
     -> Result<(), Box<dyn Error>> {
         let (_temporary, store) = temporary_store()?;
@@ -5197,13 +6202,7 @@ mod tests {
             .into(),
             [log_name].into(),
         )?;
-        let deletion = |key: &str, size| -> Result<PlannedDeletion, StateError> {
-            Ok(PlannedDeletion {
-                key: key.to_owned(),
-                size,
-                snapshot: snapshot_private_state_file(&store, key)?,
-            })
-        };
+        let deletion = |key: &str, size| planned_deletion_fixture(&store, key, size);
         let plan = EvidenceGcPlan {
             delete_evidence: vec![deletion(&evidence_key, evidence_size)?],
             delete_receipts: vec![deletion(&receipt_key, receipt_size)?],
@@ -5240,11 +6239,7 @@ mod tests {
         let replacement = b"changed-log";
         assert_eq!(original.len(), replacement.len());
         let (_, key, size) = store_fixture_log(&store, original)?;
-        let object = PlannedDeletion {
-            key: key.clone(),
-            size,
-            snapshot: snapshot_private_state_file(&store, &key)?,
-        };
+        let object = planned_deletion_fixture(&store, &key, size)?;
         let saved_original = temporary.path().join("saved-original.log");
 
         let result = remove_regular_state_file_with_hook(&store, &object, |path| {
@@ -5274,11 +6269,7 @@ mod tests {
         let (temporary, store) = temporary_store()?;
         let original = b"planned symlink race";
         let (_, key, size) = store_fixture_log(&store, original)?;
-        let object = PlannedDeletion {
-            key: key.clone(),
-            size,
-            snapshot: snapshot_private_state_file(&store, &key)?,
-        };
+        let object = planned_deletion_fixture(&store, &key, size)?;
         let saved_original = temporary.path().join("saved-symlink-original.log");
         let outside = temporary.path().join("outside.log");
         fs::write(&outside, b"outside")?;
@@ -5303,11 +6294,7 @@ mod tests {
         let (temporary, store) = temporary_store()?;
         let original = b"planned directory race";
         let (_, key, size) = store_fixture_log(&store, original)?;
-        let object = PlannedDeletion {
-            key: key.clone(),
-            size,
-            snapshot: snapshot_private_state_file(&store, &key)?,
-        };
+        let object = planned_deletion_fixture(&store, &key, size)?;
         let saved_original = temporary.path().join("saved-directory-original.log");
         let state_path = store.layout().worktree_dir().join(&key);
 
@@ -5342,11 +6329,7 @@ mod tests {
         let replacement = b"changed unreadable race";
         assert_eq!(original.len(), replacement.len());
         let (_, key, size) = store_fixture_log(&store, original)?;
-        let object = PlannedDeletion {
-            key: key.clone(),
-            size,
-            snapshot: snapshot_private_state_file(&store, &key)?,
-        };
+        let object = planned_deletion_fixture(&store, &key, size)?;
         let saved_original = temporary.path().join("saved-unreadable-original.log");
         let state_path = store.layout().worktree_dir().join(&key);
 
@@ -5372,11 +6355,7 @@ mod tests {
         let original = b"planned root replacement";
         let replacement = b"visible replacement tree";
         let (_, key, size) = store_fixture_log(&store, original)?;
-        let object = PlannedDeletion {
-            key: key.clone(),
-            size,
-            snapshot: snapshot_private_state_file(&store, &key)?,
-        };
+        let object = planned_deletion_fixture(&store, &key, size)?;
         let visible_root = store.layout().worktree_dir().to_path_buf();
         let saved_root = temporary.path().join("saved-state-root");
         let replacement_before = RefCell::new(None);
@@ -5426,11 +6405,7 @@ mod tests {
         let original = b"planned class replacement";
         let replacement = b"replacement class payload";
         let (_, key, size) = store_fixture_log(&store, original)?;
-        let object = PlannedDeletion {
-            key: key.clone(),
-            size,
-            snapshot: snapshot_private_state_file(&store, &key)?,
-        };
+        let object = planned_deletion_fixture(&store, &key, size)?;
         let visible_object = store.layout().worktree_dir().join(&key);
         let visible_parent = visible_object
             .parent()
@@ -5448,7 +6423,7 @@ mod tests {
             Ok(())
         });
 
-        assert!(matches!(result, Err(StateError::StateChanged { .. })));
+        assert!(matches!(result, Err(StateError::Io { .. })));
         assert_eq!(
             filesystem_snapshot(&visible_parent)?,
             replacement_before
@@ -5456,6 +6431,58 @@ mod tests {
                 .ok_or_else(|| io::Error::other("class replacement hook did not run"))?
         );
         assert_eq!(fs::read(&visible_object)?, replacement);
+        assert_eq!(
+            fs::read(
+                saved_parent.join(
+                    visible_object
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("state object has no filename"))?,
+                ),
+            )?,
+            original
+        );
+        assert!(!gc_quarantine_path(&visible_parent, &key)?.exists());
+        assert!(!gc_quarantine_path(&saved_parent, &key)?.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collection_never_mutates_a_hardlink_replacement_class() -> Result<(), Box<dyn Error>>
+    {
+        let (temporary, store) = temporary_store()?;
+        let original = b"planned hardlink class replacement";
+        let (_, key, size) = store_fixture_log(&store, original)?;
+        let object = planned_deletion_fixture(&store, &key, size)?;
+        let visible_object = store.layout().worktree_dir().join(&key);
+        let visible_parent = visible_object
+            .parent()
+            .ok_or_else(|| io::Error::other("state object has no parent"))?
+            .to_path_buf();
+        let saved_parent = temporary.path().join("saved-hardlink-log-class");
+        let replacement_before = RefCell::new(None);
+
+        let result = remove_regular_state_file_with_hook(&store, &object, |path| {
+            fs::rename(&visible_parent, &saved_parent)?;
+            fs::create_dir(&visible_parent)?;
+            set_private_test_directory_mode(&visible_parent)?;
+            let original_leaf = saved_parent.join(
+                path.file_name()
+                    .ok_or_else(|| io::Error::other("state object has no filename"))?,
+            );
+            fs::hard_link(original_leaf, path)?;
+            replacement_before.replace(Some(filesystem_snapshot(&visible_parent)?));
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(StateError::Io { .. })));
+        assert_eq!(
+            filesystem_snapshot(&visible_parent)?,
+            replacement_before
+                .into_inner()
+                .ok_or_else(|| io::Error::other("hardlink replacement hook did not run"))?
+        );
+        assert_eq!(fs::read(&visible_object)?, original);
         assert_eq!(
             fs::read(
                 saved_parent.join(
@@ -5496,6 +6523,52 @@ mod tests {
         assert_eq!(filesystem_snapshot(temporary.path())?, before);
         assert!(load_immutable_fixture(&store, &log_key)?.is_some());
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collection_requires_owner_rwx_on_each_kind_parent_before_deletion()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (index, parent) in ["receipts", "evidence", "logs"].into_iter().enumerate() {
+            let (temporary, store) = temporary_store()?;
+            let mut decoder = FixtureDecoder::default();
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+            store_fixture_receipt(
+                &store,
+                &mut decoder,
+                EvidenceStateVersion::V2,
+                object_name(70_000 + index as u64)?,
+                EvidenceRetentionTime::Current(now.into()),
+                Vec::new(),
+            )?;
+            store_fixture_evidence(
+                &store,
+                &mut decoder,
+                EvidenceStateVersion::V2,
+                object_name(71_000 + index as u64)?,
+                EvidenceRetentionTime::Current(now.into()),
+                Vec::new(),
+                Vec::new(),
+            )?;
+            let (_, orphan_log_key, _) =
+                store_fixture_log(&store, format!("orphan {parent}").as_bytes())?;
+            let lock = store.try_lock()?;
+            let directory = store.layout().worktree_dir().join(parent);
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o500))?;
+            let before = filesystem_snapshot(temporary.path())?;
+
+            let result = store.collect_evidence_garbage(&lock, now, &decoder);
+            assert!(matches!(
+                result,
+                Err(StateError::InvalidLayout { ref reason, .. }) if reason.contains("owner rwx")
+            ));
+            assert_eq!(filesystem_snapshot(temporary.path())?, before);
+            assert!(load_immutable_fixture(&store, &orphan_log_key)?.is_some());
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        }
         Ok(())
     }
 
@@ -5983,6 +7056,83 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collection_honors_a_low_file_descriptor_budget() -> Result<(), Box<dyn Error>> {
+        const CHILD_ENV: &str = "FORGE_TEST_LOW_EVIDENCE_GC_FD_BUDGET";
+        const TEST_NAME: &str =
+            "state::evidence::tests::garbage_collection_honors_a_low_file_descriptor_budget";
+        const OBJECTS_PER_CLASS: u64 = 64;
+        const TARGET_FILE_LIMIT: u64 = 96;
+
+        if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let output = Command::new(std::env::current_exe()?)
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "low-file-descriptor child failed with {}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+                .into());
+            }
+            return Ok(());
+        }
+
+        let (_temporary, store) = temporary_store()?;
+        let mut decoder = FixtureDecoder::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20 * 365 * 24 * 60 * 60);
+        for index in 0..OBJECTS_PER_CLASS {
+            store_fixture_receipt(
+                &store,
+                &mut decoder,
+                EvidenceStateVersion::V2,
+                object_name(200_000 + index)?,
+                EvidenceRetentionTime::Current(now.into()),
+                Vec::new(),
+            )?;
+            store_fixture_evidence(
+                &store,
+                &mut decoder,
+                EvidenceStateVersion::V2,
+                object_name(300_000 + index)?,
+                EvidenceRetentionTime::Current(now.into()),
+                Vec::new(),
+                Vec::new(),
+            )?;
+            let (_, log_key, _) =
+                store_fixture_log(&store, format!("orphan low-fd log {index}").as_bytes())?;
+            let log_path = store.layout().worktree_dir().join(&log_key);
+            let quarantine = log_path
+                .parent()
+                .ok_or_else(|| io::Error::other("low-fd log fixture has no parent"))?
+                .join(gc_quarantine_leaf(&log_key)?);
+            fs::rename(log_path, quarantine)?;
+        }
+
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+        let (soft_limit, hard_limit) = getrlimit(Resource::RLIMIT_NOFILE)?;
+        let test_limit = soft_limit.min(TARGET_FILE_LIMIT);
+        if test_limit < 48 {
+            return Err(io::Error::other(format!(
+                "test process file-descriptor limit {soft_limit} is too small for the fixed fixture"
+            ))
+            .into());
+        }
+        setrlimit(Resource::RLIMIT_NOFILE, test_limit, hard_limit)?;
+
+        let lock = store.try_lock()?;
+        let report = store.collect_evidence_garbage(&lock, now, &decoder)?;
+        assert_eq!(report.deleted_logs, OBJECTS_PER_CLASS as usize);
+        assert_eq!(report.deleted_receipts, 0);
+        assert_eq!(report.deleted_evidence, 0);
+        Ok(())
+    }
+
     #[test]
     fn garbage_collection_enforces_receipt_and_evidence_file_bounds_before_deletion()
     -> Result<(), Box<dyn Error>> {
@@ -6047,6 +7197,21 @@ mod tests {
     }
 
     #[test]
+    fn recovery_verification_has_an_independent_exact_scan_budget() -> Result<(), Box<dyn Error>> {
+        let mut budget = super::EvidenceGcRecoveryBudget::default();
+        budget.charge("logs/v1/first.log", super::EVIDENCE_GC_MAX_SCAN_BYTES)?;
+        assert!(matches!(
+            budget.charge("logs/v1/second.log", 1),
+            Err(StateError::ScanByteLimit {
+                scanned_bytes,
+                max_bytes: super::EVIDENCE_GC_MAX_SCAN_BYTES,
+                ..
+            }) if scanned_bytes == super::EVIDENCE_GC_MAX_SCAN_BYTES + 1
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn read_only_open_leaves_absent_state_and_filesystem_unchanged() -> Result<(), Box<dyn Error>> {
         let temporary = tempdir()?;
         let git_dir = temporary.path().join("git");
@@ -6108,6 +7273,15 @@ mod tests {
             Err(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn directory_names(directory: &Path) -> io::Result<Vec<String>> {
+        let mut names = fs::read_dir(directory)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
     }
 
     fn filesystem_snapshot(root: &Path) -> io::Result<FileSystemSnapshot> {
@@ -6573,6 +7747,60 @@ mod tests {
         fs::create_dir(&git_dir)?;
         let store = AtomicStateStore::new(GitStateLayout::new(&git_dir, &git_dir))?;
         store.store_new_atomic("listing/nested/value.json", b"nested")?;
+
+        assert!(matches!(
+            store.list_regular_keys_bounded("listing", 10),
+            Err(StateError::InvalidLayout { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_state_listing_rejects_symlink_entries() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
+        let store = AtomicStateStore::new(layout.clone())?;
+        store.store_new_atomic("listing/bootstrap.json", b"bootstrap")?;
+        let outside = temporary.path().join("outside.json");
+        fs::write(&outside, b"outside")?;
+        symlink(&outside, layout.worktree_dir().join("listing/linked.json"))?;
+
+        assert!(matches!(
+            store.list_regular_keys_bounded("listing", 10),
+            Err(StateError::PathSafety(
+                crate::fs::FileSystemError::SymlinkComponent { .. }
+            ))
+        ));
+        assert_eq!(fs::read(outside)?, b"outside");
+        Ok(())
+    }
+
+    // Apple filesystems reject non-Unicode names before Forge can observe them. Other Unix
+    // platforms admit arbitrary filename bytes, so exercise the fail-closed conversion there.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn direct_state_listing_rejects_non_utf8_entries() -> Result<(), Box<dyn Error>> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
+        let store = AtomicStateStore::new(layout.clone())?;
+        store.store_new_atomic("listing/bootstrap.json", b"bootstrap")?;
+        let path = layout
+            .worktree_dir()
+            .join("listing")
+            .join(OsString::from_vec(vec![0xff]));
+        fs::write(&path, b"not portable")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
         assert!(matches!(
             store.list_regular_keys_bounded("listing", 10),

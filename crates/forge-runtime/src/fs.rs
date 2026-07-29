@@ -2,7 +2,6 @@
 
 use std::ffi::OsStr;
 use std::fs;
-#[cfg(unix)]
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -24,7 +23,8 @@ use crate::inventory::{
     read_bounded_text_controlled as read_repository_bounded_text_controlled,
 };
 use crate::repository_write::{
-    BeginPrivateQuarantine, CommitMode, OpenPrivateQuarantine, RepositoryGcError, RootHandle,
+    BeginPrivateQuarantine, CommitMode, OpenPrivateQuarantine, RepositoryDirectoryEntry,
+    RepositoryDirectoryListing, RepositoryGcError, RootHandle,
 };
 
 /// The native implementation of [`FileSystemPort`].
@@ -396,27 +396,122 @@ impl RepositoryWriter {
         )
     }
 
-    pub(crate) fn begin_private_quarantine(
+    pub(crate) fn validate_open_regular_from(
         &self,
         relative_path: impl AsRef<Path>,
+        expected_parent: &File,
+        object: &File,
+    ) -> Result<(), FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .validate_regular_from(&normalized, expected_parent, object)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "validate opened repository file through pinned parent",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn open_regular_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected_parent: &File,
+    ) -> Result<Option<File>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .open_regular_from(&normalized, expected_parent)
+            .map_err(|source| {
+                FileSystemError::io("open repository file through pinned parent", target, source)
+            })
+    }
+
+    pub(crate) fn open_listed_entry_from(
+        &self,
+        directory: impl AsRef<Path>,
+        expected_directory: &File,
+        entry: &RepositoryDirectoryEntry,
+    ) -> Result<File, FileSystemError> {
+        let normalized = normalize_relative_path(directory.as_ref())?;
+        let target = self.root.join(&normalized).join(entry.name());
+        self.write_root
+            .open_listed_entry_from(&normalized, expected_directory, entry)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "open listed repository entry through pinned directory",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn list_directory(
+        &self,
+        relative_path: impl AsRef<Path>,
+        max_entries: usize,
+    ) -> Result<Option<RepositoryDirectoryListing>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .list_directory(&normalized, max_entries)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "list repository directory through root handle",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn list_directory_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected: &File,
+        max_entries: usize,
+    ) -> Result<RepositoryDirectoryListing, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .list_directory_from(&normalized, expected, max_entries)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "list pinned repository directory through root handle",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn begin_private_quarantine_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected_parent: &File,
         quarantine_leaf: &OsStr,
     ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
         let normalized = normalize_relative_path(relative_path.as_ref())
             .map_err(|error| RepositoryGcError::not_changed(error.into_io_error()))?;
         self.write_root
-            .begin_private_quarantine(&normalized, quarantine_leaf)
+            .begin_private_quarantine_from(&normalized, expected_parent, quarantine_leaf)
     }
 
-    pub(crate) fn open_private_quarantine(
+    pub(crate) fn open_private_quarantine_from(
         &self,
         directory: impl AsRef<Path>,
+        expected_parent: &File,
         original_leaf: &OsStr,
         quarantine_leaf: &OsStr,
     ) -> Result<OpenPrivateQuarantine, RepositoryGcError> {
         let normalized = normalize_relative_path(directory.as_ref())
             .map_err(|error| RepositoryGcError::not_changed(error.into_io_error()))?;
-        self.write_root
-            .open_private_quarantine(&normalized, original_leaf, quarantine_leaf)
+        self.write_root.open_private_quarantine_from(
+            &normalized,
+            expected_parent,
+            original_leaf,
+            quarantine_leaf,
+        )
     }
 
     fn read_required_bounded(

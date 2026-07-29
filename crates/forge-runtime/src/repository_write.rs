@@ -6,10 +6,133 @@
 //! then relative to the pinned target parent, so replacing a visible ancestor cannot redirect the
 //! write to the replacement tree.
 
+use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
 use std::io;
 
 use crate::fs::NewFileMode;
+
+#[cfg(unix)]
+type RepositoryDirectoryEntryIdentity = (u64, u64);
+#[cfg(windows)]
+type RepositoryDirectoryEntryIdentity = (u64, [u8; 16]);
+#[cfg(not(any(unix, windows)))]
+type RepositoryDirectoryEntryIdentity = ();
+
+/// One direct child observed relative to a pinned repository directory.
+#[derive(Debug)]
+pub(crate) struct RepositoryDirectoryEntry {
+    name: OsString,
+    kind: RepositoryDirectoryEntryKind,
+    identity: RepositoryDirectoryEntryIdentity,
+}
+
+/// One bounded directory observation rooted in a live directory handle.
+#[derive(Debug)]
+pub(crate) struct RepositoryDirectoryListing {
+    root: File,
+    ancestors: Vec<File>,
+    directory: File,
+    entries: Vec<RepositoryDirectoryEntry>,
+    opened_components: usize,
+    target_present: bool,
+}
+
+impl RepositoryDirectoryListing {
+    pub(crate) fn directory_chain(&self) -> impl Iterator<Item = &File> {
+        std::iter::once(&self.root)
+            .chain(self.ancestors.iter())
+            .chain((self.opened_components != 0).then_some(&self.directory))
+    }
+
+    pub(crate) const fn target_present(&self) -> bool {
+        self.target_present
+    }
+
+    pub(crate) fn into_directory_and_entries(
+        self,
+    ) -> Option<(File, Vec<RepositoryDirectoryEntry>)> {
+        self.target_present
+            .then_some((self.directory, self.entries))
+    }
+}
+
+impl RepositoryDirectoryEntry {
+    pub(crate) fn name(&self) -> &std::ffi::OsStr {
+        &self.name
+    }
+
+    pub(crate) fn kind(&self) -> RepositoryDirectoryEntryKind {
+        self.kind
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryDirectoryEntryKind {
+    Directory,
+    RegularFile,
+}
+
+#[derive(Debug)]
+struct DirectoryEntryLimitExceeded;
+
+impl fmt::Display for DirectoryEntryLimitExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("repository directory exceeds its bounded entry contract")
+    }
+}
+
+impl std::error::Error for DirectoryEntryLimitExceeded {}
+
+pub(crate) fn is_directory_entry_limit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<DirectoryEntryLimitExceeded>())
+}
+
+fn directory_entry_limit_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, DirectoryEntryLimitExceeded)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsupportedDirectoryEntryKind {
+    LinkOrReparse,
+    Other,
+}
+
+#[derive(Debug)]
+struct UnsupportedDirectoryEntry {
+    name: OsString,
+    kind: UnsupportedDirectoryEntryKind,
+}
+
+impl fmt::Display for UnsupportedDirectoryEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("repository directory contains an unsupported entry kind")
+    }
+}
+
+impl std::error::Error for UnsupportedDirectoryEntry {}
+
+pub(crate) fn unsupported_directory_entry(
+    error: &io::Error,
+) -> Option<(&std::ffi::OsStr, UnsupportedDirectoryEntryKind)> {
+    let entry = error
+        .get_ref()?
+        .downcast_ref::<UnsupportedDirectoryEntry>()?;
+    Some((&entry.name, entry.kind))
+}
+
+fn unsupported_directory_entry_error(
+    name: OsString,
+    kind: UnsupportedDirectoryEntryKind,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        UnsupportedDirectoryEntry { name, kind },
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitMode {
@@ -80,6 +203,11 @@ impl RepositoryGcError {
         self.commit
     }
 
+    #[must_use]
+    pub(crate) fn io_kind(&self) -> io::ErrorKind {
+        self.source.kind()
+    }
+
     pub(crate) fn into_source(self) -> io::Error {
         self.source
     }
@@ -106,18 +234,15 @@ mod platform {
     use std::ffi::{OsStr, OsString};
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
-    #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd as _;
-    #[cfg(target_os = "macos")]
-    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Component, Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use nix::dir::Dir;
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
-    #[cfg(target_os = "linux")]
-    use nix::fcntl::{RenameFlags, renameat2};
     use nix::sys::stat::{Mode, SFlag, fstatat, mkdirat};
     use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 
@@ -126,7 +251,8 @@ mod platform {
     use super::GcEvent;
     use super::{
         BeginPrivateQuarantine, CommitMode, ExpectedPreimage, NewFileMode, ReadEvent,
-        RepositoryGcCommit, RepositoryGcError, WriteEvent,
+        RepositoryDirectoryEntry, RepositoryDirectoryEntryKind, RepositoryDirectoryListing,
+        RepositoryGcCommit, RepositoryGcError, WriteEvent, directory_entry_limit_error,
     };
     use forge_core::ports::{RepositoryWriteCommit, RepositoryWriteError, RepositoryWriteOutcome};
 
@@ -247,6 +373,256 @@ mod platform {
             self.read_bounded_inner(relative, max_bytes, |_| Ok(()))
         }
 
+        pub(crate) fn validate_regular_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+            object: &File,
+        ) -> io::Result<()> {
+            let (parent_path, leaf) = split_target(relative)?;
+            if !expected_parent.metadata()?.is_dir() {
+                return Err(read_namespace_changed(
+                    "repository expected parent handle is not a directory",
+                ));
+            }
+            let parent_identity = directory_identity(expected_parent)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )?;
+            let current = open_regular_leaf(expected_parent, leaf)?;
+            if file_identity(&current)? != file_identity(object)? {
+                return Err(read_namespace_changed(
+                    "repository target identity changed under its pinned parent",
+                ));
+            }
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )
+        }
+
+        pub(crate) fn open_regular_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+        ) -> io::Result<Option<File>> {
+            let (parent_path, leaf) = split_target(relative)?;
+            if !expected_parent.metadata()?.is_dir() {
+                return Err(read_namespace_changed(
+                    "repository expected parent handle is not a directory",
+                ));
+            }
+            let parent_identity = directory_identity(expected_parent)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )?;
+            let current = open_read_leaf(expected_parent, leaf)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )?;
+            Ok(current)
+        }
+
+        pub(crate) fn open_listed_entry_from(
+            &self,
+            relative: &Path,
+            expected_directory: &File,
+            entry: &RepositoryDirectoryEntry,
+        ) -> io::Result<File> {
+            if !expected_directory.metadata()?.is_dir() {
+                return Err(read_namespace_changed(
+                    "repository expected listing handle is not a directory",
+                ));
+            }
+            let expected_identity = directory_identity(expected_directory)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_identity,
+            )?;
+            let current = match entry.kind {
+                RepositoryDirectoryEntryKind::Directory => {
+                    open_listing_directory(expected_directory, &entry.name)
+                }
+                RepositoryDirectoryEntryKind::RegularFile => {
+                    open_read_leaf(expected_directory, &entry.name)?.ok_or_else(|| {
+                        read_namespace_changed(
+                            "repository listed entry disappeared under its pinned parent",
+                        )
+                    })
+                }
+            }?;
+            if file_identity(&current)? != entry.identity {
+                return Err(read_namespace_changed(
+                    "repository listed entry identity changed under its pinned parent",
+                ));
+            }
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_identity,
+            )?;
+            Ok(current)
+        }
+
+        pub(crate) fn list_directory(
+            &self,
+            relative: &Path,
+            max_entries: usize,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            self.list_directory_inner(relative, None, max_entries, || Ok(()))
+        }
+
+        pub(crate) fn list_directory_from(
+            &self,
+            relative: &Path,
+            expected: &File,
+            max_entries: usize,
+        ) -> io::Result<RepositoryDirectoryListing> {
+            self.list_directory_inner(relative, Some(expected), max_entries, || Ok(()))?
+                .ok_or_else(|| {
+                    read_namespace_changed(
+                        "repository directory disappeared after its pinned parent listing",
+                    )
+                })
+        }
+
+        #[cfg(test)]
+        pub(super) fn list_directory_with_hook(
+            &self,
+            relative: &Path,
+            max_entries: usize,
+            hook: impl FnOnce() -> io::Result<()>,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            self.list_directory_inner(relative, None, max_entries, hook)
+        }
+
+        fn list_directory_inner(
+            &self,
+            relative: &Path,
+            expected: Option<&File>,
+            max_entries: usize,
+            hook: impl FnOnce() -> io::Result<()>,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            let observation = open_directory_for_listing(&self.directory, relative)?;
+            if !observation.complete {
+                validate_directory_observation(
+                    &self.directory,
+                    &self.path,
+                    self.identity,
+                    relative,
+                    &observation.identities,
+                )?;
+                if expected.is_some() {
+                    return Err(read_namespace_changed(
+                        "repository directory disappeared after its pinned parent listing",
+                    ));
+                }
+                return Ok(Some(RepositoryDirectoryListing {
+                    root: reopen_listing_root(&self.directory)?,
+                    ancestors: observation._ancestors,
+                    directory: observation.directory,
+                    entries: Vec::new(),
+                    opened_components: observation.identities.len(),
+                    target_present: false,
+                }));
+            }
+            let opened_components = observation.identities.len();
+            let ancestors = observation._ancestors;
+            let visible_identity = directory_identity(&observation.directory)?;
+            let directory = if let Some(expected) = expected {
+                if directory_identity(expected)? != visible_identity {
+                    return Err(read_namespace_changed(
+                        "repository directory identity changed after its parent listing",
+                    ));
+                }
+                expected.try_clone()?
+            } else {
+                observation.directory
+            };
+            if !directory.metadata()?.is_dir() {
+                return Err(read_namespace_changed(
+                    "repository listing handle is not a directory",
+                ));
+            }
+            let expected_directory = directory_identity(&directory)?;
+            let mut iterator = Dir::from_fd(directory.try_clone()?.into())?;
+            let mut entries = Vec::new();
+            for entry in iterator.iter() {
+                let entry = entry.map_err(errno_to_io)?;
+                let name = entry.file_name().to_bytes();
+                if matches!(name, b"." | b"..") {
+                    continue;
+                }
+                if entries.len() == max_entries {
+                    return Err(directory_entry_limit_error());
+                }
+                let name = OsString::from_vec(name.to_vec());
+                let metadata = fstatat(&directory, Path::new(&name), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .map_err(errno_to_io)?;
+                let file_type = SFlag::from_bits_truncate(metadata.st_mode);
+                let (kind, object) = if file_type == SFlag::S_IFREG {
+                    (
+                        RepositoryDirectoryEntryKind::RegularFile,
+                        open_regular_leaf(&directory, &name)?,
+                    )
+                } else if file_type == SFlag::S_IFDIR {
+                    (
+                        RepositoryDirectoryEntryKind::Directory,
+                        open_listing_directory(&directory, &name)?,
+                    )
+                } else {
+                    let kind = if file_type == SFlag::S_IFLNK {
+                        super::UnsupportedDirectoryEntryKind::LinkOrReparse
+                    } else {
+                        super::UnsupportedDirectoryEntryKind::Other
+                    };
+                    return Err(super::unsupported_directory_entry_error(name, kind));
+                };
+                let identity = file_identity(&object)?;
+                entries.push(RepositoryDirectoryEntry {
+                    name,
+                    kind,
+                    identity,
+                });
+            }
+            hook()?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_directory,
+            )?;
+            validate_listed_entries(&directory, &entries)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_directory,
+            )?;
+            Ok(Some(RepositoryDirectoryListing {
+                root: reopen_listing_root(&self.directory)?,
+                ancestors,
+                directory,
+                entries,
+                opened_components,
+                target_present: true,
+            }))
+        }
+
         #[cfg(test)]
         pub(super) fn read_bounded_with_hook(
             &self,
@@ -299,12 +675,27 @@ mod platform {
             })
         }
 
+        #[cfg(test)]
         pub(crate) fn begin_private_quarantine(
             &self,
             relative: &Path,
             quarantine_leaf: &OsStr,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
-            self.begin_private_quarantine_inner(relative, quarantine_leaf, |_| Ok(()))
+            self.begin_private_quarantine_inner(relative, quarantine_leaf, None, |_| Ok(()))
+        }
+
+        pub(crate) fn begin_private_quarantine_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+            quarantine_leaf: &OsStr,
+        ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
+            self.begin_private_quarantine_inner(
+                relative,
+                quarantine_leaf,
+                Some(expected_parent),
+                |_| Ok(()),
+            )
         }
 
         #[cfg(test)]
@@ -314,13 +705,14 @@ mod platform {
             quarantine_leaf: &OsStr,
             hook: impl FnMut(GcEvent) -> io::Result<()>,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
-            self.begin_private_quarantine_inner(relative, quarantine_leaf, hook)
+            self.begin_private_quarantine_inner(relative, quarantine_leaf, None, hook)
         }
 
         fn begin_private_quarantine_inner(
             &self,
             relative: &Path,
             quarantine_leaf: &OsStr,
+            expected_parent: Option<&File>,
             mut hook: impl FnMut(GcEvent) -> io::Result<()>,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
             let (parent_path, original_leaf) = split_target(relative)
@@ -328,12 +720,30 @@ mod platform {
                     validate_quarantine_names(parts.1, quarantine_leaf).map(|()| parts)
                 })
                 .map_err(not_changed_gc)?;
-            let parent = match self.open_parent(parent_path, NewFileMode::Private, false) {
-                Ok(parent) => parent,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(BeginPrivateQuarantine::Missing);
+            let parent = if let Some(expected_parent) = expected_parent {
+                if !expected_parent.metadata().map_err(not_changed_gc)?.is_dir() {
+                    return Err(not_changed_gc(read_namespace_changed(
+                        "repository GC expected parent handle is not a directory",
+                    )));
                 }
-                Err(error) => return Err(not_changed_gc(error)),
+                let expected_identity =
+                    directory_identity(expected_parent).map_err(not_changed_gc)?;
+                validate_visible_root_and_parent(
+                    &self.path,
+                    self.identity,
+                    parent_path,
+                    expected_identity,
+                )
+                .map_err(not_changed_gc)?;
+                expected_parent.try_clone().map_err(not_changed_gc)?
+            } else {
+                match self.open_parent(parent_path, NewFileMode::Private, false) {
+                    Ok(parent) => parent,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(BeginPrivateQuarantine::Missing);
+                    }
+                    Err(error) => return Err(not_changed_gc(error)),
+                }
             };
             let parent_identity = directory_identity(&parent).map_err(not_changed_gc)?;
             let object = match open_regular_leaf(&parent, original_leaf) {
@@ -396,20 +806,64 @@ mod platform {
             }))
         }
 
+        #[cfg(test)]
         pub(crate) fn open_private_quarantine(
             &self,
             directory: &Path,
             original_leaf: &OsStr,
             quarantine_leaf: &OsStr,
         ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
+            self.open_private_quarantine_inner(directory, original_leaf, quarantine_leaf, None)
+        }
+
+        pub(crate) fn open_private_quarantine_from(
+            &self,
+            directory: &Path,
+            expected_parent: &File,
+            original_leaf: &OsStr,
+            quarantine_leaf: &OsStr,
+        ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
+            self.open_private_quarantine_inner(
+                directory,
+                original_leaf,
+                quarantine_leaf,
+                Some(expected_parent),
+            )
+        }
+
+        fn open_private_quarantine_inner(
+            &self,
+            directory: &Path,
+            original_leaf: &OsStr,
+            quarantine_leaf: &OsStr,
+            expected_parent: Option<&File>,
+        ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
             validate_parent_path(directory).map_err(not_changed_gc)?;
             validate_quarantine_names(original_leaf, quarantine_leaf).map_err(not_changed_gc)?;
-            let parent = match self.open_parent(directory, NewFileMode::Private, false) {
-                Ok(parent) => parent,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(super::OpenPrivateQuarantine::Missing);
+            let parent = if let Some(expected_parent) = expected_parent {
+                if !expected_parent.metadata().map_err(not_changed_gc)?.is_dir() {
+                    return Err(not_changed_gc(read_namespace_changed(
+                        "repository GC recovery parent handle is not a directory",
+                    )));
                 }
-                Err(error) => return Err(not_changed_gc(error)),
+                let expected_identity =
+                    directory_identity(expected_parent).map_err(not_changed_gc)?;
+                validate_visible_root_and_parent(
+                    &self.path,
+                    self.identity,
+                    directory,
+                    expected_identity,
+                )
+                .map_err(not_changed_gc)?;
+                expected_parent.try_clone().map_err(not_changed_gc)?
+            } else {
+                match self.open_parent(directory, NewFileMode::Private, false) {
+                    Ok(parent) => parent,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(super::OpenPrivateQuarantine::Missing);
+                    }
+                    Err(error) => return Err(not_changed_gc(error)),
+                }
             };
             let parent_identity = directory_identity(&parent).map_err(not_changed_gc)?;
             let object = match open_regular_leaf(&parent, quarantine_leaf) {
@@ -851,6 +1305,44 @@ mod platform {
         finish_read_parent_observation(root, chain, identities, true)
     }
 
+    fn open_directory_for_listing(
+        root: &File,
+        relative: &Path,
+    ) -> io::Result<ReadParentObservation> {
+        validate_parent_path(relative)?;
+        if relative.as_os_str().is_empty() {
+            return finish_read_parent_observation(root, Vec::new(), Vec::new(), true);
+        }
+        let mut chain = Vec::new();
+        let mut identities = Vec::new();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(segment) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "repository directory path was not normalized",
+                ));
+            };
+            let current = chain.last().unwrap_or(root);
+            let opened = if components.peek().is_none() {
+                open_listing_directory(current, segment)
+            } else {
+                open_directory(current, segment)
+            };
+            match opened {
+                Ok(directory) => {
+                    identities.push(directory_identity(&directory)?);
+                    chain.push(directory);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return finish_read_parent_observation(root, chain, identities, false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        finish_read_parent_observation(root, chain, identities, true)
+    }
+
     fn finish_read_parent_observation(
         root: &File,
         mut chain: Vec<File>,
@@ -931,6 +1423,61 @@ mod platform {
         Ok(())
     }
 
+    fn validate_directory_observation(
+        pinned_root: &File,
+        root_path: &Path,
+        root_identity: (u64, u64),
+        relative: &Path,
+        identities: &[(u64, u64)],
+    ) -> io::Result<()> {
+        validate_pinned_read_root(pinned_root, root_identity)?;
+        let visible_root = open_visible_read_root(root_path, root_identity)?;
+        let mut chain = Vec::new();
+        for (index, component) in relative.components().enumerate() {
+            let Component::Normal(segment) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "repository directory path was not normalized",
+                ));
+            };
+            let current = chain.last().unwrap_or(&visible_root);
+            let directory = match open_directory(current, segment) {
+                Ok(directory) => directory,
+                Err(error)
+                    if index == identities.len() && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    validate_pinned_read_root(pinned_root, root_identity)?;
+                    open_visible_read_root(root_path, root_identity)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(read_namespace_changed(format!(
+                        "repository directory changed during listing: {error}"
+                    )));
+                }
+            };
+            let Some(expected) = identities.get(index) else {
+                return Err(read_namespace_changed(
+                    "a previously missing repository directory appeared during listing",
+                ));
+            };
+            if directory_identity(&directory)? != *expected {
+                return Err(read_namespace_changed(
+                    "repository directory identity changed during listing",
+                ));
+            }
+            chain.push(directory);
+        }
+        if chain.len() != identities.len() {
+            return Err(read_namespace_changed(
+                "repository directory observation was inconsistent during listing",
+            ));
+        }
+        validate_pinned_read_root(pinned_root, root_identity)?;
+        open_visible_read_root(root_path, root_identity)?;
+        Ok(())
+    }
+
     fn validate_pinned_read_root(root: &File, expected: (u64, u64)) -> io::Result<()> {
         if directory_identity(root)? == expected {
             Ok(())
@@ -973,6 +1520,29 @@ mod platform {
                 "repository target identity changed during bounded read",
             )),
         }
+    }
+
+    fn validate_listed_entries(
+        parent: &File,
+        entries: &[RepositoryDirectoryEntry],
+    ) -> io::Result<()> {
+        for entry in entries {
+            let current = match entry.kind {
+                RepositoryDirectoryEntryKind::Directory => open_directory(parent, &entry.name),
+                RepositoryDirectoryEntryKind::RegularFile => open_regular_leaf(parent, &entry.name),
+            }
+            .map_err(|error| {
+                read_namespace_changed(format!(
+                    "repository directory entry changed during listing: {error}"
+                ))
+            })?;
+            if file_identity(&current)? != entry.identity {
+                return Err(read_namespace_changed(
+                    "repository directory entry identity changed during listing",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn read_namespace_changed(message: impl Into<String>) -> io::Error {
@@ -1155,16 +1725,44 @@ mod platform {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
     fn rename_leaf_noreplace(parent: &File, source: &OsStr, target: &OsStr) -> io::Result<()> {
+        use std::ffi::CString;
+
         validate_quarantine_names(source, target)?;
-        renameat2(
-            parent,
-            Path::new(source),
-            parent,
-            Path::new(target),
-            RenameFlags::RENAME_NOREPLACE,
-        )
-        .map_err(exclusive_rename_error)
+        let source = CString::new(source.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repository GC source contains a NUL byte",
+            )
+        })?;
+        let target = CString::new(target.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repository GC target contains a NUL byte",
+            )
+        })?;
+        // `nix::renameat2` is intentionally unavailable on musl even though the Linux syscall is
+        // part of the supported kernel ABI. Calling that ABI directly preserves the same atomic
+        // RENAME_NOREPLACE contract on glibc and musl without a check-then-rename fallback.
+        const LINUX_RENAME_NOREPLACE: nix::libc::c_uint = 1;
+        // SAFETY: both names are NUL-terminated single leaves, the same live directory descriptor
+        // is used on each side, and SYS_renameat2 has the documented five-argument Linux ABI.
+        let status = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                target.as_ptr(),
+                LINUX_RENAME_NOREPLACE,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(exclusive_rename_io_error(io::Error::last_os_error()))
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1211,22 +1809,12 @@ mod platform {
         ))
     }
 
-    #[cfg(target_os = "linux")]
-    fn exclusive_rename_error(error: Errno) -> io::Error {
-        match error {
-            Errno::ENOSYS | Errno::EINVAL | Errno::EOPNOTSUPP => io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the filesystem does not support atomic no-replace repository GC renames",
-            ),
-            error => errno_to_io(error),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn exclusive_rename_io_error(error: io::Error) -> io::Error {
         match error.raw_os_error() {
             Some(code)
-                if code == nix::libc::ENOTSUP
+                if code == nix::libc::ENOSYS
+                    || code == nix::libc::ENOTSUP
                     || code == nix::libc::EOPNOTSUPP
                     || code == nix::libc::EINVAL =>
             {
@@ -1281,6 +1869,14 @@ mod platform {
             ),
             error => errno_to_io(error),
         })
+    }
+
+    fn open_listing_directory(parent: &File, segment: &OsStr) -> io::Result<File> {
+        open_directory(parent, segment)
+    }
+
+    fn reopen_listing_root(directory: &File) -> io::Result<File> {
+        directory.try_clone()
     }
 
     fn open_root_directory(path: &Path) -> io::Result<File> {
@@ -1441,8 +2037,8 @@ mod platform {
     use std::ffi::{OsStr, OsString, c_void};
     use std::fs::File;
     use std::io::{self, Read as _, Write as _};
-    use std::mem::{offset_of, size_of};
-    use std::os::windows::ffi::OsStrExt as _;
+    use std::mem::{offset_of, size_of, size_of_val};
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::{Component, Path, PathBuf};
     use std::ptr;
@@ -1455,17 +2051,20 @@ mod platform {
         FileRenameInformation, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
-        HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+        ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
+        RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdInfo,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
-        SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ATTRIBUTE_DEVICE,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdBothDirectoryInfo,
+        FileIdBothDirectoryRestartInfo, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
+        SetFileInformationByHandle, WRITE_DAC,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1474,7 +2073,8 @@ mod platform {
     use super::GcEvent;
     use super::{
         BeginPrivateQuarantine, CommitMode, ExpectedPreimage, NewFileMode, ReadEvent,
-        RepositoryGcCommit, RepositoryGcError, WriteEvent,
+        RepositoryDirectoryEntry, RepositoryDirectoryEntryKind, RepositoryDirectoryListing,
+        RepositoryGcCommit, RepositoryGcError, WriteEvent, directory_entry_limit_error,
     };
     use forge_core::ports::{RepositoryWriteCommit, RepositoryWriteError, RepositoryWriteOutcome};
 
@@ -1526,7 +2126,7 @@ mod platform {
             let handle = unsafe {
                 CreateFileW(
                     wide.as_ptr(),
-                    FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     ptr::null(),
                     OPEN_EXISTING,
@@ -1602,6 +2202,320 @@ mod platform {
             self.read_bounded_inner(relative, max_bytes, |_| Ok(()))
         }
 
+        pub(crate) fn validate_regular_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+            object: &File,
+        ) -> io::Result<()> {
+            let (parent_path, leaf) = split_target(relative)?;
+            validate_kind(expected_parent, true)?;
+            let parent_identity = directory_identity(expected_parent)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )?;
+            let current = open_read_leaf(expected_parent, leaf)?.ok_or_else(|| {
+                read_namespace_changed("repository target disappeared under its pinned parent")
+            })?;
+            if file_identity(&current)? != file_identity(object)? {
+                return Err(read_namespace_changed(
+                    "repository target identity changed under its pinned parent",
+                ));
+            }
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )
+        }
+
+        pub(crate) fn open_regular_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+        ) -> io::Result<Option<File>> {
+            let (parent_path, leaf) = split_target(relative)?;
+            validate_kind(expected_parent, true)?;
+            let parent_identity = directory_identity(expected_parent)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )?;
+            let current = open_read_leaf(expected_parent, leaf)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                parent_path,
+                parent_identity,
+            )?;
+            Ok(current)
+        }
+
+        pub(crate) fn open_listed_entry_from(
+            &self,
+            relative: &Path,
+            expected_directory: &File,
+            entry: &RepositoryDirectoryEntry,
+        ) -> io::Result<File> {
+            validate_kind(expected_directory, true)?;
+            let expected_identity = directory_identity(expected_directory)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_identity,
+            )?;
+            let current = match entry.kind {
+                RepositoryDirectoryEntryKind::Directory => {
+                    open_listing_directory(expected_directory, &entry.name)
+                }
+                RepositoryDirectoryEntryKind::RegularFile => {
+                    open_read_leaf(expected_directory, &entry.name)?.ok_or_else(|| {
+                        read_namespace_changed(
+                            "repository listed entry disappeared under its pinned parent",
+                        )
+                    })
+                }
+            }?;
+            if file_identity(&current)? != entry.identity {
+                return Err(read_namespace_changed(
+                    "repository listed entry identity changed under its pinned parent",
+                ));
+            }
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_identity,
+            )?;
+            Ok(current)
+        }
+
+        pub(crate) fn list_directory(
+            &self,
+            relative: &Path,
+            max_entries: usize,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            self.list_directory_inner(relative, None, max_entries, || Ok(()))
+        }
+
+        pub(crate) fn list_directory_from(
+            &self,
+            relative: &Path,
+            expected: &File,
+            max_entries: usize,
+        ) -> io::Result<RepositoryDirectoryListing> {
+            self.list_directory_inner(relative, Some(expected), max_entries, || Ok(()))?
+                .ok_or_else(|| {
+                    read_namespace_changed(
+                        "repository directory disappeared after its pinned parent listing",
+                    )
+                })
+        }
+
+        fn list_directory_inner(
+            &self,
+            relative: &Path,
+            expected: Option<&File>,
+            max_entries: usize,
+            hook: impl FnOnce() -> io::Result<()>,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            let observation = open_directory_for_listing(&self.directory, relative)?;
+            if !observation.complete {
+                validate_directory_observation(
+                    &self.directory,
+                    &self.path,
+                    self.identity,
+                    relative,
+                    &observation.identities,
+                )?;
+                if expected.is_some() {
+                    return Err(read_namespace_changed(
+                        "repository directory disappeared after its pinned parent listing",
+                    ));
+                }
+                return Ok(Some(RepositoryDirectoryListing {
+                    root: reopen_listing_root(&self.directory)?,
+                    ancestors: observation._ancestors,
+                    directory: observation.directory,
+                    entries: Vec::new(),
+                    opened_components: observation.identities.len(),
+                    target_present: false,
+                }));
+            }
+            let opened_components = observation.identities.len();
+            let ancestors = observation._ancestors;
+            let visible_identity = directory_identity(&observation.directory)?;
+            let directory = if let Some(expected) = expected {
+                if directory_identity(expected)? != visible_identity {
+                    return Err(read_namespace_changed(
+                        "repository directory identity changed after its parent listing",
+                    ));
+                }
+                expected.try_clone()?
+            } else {
+                observation.directory
+            };
+            validate_kind(&directory, true)?;
+            let expected_directory = directory_identity(&directory)?;
+            let mut entries = Vec::new();
+            let mut restart = true;
+            loop {
+                let mut buffer = [0_u64; 8_192];
+                let information_class = if restart {
+                    FileIdBothDirectoryRestartInfo
+                } else {
+                    FileIdBothDirectoryInfo
+                };
+                // SAFETY: the directory handle is live and `buffer` is aligned writable storage of
+                // exactly the supplied byte length for this variable-size information class.
+                let success = unsafe {
+                    GetFileInformationByHandleEx(
+                        directory.as_raw_handle(),
+                        information_class,
+                        buffer.as_mut_ptr().cast(),
+                        size_of_val(&buffer) as u32,
+                    )
+                };
+                if success == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                        break;
+                    }
+                    return Err(error);
+                }
+                restart = false;
+                let bytes = size_of_val(&buffer);
+                let mut offset = 0_usize;
+                loop {
+                    let header = offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                    if offset.checked_add(header).is_none_or(|end| end > bytes) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Windows returned a truncated repository directory entry",
+                        ));
+                    }
+                    // SAFETY: `offset` and the fixed header were bounds-checked above; the buffer
+                    // has alignment suitable for this structure.
+                    let information = unsafe {
+                        &*buffer
+                            .as_ptr()
+                            .cast::<u8>()
+                            .add(offset)
+                            .cast::<FILE_ID_BOTH_DIR_INFO>()
+                    };
+                    let name_bytes = information.FileNameLength as usize;
+                    if name_bytes % size_of::<u16>() != 0
+                        || offset
+                            .checked_add(header)
+                            .and_then(|start| start.checked_add(name_bytes))
+                            .is_none_or(|end| end > bytes)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Windows returned an invalid repository directory filename",
+                        ));
+                    }
+                    // SAFETY: the UTF-16 filename range was validated inside `buffer` above.
+                    let name = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer
+                                .as_ptr()
+                                .cast::<u8>()
+                                .add(offset + header)
+                                .cast::<u16>(),
+                            name_bytes / size_of::<u16>(),
+                        )
+                    };
+                    if name != [u16::from(b'.')].as_slice()
+                        && name != [u16::from(b'.'), u16::from(b'.')].as_slice()
+                    {
+                        if entries.len() == max_entries {
+                            return Err(directory_entry_limit_error());
+                        }
+                        let name = OsString::from_wide(name);
+                        let attributes = information.FileAttributes;
+                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                            return Err(super::unsupported_directory_entry_error(
+                                name,
+                                super::UnsupportedDirectoryEntryKind::LinkOrReparse,
+                            ));
+                        }
+                        if attributes & FILE_ATTRIBUTE_DEVICE != 0 {
+                            return Err(super::unsupported_directory_entry_error(
+                                name,
+                                super::UnsupportedDirectoryEntryKind::Other,
+                            ));
+                        }
+                        let (kind, object) = if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                            (
+                                RepositoryDirectoryEntryKind::Directory,
+                                open_listing_directory(&directory, &name)?,
+                            )
+                        } else {
+                            let object = open_read_leaf(&directory, &name)?.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "repository directory entry disappeared during listing",
+                                )
+                            })?;
+                            (RepositoryDirectoryEntryKind::RegularFile, object)
+                        };
+                        let identity = file_identity(&object)?;
+                        entries.push(RepositoryDirectoryEntry {
+                            name,
+                            kind,
+                            identity,
+                        });
+                    }
+                    if information.NextEntryOffset == 0 {
+                        break;
+                    }
+                    let next = information.NextEntryOffset as usize;
+                    offset = offset.checked_add(next).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Windows repository directory offset overflowed",
+                        )
+                    })?;
+                    if offset >= bytes {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Windows returned an out-of-range repository directory offset",
+                        ));
+                    }
+                }
+            }
+            hook()?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_directory,
+            )?;
+            validate_listed_entries(&directory, &entries)?;
+            validate_visible_root_and_parent(
+                &self.path,
+                self.identity,
+                relative,
+                expected_directory,
+            )?;
+            Ok(Some(RepositoryDirectoryListing {
+                root: reopen_listing_root(&self.directory)?,
+                ancestors,
+                directory,
+                entries,
+                opened_components,
+                target_present: true,
+            }))
+        }
+
         #[cfg(test)]
         pub(super) fn read_bounded_with_hook(
             &self,
@@ -1654,12 +2568,27 @@ mod platform {
             })
         }
 
+        #[cfg(test)]
         pub(crate) fn begin_private_quarantine(
             &self,
             relative: &Path,
             quarantine_leaf: &OsStr,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
-            self.begin_private_quarantine_inner(relative, quarantine_leaf, |_| Ok(()))
+            self.begin_private_quarantine_inner(relative, quarantine_leaf, None, |_| Ok(()))
+        }
+
+        pub(crate) fn begin_private_quarantine_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+            quarantine_leaf: &OsStr,
+        ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
+            self.begin_private_quarantine_inner(
+                relative,
+                quarantine_leaf,
+                Some(expected_parent),
+                |_| Ok(()),
+            )
         }
 
         #[cfg(test)]
@@ -1669,13 +2598,14 @@ mod platform {
             quarantine_leaf: &OsStr,
             hook: impl FnMut(GcEvent) -> io::Result<()>,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
-            self.begin_private_quarantine_inner(relative, quarantine_leaf, hook)
+            self.begin_private_quarantine_inner(relative, quarantine_leaf, None, hook)
         }
 
         fn begin_private_quarantine_inner(
             &self,
             relative: &Path,
             quarantine_leaf: &OsStr,
+            expected_parent: Option<&File>,
             mut hook: impl FnMut(GcEvent) -> io::Result<()>,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
             let (parent_path, original_leaf) = split_target(relative)
@@ -1683,12 +2613,26 @@ mod platform {
                     validate_quarantine_names(parts.1, quarantine_leaf).map(|()| parts)
                 })
                 .map_err(not_changed_gc)?;
-            let parent = match self.open_parent(parent_path, NewFileMode::Private, false) {
-                Ok(parent) => parent,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(BeginPrivateQuarantine::Missing);
+            let parent = if let Some(expected_parent) = expected_parent {
+                validate_kind(expected_parent, true).map_err(not_changed_gc)?;
+                let expected_identity =
+                    directory_identity(expected_parent).map_err(not_changed_gc)?;
+                validate_visible_root_and_parent(
+                    &self.path,
+                    self.identity,
+                    parent_path,
+                    expected_identity,
+                )
+                .map_err(not_changed_gc)?;
+                expected_parent.try_clone().map_err(not_changed_gc)?
+            } else {
+                match self.open_parent(parent_path, NewFileMode::Private, false) {
+                    Ok(parent) => parent,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(BeginPrivateQuarantine::Missing);
+                    }
+                    Err(error) => return Err(not_changed_gc(error)),
                 }
-                Err(error) => return Err(not_changed_gc(error)),
             };
             let parent_identity = directory_identity(&parent).map_err(not_changed_gc)?;
             let object = match open_gc_regular_leaf(&parent, original_leaf) {
@@ -1750,20 +2694,60 @@ mod platform {
             }))
         }
 
+        #[cfg(test)]
         pub(crate) fn open_private_quarantine(
             &self,
             directory: &Path,
             original_leaf: &OsStr,
             quarantine_leaf: &OsStr,
         ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
+            self.open_private_quarantine_inner(directory, original_leaf, quarantine_leaf, None)
+        }
+
+        pub(crate) fn open_private_quarantine_from(
+            &self,
+            directory: &Path,
+            expected_parent: &File,
+            original_leaf: &OsStr,
+            quarantine_leaf: &OsStr,
+        ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
+            self.open_private_quarantine_inner(
+                directory,
+                original_leaf,
+                quarantine_leaf,
+                Some(expected_parent),
+            )
+        }
+
+        fn open_private_quarantine_inner(
+            &self,
+            directory: &Path,
+            original_leaf: &OsStr,
+            quarantine_leaf: &OsStr,
+            expected_parent: Option<&File>,
+        ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
             validate_parent_path(directory).map_err(not_changed_gc)?;
             validate_quarantine_names(original_leaf, quarantine_leaf).map_err(not_changed_gc)?;
-            let parent = match self.open_parent(directory, NewFileMode::Private, false) {
-                Ok(parent) => parent,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(super::OpenPrivateQuarantine::Missing);
+            let parent = if let Some(expected_parent) = expected_parent {
+                validate_kind(expected_parent, true).map_err(not_changed_gc)?;
+                let expected_identity =
+                    directory_identity(expected_parent).map_err(not_changed_gc)?;
+                validate_visible_root_and_parent(
+                    &self.path,
+                    self.identity,
+                    directory,
+                    expected_identity,
+                )
+                .map_err(not_changed_gc)?;
+                expected_parent.try_clone().map_err(not_changed_gc)?
+            } else {
+                match self.open_parent(directory, NewFileMode::Private, false) {
+                    Ok(parent) => parent,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(super::OpenPrivateQuarantine::Missing);
+                    }
+                    Err(error) => return Err(not_changed_gc(error)),
                 }
-                Err(error) => return Err(not_changed_gc(error)),
             };
             let parent_identity = directory_identity(&parent).map_err(not_changed_gc)?;
             let object = match open_gc_regular_leaf(&parent, quarantine_leaf) {
@@ -2179,6 +3163,47 @@ mod platform {
         finish_read_parent_observation(root, chain, identities, true)
     }
 
+    fn open_directory_for_listing(
+        root: &File,
+        relative: &Path,
+    ) -> io::Result<ReadParentObservation> {
+        validate_parent_path(relative)?;
+        if relative.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows confined directory listing requires a named directory",
+            ));
+        }
+        let mut chain = Vec::new();
+        let mut identities = Vec::new();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(segment) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "repository directory path was not normalized",
+                ));
+            };
+            let current = chain.last().unwrap_or(root);
+            let opened = if components.peek().is_none() {
+                open_listing_directory(current, segment)
+            } else {
+                open_listing_ancestor_directory(current, segment)
+            };
+            match opened {
+                Ok(directory) => {
+                    identities.push(directory_identity(&directory)?);
+                    chain.push(directory);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return finish_read_parent_observation(root, chain, identities, false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        finish_read_parent_observation(root, chain, identities, true)
+    }
+
     fn finish_read_parent_observation(
         root: &File,
         mut chain: Vec<File>,
@@ -2259,6 +3284,61 @@ mod platform {
         Ok(())
     }
 
+    fn validate_directory_observation(
+        pinned_root: &File,
+        root_path: &Path,
+        root_identity: (u64, [u8; 16]),
+        relative: &Path,
+        identities: &[(u64, [u8; 16])],
+    ) -> io::Result<()> {
+        validate_pinned_read_root(pinned_root, root_identity)?;
+        let visible_root = open_visible_read_root(root_path, root_identity)?;
+        let mut chain = Vec::new();
+        for (index, component) in relative.components().enumerate() {
+            let Component::Normal(segment) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "repository directory path was not normalized",
+                ));
+            };
+            let current = chain.last().unwrap_or(&visible_root);
+            let directory = match open_directory(current, segment, FILE_OPEN, false) {
+                Ok(directory) => directory,
+                Err(error)
+                    if index == identities.len() && error.kind() == io::ErrorKind::NotFound =>
+                {
+                    validate_pinned_read_root(pinned_root, root_identity)?;
+                    open_visible_read_root(root_path, root_identity)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(read_namespace_changed(format!(
+                        "repository directory changed during listing: {error}"
+                    )));
+                }
+            };
+            let Some(expected) = identities.get(index) else {
+                return Err(read_namespace_changed(
+                    "a previously missing repository directory appeared during listing",
+                ));
+            };
+            if directory_identity(&directory)? != *expected {
+                return Err(read_namespace_changed(
+                    "repository directory identity changed during listing",
+                ));
+            }
+            chain.push(directory);
+        }
+        if chain.len() != identities.len() {
+            return Err(read_namespace_changed(
+                "repository directory observation was inconsistent during listing",
+            ));
+        }
+        validate_pinned_read_root(pinned_root, root_identity)?;
+        open_visible_read_root(root_path, root_identity)?;
+        Ok(())
+    }
+
     fn validate_pinned_read_root(root: &File, expected: (u64, [u8; 16])) -> io::Result<()> {
         if directory_identity(root)? == expected {
             Ok(())
@@ -2301,6 +3381,37 @@ mod platform {
                 "repository target identity changed during bounded read",
             )),
         }
+    }
+
+    fn validate_listed_entries(
+        parent: &File,
+        entries: &[RepositoryDirectoryEntry],
+    ) -> io::Result<()> {
+        for entry in entries {
+            let current = match entry.kind {
+                RepositoryDirectoryEntryKind::Directory => {
+                    open_directory(parent, &entry.name, FILE_OPEN, false)
+                }
+                RepositoryDirectoryEntryKind::RegularFile => open_read_leaf(parent, &entry.name)?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "repository directory entry disappeared during listing",
+                        )
+                    }),
+            }
+            .map_err(|error| {
+                read_namespace_changed(format!(
+                    "repository directory entry changed during listing: {error}"
+                ))
+            })?;
+            if file_identity(&current)? != entry.identity {
+                return Err(read_namespace_changed(
+                    "repository directory entry identity changed during listing",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn read_namespace_changed(message: impl Into<String>) -> io::Error {
@@ -2625,6 +3736,55 @@ mod platform {
         )?;
         validate_kind(&file, true)?;
         Ok(file)
+    }
+
+    fn open_listing_directory(parent: &File, segment: &OsStr) -> io::Result<File> {
+        let file = nt_open_relative(
+            parent,
+            segment,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_ATTRIBUTE_DIRECTORY,
+            None,
+        )?;
+        validate_kind(&file, true)?;
+        Ok(file)
+    }
+
+    fn open_listing_ancestor_directory(parent: &File, segment: &OsStr) -> io::Result<File> {
+        let file = nt_open_relative(
+            parent,
+            segment,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_ATTRIBUTE_DIRECTORY,
+            None,
+        )?;
+        validate_kind(&file, true)?;
+        Ok(file)
+    }
+
+    fn reopen_listing_root(directory: &File) -> io::Result<File> {
+        // ReOpenFile derives a new access mask from the already pinned root object; it does not
+        // resolve the visible root path again and therefore cannot cross a root-replacement race.
+        // SAFETY: the source handle is live and the returned owned handle is checked below.
+        let handle = unsafe {
+            ReOpenFile(
+                directory.as_raw_handle(),
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is a newly returned owned Win32 handle.
+        let reopened = unsafe { File::from_raw_handle(handle) };
+        validate_kind(&reopened, true)?;
+        Ok(reopened)
     }
 
     fn existing_target_permissions(
@@ -2962,7 +4122,8 @@ mod platform {
     use std::path::Path;
 
     use super::{
-        BeginPrivateQuarantine, CommitMode, NewFileMode, RepositoryGcCommit, RepositoryGcError,
+        BeginPrivateQuarantine, CommitMode, NewFileMode, RepositoryDirectoryEntry,
+        RepositoryDirectoryListing, RepositoryGcCommit, RepositoryGcError,
     };
     use forge_core::ports::{RepositoryWriteError, RepositoryWriteOutcome};
 
@@ -3016,12 +4177,85 @@ mod platform {
             ))
         }
 
+        pub(crate) fn validate_regular_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+            object: &File,
+        ) -> io::Result<()> {
+            let _ = (self, relative, expected_parent, object);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined repository reads require Unix or Windows directory handles",
+            ))
+        }
+
+        pub(crate) fn open_regular_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+        ) -> io::Result<Option<File>> {
+            let _ = (self, relative, expected_parent);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined repository reads require Unix or Windows directory handles",
+            ))
+        }
+
+        pub(crate) fn open_listed_entry_from(
+            &self,
+            relative: &Path,
+            expected_directory: &File,
+            entry: &RepositoryDirectoryEntry,
+        ) -> io::Result<File> {
+            let _ = (self, relative, expected_directory, entry);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined repository listings require Unix or Windows directory handles",
+            ))
+        }
+
+        pub(crate) fn list_directory(
+            &self,
+            relative: &Path,
+            max_entries: usize,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            let _ = (self, relative, max_entries);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined repository listings require Unix or Windows directory handles",
+            ))
+        }
+
+        pub(crate) fn list_directory_from(
+            &self,
+            relative: &Path,
+            expected: &File,
+            max_entries: usize,
+        ) -> io::Result<RepositoryDirectoryListing> {
+            let _ = (self, relative, expected, max_entries);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined repository listings require Unix or Windows directory handles",
+            ))
+        }
+
         pub(crate) fn begin_private_quarantine(
             &self,
             relative: &Path,
             quarantine_leaf: &OsStr,
         ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
             let _ = (self, relative, quarantine_leaf);
+            Err(unsupported_gc())
+        }
+
+        pub(crate) fn begin_private_quarantine_from(
+            &self,
+            relative: &Path,
+            expected_parent: &File,
+            quarantine_leaf: &OsStr,
+        ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
+            let _ = (self, relative, expected_parent, quarantine_leaf);
             Err(unsupported_gc())
         }
 
@@ -3032,6 +4266,23 @@ mod platform {
             quarantine_leaf: &OsStr,
         ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
             let _ = (self, directory, original_leaf, quarantine_leaf);
+            Err(unsupported_gc())
+        }
+
+        pub(crate) fn open_private_quarantine_from(
+            &self,
+            directory: &Path,
+            expected_parent: &File,
+            original_leaf: &OsStr,
+            quarantine_leaf: &OsStr,
+        ) -> Result<super::OpenPrivateQuarantine, RepositoryGcError> {
+            let _ = (
+                self,
+                directory,
+                expected_parent,
+                original_leaf,
+                quarantine_leaf,
+            );
             Err(unsupported_gc())
         }
 
@@ -3190,6 +4441,98 @@ mod tests {
             oversized,
             Err(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_rejects_visible_root_replacement() -> Result<(), Box<dyn Error>> {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let displaced = container.path().join("displaced-repository");
+        fs::create_dir(&repository)?;
+        fs::create_dir(repository.join(DIRECTORY))?;
+        fs::write(repository.join(DIRECTORY).join(ORIGINAL), CONTENT)?;
+        let root = RootHandle::open(&repository)?;
+
+        let result = root.list_directory_with_hook(Path::new(DIRECTORY), 8, || {
+            fs::rename(&repository, &displaced)?;
+            fs::create_dir(&repository)?;
+            fs::create_dir(repository.join(DIRECTORY))?;
+            fs::write(repository.join(DIRECTORY).join(ORIGINAL), b"replacement")
+        });
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(displaced.join(DIRECTORY).join(ORIGINAL))?, CONTENT);
+        assert_eq!(
+            fs::read(repository.join(DIRECTORY).join(ORIGINAL))?,
+            b"replacement"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_rejects_target_directory_replacement() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let target = repository.path().join(DIRECTORY);
+        let displaced = repository.path().join("displaced-objects");
+        fs::create_dir(&target)?;
+        fs::write(target.join(ORIGINAL), CONTENT)?;
+        let root = RootHandle::open(repository.path())?;
+
+        let result = root.list_directory_with_hook(Path::new(DIRECTORY), 8, || {
+            fs::rename(&target, &displaced)?;
+            fs::create_dir(&target)?;
+            fs::write(target.join(ORIGINAL), b"replacement")
+        });
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(displaced.join(ORIGINAL))?, CONTENT);
+        assert_eq!(fs::read(target.join(ORIGINAL))?, b"replacement");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_listing_rejects_a_replaced_child_directory() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let parent = repository.path().join("kind");
+        let child = parent.join("v1");
+        let displaced = parent.join("displaced-v1");
+        fs::create_dir_all(&child)?;
+        fs::write(child.join(ORIGINAL), CONTENT)?;
+        let root = RootHandle::open(repository.path())?;
+        let listing = root
+            .list_directory(Path::new("kind"), 8)?
+            .ok_or_else(|| io::Error::other("parent directory unexpectedly missing"))?;
+        let (parent_handle, entries) = listing
+            .into_directory_and_entries()
+            .ok_or_else(|| io::Error::other("parent directory listing was incomplete"))?;
+        let child_entry = entries
+            .into_iter()
+            .find(|entry| entry.name == OsStr::new("v1"))
+            .ok_or_else(|| io::Error::other("child directory was not listed"))?;
+        let child_handle =
+            root.open_listed_entry_from(Path::new("kind"), &parent_handle, &child_entry)?;
+
+        fs::rename(&child, &displaced)?;
+        fs::create_dir(&child)?;
+        fs::write(child.join(ORIGINAL), b"replacement")?;
+        let result = root.list_directory_from(Path::new("kind/v1"), &child_handle, 8);
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(displaced.join(ORIGINAL))?, CONTENT);
+        assert_eq!(fs::read(child.join(ORIGINAL))?, b"replacement");
         Ok(())
     }
 

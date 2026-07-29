@@ -5,11 +5,16 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use forge_core::ports::StateStore;
 use thiserror::Error;
 
 use crate::fs::{FileSystemError, RepositoryWriter};
+use crate::repository_write::{
+    RepositoryDirectoryEntry, RepositoryDirectoryEntryKind, UnsupportedDirectoryEntryKind,
+    is_directory_entry_limit, unsupported_directory_entry,
+};
 
 mod evidence;
 pub use evidence::*;
@@ -24,6 +29,21 @@ mod windows_acl_policy;
 
 /// Schema version for mutable, per-worktree state.
 pub const STATE_LAYOUT_VERSION: u16 = 1;
+
+#[derive(Debug)]
+struct PrivateStateEntry {
+    key: String,
+    relative: PathBuf,
+    kind: RepositoryDirectoryEntryKind,
+    parent: Arc<File>,
+    listed: RepositoryDirectoryEntry,
+}
+
+#[derive(Debug)]
+struct PrivateStateListing {
+    directory: Option<Arc<File>>,
+    entries: Vec<PrivateStateEntry>,
+}
 
 /// Schema version for immutable, content-addressed shared cache entries.
 pub const SHARED_CACHE_LAYOUT_VERSION: u16 = 1;
@@ -225,64 +245,203 @@ impl AtomicStateStore {
         relative: &Path,
         max_entries: usize,
     ) -> Result<Vec<String>, StateError> {
-        let Some(path) = validate_existing_state_directory(self.layout.worktree_dir(), relative)?
-        else {
-            return Ok(Vec::new());
-        };
-        let mut keys = Vec::new();
-        for entry in fs::read_dir(&path)
-            .map_err(|source| StateError::io("list private state directory", &path, source))?
-        {
-            let entry = entry
-                .map_err(|source| StateError::io("read private state entry", &path, source))?;
-            let entry_path = entry.path();
-            let metadata = fs::symlink_metadata(&entry_path).map_err(|source| {
-                StateError::io("inspect private state entry", &entry_path, source)
-            })?;
-            if metadata_is_link_or_reparse(&metadata) {
-                return Err(StateError::PathSafety(FileSystemError::SymlinkComponent {
-                    path: entry_path,
-                }));
-            }
-            if evidence::is_evidence_gc_quarantine_name(&entry.file_name()) {
-                if !metadata.is_file() {
-                    evidence::validate_legacy_evidence_gc_residue(&entry_path, &metadata)?;
+        let listing =
+            self.list_private_entries_bounded_inner(directory, relative, None, max_entries)?;
+        let entries = listing.entries;
+        let mut keys = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let path = self.layout.worktree_dir().join(&entry.relative);
+            if evidence::is_evidence_gc_quarantine_name(
+                entry.relative.file_name().unwrap_or_default(),
+            ) {
+                if entry.kind == RepositoryDirectoryEntryKind::Directory {
                     return Err(evidence::unsupported_legacy_evidence_gc_residue_error(
-                        &entry_path,
+                        &path,
                     ));
                 }
-                validate_private_state_file(&entry_path, &metadata)?;
                 return Err(StateError::InvalidLayout {
-                    path: entry_path,
+                    path,
                     reason: "immutable evidence GC residue requires held-lock recovery".to_owned(),
                 });
             }
-            if !metadata.is_file() {
+            if entry.kind != RepositoryDirectoryEntryKind::RegularFile {
                 return Err(StateError::InvalidLayout {
-                    path: entry_path,
+                    path,
                     reason: "listed state directory contains a non-regular entry".to_owned(),
                 });
             }
-            validate_private_state_file(&entry_path, &metadata)?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| StateError::InvalidLayout {
-                    path: entry.path(),
-                    reason: "state keys must use portable ASCII names".to_owned(),
-                })?;
-            let key = format!("{directory}/{name}");
-            validate_state_key(&key)?;
-            keys.push(key);
-            if keys.len() > max_entries {
-                return Err(StateError::EntryLimit {
-                    directory: directory.to_owned(),
-                    max_entries,
-                });
-            }
+            keys.push(entry.key);
         }
         keys.sort();
         Ok(keys)
+    }
+
+    fn list_private_entries_bounded_inner(
+        &self,
+        directory: &str,
+        relative: &Path,
+        expected: Option<&File>,
+        max_entries: usize,
+    ) -> Result<PrivateStateListing, StateError> {
+        let listing = match expected {
+            Some(expected) => Some(
+                self.writer
+                    .list_directory_from(relative, expected, max_entries)
+                    .map_err(|error| {
+                        map_private_listing_error(
+                            self.layout.worktree_dir(),
+                            relative,
+                            directory,
+                            max_entries,
+                            error,
+                        )
+                    })?,
+            ),
+            None => self
+                .writer
+                .list_directory(relative, max_entries)
+                .map_err(|error| {
+                    map_private_listing_error(
+                        self.layout.worktree_dir(),
+                        relative,
+                        directory,
+                        max_entries,
+                        error,
+                    )
+                })?,
+        };
+        let Some(listing) = listing else {
+            return Ok(PrivateStateListing {
+                directory: None,
+                entries: Vec::new(),
+            });
+        };
+        let mut directory_path = self.layout.worktree_dir().to_path_buf();
+        let mut components = relative.components();
+        for (index, directory_handle) in listing.directory_chain().enumerate() {
+            if index != 0 {
+                let Component::Normal(segment) =
+                    components.next().ok_or_else(|| StateError::InvalidLayout {
+                        path: directory_path.clone(),
+                        reason: "confined state directory handle chain is longer than its path"
+                            .to_owned(),
+                    })?
+                else {
+                    return Err(StateError::UnsafeKey {
+                        key: relative.to_string_lossy().into_owned(),
+                        reason: "state hierarchy is not normalized".to_owned(),
+                    });
+                };
+                directory_path.push(segment);
+            }
+            let directory_metadata = directory_handle.metadata().map_err(|source| {
+                StateError::io(
+                    "inspect opened private state directory",
+                    &directory_path,
+                    source,
+                )
+            })?;
+            if self.evidence_security {
+                evidence::validate_private_evidence_directory_handle(
+                    directory_handle,
+                    &directory_path,
+                    &directory_metadata,
+                )?;
+            } else {
+                validate_opened_private_state_directory(
+                    directory_handle,
+                    &directory_path,
+                    &directory_metadata,
+                )?;
+            }
+        }
+        if listing.target_present() && components.next().is_some() {
+            return Err(StateError::InvalidLayout {
+                path: directory_path,
+                reason: "confined state directory handle chain is shorter than its path".to_owned(),
+            });
+        }
+        if !listing.target_present() {
+            if components.next().is_none() {
+                return Err(StateError::InvalidLayout {
+                    path: directory_path,
+                    reason: "confined state listing reported a missing target after opening its complete path"
+                        .to_owned(),
+                });
+            }
+            return Ok(PrivateStateListing {
+                directory: None,
+                entries: Vec::new(),
+            });
+        }
+
+        let (listed_directory, listed_entries) =
+            listing
+                .into_directory_and_entries()
+                .ok_or_else(|| StateError::InvalidLayout {
+                    path: directory_path,
+                    reason: "confined state listing lost its opened target directory".to_owned(),
+                })?;
+        let listed_directory = Arc::new(listed_directory);
+        let mut entries = Vec::new();
+        for entry in listed_entries {
+            let name = entry.name().to_owned();
+            let kind = entry.kind();
+            let entry_relative = relative.join(&name);
+            let path = self.layout.worktree_dir().join(&entry_relative);
+            let object = self
+                .writer
+                .open_listed_entry_from(relative, &listed_directory, &entry)
+                .map_err(StateError::PathSafety)?;
+            let metadata = object.metadata().map_err(|source| {
+                StateError::io("inspect opened private state entry", &path, source)
+            })?;
+            match kind {
+                RepositoryDirectoryEntryKind::RegularFile => {
+                    validate_opened_private_state_file(&object, &path, &metadata)?;
+                }
+                RepositoryDirectoryEntryKind::Directory => {
+                    if self.evidence_security {
+                        evidence::validate_private_evidence_directory_handle(
+                            &object, &path, &metadata,
+                        )?;
+                    } else {
+                        validate_opened_private_state_directory(&object, &path, &metadata)?;
+                    }
+                }
+            }
+            let name = name.into_string().map_err(|_| StateError::InvalidLayout {
+                path,
+                reason: "state keys must use portable ASCII names".to_owned(),
+            })?;
+            let key = format!("{directory}/{name}");
+            validate_state_key(&key)?;
+            entries.push(PrivateStateEntry {
+                key,
+                relative: entry_relative,
+                kind,
+                parent: Arc::clone(&listed_directory),
+                listed: entry,
+            });
+        }
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(PrivateStateListing {
+            directory: Some(listed_directory),
+            entries,
+        })
+    }
+
+    fn open_listed_private_entry(&self, entry: &PrivateStateEntry) -> Result<File, StateError> {
+        let directory = entry
+            .relative
+            .parent()
+            .ok_or_else(|| StateError::InvalidLayout {
+                path: self.layout.worktree_dir().join(&entry.relative),
+                reason: "listed private state entry has no parent directory".to_owned(),
+            })?;
+        self.writer
+            .open_listed_entry_from(directory, &entry.parent, &entry.listed)
+            .map_err(StateError::PathSafety)
     }
 
     /// Attempts to acquire the per-worktree exclusive lock.
@@ -320,6 +479,36 @@ impl AtomicStateStore {
             actual: lock.path.clone(),
         })
     }
+}
+
+fn map_private_listing_error(
+    root: &Path,
+    relative: &Path,
+    directory: &str,
+    max_entries: usize,
+    error: FileSystemError,
+) -> StateError {
+    if let FileSystemError::Io { source, .. } = &error {
+        if is_directory_entry_limit(source) {
+            return StateError::EntryLimit {
+                directory: directory.to_owned(),
+                max_entries,
+            };
+        }
+        if let Some((name, kind)) = unsupported_directory_entry(source) {
+            let path = root.join(relative).join(name);
+            return match kind {
+                UnsupportedDirectoryEntryKind::LinkOrReparse => {
+                    StateError::PathSafety(FileSystemError::SymlinkComponent { path })
+                }
+                UnsupportedDirectoryEntryKind::Other => StateError::InvalidLayout {
+                    path,
+                    reason: "listed state directory contains an unsupported entry kind".to_owned(),
+                },
+            };
+        }
+    }
+    StateError::PathSafety(error)
 }
 
 impl StateStore for AtomicStateStore {
@@ -660,6 +849,15 @@ fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<()
 
     validate_private_directory_permissions(path, metadata)?;
     Ok(())
+}
+
+fn validate_opened_private_state_directory(
+    directory: &File,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    validate_private_directory(path, metadata)?;
+    evidence::validate_private_directory_handle_acl(directory, path)
 }
 
 fn ensure_private_relative_directories(root: &Path, relative: &Path) -> Result<(), StateError> {
@@ -1252,6 +1450,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn missing_listing_validates_private_root_and_existing_ancestor_handles()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for corrupt_root in [true, false] {
+            let temporary = tempdir()?;
+            let git_dir = temporary.path().join("git");
+            fs::create_dir(&git_dir)?;
+            let layout = GitStateLayout::new(&git_dir, &git_dir);
+            let store = AtomicStateStore::new(layout.clone())?;
+            store.store_atomic("mutable/bootstrap.json", b"private")?;
+            let corrupted = if corrupt_root {
+                layout.worktree_dir().to_path_buf()
+            } else {
+                layout.worktree_dir().join("mutable")
+            };
+            fs::set_permissions(&corrupted, fs::Permissions::from_mode(0o755))?;
+
+            let target = if corrupt_root {
+                "missing"
+            } else {
+                "mutable/missing"
+            };
+            assert_private_boundary_error(store.list_regular_keys_bounded(target, 8))?;
+            fs::set_permissions(&corrupted, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn generic_lock_rejects_a_permissive_existing_file_without_repair() -> Result<(), Box<dyn Error>>
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1332,6 +1561,50 @@ mod tests {
         assert_private_boundary_error(store.store_atomic(key, b"replacement"))?;
         assert_private_boundary_error(store.list_regular_keys_bounded("mutable", 8))?;
         assert_eq!(fs::read(path)?, b"private");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generic_state_listing_rejects_a_null_directory_dacl() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
+        let store = AtomicStateStore::new(layout.clone())?;
+        store.store_atomic("mutable/current.json", b"private")?;
+        let directory = layout.worktree_dir().join("mutable");
+        super::windows::set_null_dacl_for_test(&directory)?;
+
+        assert_private_boundary_error(store.list_regular_keys_bounded("mutable", 8))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_listing_rejects_null_dacl_on_root_and_existing_ancestor_handles()
+    -> Result<(), Box<dyn Error>> {
+        for corrupt_root in [true, false] {
+            let temporary = tempdir()?;
+            let git_dir = temporary.path().join("git");
+            fs::create_dir(&git_dir)?;
+            let layout = GitStateLayout::new(&git_dir, &git_dir);
+            let store = AtomicStateStore::new(layout.clone())?;
+            store.store_atomic("mutable/bootstrap.json", b"private")?;
+            let corrupted = if corrupt_root {
+                layout.worktree_dir().to_path_buf()
+            } else {
+                layout.worktree_dir().join("mutable")
+            };
+            super::windows::set_null_dacl_for_test(&corrupted)?;
+
+            let target = if corrupt_root {
+                "missing"
+            } else {
+                "mutable/missing"
+            };
+            assert_private_boundary_error(store.list_regular_keys_bounded(target, 8))?;
+        }
         Ok(())
     }
 

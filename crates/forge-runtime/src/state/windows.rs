@@ -363,6 +363,13 @@ pub(super) fn validate_owner_only_file_handle(file: &File, path: &Path) -> Resul
     validate_owner_only_handle(file, path, PrivateWindowsObjectKind::File)
 }
 
+pub(super) fn validate_owner_only_directory_handle(
+    directory: &File,
+    path: &Path,
+) -> Result<(), StateError> {
+    validate_owner_only_handle(directory, path, PrivateWindowsObjectKind::Directory)
+}
+
 pub(super) fn file_handle_still_names_path(
     file: &File,
     path: &Path,
@@ -786,12 +793,17 @@ pub(super) fn verbatim_child_path(path: &Path) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 pub(super) fn set_null_dacl_for_test(path: &Path) -> io::Result<()> {
+    let flags = if fs::metadata(path)?.is_dir() {
+        FILE_FLAG_BACKUP_SEMANTICS
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
     let file = open_file(
         path,
         READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        flags | FILE_FLAG_OPEN_REPARSE_POINT,
         None,
     )?;
     // SAFETY: the file handle is live. A NULL DACL deliberately broadens this test object so
