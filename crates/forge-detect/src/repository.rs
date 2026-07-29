@@ -33,12 +33,20 @@ pub struct RepositoryDetection {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Absolute Git locations resolved once for one repository detection.
+/// Absolute Git path observations resolved once for one repository detection.
 ///
 /// Keeping these values together lets callers establish process and private-state boundaries from
 /// the same Git observations later consumed by repository detection. Construction remains behind
 /// the controlled resolvers so relative repository or Git-state paths cannot enter the detection
 /// pipeline.
+///
+/// This value deliberately does not claim operating-system directory identity or continuity. The
+/// v0 repository identity is the native common-dir *path* digest frozen by ADR-0018. Replacing a
+/// root, worktree Git directory, or common Git directory at the same path (including an ABA swap)
+/// is therefore not observable through this type. Re-resolution can still detect a persistent
+/// retarget to different paths and fail closed. Callers that need mutation confinement must pin
+/// directory capabilities at the runtime write boundary; path confirmation is neither an identity
+/// proof nor a substitute for such a capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryTopology {
     root: PathBuf,
@@ -196,12 +204,12 @@ where
     })
 }
 
-/// Confirms that an earlier topology observation still names the same Git state directories.
+/// Confirms all three retained Git paths immediately before a model is returned.
 ///
-/// Callers that retain a topology while establishing process or cache boundaries must perform
-/// this confirmation after observing repository state and before accepting a model or using that
-/// cache. The repository root is deliberately reused; only the two Git-owned locations are
-/// queried again, and either changing fails closed without exposing either path in diagnostics.
+/// A persistent root, worktree Git directory, or common Git directory retarget fails closed. The
+/// comparison intentionally exposes neither expected nor observed paths in its error. Equal paths
+/// do not prove equal directory objects, and a same-path replacement or ABA remains outside this
+/// path-based v0 boundary.
 pub(crate) fn confirm_repository_topology_controlled<G>(
     expected: &RepositoryTopology,
     git: &G,
@@ -210,12 +218,41 @@ pub(crate) fn confirm_repository_topology_controlled<G>(
 where
     G: GitPort + ?Sized,
 {
-    let observed =
-        resolve_repository_topology_from_root_controlled(expected.root.clone(), git, control)?;
-    if observed.git_dir != expected.git_dir {
+    control_step("repository root", control)?;
+    let root = require_absolute_topology_path(
+        "repository root",
+        "repository-root",
+        confirmed_git_path(
+            "repository root",
+            "repository-root",
+            git.repository_root(expected.root()),
+        )?,
+    )?;
+    if root != expected.root {
+        return Err(changed_topology_error("repository root", "repository-root"));
+    }
+
+    control_step("worktree Git directory", control)?;
+    let git_dir = require_absolute_topology_path(
+        "worktree Git directory",
+        "git-dir",
+        confirmed_git_path("worktree Git directory", "git-dir", git.git_dir(&root))?,
+    )?;
+    if git_dir != expected.git_dir {
         return Err(changed_topology_error("worktree Git directory", "git-dir"));
     }
-    if observed.git_common_dir != expected.git_common_dir {
+
+    control_step("common Git directory", control)?;
+    let git_common_dir = require_absolute_topology_path(
+        "common Git directory",
+        "git-common-dir",
+        confirmed_git_path(
+            "common Git directory",
+            "git-common-dir",
+            git.git_common_dir(&root),
+        )?,
+    )?;
+    if git_common_dir != expected.git_common_dir {
         return Err(changed_topology_error(
             "common Git directory",
             "git-common-dir",
@@ -230,9 +267,27 @@ fn changed_topology_error(step: &'static str, command: &'static str) -> Reposito
         source: GitError::new(
             GitErrorKind::InvalidData,
             command,
-            format!("Git returned a different {step} during repository topology confirmation"),
+            format!("Git returned a different {step} during final path confirmation"),
         ),
     }
+}
+
+fn confirmed_git_path(
+    step: &'static str,
+    command: &'static str,
+    result: Result<PathBuf, GitError>,
+) -> Result<PathBuf, RepositoryDetectionError> {
+    result.map_err(|source| RepositoryDetectionError {
+        step,
+        source: GitError::new(
+            source.kind(),
+            command,
+            format!(
+                "Git path confirmation failed during {step} with {:?}",
+                source.kind()
+            ),
+        ),
+    })
 }
 
 fn require_absolute_topology_path(
@@ -610,8 +665,11 @@ fn status_diagnostic(root: &Path, state: WorkState, kind: GitErrorKind) -> Diagn
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use forge_core::ports::{FileSystemPort, GitPort, Hasher};
     use forge_core::{
@@ -621,9 +679,9 @@ mod tests {
     };
 
     use super::{
-        Confidence, OperationState, WorkState, classify_work_state, derive_repository_id,
-        detect_repository, detect_repository_from_topology_controlled,
-        resolve_repository_topology_controlled,
+        Confidence, OperationState, WorkState, classify_work_state,
+        confirm_repository_topology_controlled, derive_repository_id, detect_repository,
+        detect_repository_from_topology_controlled, resolve_repository_topology_controlled,
     };
     use crate::test_support::{absolute_path, repository_path, repository_root};
 
@@ -678,6 +736,71 @@ mod tests {
                 status,
                 calls: RefCell::new(Vec::new()),
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReplaceableTopologyPaths {
+        base: PathBuf,
+        root: PathBuf,
+        git_dir: PathBuf,
+        git_common_dir: PathBuf,
+    }
+
+    impl ReplaceableTopologyPaths {
+        fn new() -> io::Result<Self> {
+            static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+            let temporary_root = std::env::temp_dir();
+            let base = loop {
+                let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+                let candidate = temporary_root.join(format!(
+                    "forge-detect-topology-paths-{}-{sequence}",
+                    process::id()
+                ));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            let root = base.join("root");
+            let git_dir = base.join("worktree-git-dir");
+            let git_common_dir = base.join("common-git-dir");
+            let fixture = Self {
+                base,
+                root,
+                git_dir,
+                git_common_dir,
+            };
+            for path in [&fixture.root, &fixture.git_dir, &fixture.git_common_dir] {
+                fs::create_dir(path)?;
+            }
+            Ok(fixture)
+        }
+
+        fn replace_every_visible_directory(&self) -> io::Result<()> {
+            for (name, visible) in [
+                ("root", &self.root),
+                ("worktree-git-dir", &self.git_dir),
+                ("common-git-dir", &self.git_common_dir),
+            ] {
+                let displaced = self.base.join(format!("displaced-{name}"));
+                fs::rename(visible, &displaced)?;
+                fs::create_dir(visible)?;
+                if !displaced.is_dir() || !visible.is_dir() {
+                    return Err(io::Error::other(
+                        "topology replacement fixture did not retain both directory objects",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ReplaceableTopologyPaths {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.base));
         }
     }
 
@@ -907,6 +1030,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn path_confirmation_is_not_identity_proof_across_same_path_directory_replacements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ReplaceableTopologyPaths::new()?;
+        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+        git.root = Ok(fixture.root.clone());
+        git.git_dir = Ok(fixture.git_dir.clone());
+        git.common_dir = Ok(fixture.git_common_dir.clone());
+        let topology = resolve_repository_topology_controlled(
+            &fixture.root,
+            &git,
+            &UnlimitedOperationControl,
+        )?;
+
+        // Rename preserves each old object under a second name while create_dir installs a
+        // distinct object at the same visible path. RepositoryTopology intentionally has no OS
+        // identity/capability field, so this is a contract test for its explicit limitation, not
+        // a claim that same-principal replacement races are detected.
+        fixture.replace_every_visible_directory()?;
+        git.calls.borrow_mut().clear();
+
+        confirm_repository_topology_controlled(&topology, &git, &UnlimitedOperationControl)?;
+        assert_eq!(
+            git.calls.borrow().as_slice(),
+            ["repository-root", "git-dir", "git-common-dir"]
+        );
+        git.calls.borrow_mut().clear();
+
+        let detection = detect_repository_from_topology_controlled(
+            topology,
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+            &UnlimitedOperationControl,
+        )?;
+
+        assert_eq!(git.calls.borrow().as_slice(), ["status"]);
+        assert_eq!(detection.facts.root, fixture.root);
+        assert_eq!(detection.facts.git_dir, fixture.git_dir);
+        assert_eq!(detection.facts.git_common_dir, fixture.git_common_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn path_confirmation_redacts_git_failure_details() -> Result<(), Box<dyn std::error::Error>> {
+        for (field, expected_step, expected_calls) in [
+            ("root", "repository root", vec!["repository-root"]),
+            (
+                "git-dir",
+                "worktree Git directory",
+                vec!["repository-root", "git-dir"],
+            ),
+            (
+                "common-dir",
+                "common Git directory",
+                vec!["repository-root", "git-dir", "git-common-dir"],
+            ),
+        ] {
+            let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+            let topology = resolve_repository_topology_controlled(
+                repository_root(),
+                &git,
+                &UnlimitedOperationControl,
+            )?;
+            let failure = GitError::new(
+                GitErrorKind::Io,
+                "fixture-path-query",
+                format!("private-{field}-path-and-detail"),
+            );
+            match field {
+                "root" => git.root = Err(failure),
+                "git-dir" => git.git_dir = Err(failure),
+                "common-dir" => git.common_dir = Err(failure),
+                _ => unreachable!(),
+            }
+            git.calls.borrow_mut().clear();
+
+            let error =
+                confirm_repository_topology_controlled(&topology, &git, &UnlimitedOperationControl)
+                    .err()
+                    .ok_or("failed Git path confirmation unexpectedly succeeded")?;
+
+            assert_eq!(error.step(), expected_step);
+            assert_eq!(error.source_error().kind(), GitErrorKind::Io);
+            assert!(!error.to_string().contains("private-"));
+            assert_eq!(git.calls.borrow().as_slice(), expected_calls);
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn repository_identity_preserves_non_utf8_unix_common_dir_bytes()
@@ -973,10 +1186,11 @@ mod tests {
             ("common-dir", "common Git directory"),
         ] {
             let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+            let rejected_path = format!("private-{field}-path");
             match field {
-                "root" => git.root = Ok(PathBuf::from("repo")),
-                "git-dir" => git.git_dir = Ok(PathBuf::from(".git")),
-                "common-dir" => git.common_dir = Ok(PathBuf::from(".git")),
+                "root" => git.root = Ok(PathBuf::from(&rejected_path)),
+                "git-dir" => git.git_dir = Ok(PathBuf::from(&rejected_path)),
+                "common-dir" => git.common_dir = Ok(PathBuf::from(&rejected_path)),
                 _ => unreachable!(),
             }
             let hasher = RecordingHasher::returning("blake3:must-not-be-used");
@@ -992,6 +1206,7 @@ mod tests {
 
             assert_eq!(error.step(), expected_step);
             assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
+            assert!(!error.to_string().contains(&rejected_path));
             assert!(hasher.calls.borrow().is_empty());
         }
         Ok(())
