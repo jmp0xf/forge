@@ -1268,12 +1268,12 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
         workflow
             .matches("uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
             .count(),
-        10,
+        11,
         "every checkout must use the ADR-0037 immutable v7.0.1 commit"
     );
     assert_eq!(
         workflow.matches("persist-credentials: false").count(),
-        10,
+        11,
         "every checkout must discard its credential helper"
     );
     for line in workflow
@@ -1299,13 +1299,21 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
 
     for required in [
         "cargo +stable fmt --all -- --check",
+        "cargo +stable check --locked --workspace --all-targets",
+        "cargo +stable clippy --locked --workspace --all-targets -- -D warnings",
+        "cargo +stable test --locked --workspace --no-fail-fast",
+        "cargo +stable check --locked --all-targets",
+        "cargo +stable test --locked --no-fail-fast",
+        "cargo +stable clippy --locked --all-targets",
         "cargo +1.85.0 check --locked --workspace --all-targets",
         "cargo +1.85.0 test --locked --workspace --no-fail-fast",
-        "cargo +1.85.0 run --locked -p xtask -- generate-fixtures",
+        "cargo +1.85.0 run --locked -p xtask -- check-fixtures",
         "cargo +stable check --locked --workspace --all-targets --target",
         "cargo +stable clippy --locked --workspace --all-targets --target",
         "cargo +stable test --locked --workspace --target",
         "cargo +stable run --locked -p xtask -- check-schemas",
+        "cargo +stable run --locked -p xtask -- check-fixtures",
+        "cargo +stable run --locked -p xtask -- verify",
         "every_declared_native_command_survives_fixture_install_and_uninstall_for_release",
         "release-build --target",
         "cargo +nightly-2026-07-26 fuzz run",
@@ -1313,6 +1321,28 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
     ] {
         assert!(workflow.contains(required), "missing CI gate `{required}`");
     }
+    assert!(
+        !workflow.contains("generate-fixtures"),
+        "verification CI must use the read-only fixture drift check"
+    );
+    let unified_job = workflow
+        .split_once("\n  unified-verify:\n")
+        .and_then(|(_, jobs)| jobs.split_once("\n  native:\n"))
+        .map(|(unified, _)| unified)
+        .ok_or("primary verification workflow lacks unified-verify job markers")?;
+    for required in [
+        "runner: [ubuntu-24.04, windows-2025]",
+        "timeout-minutes: 60",
+        "fail-fast: false",
+        "rustfmt,clippy",
+        "cargo +stable run --locked -p xtask -- verify",
+    ] {
+        assert!(
+            unified_job.contains(required),
+            "unified verification job lacks `{required}`"
+        );
+    }
+    assert!(!unified_job.contains("continue-on-error"));
     for required_runner in [
         "ubuntu-24.04",
         "ubuntu-24.04-arm",
