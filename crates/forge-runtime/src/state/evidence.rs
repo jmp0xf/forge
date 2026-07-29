@@ -14,9 +14,9 @@ use forge_core::{OperationControl, OperationControlError, UnlimitedOperationCont
 
 use super::{
     AtomicStateStore, GitStateLayout, StateError, StateLock, ensure_private_directory,
-    metadata_is_link_or_reparse, sync_directory, validate_existing_state_directory,
-    validate_private_directory, validate_private_file_permissions,
-    validate_required_private_state_file, validate_resolved_directory, validate_state_key,
+    metadata_is_link_or_reparse, validate_existing_state_directory, validate_private_directory,
+    validate_private_file_permissions, validate_required_private_state_file,
+    validate_resolved_directory, validate_state_key,
 };
 use crate::fs::{FileSystemError, RepositoryWriter};
 use crate::repository_write::{
@@ -2519,22 +2519,23 @@ fn apply_evidence_gc_plan(
     store: &AtomicStateStore,
     plan: &EvidenceGcPlan,
 ) -> Result<EvidenceGcReport, StateError> {
-    // Multi-file deletion is not a filesystem transaction. A class-directory durability barrier
-    // separates each dependency layer, so a crash cannot make a later Receipt/log deletion durable
-    // before the Evidence/Receipt deletions that made it unreferenced. Deterministic quarantine
-    // residue is recovered conservatively under the same worktree lock before the next scan.
+    // Multi-file deletion is not a filesystem transaction. Every successful quarantine deletion
+    // completes the platform-defined barrier through the same pinned class-directory capability:
+    // Unix synchronizes and rereads the parent namespace, while Windows rereads it after deleting
+    // through the verified object handle. The final deletion in each non-empty class therefore
+    // separates dependency layers; an empty class has no mutation to make durable. This order
+    // prevents a later Receipt/log deletion from completing before the Evidence/Receipt deletions
+    // that made it unreferenced. Deterministic quarantine residue is recovered conservatively under
+    // the same worktree lock before the next scan.
     for object in &plan.delete_evidence {
         remove_regular_state_file(store, object)?;
     }
-    sync_evidence_gc_class(store, EVIDENCE_V2_DIRECTORY)?;
     for object in &plan.delete_receipts {
         remove_regular_state_file(store, object)?;
     }
-    sync_evidence_gc_class(store, RECEIPTS_V2_DIRECTORY)?;
     for object in &plan.delete_logs {
         remove_regular_state_file(store, object)?;
     }
-    sync_evidence_gc_class(store, LOGS_V1_DIRECTORY)?;
 
     Ok(EvidenceGcReport {
         deleted_evidence: plan.delete_evidence.len(),
@@ -2756,16 +2757,6 @@ fn gc_quarantine_leaf(key: &str) -> Result<String, StateError> {
     };
     let object_name = object_name_from_key(key, extension)?;
     Ok(format!("{GC_QUARANTINE_PREFIX}{}", object_name.as_str()))
-}
-
-fn sync_evidence_gc_class(store: &AtomicStateStore, directory: &str) -> Result<(), StateError> {
-    let relative = validate_state_key(directory)?;
-    let Some(path) = validate_existing_state_directory(store.layout.worktree_dir(), &relative)?
-    else {
-        return Ok(());
-    };
-    validate_evidence_ancestor_permissions(store.layout.worktree_dir(), &relative)?;
-    sync_directory(&path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
