@@ -3,3 +3,29 @@ schema = 1
 [project]
 # These are inert detection corpora, not buildable units of the Forge repository itself.
 exclude = ["fixtures/**"]
+
+[policy]
+# The enclosing Forge command has a 45-minute budget. The xtask child reserves one minute for
+# repository discovery, command setup, and bounded local Receipt persistence.
+default_timeout_seconds = 2700
+
+[commands.verify]
+program = "cargo"
+args = ["run", "--locked", "-p", "xtask", "--", "verify"]
+cwd = "."
+inputs = ["**"]
+mutability = "external-side-effect"
+network = "inherit"
+success = "exit-zero"
+coverage = [
+  "format",
+  "compile",
+  "lint",
+  "unit-test",
+  "integration-test",
+  "custom:schema-contract",
+  "custom:fixture-contract",
+  "custom:fuzz-contract",
+  "custom:bootstrap",
+]
+enforcement = "required"

@@ -19,17 +19,32 @@ Installation does not replace verification. Run the complete local gates from th
 exact exit codes:
 
 ```bash
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify
+```
+
+This project-owned entry point checks schemas and generated fixtures without writing them, then runs the following
+bounded argv-only command set. It gives all required children one 44-minute shared budget, limits complete output per
+child, and leaves the fuzz Clippy result advisory:
+
+```bash
 RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check
-RUSTUP_AUTO_INSTALL=0 cargo check --workspace --all-targets
-RUSTUP_AUTO_INSTALL=0 cargo clippy --workspace --all-targets -- -D warnings
-RUSTUP_AUTO_INSTALL=0 cargo test --workspace --no-fail-fast
+RUSTUP_AUTO_INSTALL=0 cargo check --locked --workspace --all-targets
+RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --workspace --all-targets -- -D warnings
+RUSTUP_AUTO_INSTALL=0 cargo test --locked --workspace --no-fail-fast
 
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check)
-(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --all-targets)
-(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --no-fail-fast)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --locked --all-targets)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --locked --no-fail-fast)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --all-targets) # advisory
 
-RUSTUP_AUTO_INSTALL=0 cargo run -p xtask -- check-schemas
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-schemas
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-fixtures
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p forge-cli -- version
 ```
+
+`forge evidence run verify` executes the same entry point and records a scope-bound local Receipt. The project override
+allows 45 minutes so Forge retains time around the 44-minute child budget for repository discovery and Receipt
+persistence. That Receipt is optional local evidence, not CI, review, approval, signing, or release authority.
 
 The repository intentionally dogfoods its Cargo commands directly; it does not need a generated Makefile, justfile, or
 Taskfile to build itself. `forge init --with-runner make|just|task` is an explicit product feature for repositories that
@@ -92,13 +107,14 @@ claim that a campaign ran for the current candidate.
 Checked-in schemas and fixture repositories are reviewable interfaces:
 
 ```bash
-cargo run -p xtask -- check-schemas
-cargo run -p xtask -- generate-fixtures
+cargo run --locked -p xtask -- check-schemas
+cargo run --locked -p xtask -- check-fixtures
+cargo run --locked -p xtask -- generate-fixtures
 ```
 
-`schema-export` and `generate-fixtures` are writes. Run them only when intentionally updating their source contracts,
-then review the complete diff. Fixture definitions live under `fixtures/definitions/`; generated material belongs only
-under `fixtures/generated/`.
+`check-schemas` and `check-fixtures` are read-only drift checks. `schema-export` and `generate-fixtures` are writes. Run
+the writers only when intentionally updating their source contracts, then review the complete diff. Fixture
+definitions live under `fixtures/definitions/`; generated material belongs only under `fixtures/generated/`.
 
 The default fixture matrix remains portable: it runs every declared project-native command whose tool is available and
 reports unavailable host tools without treating those commands as release evidence. Release qualification requires a

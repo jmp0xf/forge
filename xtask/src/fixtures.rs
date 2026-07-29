@@ -72,6 +72,12 @@ pub(crate) struct GenerationReport {
     pub(crate) unchanged: usize,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CheckReport {
+    pub(crate) fixture_count: usize,
+    pub(crate) file_count: usize,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceManifest {
@@ -166,6 +172,57 @@ pub(crate) fn generate(
     })
 }
 
+pub(crate) fn check(
+    paths: &FixturePaths,
+    required_fixture_ids: &[&str],
+) -> Result<CheckReport, String> {
+    let plan = build_plan(paths, required_fixture_ids)?;
+    validate_destination(paths, &plan)?;
+    require_real_directory(&paths.generated, "generated fixture root")?;
+
+    let mut expected = plan
+        .files
+        .iter()
+        .map(|file| path_to_manifest_string(&file.output_relative))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    expected.insert(MATERIALIZED_MANIFEST_FILE.to_owned());
+    let actual = collect_tree_files(&paths.generated, "generated fixture tree")?;
+    if actual != expected {
+        let missing: Vec<_> = expected.difference(&actual).cloned().collect();
+        let unexpected: Vec<_> = actual.difference(&expected).cloned().collect();
+        return Err(format!(
+            "generated fixture inventory differs from the deterministic plan; missing={missing:?}, unexpected={unexpected:?}"
+        ));
+    }
+
+    for file in &plan.files {
+        let path = paths.generated.join(&file.output_relative);
+        require_real_file(&path, "generated fixture file")?;
+        let maximum = u64::try_from(file.bytes.len())
+            .map_err(|_| format!("generated fixture size overflowed: {}", path.display()))?;
+        let actual = read_bounded(&path, maximum)?;
+        if actual != file.bytes {
+            return Err(format!(
+                "generated fixture content drifted: {}",
+                file.output_relative.display()
+            ));
+        }
+    }
+
+    let manifest_path = paths.generated.join(MATERIALIZED_MANIFEST_FILE);
+    require_real_file(&manifest_path, "generated fixture manifest")?;
+    let manifest_maximum = u64::try_from(plan.manifest.len())
+        .map_err(|_| String::from("generated fixture manifest size overflowed"))?;
+    if read_bounded(&manifest_path, manifest_maximum)? != plan.manifest {
+        return Err(String::from("generated fixture manifest content drifted"));
+    }
+
+    Ok(CheckReport {
+        fixture_count: plan.fixture_count,
+        file_count: expected.len(),
+    })
+}
+
 fn build_plan(
     paths: &FixturePaths,
     required_fixture_ids: &[&str],
@@ -224,7 +281,7 @@ fn build_plan(
                 Ok(path.clone())
             })
             .collect::<Result<_, String>>()?;
-        let actual = collect_source_files(&fixture_source_root)?;
+        let actual = collect_tree_files(&fixture_source_root, "fixture definition tree")?;
         if actual != declared {
             let missing: Vec<_> = declared.difference(&actual).cloned().collect();
             let undeclared: Vec<_> = actual.difference(&declared).cloned().collect();
@@ -360,16 +417,17 @@ fn validate_project_directories(
     Ok(())
 }
 
-fn collect_source_files(root: &Path) -> Result<BTreeSet<String>, String> {
-    require_real_directory(root, "fixture source directory")?;
+fn collect_tree_files(root: &Path, label: &str) -> Result<BTreeSet<String>, String> {
+    require_real_directory(root, label)?;
     let mut files = BTreeSet::new();
-    collect_source_files_at(root, root, &mut files)?;
+    collect_tree_files_at(root, root, label, &mut files)?;
     Ok(files)
 }
 
-fn collect_source_files_at(
+fn collect_tree_files_at(
     root: &Path,
     directory: &Path,
+    label: &str,
     files: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     for entry in sorted_entries(directory)? {
@@ -379,12 +437,12 @@ fn collect_source_files_at(
             .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
         if file_type.is_symlink() {
             return Err(format!(
-                "fixture definitions must not contain symlinks: {}",
+                "{label} must not contain symlinks: {}",
                 path.display()
             ));
         }
         if file_type.is_dir() {
-            collect_source_files_at(root, &path, files)?;
+            collect_tree_files_at(root, &path, label, files)?;
         } else if file_type.is_file() {
             let relative = path
                 .strip_prefix(root)
@@ -392,7 +450,7 @@ fn collect_source_files_at(
             files.insert(path_to_manifest_string(relative)?);
         } else {
             return Err(format!(
-                "fixture source is not a regular file: {}",
+                "{label} contains a non-regular file: {}",
                 path.display()
             ));
         }
@@ -694,7 +752,7 @@ mod tests {
 
     use super::{
         FixturePaths, MATERIALIZED_MANIFEST_FILE, REQUIRED_FIXTURE_IDS, SOURCE_MANIFEST_FILE,
-        build_plan, digest, generate,
+        build_plan, check, digest, generate,
     };
 
     #[test]
@@ -759,6 +817,55 @@ mod tests {
         assert_eq!(second.written, 0);
         assert_eq!(before, after);
         assert_eq!(fs::read(unowned)?, b"do not replace\n");
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_check_requires_exact_generated_inventory_and_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let setup = TestDefinitions::new(&[TestFixture::new("alpha", &["src/lib.rs"])])?;
+        generate(&setup.paths, &[])?;
+
+        let pristine = snapshot(&setup.paths.generated)?;
+        let report = check(&setup.paths, &[])?;
+        assert_eq!(report.fixture_count, 1);
+        assert_eq!(report.file_count, 2);
+        assert_eq!(snapshot(&setup.paths.generated)?, pristine);
+
+        let generated = setup.paths.generated.join("alpha/src/lib.rs");
+        fs::remove_file(&generated)?;
+        let error = require_check_error(check(&setup.paths, &[]))?;
+        assert!(error.contains("missing"));
+
+        generate(&setup.paths, &[])?;
+        fs::write(&generated, b"drifted\n")?;
+        let error = require_check_error(check(&setup.paths, &[]))?;
+        assert!(error.contains("content drifted"));
+
+        generate(&setup.paths, &[])?;
+        fs::write(setup.paths.generated.join("obsolete.txt"), b"obsolete\n")?;
+        let error = require_check_error(check(&setup.paths, &[]))?;
+        assert!(error.contains("unexpected"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_check_rejects_a_generated_symlink_without_following_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let setup = TestDefinitions::new(&[TestFixture::new("alpha", &["src/lib.rs"])])?;
+        generate(&setup.paths, &[])?;
+        let generated = setup.paths.generated.join("alpha/src/lib.rs");
+        let outside = setup._temporary.path().join("outside.txt");
+        fs::write(&outside, b"outside\n")?;
+        fs::remove_file(&generated)?;
+        symlink(&outside, &generated)?;
+
+        let error = require_check_error(check(&setup.paths, &[]))?;
+        assert!(error.contains("symlink"));
+        assert_eq!(fs::read(outside)?, b"outside\n");
         Ok(())
     }
 
@@ -899,6 +1006,15 @@ mod tests {
     ) -> Result<String, Box<dyn std::error::Error>> {
         match result {
             Ok(report) => Err(format!("generation unexpectedly succeeded: {report:?}").into()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    fn require_check_error(
+        result: Result<super::CheckReport, String>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        match result {
+            Ok(report) => Err(format!("fixture check unexpectedly succeeded: {report:?}").into()),
             Err(error) => Ok(error),
         }
     }

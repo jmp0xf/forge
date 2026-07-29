@@ -29,6 +29,8 @@ use forge_schema::{
     ReleaseSigningData, ReleaseSubjectSetData, SchemaKind,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::cargo_env::{CargoNetworkMode, cargo_environment};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -1657,7 +1659,7 @@ fn cargo_build(
         repository,
         cargo_program(),
         arguments,
-        cargo_environment(),
+        cargo_environment(CargoNetworkMode::Offline),
         CARGO_BUILD_TIMEOUT,
         MAX_BUILD_STREAM_BYTES,
         MAX_BUILD_STREAM_BYTES,
@@ -1716,7 +1718,7 @@ fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, 
         .into_iter()
         .map(OsString::from)
         .collect(),
-        cargo_environment(),
+        cargo_environment(CargoNetworkMode::Offline),
         CARGO_METADATA_TIMEOUT,
         MAX_METADATA_BYTES,
         MAX_DIAGNOSTIC_BYTES,
@@ -1785,74 +1787,6 @@ fn require_no_external_cargo_configuration(repository: &Path) -> Result<(), Rele
         }
     }
     Ok(())
-}
-
-fn cargo_environment() -> EnvPolicy {
-    let mut policy = EnvPolicy::minimal();
-    policy.inherit.extend(
-        env::vars_os()
-            .map(|(key, _)| key)
-            .filter(|key| is_cargo_build_environment_key(key)),
-    );
-    policy
-        .overrides
-        .insert(OsString::from("RUSTUP_AUTO_INSTALL"), OsString::from("0"));
-    policy
-        .overrides
-        .insert(OsString::from("CARGO_NET_OFFLINE"), OsString::from("true"));
-    policy
-}
-
-fn is_cargo_build_environment_key(key: &OsStr) -> bool {
-    let Some(key) = key.to_str() else {
-        return false;
-    };
-    if forge_core::fingerprint::is_secret_like_name(key) {
-        return false;
-    }
-    let key = key.to_ascii_uppercase();
-    matches!(
-        key.as_str(),
-        "AR" | "CC"
-            | "CFLAGS"
-            | "CPATH"
-            | "CXX"
-            | "CXXFLAGS"
-            | "DEVELOPER_DIR"
-            | "INCLUDE"
-            | "LDFLAGS"
-            | "LIB"
-            | "LIBPATH"
-            | "LIBRARY_PATH"
-            | "MACOSX_DEPLOYMENT_TARGET"
-            | "PKG_CONFIG_PATH"
-            | "RANLIB"
-            | "RUSTC"
-            | "RUSTC_WRAPPER"
-            | "RUSTC_WORKSPACE_WRAPPER"
-            | "RUSTDOC"
-            | "RUSTFLAGS"
-            | "CARGO_ENCODED_RUSTFLAGS"
-            | "RUSTUP_TOOLCHAIN"
-            | "SDKROOT"
-            | "UNIVERSALCRTSDKDIR"
-            | "UCRTVERSION"
-            | "VCINSTALLDIR"
-            | "VCTOOLSINSTALLDIR"
-            | "WINDOWSSDKDIR"
-            | "WINDOWSSDKVERSION"
-    ) || [
-        "AR_",
-        "CC_",
-        "CFLAGS_",
-        "CXX_",
-        "CXXFLAGS_",
-        "PKG_CONFIG_",
-        "RANLIB_",
-        "CARGO_TARGET_",
-    ]
-    .iter()
-    .any(|prefix| key.starts_with(prefix))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3867,25 +3801,6 @@ mod tests {
             }
             _ => Ok(()),
         }
-    }
-
-    #[test]
-    fn cargo_environment_allows_toolchain_controls_but_not_registry_tokens() {
-        assert!(super::is_cargo_build_environment_key(std::ffi::OsStr::new(
-            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
-        )));
-        assert!(super::is_cargo_build_environment_key(std::ffi::OsStr::new(
-            "RUSTC_WRAPPER"
-        )));
-        assert!(!super::is_cargo_build_environment_key(
-            std::ffi::OsStr::new("CARGO_REGISTRIES_CRATES_IO_TOKEN")
-        ));
-        assert!(!super::is_cargo_build_environment_key(
-            std::ffi::OsStr::new("CARGO_TARGET_PRIVATE_TOKEN")
-        ));
-        assert!(super::is_cargo_build_environment_key(std::ffi::OsStr::new(
-            "LIB"
-        )));
     }
 
     #[test]

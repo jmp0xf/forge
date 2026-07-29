@@ -9,9 +9,11 @@ use std::process::ExitCode;
 
 use forge_schema::{SchemaKind, schema_json};
 
+mod cargo_env;
 mod compat;
 mod fixtures;
 mod release;
+mod verify;
 
 const EXIT_OK: u8 = 0;
 const EXIT_NEGATIVE: u8 = 1;
@@ -32,6 +34,8 @@ fn main() -> ExitCode {
         }
         [command] if command == "schema-export" => run_schema_export(),
         [command] if command == "check-schemas" => run_check_schemas(),
+        [command] if command == "check-fixtures" => run_check_fixtures(),
+        [command] if command == "verify" => run_verify(),
         [command] if command == "generate-fixtures" => run_generate_fixtures(),
         [command, rest @ ..] if command == "diff-plans" => run_diff_plans(rest),
         [command, rest @ ..] if command == "release-build" => {
@@ -145,6 +149,78 @@ fn run_generate_fixtures() -> ExitCode {
     }
 }
 
+fn run_check_fixtures() -> ExitCode {
+    let paths = match fixtures::FixturePaths::repository_default() {
+        Ok(paths) => paths,
+        Err(error) => return report_error(EXIT_INTERNAL, &error),
+    };
+    match fixtures::check(&paths, fixtures::REQUIRED_FIXTURE_IDS) {
+        Ok(report) => {
+            println!(
+                "checked {} deterministic fixtures across {} generated files",
+                report.fixture_count, report.file_count
+            );
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => report_error(EXIT_NEGATIVE, &error),
+    }
+}
+
+fn run_verify() -> ExitCode {
+    let schema_count = match check_schemas() {
+        Ok(count) => {
+            println!("verify: checked {count} checked-in schemas");
+            count
+        }
+        Err(SchemaCheckError::Drift(drifted)) => {
+            report_schema_drift(&drifted);
+            return ExitCode::from(EXIT_NEGATIVE);
+        }
+        Err(SchemaCheckError::Environment(error)) => {
+            return report_error(EXIT_ENV_UNMET, &error);
+        }
+        Err(SchemaCheckError::Internal(error)) => return report_error(EXIT_INTERNAL, &error),
+    };
+    let fixture_paths = match fixtures::FixturePaths::repository_default() {
+        Ok(paths) => paths,
+        Err(error) => return report_error(EXIT_INTERNAL, &error),
+    };
+    let fixture_report = match fixtures::check(&fixture_paths, fixtures::REQUIRED_FIXTURE_IDS) {
+        Ok(report) => {
+            println!(
+                "verify: checked {} deterministic fixtures across {} generated files",
+                report.fixture_count, report.file_count
+            );
+            report
+        }
+        Err(error) => return report_error(EXIT_NEGATIVE, &error),
+    };
+    let repository = match repository_root() {
+        Ok(repository) => repository,
+        Err(error) => return report_error(EXIT_INTERNAL, &error),
+    };
+    match verify::run(&repository) {
+        Ok(report) => {
+            println!(
+                "verification passed: {schema_count} schemas, {} fixtures, {} required command steps, {} advisory passed, {} advisory gaps",
+                fixture_report.fixture_count,
+                report.required_steps,
+                report.advisory_steps_passed,
+                report.advisory_steps_failed
+            );
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => {
+            let code = match error.kind() {
+                verify::VerifyErrorKind::Negative => EXIT_NEGATIVE,
+                verify::VerifyErrorKind::Environment => EXIT_ENV_UNMET,
+                verify::VerifyErrorKind::Internal => EXIT_INTERNAL,
+            };
+            report_error(code, &error.to_string())
+        }
+    }
+}
+
 fn run_schema_export() -> ExitCode {
     let directory = match schema_directory() {
         Ok(directory) => directory,
@@ -185,22 +261,34 @@ fn run_schema_export() -> ExitCode {
 }
 
 fn run_check_schemas() -> ExitCode {
-    let directory = match schema_directory() {
-        Ok(directory) => directory,
-        Err(error) => return report_error(EXIT_INTERNAL, &error),
-    };
-    let mut drifted = Vec::new();
+    match check_schemas() {
+        Ok(_) => {
+            println!("checked-in schemas match generated contracts");
+            ExitCode::from(EXIT_OK)
+        }
+        Err(SchemaCheckError::Drift(drifted)) => {
+            report_schema_drift(&drifted);
+            ExitCode::from(EXIT_NEGATIVE)
+        }
+        Err(SchemaCheckError::Environment(error)) => report_error(EXIT_ENV_UNMET, &error),
+        Err(SchemaCheckError::Internal(error)) => report_error(EXIT_INTERNAL, &error),
+    }
+}
 
+#[derive(Debug)]
+enum SchemaCheckError {
+    Drift(Vec<String>),
+    Environment(String),
+    Internal(String),
+}
+
+fn check_schemas() -> Result<usize, SchemaCheckError> {
+    let directory = schema_directory().map_err(SchemaCheckError::Internal)?;
+    let mut drifted = Vec::new();
     for kind in SchemaKind::all() {
-        let expected = match schema_json(*kind) {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                return report_error(
-                    EXIT_INTERNAL,
-                    &format!("failed to render {}: {error}", kind.id()),
-                );
-            }
-        };
+        let expected = schema_json(*kind).map_err(|error| {
+            SchemaCheckError::Internal(format!("failed to render {}: {error}", kind.id()))
+        })?;
         let path = directory.join(kind.file_name());
         match fs::read(&path) {
             Ok(actual) if actual == expected.as_bytes() => {}
@@ -209,32 +297,37 @@ fn run_check_schemas() -> ExitCode {
                 drifted.push(format!("{} (missing)", path.display()));
             }
             Err(error) => {
-                return report_error(
-                    EXIT_ENV_UNMET,
-                    &format!("failed to read {}: {error}", path.display()),
-                );
+                return Err(SchemaCheckError::Environment(format!(
+                    "failed to read {}: {error}",
+                    path.display()
+                )));
             }
         }
     }
 
     if drifted.is_empty() {
-        println!("checked-in schemas match generated contracts");
-        ExitCode::from(EXIT_OK)
+        Ok(SchemaKind::all().len())
     } else {
-        eprintln!("checked-in schema drift detected:");
-        for path in drifted {
-            eprintln!("  {path}");
-        }
-        eprintln!("next: run `cargo run -p xtask -- schema-export` and review the diff");
-        ExitCode::from(EXIT_NEGATIVE)
+        Err(SchemaCheckError::Drift(drifted))
     }
 }
 
+fn report_schema_drift(drifted: &[String]) {
+    eprintln!("checked-in schema drift detected:");
+    for path in drifted {
+        eprintln!("  {path}");
+    }
+    eprintln!("next: run `cargo run -p xtask -- schema-export` and review the diff");
+}
+
 fn schema_directory() -> Result<PathBuf, String> {
-    let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_directory
+    repository_root().map(|root| root.join("docs/schemas"))
+}
+
+fn repository_root() -> Result<PathBuf, String> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .map(|root| root.join("docs/schemas"))
+        .map(Path::to_path_buf)
         .ok_or_else(|| String::from("xtask manifest directory has no repository parent"))
 }
 
@@ -257,6 +350,8 @@ fn print_help() {
         "xtask commands:\n\
          schema-export     export checked-in JSON Schemas\n\
          check-schemas     detect unreviewed Schema drift\n\
+         check-fixtures    detect generated fixture inventory or content drift\n\
+         verify            run the complete bounded local project contract\n\
          generate-fixtures build deterministic fixture repositories\n\
          diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate\n\
          release-build     build and stage one accepted release target\n\

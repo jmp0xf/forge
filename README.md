@@ -100,17 +100,29 @@ working-tree directory.
 Run the required local Cargo gates from the repository root and report their exact exit codes:
 
 ```bash
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify
+```
+
+That is the project-owned complete local entry point. Its required steps expand to:
+
+```bash
 RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check
-RUSTUP_AUTO_INSTALL=0 cargo check --workspace --all-targets
-RUSTUP_AUTO_INSTALL=0 cargo clippy --workspace --all-targets -- -D warnings
-RUSTUP_AUTO_INSTALL=0 cargo test --workspace --no-fail-fast
+RUSTUP_AUTO_INSTALL=0 cargo check --locked --workspace --all-targets
+RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --workspace --all-targets -- -D warnings
+RUSTUP_AUTO_INSTALL=0 cargo test --locked --workspace --no-fail-fast
 
 (cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check)
-(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --all-targets)
-(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --no-fail-fast)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo check --locked --all-targets)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo test --locked --no-fail-fast)
+(cd fuzz && RUSTUP_AUTO_INSTALL=0 cargo clippy --locked --all-targets) # advisory
 
-RUSTUP_AUTO_INSTALL=0 cargo run -p xtask -- check-schemas
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-schemas
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- check-fixtures
+RUSTUP_AUTO_INSTALL=0 cargo run --locked -p forge-cli -- version
 ```
+
+`forge evidence run verify` runs the same command and records optional worktree-local evidence; it does not replace
+independent CI, review, approval, signing, or release authority.
 
 Rust 2024 Edition is required and the declared MSRV is Rust 1.85. Verification on Rust 1.85 remains required before
 release. A local pass is necessary evidence for the current worktree, but it is not proof of the required CI matrix,

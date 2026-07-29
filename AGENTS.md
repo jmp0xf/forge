@@ -26,7 +26,7 @@ commands and exit codes. Merge readiness still depends on independent CI and req
 Stop before weakening tests or assertions; changing CI, release, signing, ownership, or authority boundaries;
 changing a versioned machine contract without a migration; or contradicting an accepted ADR without a superseding ADR.
 
-<!-- forge:begin block=project-index schema=1 hash=blake3:a351ce7d846f914dc040acdf50b8df7960d5dfd37c02ee01d61feb52ebb7086b -->
+<!-- forge:begin block=project-index schema=1 hash=blake3:e1acb2f9afc6fdca74da84ad334e3ff68eefe00c3a9904c724f369799f8bb35a -->
 ## Authoritative paths
 - `.github/workflows/verify.yml`
 - `CONTRIBUTING.md`
@@ -68,11 +68,13 @@ changing a versioned machine contract without a migration; or contradicting an a
 - test step 6/8 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `check` `--all-targets`; cwd `fuzz`; explicit authorization required.
 - test step 7/8 (advisory): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `clippy` `--all-targets`; cwd `fuzz`; explicit authorization required.
 - test step 8/8 (required): env `RUSTUP_AUTO_INSTALL=0`; argv `cargo` `test` `--no-fail-fast`; cwd `fuzz`; explicit authorization required.
+- verify (required): argv `cargo` `run` `--locked` `-p` `xtask` `--` `verify`; cwd `.`; explicit authorization required.
 
 ## Optional local Receipts
 - `forge evidence run format-check` executes the same resolved `format-check` command set and records a scope-bound local Receipt.
 - `forge evidence run check` executes the same resolved `check` command set and records a scope-bound local Receipt.
 - `forge evidence run test` executes the same resolved `test` command set and records a scope-bound local Receipt.
+- `forge evidence run verify` executes the same resolved `verify` command set and records a scope-bound local Receipt.
 - A local Receipt is optional evidence, never CI, review, release, or approval authority.
 
 ## Completion evidence
