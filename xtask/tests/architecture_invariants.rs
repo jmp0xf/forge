@@ -258,7 +258,7 @@ const V0_INVARIANT_COVERAGE: &[InvariantCoverage] = &[
             ),
             anchor!(
                 "crates/forge-runtime/src/process.rs",
-                "cancellation_kills_descendants_without_reporting_timeout"
+                "cancellation_stops_descendants_in_platform_process_tree"
             ),
         ],
         ci_jobs: &["contracts", "native"],

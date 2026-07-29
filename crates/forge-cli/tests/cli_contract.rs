@@ -1298,6 +1298,7 @@ fn init_apply_is_brownfield_safe_and_second_plan_is_empty() -> Result<(), Box<dy
 {
     let fixture = TestWorkspace::clean_runner_repository("init-apply")?;
     let makefile_before = fs::read(fixture.worktree.join("Makefile"))?;
+    assert!(!fixture.worktree.join("forge.toml").exists());
 
     let applied = fixture.run_forge(&["init", "--apply", "--json"])?;
 
@@ -1314,6 +1315,10 @@ fn init_apply_is_brownfield_safe_and_second_plan_is_empty() -> Result<(), Box<dy
         makefile_before
     );
     assert!(!fixture.worktree.join("explain-must-not-run").exists());
+    assert!(
+        !fixture.worktree.join("forge.toml").exists(),
+        "zero-config init must not create a Forge configuration file"
+    );
     let manifest_bytes = fs::read(fixture.generated_manifest_path()?)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
     assert_eq!(manifest["schema"], 1);

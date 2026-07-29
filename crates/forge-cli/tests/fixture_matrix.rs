@@ -332,6 +332,18 @@ fn linked_worktrees_keep_private_state_and_receipts_isolated()
         display_output(&main_run)
     );
     assert!(main_git_dir.join("forge/receipts/v2").is_dir());
+    let main_export = fixture.run_forge_in(&fixture.worktree, &["evidence", "export", "--json"])?;
+    assert_eq!(
+        main_export.status.code(),
+        Some(0),
+        "{}",
+        display_output(&main_export)
+    );
+    assert!(main_git_dir.join("forge/evidence/v2").is_dir());
+    assert_eq!(
+        receipt_files(&main_git_dir.join("forge/evidence/v2"))?.len(),
+        1
+    );
     let shared_inventory_cache = main_git_dir.join("forge/cache/inventory");
     let cache_entries = receipt_files(&shared_inventory_cache)?;
     assert_eq!(cache_entries.len(), 1);
@@ -377,8 +389,24 @@ fn linked_worktrees_keep_private_state_and_receipts_isolated()
         display_output(&linked_run)
     );
     assert!(linked_git_dir.join("forge/receipts/v2").is_dir());
+    let linked_export = fixture.run_forge_in(&linked, &["evidence", "export", "--json"])?;
+    assert_eq!(
+        linked_export.status.code(),
+        Some(0),
+        "{}",
+        display_output(&linked_export)
+    );
+    assert!(linked_git_dir.join("forge/evidence/v2").is_dir());
     assert!(!receipt_files(&main_git_dir.join("forge/receipts/v2"))?.is_empty());
     assert!(!receipt_files(&linked_git_dir.join("forge/receipts/v2"))?.is_empty());
+    assert_eq!(
+        receipt_files(&main_git_dir.join("forge/evidence/v2"))?.len(),
+        1
+    );
+    assert_eq!(
+        receipt_files(&linked_git_dir.join("forge/evidence/v2"))?.len(),
+        1
+    );
     Ok(())
 }
 

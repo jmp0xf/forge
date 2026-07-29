@@ -2526,6 +2526,73 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_stops_descendants_in_platform_process_tree() -> Result<(), Box<dyn Error>> {
+        use std::sync::atomic::Ordering;
+
+        let root = tempdir()?;
+        let heartbeat = root.path().join("portable-cancel-tree-heartbeat");
+        let executable = std::env::current_exe()?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let runner = SynchronousProcessRunner::new(root.path())?
+            .with_cancellation_flag(Arc::clone(&cancellation));
+        let mut command = spec(
+            executable,
+            &["--exact", PROCESS_TREE_FIXTURE_TEST, "--nocapture"],
+        );
+        command.env.overrides.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_MODE),
+            OsString::from("parent"),
+        );
+        command.env.overrides.insert(
+            OsString::from(PROCESS_TREE_FIXTURE_HEARTBEAT),
+            heartbeat.as_os_str().to_os_string(),
+        );
+        command.timeout = Duration::from_secs(30);
+
+        let worker = thread::spawn(move || runner.run(&command));
+        let heartbeat_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::metadata(&heartbeat) {
+                Ok(metadata) if metadata.len() > 0 => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    cancellation.store(true, Ordering::Release);
+                    let _ = worker.join();
+                    return Err(error.into());
+                }
+            }
+            if Instant::now() >= heartbeat_deadline {
+                cancellation.store(true, Ordering::Release);
+                let _ = worker.join();
+                return Err(io::Error::other(
+                    "portable descendant did not start before cancellation",
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        cancellation.store(true, Ordering::Release);
+        let observation = worker
+            .join()
+            .map_err(|_| io::Error::other("process runner thread failed"))??;
+
+        assert!(observation.interrupted);
+        assert!(!observation.timed_out);
+        assert!(observation.stdout_digest.as_str().starts_with("blake3:"));
+        assert!(observation.stderr_digest.as_str().starts_with("blake3:"));
+        let stopped_at = fs::metadata(&heartbeat)?.len();
+        thread::sleep(Duration::from_millis(300));
+        let after = fs::metadata(&heartbeat)?.len();
+        assert_eq!(
+            stopped_at, after,
+            "a fixture descendant survived process-tree cancellation"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn normal_exit_stops_background_descendants_before_pipe_drain() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let heartbeat = root.path().join("normal-exit-tree-heartbeat");
