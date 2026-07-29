@@ -4,6 +4,387 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy)]
+struct InvariantTestAnchor {
+    path: &'static str,
+    test: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InvariantCoverage {
+    id: &'static str,
+    tests: &'static [InvariantTestAnchor],
+    ci_jobs: &'static [&'static str],
+    external_required: bool,
+}
+
+macro_rules! anchor {
+    ($path:literal, $test:literal) => {
+        InvariantTestAnchor {
+            path: $path,
+            test: $test,
+        }
+    };
+}
+
+const EXTERNAL_REQUIRED_CHECK: &str = "external-required-check";
+
+// This ledger does not claim that naming a test proves its semantics. It makes the accepted
+// design's ID -> executable check -> CI route relationship complete and reviewable, while the
+// linked tests remain the behavioral evidence. Candidate-controlled CI cannot close the one
+// explicitly external authority boundary.
+const V0_INVARIANT_COVERAGE: &[InvariantCoverage] = &[
+    InvariantCoverage {
+        id: "INV-NO-REVERSE-DEPENDENCY",
+        tests: &[
+            anchor!(
+                "xtask/tests/architecture_invariants.rs",
+                "primary_verification_workflow_does_not_depend_on_forge"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/fixture_matrix.rs",
+                "every_declared_native_command_survives_fixture_install_and_uninstall_for_release"
+            ),
+        ],
+        ci_jobs: &["authority-boundary", "strict-exitability"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-PROJECT-OWNS-COMMANDS",
+        tests: &[anchor!(
+            "crates/forge-cli/src/args.rs",
+            "forbidden_project_wrappers_are_not_top_level_commands"
+        )],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-DRY-RUN-DEFAULT",
+        tests: &[
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "init_defaults_to_a_deterministic_read_only_plan"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/dogfood_fixed_point.rs",
+                "forge_init_dry_run_is_a_zero_diff_on_its_own_repository"
+            ),
+        ],
+        ci_jobs: &["contracts", "self-hosting"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-IDEMPOTENT",
+        tests: &[anchor!(
+            "crates/forge-cli/tests/cli_contract.rs",
+            "init_apply_is_brownfield_safe_and_second_plan_is_empty"
+        )],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-DETERMINISTIC-RENDER",
+        tests: &[
+            anchor!(
+                "crates/forge-render/src/plan.rs",
+                "planning_is_deterministic_and_enforces_the_agents_limit"
+            ),
+            anchor!(
+                "crates/forge-render/src/managed_block.rs",
+                "rendering_is_deterministic_and_hashes_only_canonical_body"
+            ),
+        ],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-NO-PRIVATE-WORKTREE-DIR",
+        tests: &[anchor!(
+            "xtask/tests/architecture_invariants.rs",
+            "committed_tree_has_no_tool_private_worktree_directory"
+        )],
+        ci_jobs: &["authority-boundary"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-ZERO-CONFIG-DEFAULT",
+        tests: &[anchor!(
+            "crates/forge-detect/src/config.rs",
+            "missing_default_config_preserves_zero_configuration_without_reading"
+        )],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-MANAGED-BLOCK-ONLY",
+        tests: &[
+            anchor!(
+                "crates/forge-render/src/plan.rs",
+                "brownfield_plan_preserves_every_byte_outside_the_block"
+            ),
+            anchor!(
+                "crates/forge-render/src/managed_block.rs",
+                "hash_comment_blocks_are_idempotent_and_preserve_brownfield_bytes"
+            ),
+        ],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-ARGV-ONLY",
+        tests: &[anchor!(
+            "xtask/tests/architecture_invariants.rs",
+            "only_the_runtime_process_module_constructs_product_subprocesses"
+        )],
+        ci_jobs: &["authority-boundary"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-READ-ONLY-COMMANDS",
+        tests: &[
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "doctor_json_is_complete_deterministic_and_read_only"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "next_on_unborn_changes_is_deterministic_read_only_and_never_executes_commands"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "adapters_check_is_read_only_after_init_and_detects_missing_generated_target"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "evidence_show_and_verify_leave_absent_private_state_absent"
+            ),
+        ],
+        ci_jobs: &["contracts", "adapters"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-WIRE-CONTRACT",
+        tests: &[
+            anchor!(
+                "crates/forge-cli/tests/json_schema_contract.rs",
+                "every_checked_in_contract_is_a_valid_json_schema"
+            ),
+            anchor!(
+                "crates/forge-core/src/error.rs",
+                "every_stable_exit_code_matches_the_public_matrix"
+            ),
+        ],
+        ci_jobs: &["contracts", "generated-contract"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-LOCAL-EVIDENCE-NOT-AUTHORITY",
+        tests: &[anchor!(
+            "crates/forge-core/src/evidence.rs",
+            "local_sufficiency_never_consumes_external_requirements"
+        )],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-AUTHORITY-SEPARATION",
+        tests: &[
+            anchor!(
+                "xtask/tests/architecture_invariants.rs",
+                "primary_verification_workflow_keeps_authority_read_only_and_dependencies_immutable"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/cli_contract.rs",
+                "doctor_separates_visible_repository_evidence_from_unobservable_host_enforcement"
+            ),
+        ],
+        ci_jobs: &["authority-boundary", EXTERNAL_REQUIRED_CHECK],
+        external_required: true,
+    },
+    InvariantCoverage {
+        id: "INV-WORKTREE-ISOLATION",
+        tests: &[
+            anchor!(
+                "crates/forge-cli/tests/fixture_matrix.rs",
+                "linked_worktrees_keep_private_state_and_receipts_isolated"
+            ),
+            anchor!(
+                "crates/forge-runtime/src/state/evidence.rs",
+                "worktree_state_is_isolated_while_cache_is_shared"
+            ),
+        ],
+        ci_jobs: &["contracts", "native"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-DEPENDENCY-BASED-INVALIDATION",
+        tests: &[anchor!(
+            "crates/forge-core/src/evidence.rs",
+            "every_dependency_mutation_makes_the_receipt_stale"
+        )],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-NO-SELF-WEAKENING",
+        tests: &[anchor!(
+            "crates/forge-detect/src/policy.rs",
+            "accepted_head_policy_survives_candidate_relaxation_and_deletion"
+        )],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-NATIVE-PATHS",
+        tests: &[
+            anchor!(
+                "crates/forge-cli/tests/fixture_matrix.rs",
+                "unix_non_utf8_git_path_survives_detection_and_init_without_loss"
+            ),
+            anchor!(
+                "crates/forge-cli/tests/fixture_matrix.rs",
+                "windows_long_utf16_path_survives_detection_init_and_write"
+            ),
+        ],
+        ci_jobs: &["contracts", "native"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-PROCESS-TREE-TERMINATION",
+        tests: &[
+            anchor!(
+                "crates/forge-runtime/src/process.rs",
+                "timeout_stops_descendants_in_platform_process_tree"
+            ),
+            anchor!(
+                "crates/forge-runtime/src/process.rs",
+                "cancellation_kills_descendants_without_reporting_timeout"
+            ),
+        ],
+        ci_jobs: &["contracts", "native"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-BOUNDED-OUTPUT",
+        tests: &[
+            anchor!(
+                "crates/forge-runtime/src/process.rs",
+                "combined_output_hard_limit_interrupts_dual_pipes_and_reaps_descendants"
+            ),
+            anchor!(
+                "crates/forge-runtime/src/process.rs",
+                "huge_output_is_drained_but_retained_within_each_limit"
+            ),
+        ],
+        ci_jobs: &["contracts", "native"],
+        external_required: false,
+    },
+    InvariantCoverage {
+        id: "INV-UNKNOWN-IS-NOT-PASS",
+        tests: &[
+            anchor!(
+                "crates/forge-core/src/evidence.rs",
+                "every_unknown_dependency_on_either_side_is_non_passing"
+            ),
+            anchor!(
+                "crates/forge-core/src/evidence.rs",
+                "unknown_outcome_never_passes_with_current_dependencies"
+            ),
+        ],
+        ci_jobs: &["contracts"],
+        external_required: false,
+    },
+];
+
+#[test]
+fn every_design_invariant_has_a_live_test_and_ci_route() -> Result<(), Box<dyn std::error::Error>> {
+    let root = repository_root()?;
+    let design = fs::read_to_string(root.join("docs/design-proposal.md"))?;
+    let design_ids = design_invariant_ids(&design)?;
+    assert_eq!(
+        design_ids.len(),
+        20,
+        "the accepted v0 design must name 20 invariants"
+    );
+
+    let workflow = fs::read_to_string(root.join(".github/workflows/verify.yml"))?;
+    let mut mapped_ids = BTreeSet::new();
+    for coverage in V0_INVARIANT_COVERAGE {
+        assert!(
+            mapped_ids.insert(coverage.id),
+            "duplicate invariant coverage entry: {}",
+            coverage.id
+        );
+        assert!(
+            !coverage.tests.is_empty(),
+            "{} has no test anchor",
+            coverage.id
+        );
+        assert!(
+            !coverage.ci_jobs.is_empty(),
+            "{} has no CI route",
+            coverage.id
+        );
+
+        for anchor in coverage.tests {
+            let path = root.join(anchor.path);
+            let source = fs::read_to_string(&path).map_err(|error| {
+                format!(
+                    "{} test anchor cannot read {}: {error}",
+                    coverage.id,
+                    path.display()
+                )
+            })?;
+            let function = format!("fn {}(", anchor.test);
+            assert!(
+                source.contains(&function),
+                "{} test anchor is stale: {}::{}",
+                coverage.id,
+                anchor.path,
+                anchor.test
+            );
+        }
+
+        for job in coverage.ci_jobs {
+            if *job == EXTERNAL_REQUIRED_CHECK {
+                continue;
+            }
+            assert!(
+                workflow.contains(&format!("\n  {job}:\n")),
+                "{} references missing CI job `{job}`",
+                coverage.id
+            );
+        }
+        assert_eq!(
+            coverage.external_required,
+            coverage.ci_jobs.contains(&EXTERNAL_REQUIRED_CHECK),
+            "{} external authority marker and route disagree",
+            coverage.id
+        );
+    }
+
+    assert_eq!(mapped_ids, design_ids, "design invariant coverage drifted");
+    Ok(())
+}
+
+fn design_invariant_ids(source: &str) -> Result<BTreeSet<&str>, String> {
+    let mut ids = BTreeSet::new();
+    for line in source.lines() {
+        let Some(rest) = line.strip_prefix("| `INV-") else {
+            continue;
+        };
+        let suffix = rest
+            .split_once('`')
+            .map(|(suffix, _)| suffix)
+            .ok_or_else(|| format!("malformed design invariant row: {line}"))?;
+        let id = &line[3..3 + "INV-".len() + suffix.len()];
+        if !ids.insert(id) {
+            return Err(format!("duplicate design invariant ID: {id}"));
+        }
+    }
+    Ok(ids)
+}
+
 fn repository_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
