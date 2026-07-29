@@ -2855,6 +2855,9 @@ N-1 public compatibility harness skeleton
 
 ## 27. v0 发布验收清单
 
+本节是当前候选的发布前验收汇总，不是第 4 节 20 个不变量的第二套机器协议。只有条目在
+当前候选上具备可定位证据时才可勾选；外部 authority 未确认前不得宣称整套清单通过。
+
 ### 27.1 功能
 
 - [ ] 识别 Rust package、workspace、多个 workspace。
@@ -2875,8 +2878,11 @@ N-1 public compatibility harness skeleton
 
 - [ ] Git 路径输出使用 porcelain `-z`。
 - [ ] 外部命令全部 argv 执行。
-- [ ] 所有写入使用 preimage + 同目录原子替换。
-- [ ] 所有集合稳定排序。
+- [ ] 覆盖既有工作树文件使用 preimage + 同目录原子替换；新建工作树文件使用 expected
+  absence + 原子 create-only/no-clobber；不可变对象使用原子 create-only/no-clobber；可变
+  私有状态在独占 worktree lock 下按 versioned conflict policy 同目录原子替换。
+- [ ] 进入稳定机器合同、渲染、摘要或决策结果的无序集合先 canonical sort；有序序列保留
+  合同定义的顺序。
 - [ ] JSON stdout 无污染。
 - [ ] 退出码符合规范。
 - [ ] Receipt validity 包含 scope、command、toolchain、environment、policy。
@@ -2888,7 +2894,8 @@ N-1 public compatibility harness skeleton
 
 - [ ] symlink 逃逸测试。
 - [ ] 非 UTF-8/特殊文件名测试。
-- [ ] secret/env 脱敏测试。
+- [ ] 冻结启发式命中的凭据类 env 名与明显凭据 argv 被拒绝；Forge 管理的
+  Receipt/Evidence/log 状态不持久化环境原值，拒绝诊断不回显被拒输入。
 - [ ] 子进程树终止测试。
 - [ ] huge output 测试。
 - [ ] 恶意 README/manifest 不变成 shell 执行。
@@ -2907,7 +2914,8 @@ N-1 public compatibility harness skeleton
 - [ ] managed marker 集中。
 - [ ] 输出文案快照可审查。
 - [ ] fixtures 可独立生成/运行。
-- [ ] 没有未使用的“未来平台”死实现。
+- [ ] v0 支持矩阵只列入具有 native CI 路由的平台；矩阵外分支不得公开为受支持能力，也
+  不得预实现未被入口使用的未来行为。
 
 ### 27.5 可退出性
 
