@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   contracts:
-    name: Project contract / generated drift
+    name: Root and fuzz project contract
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -67,6 +67,24 @@ jobs:
         continue-on-error: true
         working-directory: fuzz
         run: cargo clippy --all-targets
+      - name: Measure v0 performance targets
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.performance }}
+        run: >-
+          cargo +stable test --locked --release -p forge-cli --test fixture_matrix
+          large_repository_v0_latency_benchmark
+          -- --ignored --exact --nocapture
+
+  generated-contract:
+    name: Schemas / generated drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
       - name: Check checked-in schemas
         run: cargo +stable run --locked -p xtask -- check-schemas
       - name: Regenerate fixtures
@@ -78,12 +96,6 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Smoke bootstrap CLI
         run: cargo +stable run --locked -p forge-cli -- version
-      - name: Measure v0 performance targets
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.performance }}
-        run: >-
-          cargo +stable test --locked --release -p forge-cli --test fixture_matrix
-          large_repository_v0_latency_benchmark
-          -- --ignored --exact --nocapture
 
   msrv:
     name: Rust 1.85 (MSRV)
@@ -184,6 +196,58 @@ jobs:
           New-Item -ItemType Directory -Path $dist | Out-Null
           .\target\debug\xtask.exe release-build --target "${{ matrix.target }}" --output-dir $dist
           & (Join-Path $dist "${{ matrix.asset }}") version
+
+  adapters:
+    name: Host adapter contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test adapter unit contracts
+        run: cargo +stable test --locked -p forge-cli --bin forge adapter
+      - name: Test adapter CLI contracts
+        run: cargo +stable test --locked -p forge-cli --test cli_contract adapter
+      - name: Test adapter fixture boundaries
+        run: cargo +stable test --locked -p forge-cli --test fixture_matrix adapter
+      - name: Test adapter human output
+        run: cargo +stable test --locked -p forge-cli --test human_golden adapter
+
+  self-hosting:
+    name: Repository dogfood fixed point
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test repository fixed point
+        run: cargo +stable test --locked -p forge-cli --test dogfood_fixed_point --no-fail-fast
+
+  authority-boundary:
+    name: Candidate authority boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test architecture and compatibility boundaries
+        run: >-
+          cargo +stable test --locked -p xtask
+          --test architecture_invariants
+          --test compatibility_harness
+          --no-fail-fast
 
   strict-exitability:
     name: Strict fixture exitability

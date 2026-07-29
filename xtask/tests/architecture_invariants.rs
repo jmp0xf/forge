@@ -387,11 +387,12 @@ const AUTHORIZED_PRODUCT_IDENTITY_USES: &[AuthorizedProductIdentityUse] = &[
     authorize_identity!("crates/forge-runtime/src/hash.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-runtime/src/process.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-runtime/src/process.rs", ProductNamespace, 2, OS_RESOURCE_NAME),
+    authorize_identity!("crates/forge-runtime/src/repository_write.rs", ProductNamespace, 1, OS_RESOURCE_NAME),
     authorize_identity!("crates/forge-runtime/src/scope.rs", DisplayName, 2, USER_FACING_IDENTITY),
     authorize_identity!("crates/forge-runtime/src/scope.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-runtime/src/state.rs", CliReference, 2, OS_RESOURCE_NAME),
     authorize_identity!("crates/forge-runtime/src/state/evidence.rs", MachineNamespace, 2, MACHINE_PROTOCOL),
-    authorize_identity!("crates/forge-runtime/src/state/evidence.rs", ProductNamespace, 2, OS_RESOURCE_NAME),
+    authorize_identity!("crates/forge-runtime/src/state/evidence.rs", ProductNamespace, 1, OS_RESOURCE_NAME),
     authorize_identity!("crates/forge-runtime/src/toolchain.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
 ];
 
@@ -868,14 +869,14 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
     }
     assert_eq!(
         workflow
-            .matches("uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
+            .matches("uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
             .count(),
-        6,
-        "every checkout must use the ADR-0027 immutable v4.2.2 commit"
+        10,
+        "every checkout must use the ADR-0037 immutable v7.0.1 commit"
     );
     assert_eq!(
         workflow.matches("persist-credentials: false").count(),
-        6,
+        10,
         "every checkout must discard its credential helper"
     );
     for line in workflow
