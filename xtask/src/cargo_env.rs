@@ -221,7 +221,7 @@ fn msvc_target_arch(target: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(any(all(windows, target_env = "msvc"), test))]
+#[cfg(test)]
 fn is_msvc_probe_input_key(key: &str) -> bool {
     MSVC_PROBE_BASE_INPUT_KEYS.contains(&key) || MSVC_PROBE_DEVELOPER_INPUT_KEYS.contains(&key)
 }
