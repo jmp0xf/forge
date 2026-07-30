@@ -742,35 +742,21 @@ fn write_retained(
     if bytes.is_empty() && !truncated {
         return Ok(());
     }
-    let displayed = &bytes[..bytes.len().min(FAILURE_DISPLAY_BYTES)];
-    let mut safe_display = String::with_capacity(displayed.len());
-    for character in String::from_utf8_lossy(displayed).chars() {
-        if character == '\n' || character == '\t' {
-            safe_display.push(character);
-        } else if character.is_control() {
-            safe_display.extend(character.escape_default());
-        } else {
-            safe_display.push(character);
-        }
-    }
+    // CaptureBounded retains a prefix. This tail is therefore the end of the retained buffer, not
+    // necessarily the process stream; the separate retention marker below preserves that fact.
+    let (head, skipped, tail) = retained_display_parts(bytes, FAILURE_DISPLAY_BYTES);
+    let mut safe_display = String::with_capacity(FAILURE_DISPLAY_BYTES);
     writeln!(destination, "verify: retained {stream} for failed {label}:")
-        .and_then(|()| destination.write_all(safe_display.as_bytes()))
+        .and_then(|()| write_safe_display(destination, head, &mut safe_display))
         .and_then(|()| {
-            if safe_display.ends_with('\n') {
-                Ok(())
-            } else {
-                destination.write_all(b"\n")
+            if skipped == 0 {
+                return Ok(());
             }
-        })
-        .and_then(|()| {
-            if bytes.len() > FAILURE_DISPLAY_BYTES {
-                writeln!(
-                    destination,
-                    "verify: {stream} display was limited to {FAILURE_DISPLAY_BYTES} retained bytes"
-                )
-            } else {
-                Ok(())
-            }
+            writeln!(
+                destination,
+                "verify: {stream} display skipped {skipped} retained middle bytes"
+            )
+            .and_then(|()| write_safe_display(destination, tail, &mut safe_display))
         })
         .and_then(|()| {
             if truncated {
@@ -785,6 +771,41 @@ fn write_retained(
         .map_err(|error| {
             VerifyError::environment(format!("failed to write retained child output: {error}"))
         })
+}
+
+fn retained_display_parts(bytes: &[u8], budget: usize) -> (&[u8], usize, &[u8]) {
+    if bytes.len() <= budget {
+        return (bytes, 0, &[]);
+    }
+    let head_bytes = budget / 2;
+    let tail_bytes = budget - head_bytes;
+    (
+        &bytes[..head_bytes],
+        bytes.len() - budget,
+        &bytes[bytes.len() - tail_bytes..],
+    )
+}
+
+fn write_safe_display(
+    destination: &mut impl Write,
+    bytes: &[u8],
+    safe_display: &mut String,
+) -> io::Result<()> {
+    safe_display.clear();
+    for character in String::from_utf8_lossy(bytes).chars() {
+        if character == '\n' || character == '\t' {
+            safe_display.push(character);
+        } else if character.is_control() {
+            safe_display.extend(character.escape_default());
+        } else {
+            safe_display.push(character);
+        }
+    }
+    destination.write_all(safe_display.as_bytes())?;
+    if !safe_display.ends_with('\n') {
+        destination.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -803,9 +824,72 @@ mod tests {
         CARGO_METADATA_OUTPUT_BYTES, COMPLETE_OUTPUT_BYTES, Enforcement, FAILURE_DISPLAY_BYTES,
         OPERATION_TIMEOUT, RETAINED_STREAM_BYTES, VERIFY_STEPS, WINDOWS_VERIFY_TARGET_PRIMARY,
         WINDOWS_VERIFY_TARGET_SECONDARY, cargo_metadata_spec, parse_cargo_target_directory,
-        revalidate_windows_verify_target_directory, select_windows_verify_target_dir, step_spec,
-        unique_verify_working_directories, with_cargo_target_discovery_context,
+        retained_display_parts, revalidate_windows_verify_target_directory,
+        select_windows_verify_target_dir, step_spec, unique_verify_working_directories,
+        with_cargo_target_discovery_context, write_retained,
     };
+
+    #[test]
+    fn failed_output_display_preserves_a_bounded_head_and_retained_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let head_marker = b"first diagnostic line\n";
+        let middle_marker = b"omitted middle payload";
+        let tail_marker = b"\nfinal failure summary\n";
+        let omitted = 4_096;
+        let mut retained = vec![b'x'; FAILURE_DISPLAY_BYTES + omitted];
+        retained[..head_marker.len()].copy_from_slice(head_marker);
+        let middle_start = retained.len() / 2;
+        retained[middle_start..middle_start + middle_marker.len()].copy_from_slice(middle_marker);
+        let tail_start = retained.len() - tail_marker.len();
+        retained[tail_start..].copy_from_slice(tail_marker);
+
+        let (head, skipped, tail) = retained_display_parts(&retained, FAILURE_DISPLAY_BYTES);
+        assert_eq!(head.len() + tail.len(), FAILURE_DISPLAY_BYTES);
+        assert_eq!(skipped, omitted);
+
+        let mut output = Vec::new();
+        write_retained(&mut output, "synthetic step", "stdout", &retained, false)?;
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("first diagnostic line"));
+        assert!(output.contains("final failure summary"));
+        assert!(!output.contains("omitted middle payload"));
+        assert!(output.contains(&format!("display skipped {omitted} retained middle bytes")));
+        assert!(!output.contains("retention was truncated"));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_tail_and_capture_truncation_are_reported_as_distinct_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let retained = vec![b'x'; RETAINED_STREAM_BYTES];
+        let omitted = RETAINED_STREAM_BYTES - FAILURE_DISPLAY_BYTES;
+        let mut output = Vec::new();
+        write_retained(&mut output, "synthetic step", "stderr", &retained, true)?;
+        let output = String::from_utf8(output)?;
+        assert!(output.contains(&format!("display skipped {omitted} retained middle bytes")));
+        assert!(output.contains(&format!(
+            "retention was truncated at {RETAINED_STREAM_BYTES} bytes"
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn complete_short_failure_output_has_no_omission_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        write_retained(
+            &mut output,
+            "synthetic step",
+            "stderr",
+            b"complete output\n",
+            false,
+        )?;
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("complete output"));
+        assert!(!output.contains("display skipped"));
+        assert!(!output.contains("retention was truncated"));
+        Ok(())
+    }
 
     #[test]
     fn verification_plan_contains_all_required_contracts_before_advisory_work() {
