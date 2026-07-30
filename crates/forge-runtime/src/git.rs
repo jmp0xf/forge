@@ -456,7 +456,7 @@ mod windows_git_cwd {
                 GitErrorKind::Io,
                 operation.name(),
                 format!(
-                    "Forge cannot safely launch Git for Windows from this canonical working-directory namespace: {reason}; use a drive-letter or UNC repository path and invoke Forge with `--dir <short-repository-root>` from a short working directory"
+                    "Git for Windows cannot be safely launched from this canonical working-directory namespace: {reason}; use a drive-letter or UNC repository path and invoke the command with `--dir <short-repository-root>` from a short working directory"
                 ),
             )
         })?;
@@ -1447,7 +1447,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_git_cwd_limit_counts_only_supported_native_spellings() {
+    fn windows_git_cwd_limit_counts_only_supported_native_spellings()
+    -> Result<(), Box<dyn std::error::Error>> {
         let limit = super::windows_git_cwd::cwd_unit_limit();
         let below = PathBuf::from(format!(r"C:\{}", "a".repeat(limit - 4)));
         let at_limit = PathBuf::from(format!(r"C:\{}", "a".repeat(limit - 3)));
@@ -1482,28 +1483,33 @@ mod tests {
             Ok(limit)
         );
         assert!(super::windows_git_cwd::validate(&below, GitOperation::RepositoryRoot).is_ok());
-        let error = super::windows_git_cwd::validate(&at_limit, GitOperation::RepositoryRoot)
-            .err()
-            .expect("MAX_PATH-sized Git working directory was accepted");
+        let error = match super::windows_git_cwd::validate(&at_limit, GitOperation::RepositoryRoot)
+        {
+            Ok(()) => return Err("MAX_PATH-sized Git working directory was accepted".into()),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), GitErrorKind::Io);
         assert!(error.detail().contains("requires fewer than 260"));
         assert!(error.detail().contains("--dir <short-repository-root>"));
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn generic_verbatim_windows_git_cwd_fails_closed() {
+    fn generic_verbatim_windows_git_cwd_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let generic = PathBuf::from(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\forge");
 
         assert!(
             super::windows_git_cwd::test_effective_native_units(&generic).is_err(),
             "generic verbatim namespace was treated as a drive-letter path"
         );
-        let error = super::windows_git_cwd::validate(&generic, GitOperation::RepositoryRoot)
-            .err()
-            .expect("generic verbatim namespace was accepted for Git launch");
+        let error = match super::windows_git_cwd::validate(&generic, GitOperation::RepositoryRoot) {
+            Ok(()) => return Err("generic verbatim namespace was accepted for Git launch".into()),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), GitErrorKind::Io);
         assert!(error.detail().contains("generic verbatim paths"));
+        Ok(())
     }
 
     #[cfg(windows)]
