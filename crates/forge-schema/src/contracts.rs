@@ -52,6 +52,7 @@ pub enum SchemaKind {
     EvidenceV1,
     Evidence,
     Adapters,
+    ReleaseManifestV1,
     ReleaseManifest,
     Diagnostic,
     #[serde(other)]
@@ -71,6 +72,7 @@ impl SchemaKind {
         Self::EvidenceV1,
         Self::Evidence,
         Self::Adapters,
+        Self::ReleaseManifestV1,
         Self::ReleaseManifest,
         Self::Diagnostic,
     ];
@@ -93,7 +95,7 @@ impl SchemaKind {
             Self::ReceiptV1 | Self::Receipt => "receipt",
             Self::EvidenceV1 | Self::Evidence => "evidence",
             Self::Adapters => "adapters",
-            Self::ReleaseManifest => "release-manifest",
+            Self::ReleaseManifestV1 | Self::ReleaseManifest => "release-manifest",
             Self::Diagnostic => "diagnostic",
             Self::Unknown => "unknown",
         }
@@ -103,7 +105,7 @@ impl SchemaKind {
     #[must_use]
     pub const fn major(self) -> u16 {
         match self {
-            Self::Receipt | Self::Evidence => 2,
+            Self::Receipt | Self::Evidence | Self::ReleaseManifest => 2,
             Self::Version
             | Self::SchemaIndex
             | Self::InitPlan
@@ -113,7 +115,7 @@ impl SchemaKind {
             | Self::ReceiptV1
             | Self::EvidenceV1
             | Self::Adapters
-            | Self::ReleaseManifest
+            | Self::ReleaseManifestV1
             | Self::Diagnostic
             | Self::Unknown => 1,
         }
@@ -159,7 +161,8 @@ impl FromStr for SchemaKind {
             ("evidence", Some(1)) => Self::EvidenceV1,
             ("evidence", None | Some(2)) => Self::Evidence,
             ("adapters", None | Some(1)) => Self::Adapters,
-            ("release-manifest" | "release", None | Some(1)) => Self::ReleaseManifest,
+            ("release-manifest" | "release", Some(1)) => Self::ReleaseManifestV1,
+            ("release-manifest" | "release", None | Some(2)) => Self::ReleaseManifest,
             ("diagnostic", None | Some(1)) => Self::Diagnostic,
             _ => return Err(UnknownSchemaKind(value.to_owned())),
         };
@@ -1578,6 +1581,29 @@ pub struct ReleaseArtifactData {
     pub sha256: ReleaseSha256Data,
 }
 
+/// One immutable artifact described by the current local release-candidate manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseArtifactKindV2Data {
+    Binary,
+    CyclonedxSbom,
+    LicenseNotices,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One immutable artifact described by the current local release-candidate manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseArtifactV2Data {
+    pub name: String,
+    pub kind: ReleaseArtifactKindV2Data,
+    /// Release target triple, or `all` for the distribution-wide license-notices artifact.
+    pub target: String,
+    pub length: u64,
+    pub sha256: ReleaseSha256Data,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -1671,6 +1697,17 @@ pub struct ReleaseProvenanceData {
     pub subjects: [String; 12],
 }
 
+/// External provenance and signing work for the current candidate asset set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseProvenanceV2Data {
+    pub status: ReleaseProvenanceStatusData,
+    pub predicate_type: ReleasePredicateTypeData,
+    pub signing: ReleaseSigningData,
+    pub authority_status: ReleaseAuthorityStatusData,
+    pub subject_set: ReleaseSubjectSetData,
+    pub subjects: [String; 13],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -1702,6 +1739,20 @@ pub struct ReleaseManifestData {
     pub rollback: ReleaseRollbackData,
 }
 
+/// Standalone `forge.release-manifest/v2` document shipped with release assets.
+///
+/// This major version adds the license-notices artifact to the exact candidate asset set. As with
+/// v1, compatibility readers are non-authorizing; exact candidate acceptance remains a separate,
+/// canonical procedure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseManifestV2Data {
+    pub schema: String,
+    pub release: ReleaseDescriptorData,
+    pub artifacts: [ReleaseArtifactV2Data; 11],
+    pub provenance: ReleaseProvenanceV2Data,
+    pub rollback: ReleaseRollbackData,
+}
+
 /// Root data for a standalone structured diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiagnosticData {
@@ -1726,7 +1777,8 @@ pub fn schema_for_kind(kind: SchemaKind) -> SchemaDocument {
         SchemaKind::EvidenceV1 => schema_for!(Envelope<EvidenceData>),
         SchemaKind::Evidence => schema_for!(Envelope<EvidenceV2Data>),
         SchemaKind::Adapters => schema_for!(Envelope<AdaptersData>),
-        SchemaKind::ReleaseManifest => schema_for!(ReleaseManifestData),
+        SchemaKind::ReleaseManifestV1 => schema_for!(ReleaseManifestData),
+        SchemaKind::ReleaseManifest => schema_for!(ReleaseManifestV2Data),
         SchemaKind::Diagnostic | SchemaKind::Unknown => {
             schema_for!(Envelope<DiagnosticData>)
         }
@@ -1783,12 +1835,13 @@ mod tests {
         EvidenceDependencyV2Data, EvidenceV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
         GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
         ProcessErrorKindV2Data, ProjectModelData, ProjectUnitDetailData,
-        ReceiptValidityReasonV2Data, ReleaseArtifactKindData, ReleaseAuthorityStatusData,
-        ReleaseCandidateStatusData, ReleaseChannelData, ReleaseDistributionData,
-        ReleaseManifestData, ReleasePredicateTypeData, ReleaseProvenanceStatusData,
-        ReleaseRollbackStatusData, ReleaseSha256Data, ReleaseSigningData, ReleaseSubjectSetData,
-        SchemaIndexData, SchemaKind, SchemaVersion, StaleReceiptV2Data, SuccessPredicateData,
-        TaskAcceptanceV2Data, VersionData, schema_json,
+        ReceiptValidityReasonV2Data, ReleaseArtifactKindData, ReleaseArtifactKindV2Data,
+        ReleaseAuthorityStatusData, ReleaseCandidateStatusData, ReleaseChannelData,
+        ReleaseDistributionData, ReleaseManifestData, ReleaseManifestV2Data,
+        ReleasePredicateTypeData, ReleaseProvenanceStatusData, ReleaseRollbackStatusData,
+        ReleaseSha256Data, ReleaseSigningData, ReleaseSubjectSetData, SchemaIndexData, SchemaKind,
+        SchemaVersion, StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData,
+        schema_json,
     };
     use crate::Digest;
 
@@ -1809,6 +1862,8 @@ mod tests {
         assert!(ids.contains(&String::from("forge.receipt/v2")));
         assert!(ids.contains(&String::from("forge.evidence/v1")));
         assert!(ids.contains(&String::from("forge.evidence/v2")));
+        assert!(ids.contains(&String::from("forge.release-manifest/v1")));
+        assert!(ids.contains(&String::from("forge.release-manifest/v2")));
     }
 
     #[test]
@@ -1838,6 +1893,10 @@ mod tests {
         );
         assert_eq!(
             SchemaKind::from_str("forge.release-manifest/v1")?,
+            SchemaKind::ReleaseManifestV1
+        );
+        assert_eq!(
+            SchemaKind::from_str("forge.release-manifest/v2")?,
             SchemaKind::ReleaseManifest
         );
         assert_eq!(
@@ -1847,9 +1906,14 @@ mod tests {
         assert!(SchemaKind::from_str("forge.receipt/v3").is_err());
         assert!(SchemaKind::from_str("forge.receipt/v02").is_err());
         assert!(SchemaKind::from_str("forge.model/v2").is_err());
+        assert!(SchemaKind::from_str("forge.release-manifest/v3").is_err());
         assert_eq!(
             SchemaVersion::for_kind(SchemaKind::Receipt),
             SchemaVersion::new("receipt", 2)
+        );
+        assert_eq!(
+            SchemaVersion::for_kind(SchemaKind::ReleaseManifest),
+            SchemaVersion::new("release-manifest", 2)
         );
         Ok(())
     }
@@ -1870,7 +1934,7 @@ mod tests {
         Ok(())
     }
 
-    fn release_manifest_value() -> Value {
+    fn release_manifest_v1_value() -> Value {
         let artifacts = (0..10)
             .map(|index| {
                 serde_json::json!({
@@ -1910,10 +1974,67 @@ mod tests {
         })
     }
 
+    fn release_manifest_v2_value() -> Value {
+        let mut artifacts = (0..5)
+            .flat_map(|index| {
+                let target = format!("target-{index}");
+                [
+                    serde_json::json!({
+                        "name": format!("forge-{index}"),
+                        "kind": "binary",
+                        "target": target,
+                        "length": 1,
+                        "sha256": "a".repeat(64)
+                    }),
+                    serde_json::json!({
+                        "name": format!("forge-{index}.cdx.json"),
+                        "kind": "cyclonedx-sbom",
+                        "target": format!("target-{index}"),
+                        "length": 1,
+                        "sha256": "b".repeat(64)
+                    }),
+                ]
+            })
+            .collect::<Vec<_>>();
+        artifacts.push(serde_json::json!({
+            "name": "THIRD-PARTY-LICENSES.txt",
+            "kind": "license-notices",
+            "target": "all",
+            "length": 1,
+            "sha256": "c".repeat(64)
+        }));
+        let subjects = (0..13)
+            .map(|index| format!("subject-{index}"))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema": "forge.release-manifest/v2",
+            "release": {
+                "version": "0.1.0-rc.2",
+                "channel": "release-candidate",
+                "distribution": "github-release",
+                "status": "local-review-candidate"
+            },
+            "artifacts": artifacts,
+            "provenance": {
+                "status": "required-external",
+                "predicate_type": "https://slsa.dev/provenance/v1",
+                "signing": "sigstore-keyless-oidc",
+                "authority_status": "unassigned-external",
+                "subject_set": "exact-finalized-local-assets",
+                "subjects": subjects
+            },
+            "rollback": {
+                "retain_published_releases": 2,
+                "previous_release": null,
+                "status": "first-candidate-no-n-minus-one"
+            }
+        })
+    }
+
     #[test]
     fn release_manifest_v1_reader_accepts_same_major_optional_fields()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut value = release_manifest_value();
+        let mut value = release_manifest_v1_value();
         value["future_root"] = serde_json::json!({"ignored": true});
         value["release"]["future_release"] = serde_json::json!(1);
         value["artifacts"][0]["future_artifact"] = serde_json::json!(2);
@@ -1927,7 +2048,7 @@ mod tests {
         );
         assert_eq!(manifest.artifacts[0].kind, ReleaseArtifactKindData::Binary);
 
-        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::ReleaseManifest)?)?;
+        let schema: Value = serde_json::from_str(&schema_json(SchemaKind::ReleaseManifestV1)?)?;
         for pointer in [
             "/additionalProperties",
             "/$defs/ReleaseArtifactData/additionalProperties",
@@ -1947,7 +2068,7 @@ mod tests {
     #[test]
     fn release_manifest_v1_reader_maps_future_enums_to_unknown()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut value = release_manifest_value();
+        let mut value = release_manifest_v1_value();
         value["release"]["channel"] = serde_json::json!("future-channel");
         value["release"]["distribution"] = serde_json::json!("future-distribution");
         value["release"]["status"] = serde_json::json!("future-status");
@@ -1986,12 +2107,100 @@ mod tests {
         );
         assert_eq!(manifest.rollback.status, ReleaseRollbackStatusData::Unknown);
 
-        let mut missing_required = release_manifest_value();
+        let mut missing_required = release_manifest_v1_value();
         missing_required["rollback"]
             .as_object_mut()
             .ok_or_else(|| std::io::Error::other("test rollback was not an object"))?
             .remove("status");
         assert!(serde_json::from_value::<ReleaseManifestData>(missing_required).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn release_manifest_v1_schema_remains_the_checked_in_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            schema_json(SchemaKind::ReleaseManifestV1)?,
+            include_str!("../../../docs/schemas/release-manifest-v1.schema.json")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_manifest_v2_has_a_distribution_wide_license_artifact_and_thirteen_subjects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = release_manifest_v2_value();
+        let manifest: ReleaseManifestV2Data = serde_json::from_value(value.clone())?;
+
+        assert_eq!(manifest.artifacts.len(), 11);
+        let license_artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == ReleaseArtifactKindV2Data::LicenseNotices)
+            .ok_or_else(|| std::io::Error::other("v2 fixture lacked license notices"))?;
+        assert_eq!(license_artifact.name, "THIRD-PARTY-LICENSES.txt");
+        assert_eq!(license_artifact.target, "all");
+        assert_eq!(manifest.provenance.subjects.len(), 13);
+
+        assert!(serde_json::from_value::<ReleaseManifestData>(value).is_err());
+        assert!(
+            serde_json::from_value::<ReleaseManifestV2Data>(release_manifest_v1_value()).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_manifest_v1_and_v2_generate_distinct_root_documents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let v1: Value = serde_json::from_str(&schema_json(SchemaKind::ReleaseManifestV1)?)?;
+        let v2: Value = serde_json::from_str(&schema_json(SchemaKind::ReleaseManifest)?)?;
+
+        assert_eq!(v1["$id"], "forge.release-manifest/v1");
+        assert_eq!(
+            v1.pointer("/properties/artifacts/minItems"),
+            Some(&serde_json::json!(10))
+        );
+        assert_eq!(
+            v1.pointer("/$defs/ReleaseProvenanceData/properties/subjects/minItems"),
+            Some(&serde_json::json!(12))
+        );
+        assert!(
+            v1.pointer("/$defs/ReleaseArtifactKindData/enum")
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.contains(&serde_json::json!("license-notices")))
+        );
+
+        assert_eq!(v2["$id"], "forge.release-manifest/v2");
+        assert_eq!(
+            v2.pointer("/properties/artifacts/minItems"),
+            Some(&serde_json::json!(11))
+        );
+        assert_eq!(
+            v2.pointer("/properties/artifacts/maxItems"),
+            Some(&serde_json::json!(11))
+        );
+        assert_eq!(
+            v2.pointer("/$defs/ReleaseProvenanceV2Data/properties/subjects/minItems"),
+            Some(&serde_json::json!(13))
+        );
+        assert_eq!(
+            v2.pointer("/$defs/ReleaseProvenanceV2Data/properties/subjects/maxItems"),
+            Some(&serde_json::json!(13))
+        );
+        assert_eq!(
+            v2.pointer("/$defs/ReleaseArtifactKindV2Data/enum"),
+            Some(&serde_json::json!([
+                "binary",
+                "cyclonedx-sbom",
+                "license-notices",
+                "unknown"
+            ]))
+        );
+        assert!(
+            v2.pointer("/$defs/ReleaseArtifactV2Data/properties/target/description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("`all`"))
+        );
         Ok(())
     }
 
@@ -2788,7 +2997,16 @@ mod tests {
             .filter(|id| id.starts_with("forge.evidence/"))
             .map(String::as_str)
             .collect();
+        let release_manifest_ids: Vec<&str> = actual
+            .iter()
+            .filter(|id| id.starts_with("forge.release-manifest/"))
+            .map(String::as_str)
+            .collect();
         assert_eq!(receipt_ids, ["forge.receipt/v1", "forge.receipt/v2"]);
         assert_eq!(evidence_ids, ["forge.evidence/v1", "forge.evidence/v2"]);
+        assert_eq!(
+            release_manifest_ids,
+            ["forge.release-manifest/v1", "forge.release-manifest/v2"]
+        );
     }
 }
