@@ -778,7 +778,7 @@ const AUTHORIZED_PRODUCT_IDENTITY_USES: &[AuthorizedProductIdentityUse] = &[
     authorize_identity!("crates/forge-render/src/plan.rs", DisplayName, 3, USER_FACING_IDENTITY),
     authorize_identity!("crates/forge-render/src/plan.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
     authorize_identity!("crates/forge-runtime/src/fs.rs", ProductNamespace, 1, OS_RESOURCE_NAME),
-    authorize_identity!("crates/forge-runtime/src/git.rs", DisplayName, 1, USER_FACING_IDENTITY),
+    authorize_identity!("crates/forge-runtime/src/git.rs", DisplayName, 2, USER_FACING_IDENTITY),
     authorize_identity!("crates/forge-runtime/src/git.rs", CliReference, 1, USER_FACING_IDENTITY),
     authorize_identity!("crates/forge-runtime/src/git.rs", ProductNamespace, 1, OS_RESOURCE_NAME),
     authorize_identity!("crates/forge-runtime/src/hash.rs", MachineNamespace, 1, MACHINE_PROTOCOL),
