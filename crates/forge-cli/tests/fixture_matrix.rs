@@ -766,24 +766,34 @@ mod windows_wide_path_fixture {
 
         assert!(fixture.worktree.join(".git").is_file());
         assert!(fs::read(&fixture.global_git_config)?.is_empty());
+        let git_dir_launch = fixture.root.join(GIT_METADATA_DIRECTORY);
+        let expected_git_dir = fs::canonicalize(&git_dir_launch)?;
+        let gitfile = fs::read_to_string(fixture.worktree.join(".git"))?;
+        let mut gitfile_lines = gitfile.lines();
+        let gitfile_target = gitfile_lines
+            .next()
+            .and_then(|line| line.strip_prefix("gitdir: "))
+            .ok_or("relocated worktree has an invalid .git gitfile")?;
+        assert!(gitfile_lines.next().is_none());
+        let gitfile_target = PathBuf::from(gitfile_target);
+        let gitfile_target = if gitfile_target.is_absolute() {
+            gitfile_target
+        } else {
+            fixture.worktree.join(gitfile_target)
+        };
+        assert_eq!(fs::canonicalize(gitfile_target)?, expected_git_dir);
+
+        // Validate the repository metadata from its short Git directory. The Forge preview below
+        // intentionally owns the first Git access that must resolve the relocated long worktree.
         let bare = fixture.git_stdout_in(
-            &fixture.worktree,
+            &git_dir_launch,
             &["config", "--local", "--type=bool", "--get", "core.bare"],
         )?;
         assert_eq!(String::from_utf8(bare)?.trim(), "false");
-        let head = fixture.git_stdout_in(
-            &fixture.worktree,
-            &["rev-parse", "--verify", "HEAD^{commit}"],
-        )?;
+        let head =
+            fixture.git_stdout_in(&git_dir_launch, &["rev-parse", "--verify", "HEAD^{commit}"])?;
         assert!(!String::from_utf8(head)?.trim().is_empty());
-        let reported_worktree =
-            fixture.git_stdout_in(&fixture.worktree, &["rev-parse", "--show-toplevel"])?;
-        assert_eq!(
-            fs::canonicalize(PathBuf::from(String::from_utf8(reported_worktree)?.trim()))?,
-            canonical_worktree
-        );
-        let git_dir = fs::canonicalize(fixture.git_dir(&fixture.worktree)?)?;
-        let expected_git_dir = fs::canonicalize(fixture.root.join(GIT_METADATA_DIRECTORY))?;
+        let git_dir = fs::canonicalize(fixture.git_dir(&git_dir_launch)?)?;
         assert_eq!(git_dir, expected_git_dir);
         assert!(git_dir.starts_with(fs::canonicalize(&fixture.root)?));
         assert!(wide_units(&git_dir) < CLASSIC_MAX_PATH_UNITS);
@@ -793,7 +803,7 @@ mod windows_wide_path_fixture {
         );
 
         let tracked =
-            fixture.git_stdout_in(&fixture.worktree, &["ls-files", "--cached", "-z", "--"])?;
+            fixture.git_stdout_in(&git_dir_launch, &["ls-files", "--cached", "-z", "--"])?;
         assert!(
             tracked
                 .split(|byte| *byte == 0)
@@ -810,6 +820,11 @@ mod windows_wide_path_fixture {
             "{}",
             display_output(&preview)
         );
+        let preview_document: Value = serde_json::from_slice(&preview.stdout)?;
+        let reported_worktree = preview_document["data"]["repository_root"]["display"]
+            .as_str()
+            .ok_or("init preview omitted the repository-root display path")?;
+        assert_eq!(fs::canonicalize(reported_worktree)?, canonical_worktree);
         assert_eq!(fixture.snapshot_worktree()?, before_preview);
 
         let applied = run_forge_with_explicit_dir(
