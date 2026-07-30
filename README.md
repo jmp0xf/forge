@@ -109,12 +109,17 @@ working-tree directory.
 Run the normal full local code gate from the repository root and report its exact exit code:
 
 ```bash
+RUSTUP_AUTO_INSTALL=0 cargo fetch --locked
 RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify
 ```
 
-This is the project-owned local verification entry point, not complete release qualification. Before starting child
-processes it checks all checked-in schemas and required generated fixtures in-process and without rewriting them. It
-then runs these eight required child steps in order, followed by one advisory step:
+The explicit locked fetch populates the complete lockfile dependency cache across all targets; the verification gate
+itself remains offline while resolving all five release targets and fails if a required package archive is absent. This
+is the project-owned local verification entry point, not complete release qualification. Before starting its scheduled
+child plan it checks all checked-in schemas and required generated fixtures without rewriting them, then verifies the
+reviewed five-target release-license fixed point: 96 packages, 198 legal files, Cargo.lock-bound `.crate` archives,
+separately hashed unpacked legal text, and the canonical notice bundle. It then runs these eight required child steps
+in order, followed by one advisory step:
 
 ```bash
 RUSTUP_AUTO_INSTALL=0 cargo fmt --all -- --check
@@ -132,9 +137,9 @@ RUSTUP_AUTO_INSTALL=0 cargo run --locked -p forge-cli -- version
 
 The child phase has one shared 44-minute budget. Each child runs as argv with closed stdin, retains at most 256 KiB
 per stream, and is terminated if combined stdout/stderr exceeds 8 MiB; failed output display is escaped and capped at
-16 KiB per stream. Compiling/starting `xtask` and the in-process schema/fixture checks occur before that child budget.
-Cargo build scripts and tests are repository code: network access and external side effects are inherited, so this
-entry point is not an OS sandbox.
+16 KiB per stream. Compiling/starting `xtask`, schema/fixture checks, and the separately bounded offline Cargo
+metadata/tree calls used by the release-license gate occur before that child budget. Cargo build scripts and tests are
+repository code: network access and external side effects are inherited, so this entry point is not an OS sandbox.
 
 `forge evidence run verify` runs the same command and records optional worktree-local evidence; it does not replace
 independent CI, review, approval, signing, or release authority.

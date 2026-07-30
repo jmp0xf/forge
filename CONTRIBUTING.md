@@ -19,11 +19,14 @@ Installation does not replace verification. Run the normal full local code gate 
 its exact exit code:
 
 ```bash
+RUSTUP_AUTO_INSTALL=0 cargo fetch --locked
 RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify
 ```
 
-This project-owned entry point is the normal local verification contract, not complete release qualification. It first
-checks checked-in schemas and required generated fixtures in-process without writing them, then runs the following
+The fetch explicitly populates the complete lockfile dependency cache across all five release targets; the verifier's
+license gate remains offline and fails on a missing `.crate` archive. This project-owned entry point is the normal local
+verification contract, not complete release qualification. It first checks checked-in schemas, generated fixtures,
+and the reviewed 96-package/198-legal-file release-license fixed point without rewriting them, then runs the following
 eight required argv-only child steps in order and leaves fuzz Clippy advisory and last:
 
 ```bash
@@ -42,8 +45,9 @@ RUSTUP_AUTO_INSTALL=0 cargo run --locked -p forge-cli -- version
 
 The child phase has one shared 44-minute budget. Each child has closed stdin, at most 256 KiB retained per stream, an
 8 MiB combined complete-output hard limit, and at most 16 KiB escaped failure display per stream. Compiling/starting
-`xtask` and its in-process checks are outside that child budget. Cargo build scripts and tests execute repository code,
-inherit network intent, and may have external side effects; this entry point is not an OS sandbox.
+`xtask`, schema/fixture checks, and the separately bounded offline Cargo metadata/tree calls used by the license gate
+are outside that child budget. Cargo build scripts and tests execute repository code, inherit network intent, and may
+have external side effects; this entry point is not an OS sandbox.
 
 `forge evidence run verify` executes the same entry point and records a scope-bound local Receipt. The project override
 allows 45 minutes total, including Forge discovery, `xtask` startup and in-process checks, the 44-minute child phase,

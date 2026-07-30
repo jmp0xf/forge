@@ -18,7 +18,7 @@ acceptance is not complete.
 | Navigation | `doctor`, deterministic read-only `next`, `explain`, schema/version/completion output |
 | Local evidence | Receipt/Evidence v2 run/show/verify/export, content-free dual-stream diagnostic summaries, dependency invalidation with typed-unknown fact preservation and fail-closed handling of unbound Cargo/Go configuration, immutable state, bounded retention, and v1 historical readers |
 | In-repository hardening | Direct project-native CI gates plus a bounded unified verifier, an exact 20-invariant executable-test/CI/external-required marker ledger, 28 public fixtures, schema/golden/compatibility tests, dogfood fixed point, fuzz corpora, bounded mutation config, and opt-in large-repository benchmark |
-| Local release candidates | ADR-0041 rc.2 migration in progress: create-only five-target assembly, exact-commit isolated source binding, executable checks, license-bearing CycloneDX SBOMs, source-bound third-party notices, manifest v2, SHA-256 checksums, and explicit external authority/rollback gates |
+| Local release candidates | ADR-0041 rc.2 local implementation: create-only five-target assembly, exact-commit isolated source binding, native-build/scoped-graph parity, executable checks, a reviewed 96-package/198-legal-file license fixed point, license-bearing CycloneDX SBOMs, source-bound third-party notices, manifest v2, SHA-256 checksums, and explicit external authority/rollback gates |
 
 Default `init` still does not generate a runner, CI, configuration, ADR, runbook, or ownership file.
 Runner generation occurs only after an explicit choice and creates a project-native managed `verify`
@@ -69,9 +69,9 @@ five binaries, five license-bearing CycloneDX SBOMs, `THIRD-PARTY-LICENSES.txt`,
 discovering them from a network or Cargo cache. The candidate repository still has no release or
 signing workflow; final qualification is assigned to the independent
 `jmp0xf/forge-release-authority` repository with isolated build, finalize, and protected-attestation
-permission domains. The local rc.2 migration is in progress. No external qualification,
-owner/legal confirmation, protected attestation, immutable publication, or release follows from
-this status text.
+permission domains. The local rc.2 implementation is present, while external qualification remains
+pending. No external qualification, owner/legal confirmation, protected attestation, immutable
+publication, or release follows from this status text.
 
 Windows Git execution has a narrower explicit path boundary than Forge's internal native-path
 representation. Every Git launch validates its canonical working directory. Its effective ordinary

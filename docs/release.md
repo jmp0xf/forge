@@ -63,6 +63,7 @@ boundary. Review the checkout, create a dedicated output directory outside it, a
 ```text
 git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
 mkdir -p /absolute/path/to/forge-0.1.0-rc.2-dist
+RUSTUP_AUTO_INSTALL=0 cargo fetch --locked
 RUSTUP_AUTO_INSTALL=0 cargo build --locked --offline -p xtask
 ```
 
@@ -72,8 +73,13 @@ On Windows PowerShell, use the native path and environment syntax:
 git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
 New-Item -ItemType Directory -Force C:\forge-0.1.0-rc.2-dist
 $env:RUSTUP_AUTO_INSTALL = "0"
+cargo fetch --locked
 cargo build --locked --offline -p xtask
 ```
+
+The explicit online fetch must complete before entering the offline candidate path. It populates the locked `.crate`
+archives for every target; having only unpacked source directories is insufficient because Forge independently hashes
+the fetched archive bytes against `Cargo.lock`.
 
 On a runner with the exact target and linker already installed, build and stage one target. Keep each invocation on one
 line so the same argument contract works in POSIX shells and PowerShell:
@@ -124,6 +130,10 @@ excludes dev-only dependencies, and binds:
 A selected local package with no registry source must be an exact workspace member; external path dependencies are
 rejected because their source bytes are not covered by this Git snapshot and lockfile claim.
 
+The scoped Cargo tree supplies the reviewed nodes and edges; before staging, every native build must independently
+report the same package-ID set through Cargo `compiler-artifact` messages. A mismatch fails rather than claiming that
+the Cargo tree alone proves the built package set.
+
 The SBOM deliberately has no timestamp or host path. Its license fields are an audit index, not a substitute for the
 complete license and notice text distributed with the binary.
 
@@ -142,12 +152,14 @@ the selected complete license and notice text, and the mapping from every packag
 The read-only drift gate is:
 
 ```text
+cargo fetch --locked
 cargo run --locked -p xtask -- release-license-check
 ```
 
 After an intentional dependency change, generate a review candidate with:
 
 ```text
+cargo fetch --locked
 cargo run --locked -p xtask -- release-license-generate
 ```
 
@@ -166,6 +178,11 @@ source/root revalidation failure can return nonzero after one or more create-onl
 command therefore never accepts the directory as a candidate. Do not overwrite or guess which files are valid; inspect
 the reported fixed names, move the directory aside or choose a new empty output directory, rerun the required build or
 finalize step, and require `release-check` to pass before external review.
+
+`release-license-generate` likewise is not a two-file transaction. It atomically replaces the baseline and notice
+files one at a time, then rechecks that the reviewed policy did not change. A second write failure or a late policy
+change can therefore leave a mixed pair. On any nonzero exit, inspect both diffs, restore a stable policy, rerun the
+generator, and require `release-license-check` to pass before accepting either file.
 
 The isolated source tree is bounded to 200,000 entries, 256 MiB per file, and 4 GiB total visible file bytes. Those
 bounds apply after Git has cloned its object database. The local clone and full `git fsck` are time-bounded but the
