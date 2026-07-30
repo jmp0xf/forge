@@ -50,6 +50,11 @@ pub(crate) fn is_cargo_build_environment_key(key: &OsStr) -> bool {
             | "LIBRARY_PATH"
             | "MACOSX_DEPLOYMENT_TARGET"
             | "PKG_CONFIG_PATH"
+            // rustc's MSVC discovery uses these roots to locate the installed `vswhere.exe`
+            // fallback. Without them, a nested Cargo invocation can fall back to an unrelated
+            // `link.exe` earlier on PATH even though the parent Cargo invocation linked normally.
+            | "PROGRAMFILES"
+            | "PROGRAMFILES(X86)"
             | "RANLIB"
             | "RUSTC"
             | "RUSTC_WRAPPER"
@@ -91,6 +96,10 @@ mod tests {
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
         )));
         assert!(is_cargo_build_environment_key(OsStr::new("RUSTC_WRAPPER")));
+        assert!(is_cargo_build_environment_key(OsStr::new("ProgramFiles")));
+        assert!(is_cargo_build_environment_key(OsStr::new(
+            "ProgramFiles(x86)"
+        )));
         assert!(!is_cargo_build_environment_key(OsStr::new(
             "CARGO_REGISTRIES_CRATES_IO_TOKEN"
         )));
