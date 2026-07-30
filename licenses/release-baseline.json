@@ -31,32 +31,6 @@
       "version": "1.1.4"
     },
     {
-      "id": "registry+https://github.com/rust-lang/crates.io-index#allocator-api2@0.2.21",
-      "legal_files": [
-        {
-          "path": "LICENSE-APACHE",
-          "sha256": "20fe7b00e904ed690e3b9fd6073784d3fc428141dbd10b81c01fd143d0797f58"
-        },
-        {
-          "path": "LICENSE-MIT",
-          "sha256": "36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9"
-        }
-      ],
-      "license_expression": "MIT OR Apache-2.0",
-      "lock_checksum": "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923",
-      "name": "allocator-api2",
-      "sbom_license_expression": "MIT OR Apache-2.0",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "targets": [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-musl",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-unknown-linux-musl"
-      ],
-      "version": "0.2.21"
-    },
-    {
       "id": "registry+https://github.com/rust-lang/crates.io-index#anstream@1.0.0",
       "legal_files": [
         {
@@ -803,9 +777,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "targets": [
         "aarch64-apple-darwin",
-        "aarch64-unknown-linux-musl",
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-musl"
+        "x86_64-apple-darwin"
       ],
       "version": "0.3.14"
     },
@@ -860,28 +832,6 @@
         "x86_64-unknown-linux-musl"
       ],
       "version": "0.1.9"
-    },
-    {
-      "id": "registry+https://github.com/rust-lang/crates.io-index#foldhash@0.2.0",
-      "legal_files": [
-        {
-          "path": "LICENSE",
-          "sha256": "b1181a40b2a7b25cf66fd01481713bc1005df082c53ef73e851e55071b102744"
-        }
-      ],
-      "license_expression": "Zlib",
-      "lock_checksum": "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb",
-      "name": "foldhash",
-      "sbom_license_expression": "Zlib",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "targets": [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-musl",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-unknown-linux-musl"
-      ],
-      "version": "0.2.0"
     },
     {
       "id": "registry+https://github.com/rust-lang/crates.io-index#fs2@0.4.3",
@@ -2043,32 +1993,6 @@
       "license_expression": "MIT OR Apache-2.0",
       "lock_checksum": "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526",
       "name": "toml_parser",
-      "sbom_license_expression": "MIT OR Apache-2.0",
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "targets": [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-musl",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-unknown-linux-musl"
-      ],
-      "version": "1.1.2+spec-1.1.0"
-    },
-    {
-      "id": "registry+https://github.com/rust-lang/crates.io-index#toml_writer@1.1.2+spec-1.1.0",
-      "legal_files": [
-        {
-          "path": "LICENSE-APACHE",
-          "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
-        },
-        {
-          "path": "LICENSE-MIT",
-          "sha256": "6efb0476a1cc085077ed49357026d8c173bf33017278ef440f222fb9cbcb66e6"
-        }
-      ],
-      "license_expression": "MIT OR Apache-2.0",
-      "lock_checksum": "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2",
-      "name": "toml_writer",
       "sbom_license_expression": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "targets": [

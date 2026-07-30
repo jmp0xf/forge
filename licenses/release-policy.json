@@ -2,12 +2,8 @@
   "schema": "forge.license-bundle-exceptions/v1",
   "cargo_about": {
     "assessed_version": "0.9.1",
-    "known_selected_packages_absent_from_custom_json": [
-      "allocator-api2@0.2.21",
-      "foldhash@0.2.0",
-      "toml_writer@1.1.2+spec-1.1.0"
-    ],
-    "decision": "fallback-to-checksum-verified-complete-legal-file-aggregation"
+    "known_selected_packages_absent_from_custom_json": [],
+    "decision": "locked-crate-archive-sha256-verification-and-separate-unpacked-source-legal-file-aggregation"
   },
   "spdx_expression_normalizations": {
     "ctrlc@3.4.7": {
@@ -32,16 +28,9 @@
     }
   },
   "required_registry_legal_files": {
-    "allocator-api2@0.2.21": [
-      "LICENSE-APACHE",
-      "LICENSE-MIT"
-    ],
     "cfg_aliases@0.2.2": [
       "LICENSE",
       "NOTICES.md"
-    ],
-    "foldhash@0.2.0": [
-      "LICENSE"
     ],
     "linux-raw-sys@0.12.1": [
       "COPYRIGHT",
@@ -58,10 +47,6 @@
       "COPYRIGHT",
       "LICENSE-APACHE",
       "LICENSE-Apache-2.0_WITH_LLVM-exception",
-      "LICENSE-MIT"
-    ],
-    "toml_writer@1.1.2+spec-1.1.0": [
-      "LICENSE-APACHE",
       "LICENSE-MIT"
     ]
   },

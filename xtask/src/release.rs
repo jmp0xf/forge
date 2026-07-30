@@ -2,7 +2,7 @@
 //!
 //! These tasks deliberately stop before provenance, signing, upload, or release authorization.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -36,6 +36,25 @@ use tempfile::{TempDir, tempdir};
 
 const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LICENSE_NOTICES_FILE: &str = "THIRD-PARTY-LICENSES.txt";
+const LICENSE_BASELINE_FILE: &str = "licenses/release-baseline.json";
+const LICENSE_POLICY_FILE: &str = "licenses/release-policy.json";
+const LICENSE_BASELINE_SCHEMA: &str = "forge.license-bundle-baseline/v1";
+const LICENSE_POLICY_SCHEMA: &str = "forge.license-bundle-exceptions/v1";
+const EXPECTED_LICENSE_PACKAGES: usize = 96;
+const EXPECTED_WORKSPACE_LICENSE_PACKAGES: usize = 6;
+const EXPECTED_REGISTRY_LICENSE_PACKAGES: usize = 90;
+const EXPECTED_LEGAL_FILES: usize = 198;
+const MAX_LICENSE_POLICY_BYTES: u64 = 1024 * 1024;
+const MAX_LICENSE_BASELINE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CARGO_TREE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CARGO_TREE_LINES: usize = 1_000_000;
+const MAX_CARGO_BUILD_MESSAGES: usize = 1_000_000;
+const MAX_LEGAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_LICENSE_SCAN_ENTRIES_PER_PACKAGE: usize = 100_000;
+const MAX_LEGAL_FILES_PER_PACKAGE: usize = 4_096;
+const MAX_TOTAL_LEGAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_REGISTRY_CRATE_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REGISTRY_CACHE_ENTRIES: usize = 1_000_000;
 const MANIFEST_FILE: &str = "release-manifest.json";
 const CHECKSUMS_FILE: &str = "SHA256SUMS";
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -67,6 +86,8 @@ const REJECTED_RELEASE_GIT_ENV: &[&str] = &[
 pub(crate) const BUILD_HELP: &str = "usage: xtask release-build --target <TRIPLE> --output-dir <DIR>\n\nBuilds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. Run the compiled xtask directly when a nested `cargo run` is unsuitable.";
 pub(crate) const FINALIZE_HELP: &str = "usage: xtask release-finalize --output-dir <DIR>\n\nRequires all five target binaries and SBOMs, then copies the source-bound license notices and writes release-manifest.json and SHA256SUMS without overwriting different bytes.";
 pub(crate) const CHECK_HELP: &str = "usage: xtask release-check --output-dir <DIR>\n\nRecomputes the complete local asset set, binary formats, SBOMs, manifest, and SHA-256 checksums. Success is local consistency evidence, not provenance, signature, approval, upload, or publication.";
+pub(crate) const LICENSE_CHECK_HELP: &str = "usage: xtask release-license-check\n\nRecomputes the reviewed five-target scoped Cargo tree graph, legal-file inventory, policy, and deterministic THIRD-PARTY-LICENSES.txt fixed point. Fetched .crate archive bytes must match Cargo.lock SHA-256; legal text is separately read and hashed from current unpacked sources, without claiming the archive check proves those unpacked bytes. Each native release-build must independently prove compiler-artifact parity before staging.";
+pub(crate) const LICENSE_GENERATE_HELP: &str = "usage: xtask release-license-generate\n\nMaintainer-only regeneration of licenses/release-baseline.json and THIRD-PARTY-LICENSES.txt from the reviewed scoped Cargo tree graph. The reviewed policy is never modified. Generated evidence requires human review before commit and is never called by release-finalize.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinaryFormat {
@@ -114,6 +135,7 @@ const RELEASE_TARGETS: [ReleaseTarget; 5] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReleaseErrorKind {
+    Negative,
     Usage,
     Environment,
     Internal,
@@ -128,6 +150,13 @@ pub(crate) struct ReleaseError {
 impl ReleaseError {
     pub(crate) fn kind(&self) -> ReleaseErrorKind {
         self.kind
+    }
+
+    fn negative(message: impl Into<String>) -> Self {
+        Self {
+            kind: ReleaseErrorKind::Negative,
+            message: message.into(),
+        }
     }
 
     fn usage(message: impl Into<String>) -> Self {
@@ -150,6 +179,12 @@ impl ReleaseError {
             message: message.into(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReleaseLicenseReport {
+    pub(crate) package_count: usize,
+    pub(crate) legal_file_count: usize,
 }
 
 impl fmt::Display for ReleaseError {
@@ -195,8 +230,25 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
             "failed to pin the fresh Cargo target directory before building: {error}"
         ))
     })?;
-    cargo_build(source.repository(), request.target, build_directory.path())?;
+    let built_packages = cargo_build(source.repository(), request.target, build_directory.path())?;
     source.require_unchanged(targets, "Cargo release build")?;
+    let metadata: CargoMetadata =
+        serde_json::from_slice(source.snapshot().metadata(request.target)?).map_err(|error| {
+            ReleaseError::environment(format!(
+                "Cargo metadata for {} is not valid JSON after the native release build: {error}",
+                request.target.triple
+            ))
+        })?;
+    let scoped_graph = parse_scoped_cargo_tree_graph(
+        &metadata,
+        source.snapshot().tree(request.target)?,
+        request.target.triple,
+    )?;
+    require_native_build_graph_parity(
+        &scoped_graph.package_ids,
+        &built_packages,
+        request.target.triple,
+    )?;
     let binary = read_built_binary(&build_output, request.target)?;
     validate_binary_format(request.target, &binary)?;
     stage_built(&output, request.target, &binary, source.snapshot())?;
@@ -241,6 +293,44 @@ pub(crate) fn run_check(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
         "verified the complete local {} asset set in {}; this does not verify provenance, signature, approval, upload, or publication",
         RELEASE_VERSION,
         output_writer.root().display()
+    )))
+}
+
+pub(crate) fn run_license_check(
+    arguments: &[String],
+) -> Result<ReleaseCommandOutput, ReleaseError> {
+    if is_help(arguments) {
+        return Ok(ReleaseCommandOutput::Help(LICENSE_CHECK_HELP));
+    }
+    if !arguments.is_empty() {
+        return Err(ReleaseError::usage(
+            "release-license-check accepts no options",
+        ));
+    }
+    let repository = repository_root()?;
+    let report = check_release_licenses(&repository)?;
+    Ok(ReleaseCommandOutput::Completed(format!(
+        "verified a scoped Cargo tree fixed point of {} release-license packages and {} legal files; fetched .crate archives match Cargo.lock SHA-256, unpacked legal files are separately hashed, and each native release-build must pass compiler-artifact parity before staging",
+        report.package_count, report.legal_file_count
+    )))
+}
+
+pub(crate) fn run_license_generate(
+    arguments: &[String],
+) -> Result<ReleaseCommandOutput, ReleaseError> {
+    if is_help(arguments) {
+        return Ok(ReleaseCommandOutput::Help(LICENSE_GENERATE_HELP));
+    }
+    if !arguments.is_empty() {
+        return Err(ReleaseError::usage(
+            "release-license-generate accepts no options",
+        ));
+    }
+    let repository = repository_root()?;
+    let report = generate_release_licenses(&repository, &repository)?;
+    Ok(ReleaseCommandOutput::Completed(format!(
+        "WARNING: regenerated a scoped Cargo tree fixed point of {} release-license packages and {} legal files without changing {}; review the complete baseline and notice diff before commit; this command is never release authority",
+        report.package_count, report.legal_file_count, LICENSE_POLICY_FILE
     )))
 }
 
@@ -390,6 +480,7 @@ struct RepositorySnapshot {
     cargo_lock: Vec<u8>,
     license_notices: Vec<u8>,
     metadata_by_target: BTreeMap<String, Vec<u8>>,
+    tree_by_target: BTreeMap<String, Vec<u8>>,
 }
 
 impl RepositorySnapshot {
@@ -405,12 +496,24 @@ impl RepositorySnapshot {
             })
     }
 
+    fn tree(&self, target: &ReleaseTarget) -> Result<&[u8], ReleaseError> {
+        self.tree_by_target
+            .get(target.triple)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                ReleaseError::internal(format!(
+                    "release snapshot omitted scoped Cargo tree graph for {}",
+                    target.triple
+                ))
+            })
+    }
+
     fn require_same(&self, later: &Self, operation: &str) -> Result<(), ReleaseError> {
         if self == later {
             Ok(())
         } else {
             Err(ReleaseError::environment(format!(
-                "isolated source commit, Cargo.lock, license notices, or target-filtered Cargo metadata changed during {operation}"
+                "isolated source commit, Cargo.lock, license notices, target-filtered Cargo metadata, or scoped Cargo tree graph changed during {operation}"
             )))
         }
     }
@@ -464,17 +567,25 @@ impl ReleaseSource {
         let source_tree = capture_source_tree(&checkout)?;
         let license_notices = read_candidate_license_notices(&checkout)?;
         let metadata_by_target = capture_cargo_metadata(checkout.root(), targets)?;
+        let tree_by_target = capture_cargo_trees(checkout.root(), targets)?;
         validate_cargo_metadata_source_boundaries(
             checkout.root(),
             targets,
             &metadata_by_target,
             &source_tree,
         )?;
+        validate_scoped_cargo_tree_graphs(
+            targets,
+            &metadata_by_target,
+            &tree_by_target,
+            &isolated_guard.cargo_lock,
+        )?;
         let snapshot = RepositorySnapshot {
             source_commit: isolated_guard.source_commit,
             cargo_lock: isolated_guard.cargo_lock,
             license_notices,
             metadata_by_target,
+            tree_by_target,
         };
         if capture_source_tree(&checkout)? != source_tree {
             return Err(ReleaseError::environment(
@@ -516,11 +627,18 @@ impl ReleaseSource {
             )));
         }
         let metadata_by_target = capture_cargo_metadata(self.checkout.root(), targets)?;
+        let tree_by_target = capture_cargo_trees(self.checkout.root(), targets)?;
         validate_cargo_metadata_source_boundaries(
             self.checkout.root(),
             targets,
             &metadata_by_target,
             &self.source_tree,
+        )?;
+        validate_scoped_cargo_tree_graphs(
+            targets,
+            &metadata_by_target,
+            &tree_by_target,
+            &self.snapshot.cargo_lock,
         )?;
         self.snapshot.require_same(
             &RepositorySnapshot {
@@ -528,6 +646,7 @@ impl ReleaseSource {
                 cargo_lock: self.snapshot.cargo_lock.clone(),
                 license_notices: read_candidate_license_notices(&self.checkout)?,
                 metadata_by_target,
+                tree_by_target,
             },
             operation,
         )?;
@@ -987,6 +1106,73 @@ fn capture_cargo_metadata(
             ))
         })
         .collect()
+}
+
+fn capture_cargo_trees(
+    repository: &Path,
+    targets: &[ReleaseTarget],
+) -> Result<BTreeMap<String, Vec<u8>>, ReleaseError> {
+    targets
+        .iter()
+        .map(|target| Ok((target.triple.to_owned(), cargo_tree(repository, target)?)))
+        .collect()
+}
+
+fn validate_scoped_cargo_tree_graphs(
+    targets: &[ReleaseTarget],
+    metadata_by_target: &BTreeMap<String, Vec<u8>>,
+    tree_by_target: &BTreeMap<String, Vec<u8>>,
+    cargo_lock: &[u8],
+) -> Result<(), ReleaseError> {
+    let lock = parse_cargo_lock(cargo_lock)?;
+    let lock_packages = cargo_lock_packages(&lock)?;
+    for target in targets {
+        let metadata_bytes = metadata_by_target.get(target.triple).ok_or_else(|| {
+            ReleaseError::internal(format!(
+                "release snapshot omitted Cargo metadata for {}",
+                target.triple
+            ))
+        })?;
+        let tree_bytes = tree_by_target.get(target.triple).ok_or_else(|| {
+            ReleaseError::internal(format!(
+                "release snapshot omitted scoped Cargo tree graph for {}",
+                target.triple
+            ))
+        })?;
+        let metadata: CargoMetadata = serde_json::from_slice(metadata_bytes).map_err(|error| {
+            ReleaseError::environment(format!(
+                "Cargo metadata for {} is not valid JSON: {error}",
+                target.triple
+            ))
+        })?;
+        let graph = parse_scoped_cargo_tree_graph(&metadata, tree_bytes, target.triple)?;
+        let packages: BTreeMap<_, _> = metadata
+            .packages
+            .iter()
+            .map(|package| (package.id.as_str(), package))
+            .collect();
+        for package_id in &graph.package_ids {
+            let package = packages.get(package_id.as_str()).ok_or_else(|| {
+                ReleaseError::internal("scoped Cargo tree package disappeared from metadata")
+            })?;
+            if let Some(checksum) = release_package_lock_checksum(package, &lock_packages)? {
+                let manifest = package.manifest_path.as_deref().ok_or_else(|| {
+                    ReleaseError::environment(format!(
+                        "registry dependency {} omitted manifest_path",
+                        release_license_package_id(package)
+                    ))
+                })?;
+                let package_root = manifest.parent().ok_or_else(|| {
+                    ReleaseError::environment(format!(
+                        "registry dependency {} has no package root",
+                        release_license_package_id(package)
+                    ))
+                })?;
+                verify_registry_crate_archive(package, package_root, &checksum)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_cargo_metadata_source_boundaries(
@@ -1663,7 +1849,7 @@ fn cargo_build(
     repository: &Path,
     target: &ReleaseTarget,
     target_directory: &Path,
-) -> Result<(), ReleaseError> {
+) -> Result<BTreeSet<String>, ReleaseError> {
     require_no_external_cargo_configuration(repository)?;
     let mut arguments = [
         "build",
@@ -1674,6 +1860,7 @@ fn cargo_build(
         "forge-cli",
         "--bin",
         "forge",
+        "--message-format=json-render-diagnostics",
         "--target",
         target.triple,
         "--target-dir",
@@ -1704,8 +1891,110 @@ fn cargo_build(
     let later_configuration_boundary = require_no_external_cargo_configuration(repository);
     let observation = observation?;
     later_configuration_boundary?;
-    let _ = require_process_success(observation, &label)?;
-    Ok(())
+    let stdout = require_process_success(observation, &label)?;
+    parse_cargo_build_artifacts(&stdout, target.triple)
+}
+
+fn parse_cargo_build_artifacts(
+    stdout: &[u8],
+    target_label: &str,
+) -> Result<BTreeSet<String>, ReleaseError> {
+    let text = std::str::from_utf8(stdout).map_err(|error| {
+        ReleaseError::environment(format!(
+            "Cargo release build messages for {target_label} are not UTF-8: {error}"
+        ))
+    })?;
+    if text.is_empty() || text.contains('\r') || !text.ends_with('\n') || text.ends_with("\n\n") {
+        return Err(ReleaseError::environment(format!(
+            "Cargo release build messages for {target_label} are not non-empty JSON lines with one LF terminator"
+        )));
+    }
+
+    let mut package_ids = BTreeSet::new();
+    let mut build_finished = false;
+    for (index, line) in text.lines().enumerate() {
+        if index >= MAX_CARGO_BUILD_MESSAGES {
+            return Err(ReleaseError::environment(format!(
+                "Cargo release build for {target_label} exceeds the {MAX_CARGO_BUILD_MESSAGES}-message bound"
+            )));
+        }
+        if build_finished {
+            return Err(ReleaseError::environment(format!(
+                "Cargo release build for {target_label} emitted a message after build-finished"
+            )));
+        }
+        let message: CargoBuildMessage = serde_json::from_str(line).map_err(|error| {
+            ReleaseError::environment(format!(
+                "Cargo release build for {target_label} emitted invalid JSON at message {}: {error}",
+                index + 1
+            ))
+        })?;
+        match message.reason.as_str() {
+            "compiler-artifact" => {
+                let package_id = message.package_id.ok_or_else(|| {
+                    ReleaseError::environment(format!(
+                        "Cargo compiler-artifact for {target_label} omitted package_id"
+                    ))
+                })?;
+                if package_id.is_empty()
+                    || package_id.contains('\0')
+                    || package_id.contains(['\r', '\n'])
+                {
+                    return Err(ReleaseError::environment(format!(
+                        "Cargo compiler-artifact for {target_label} has an invalid package_id"
+                    )));
+                }
+                package_ids.insert(package_id);
+            }
+            "compiler-message" | "build-script-executed" => {}
+            "build-finished" => {
+                if message.success != Some(true) {
+                    return Err(ReleaseError::environment(format!(
+                        "Cargo release build message for {target_label} did not report success"
+                    )));
+                }
+                build_finished = true;
+            }
+            reason => {
+                return Err(ReleaseError::environment(format!(
+                    "Cargo release build for {target_label} emitted unsupported message reason `{reason}`"
+                )));
+            }
+        }
+    }
+    if !build_finished || package_ids.is_empty() {
+        return Err(ReleaseError::environment(format!(
+            "Cargo release build for {target_label} omitted successful completion or compiler artifacts"
+        )));
+    }
+    Ok(package_ids)
+}
+
+fn require_native_build_graph_parity(
+    scoped_package_ids: &BTreeSet<String>,
+    built_package_ids: &BTreeSet<String>,
+    target_label: &str,
+) -> Result<(), ReleaseError> {
+    if scoped_package_ids == built_package_ids {
+        return Ok(());
+    }
+    let missing: Vec<_> = scoped_package_ids
+        .difference(built_package_ids)
+        .take(8)
+        .cloned()
+        .collect();
+    let unexpected: Vec<_> = built_package_ids
+        .difference(scoped_package_ids)
+        .take(8)
+        .cloned()
+        .collect();
+    Err(ReleaseError::environment(format!(
+        "native Cargo release build for {target_label} disagrees with the scoped Cargo tree graph: graph={} artifacts={}, missing artifact package IDs (up to 8)=[{}], unexpected artifact package IDs (up to 8)=[{}]",
+        scoped_package_ids.len(),
+        built_package_ids.len(),
+        missing.join(", "),
+        unexpected.join(", ")
+    )))
 }
 
 fn read_built_binary(
@@ -1761,6 +2050,51 @@ fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, 
         environment,
         CARGO_METADATA_TIMEOUT,
         MAX_METADATA_BYTES,
+        MAX_DIAGNOSTIC_BYTES,
+        Mutability::Unknown,
+        NetworkIntent::OfflineRequested,
+        &label,
+    );
+    let later_configuration_boundary = require_no_external_cargo_configuration(repository);
+    let observation = observation?;
+    later_configuration_boundary?;
+    require_process_success(observation, &label)
+}
+
+fn cargo_tree(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, ReleaseError> {
+    require_no_external_cargo_configuration(repository)?;
+    let label = format!("scoped Cargo tree graph for {}", target.triple);
+    let environment = prepared_release_cargo_environment(
+        repository,
+        CargoNetworkMode::Offline,
+        CargoCompilationTarget::Target(target.triple),
+        &label,
+    )?;
+    let observation = run_bounded_process(
+        repository,
+        cargo_program(),
+        [
+            "tree",
+            "--locked",
+            "--offline",
+            "-p",
+            "forge-cli",
+            "--target",
+            target.triple,
+            "-e",
+            "normal,build",
+            "--prefix",
+            "depth",
+            "--format",
+            "@@{p}@@",
+            "--no-dedupe",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        environment,
+        CARGO_METADATA_TIMEOUT,
+        MAX_CARGO_TREE_BYTES,
         MAX_DIAGNOSTIC_BYTES,
         Mutability::Unknown,
         NetworkIntent::OfflineRequested,
@@ -1934,6 +2268,7 @@ fn stage_built(
     let sbom = render_sbom(
         target,
         snapshot.metadata(target)?,
+        snapshot.tree(target)?,
         &snapshot.cargo_lock,
         &snapshot.source_commit,
         binary,
@@ -2008,6 +2343,7 @@ fn validate_staged_assets(
         let expected_sbom = render_sbom(
             target,
             snapshot.metadata(target)?,
+            snapshot.tree(target)?,
             &snapshot.cargo_lock,
             &snapshot.source_commit,
             &binary,
@@ -2040,6 +2376,7 @@ fn absolute_clean_path(path: &Path) -> Result<PathBuf, ReleaseError> {
             )));
         }
     }
+
     Ok(absolute)
 }
 
@@ -2837,49 +3174,34 @@ struct CargoMetadata {
     workspace_members: Vec<String>,
     #[serde(default)]
     workspace_root: Option<PathBuf>,
-    resolve: Option<CargoResolve>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CargoPackage {
     id: String,
     name: String,
     version: String,
     license: Option<String>,
     source: Option<String>,
-    checksum: Option<String>,
     #[serde(default)]
     manifest_path: Option<PathBuf>,
     #[serde(default)]
     targets: Vec<CargoTarget>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CargoTarget {
     #[serde(default)]
     src_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoResolve {
-    nodes: Vec<CargoNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoNode {
-    id: String,
-    deps: Vec<CargoDependency>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoDependency {
-    pkg: String,
-    dep_kinds: Vec<CargoDependencyKind>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoDependencyKind {
-    kind: Option<String>,
+struct CargoBuildMessage {
+    reason: String,
+    #[serde(default)]
+    package_id: Option<String>,
+    #[serde(default)]
+    success: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2990,9 +3312,194 @@ fn package_license_expression(package: &CargoPackage) -> Result<String, ReleaseE
     Ok(expression.to_owned())
 }
 
+#[derive(Debug)]
+struct ScopedCargoTreeGraph {
+    root_id: String,
+    package_ids: BTreeSet<String>,
+    edges: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn parse_scoped_cargo_tree_graph(
+    metadata: &CargoMetadata,
+    tree_bytes: &[u8],
+    target_label: &str,
+) -> Result<ScopedCargoTreeGraph, ReleaseError> {
+    if tree_bytes.len() > MAX_CARGO_TREE_BYTES {
+        return Err(ReleaseError::environment(format!(
+            "scoped Cargo tree graph for {target_label} exceeds the {MAX_CARGO_TREE_BYTES}-byte bound"
+        )));
+    }
+    let tree = std::str::from_utf8(tree_bytes).map_err(|error| {
+        ReleaseError::environment(format!(
+            "scoped Cargo tree graph for {target_label} is not UTF-8: {error}"
+        ))
+    })?;
+    if tree.is_empty() || tree.contains('\r') || !tree.ends_with('\n') || tree.ends_with("\n\n") {
+        return Err(ReleaseError::environment(format!(
+            "scoped Cargo tree graph for {target_label} is not non-empty text with one LF terminator"
+        )));
+    }
+    let mut identities: BTreeMap<(&str, &str), Vec<&CargoPackage>> = BTreeMap::new();
+    for package in &metadata.packages {
+        identities
+            .entry((package.name.as_str(), package.version.as_str()))
+            .or_default()
+            .push(package);
+    }
+    let workspace_members: BTreeSet<_> = metadata
+        .workspace_members
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut stack: Vec<String> = Vec::new();
+    let mut selected = BTreeSet::new();
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut root_id = None;
+    let mut line_count = 0_usize;
+    for line in tree.lines() {
+        line_count = line_count
+            .checked_add(1)
+            .ok_or_else(|| ReleaseError::environment("scoped Cargo tree line count overflowed"))?;
+        if line_count > MAX_CARGO_TREE_LINES {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} exceeds the {MAX_CARGO_TREE_LINES}-line bound"
+            )));
+        }
+        let marker = line.find("@@").ok_or_else(|| {
+            ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} has a line without the package sentinel"
+            ))
+        })?;
+        let (depth, display) = line.split_at(marker);
+        if depth.is_empty()
+            || (depth.len() > 1 && depth.starts_with('0'))
+            || !depth.as_bytes().iter().all(u8::is_ascii_digit)
+        {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} has an invalid depth prefix"
+            )));
+        }
+        let depth: usize = depth.parse().map_err(|error| {
+            ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} has an unrepresentable depth: {error}"
+            ))
+        })?;
+        let display = display
+            .strip_prefix("@@")
+            .and_then(|value| value.strip_suffix("@@"))
+            .filter(|value| !value.contains("@@"))
+            .ok_or_else(|| {
+                ReleaseError::environment(format!(
+                    "scoped Cargo tree graph for {target_label} has malformed package sentinels"
+                ))
+            })?;
+        let mut words = display.split_ascii_whitespace();
+        let name = words.next().ok_or_else(|| {
+            ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} omitted a package name"
+            ))
+        })?;
+        let version = words
+            .next()
+            .and_then(|value| value.strip_prefix('v'))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ReleaseError::environment(format!(
+                    "scoped Cargo tree graph for {target_label} omitted a package version"
+                ))
+            })?;
+        let candidates = identities.get(&(name, version)).ok_or_else(|| {
+            ReleaseError::environment(format!(
+                "scoped Cargo tree package {name}@{version} is absent from target-filtered metadata"
+            ))
+        })?;
+        let [package] = candidates.as_slice() else {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree package {name}@{version} maps to {} metadata identities; source-qualified disambiguation is required",
+                candidates.len()
+            )));
+        };
+        let suffix = words.collect::<Vec<_>>().join(" ");
+        let suffix_is_valid = if suffix.is_empty() || suffix == "(proc-macro)" {
+            true
+        } else if package.source.is_none() {
+            let displayed_path = suffix
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'));
+            let manifest_parent = package
+                .manifest_path
+                .as_deref()
+                .and_then(Path::parent)
+                .and_then(Path::to_str);
+            displayed_path.is_some() && displayed_path == manifest_parent
+        } else {
+            false
+        };
+        if !suffix_is_valid {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree package {name}@{version} has an unexpected display suffix"
+            )));
+        }
+        if package.source.is_none() && !workspace_members.contains(package.id.as_str()) {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} selected local package {name}@{version} outside the workspace"
+            )));
+        }
+        if depth > stack.len() {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} has a depth discontinuity"
+            )));
+        }
+        if line_count == 1 {
+            if depth != 0
+                || package.name != "forge-cli"
+                || package.version != RELEASE_VERSION
+                || package.source.is_some()
+            {
+                return Err(ReleaseError::environment(format!(
+                    "scoped Cargo tree graph for {target_label} does not start at workspace forge-cli {RELEASE_VERSION}"
+                )));
+            }
+            root_id = Some(package.id.clone());
+        } else if depth == 0 {
+            return Err(ReleaseError::environment(format!(
+                "scoped Cargo tree graph for {target_label} contains more than one root"
+            )));
+        }
+        stack.truncate(depth);
+        if let Some(parent) = stack.last() {
+            if parent == &package.id {
+                return Err(ReleaseError::environment(format!(
+                    "scoped Cargo tree graph for {target_label} contains a self edge"
+                )));
+            }
+            edges
+                .entry(parent.clone())
+                .or_default()
+                .insert(package.id.clone());
+        }
+        selected.insert(package.id.clone());
+        edges.entry(package.id.clone()).or_default();
+        stack.push(package.id.clone());
+    }
+    if line_count == 0 {
+        return Err(ReleaseError::environment(format!(
+            "scoped Cargo tree graph for {target_label} is empty"
+        )));
+    }
+    Ok(ScopedCargoTreeGraph {
+        root_id: root_id.ok_or_else(|| {
+            ReleaseError::internal("scoped Cargo tree parser omitted its validated root")
+        })?,
+        package_ids: selected,
+        edges,
+    })
+}
+
 fn render_sbom(
     target: &ReleaseTarget,
     metadata_bytes: &[u8],
+    tree_bytes: &[u8],
     cargo_lock: &[u8],
     source_commit: &str,
     binary: &[u8],
@@ -3003,66 +3510,23 @@ fn render_sbom(
             target.triple
         ))
     })?;
-    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
-        ReleaseError::environment(format!(
-            "Cargo metadata for {} has no resolved dependency graph",
-            target.triple
-        ))
-    })?;
+    let lock = parse_cargo_lock(cargo_lock)?;
+    let lock_packages = cargo_lock_packages(&lock)?;
     let packages: BTreeMap<_, _> = metadata
         .packages
         .iter()
         .map(|package| (package.id.as_str(), package))
         .collect();
-    let workspace_members: BTreeSet<_> = metadata
-        .workspace_members
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let roots: Vec<_> = metadata
-        .workspace_members
-        .iter()
-        .filter_map(|id| packages.get(id.as_str()).copied())
-        .filter(|package| package.name == "forge-cli" && package.version == RELEASE_VERSION)
-        .collect();
-    let [root] = roots.as_slice() else {
-        return Err(ReleaseError::environment(format!(
-            "Cargo metadata must identify exactly one workspace-member forge-cli {RELEASE_VERSION}, found {}",
-            roots.len()
-        )));
-    };
-    let nodes: BTreeMap<_, _> = resolve
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect();
-    let mut selected = BTreeSet::new();
-    let mut pending = VecDeque::from([root.id.as_str()]);
-    while let Some(id) = pending.pop_front() {
-        if !selected.insert(id.to_owned()) {
-            continue;
-        }
-        let package = packages.get(id).ok_or_else(|| {
-            ReleaseError::environment(format!("Cargo metadata has no package for `{id}`"))
-        })?;
-        if package.source.is_none() && !workspace_members.contains(id) {
-            return Err(ReleaseError::environment(format!(
-                "source-bound SBOM rejects local path dependency outside the exact workspace: `{id}`"
-            )));
-        }
-        let node = nodes.get(id).ok_or_else(|| {
-            ReleaseError::environment(format!("Cargo metadata has no resolve node for `{id}`"))
-        })?;
-        for dependency in &node.deps {
-            if is_release_dependency(dependency) {
-                pending.push_back(dependency.pkg.as_str());
-            }
-        }
-    }
+    let selection = parse_scoped_cargo_tree_graph(&metadata, tree_bytes, target.triple)?;
+    let root = packages
+        .get(selection.root_id.as_str())
+        .copied()
+        .ok_or_else(|| ReleaseError::internal("selected Cargo root disappeared"))?;
+    let selected = &selection.package_ids;
 
     let root_ref = format!("pkg:cargo/forge@{RELEASE_VERSION}");
     let mut references = BTreeMap::new();
-    for id in &selected {
+    for id in selected {
         let package = packages.get(id.as_str()).ok_or_else(|| {
             ReleaseError::environment(format!("Cargo metadata has no package for `{id}`"))
         })?;
@@ -3102,16 +3566,14 @@ fn render_sbom(
         let package = packages.get(id.as_str()).ok_or_else(|| {
             ReleaseError::internal(format!("selected Cargo package disappeared: `{id}`"))
         })?;
-        let hashes = package
-            .checksum
-            .as_ref()
-            .map(|checksum| {
-                vec![BomHash {
-                    alg: "SHA-256",
-                    content: checksum.clone(),
-                }]
-            })
-            .unwrap_or_default();
+        let lock_checksum = release_package_lock_checksum(package, &lock_packages)?;
+        let hashes = match lock_checksum {
+            Some(checksum) => vec![BomHash {
+                alg: "SHA-256",
+                content: checksum,
+            }],
+            None => Vec::new(),
+        };
         let properties = package
             .source
             .as_ref()
@@ -3138,16 +3600,18 @@ fn render_sbom(
     }
 
     let mut dependencies = Vec::with_capacity(selected.len());
-    for id in &selected {
-        let node = nodes.get(id.as_str()).ok_or_else(|| {
-            ReleaseError::internal(format!("selected Cargo node disappeared: `{id}`"))
-        })?;
-        let mut depends_on: Vec<_> = node
-            .deps
+    for id in selected {
+        let mut depends_on: Vec<_> = selection
+            .edges
+            .get(id)
+            .ok_or_else(|| ReleaseError::internal("selected scoped Cargo tree node disappeared"))?
             .iter()
-            .filter(|dependency| is_release_dependency(dependency))
-            .filter_map(|dependency| references.get(&dependency.pkg).cloned())
-            .collect();
+            .map(|dependency| {
+                references.get(dependency).cloned().ok_or_else(|| {
+                    ReleaseError::internal("scoped Cargo tree edge target has no SBOM reference")
+                })
+            })
+            .collect::<Result<Vec<_>, ReleaseError>>()?;
         depends_on.sort();
         depends_on.dedup();
         dependencies.push(BomDependency {
@@ -3207,12 +3671,1431 @@ fn render_sbom(
     to_pretty_json(&bom, "CycloneDX SBOM")
 }
 
-fn is_release_dependency(dependency: &CargoDependency) -> bool {
-    dependency.dep_kinds.is_empty()
-        || dependency
-            .dep_kinds
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseLicenseBaseline {
+    packages: Vec<ReleaseLicensePackage>,
+    schema: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseLicensePackage {
+    id: String,
+    legal_files: Vec<ReleaseLegalFile>,
+    license_expression: String,
+    lock_checksum: Option<String>,
+    name: String,
+    sbom_license_expression: String,
+    source: String,
+    targets: Vec<String>,
+    version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseLegalFile {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ReleaseLicensePolicy {
+    schema: String,
+    cargo_about: CargoAboutLicensePolicy,
+    spdx_expression_normalizations: BTreeMap<String, LicenseExpressionNormalization>,
+    required_registry_legal_files: BTreeMap<String, Vec<String>>,
+    required_workspace_legal_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CargoAboutLicensePolicy {
+    assessed_version: String,
+    known_selected_packages_absent_from_custom_json: Vec<String>,
+    decision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct LicenseExpressionNormalization {
+    upstream_declared: String,
+    normalized_for_sbom: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CargoLockFile {
+    version: u32,
+    package: Vec<CargoLockPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "dependencies")]
+    _dependencies: Vec<toml::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct LicensePackageSeed {
+    package: CargoPackage,
+    targets: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct ReleaseLicenseEvidence {
+    baseline: ReleaseLicenseBaseline,
+    legal_text_by_package: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+}
+
+pub(crate) fn check_release_licenses(
+    repository: &Path,
+) -> Result<ReleaseLicenseReport, ReleaseError> {
+    let baseline_bytes = read_bounded(
+        &repository.join(LICENSE_BASELINE_FILE),
+        MAX_LICENSE_BASELINE_BYTES,
+        "release-license baseline",
+    )?;
+    let policy_bytes = read_bounded(
+        &repository.join(LICENSE_POLICY_FILE),
+        MAX_LICENSE_POLICY_BYTES,
+        "release-license policy",
+    )?;
+    let checked_bundle = read_bounded(
+        &repository.join(LICENSE_NOTICES_FILE),
+        MAX_SOURCE_FILE_BYTES as u64,
+        "release-license bundle",
+    )?;
+    let expected: ReleaseLicenseBaseline =
+        serde_json::from_slice(&baseline_bytes).map_err(|error| {
+            ReleaseError::negative(format!(
+                "{LICENSE_BASELINE_FILE} is not valid release-license baseline JSON: {error}"
+            ))
+        })?;
+    let policy = parse_release_license_policy(&policy_bytes)?;
+    let evidence = collect_release_license_evidence(repository, &policy)?;
+    require_release_license_baseline_matches(&expected, &evidence.baseline)?;
+    let rendered_baseline = to_pretty_json(&evidence.baseline, "release-license baseline")?;
+    if baseline_bytes != rendered_baseline {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_BASELINE_FILE} is semantically current but not in canonical deterministic form; run release-license-generate and review the diff"
+        )));
+    }
+    let rendered_bundle = render_release_license_bundle(&evidence)?;
+    require_portable_release_license_output(LICENSE_BASELINE_FILE, &rendered_baseline)?;
+    require_portable_release_license_output(LICENSE_NOTICES_FILE, &rendered_bundle)?;
+    if checked_bundle != rendered_bundle {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_NOTICES_FILE} differs from the locked release dependency graph, reviewed policy, or legal-file bytes; run release-license-generate and review the diff"
+        )));
+    }
+    Ok(release_license_report(&evidence))
+}
+
+fn generate_release_licenses(
+    repository: &Path,
+    output_root: &Path,
+) -> Result<ReleaseLicenseReport, ReleaseError> {
+    let policy_path = repository.join(LICENSE_POLICY_FILE);
+    let policy_before = read_bounded(
+        &policy_path,
+        MAX_LICENSE_POLICY_BYTES,
+        "release-license policy",
+    )?;
+    let policy = parse_release_license_policy(&policy_before)?;
+    let evidence = collect_release_license_evidence(repository, &policy)?;
+    let baseline = to_pretty_json(&evidence.baseline, "release-license baseline")?;
+    let bundle = render_release_license_bundle(&evidence)?;
+    require_portable_release_license_output(LICENSE_BASELINE_FILE, &baseline)?;
+    require_portable_release_license_output(LICENSE_NOTICES_FILE, &bundle)?;
+    if baseline.len() > MAX_LICENSE_BASELINE_BYTES as usize {
+        return Err(ReleaseError::negative(format!(
+            "generated {LICENSE_BASELINE_FILE} exceeds its {MAX_LICENSE_BASELINE_BYTES}-byte reader bound"
+        )));
+    }
+    if bundle.len() > MAX_SOURCE_FILE_BYTES {
+        return Err(ReleaseError::negative(format!(
+            "generated {LICENSE_NOTICES_FILE} exceeds its {MAX_SOURCE_FILE_BYTES}-byte reader bound"
+        )));
+    }
+
+    let output = RepositoryWriter::new(output_root).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to pin release-license output root before generation: {error}"
+        ))
+    })?;
+    output
+        .write_atomic(LICENSE_BASELINE_FILE, &baseline)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to atomically write generated {LICENSE_BASELINE_FILE}: {error}"
+            ))
+        })?;
+    output
+        .write_atomic(LICENSE_NOTICES_FILE, &bundle)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to atomically write generated {LICENSE_NOTICES_FILE}: {error}"
+            ))
+        })?;
+    let policy_after = read_bounded(
+        &policy_path,
+        MAX_LICENSE_POLICY_BYTES,
+        "release-license policy",
+    )?;
+    if policy_before != policy_after {
+        return Err(ReleaseError::environment(format!(
+            "{LICENSE_POLICY_FILE} changed during generation; generated evidence must be reviewed from a stable policy"
+        )));
+    }
+    Ok(release_license_report(&evidence))
+}
+
+fn release_license_report(evidence: &ReleaseLicenseEvidence) -> ReleaseLicenseReport {
+    ReleaseLicenseReport {
+        package_count: evidence.baseline.packages.len(),
+        legal_file_count: evidence
+            .baseline
+            .packages
             .iter()
-            .any(|kind| kind.kind.as_deref() != Some("dev"))
+            .map(|package| package.legal_files.len())
+            .sum(),
+    }
+}
+
+fn parse_release_license_policy(bytes: &[u8]) -> Result<ReleaseLicensePolicy, ReleaseError> {
+    let policy: ReleaseLicensePolicy = serde_json::from_slice(bytes).map_err(|error| {
+        ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} is not valid release-license policy JSON: {error}"
+        ))
+    })?;
+    if policy.schema != LICENSE_POLICY_SCHEMA {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} has unsupported schema `{}`",
+            policy.schema
+        )));
+    }
+    if policy.cargo_about.assessed_version != "0.9.1"
+        || policy.cargo_about.decision
+            != "locked-crate-archive-sha256-verification-and-separate-unpacked-source-legal-file-aggregation"
+    {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} changed the reviewed cargo-about advisory decision"
+        )));
+    }
+    let expected_about_omissions = BTreeSet::new();
+    let actual_about_omissions: BTreeSet<_> = policy
+        .cargo_about
+        .known_selected_packages_absent_from_custom_json
+        .iter()
+        .cloned()
+        .collect();
+    if actual_about_omissions != expected_about_omissions
+        || actual_about_omissions.len()
+            != policy
+                .cargo_about
+                .known_selected_packages_absent_from_custom_json
+                .len()
+    {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} changed or duplicated the reviewed cargo-about omission set"
+        )));
+    }
+    let expected_workspace_files = ["LICENSE-APACHE", "LICENSE-MIT"];
+    if policy.required_workspace_legal_files != expected_workspace_files.map(str::to_owned).to_vec()
+    {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} changed the exact Forge workspace license-file set"
+        )));
+    }
+    if policy.spdx_expression_normalizations.len() != 5 {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} must contain exactly five reviewed slash-expression mappings"
+        )));
+    }
+    if policy.required_registry_legal_files.len() != 4 {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} must contain exactly four special registry legal-file requirements"
+        )));
+    }
+    Ok(policy)
+}
+
+fn collect_release_license_evidence(
+    repository: &Path,
+    policy: &ReleaseLicensePolicy,
+) -> Result<ReleaseLicenseEvidence, ReleaseError> {
+    let repository_root = fs::canonicalize(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve repository root before release-license collection: {error}"
+        ))
+    })?;
+    let lock_bytes = read_bounded(
+        &repository.join("Cargo.lock"),
+        MAX_METADATA_BYTES as u64,
+        "Cargo.lock",
+    )?;
+    let lock = parse_cargo_lock(&lock_bytes)?;
+    let lock_packages = cargo_lock_packages(&lock)?;
+    let mut seeds: BTreeMap<String, LicensePackageSeed> = BTreeMap::new();
+
+    for target in &RELEASE_TARGETS {
+        let metadata_bytes = cargo_metadata(repository, target)?;
+        let tree_bytes = cargo_tree(repository, target)?;
+        let metadata: CargoMetadata = serde_json::from_slice(&metadata_bytes).map_err(|error| {
+            ReleaseError::environment(format!(
+                "Cargo metadata for {} is not valid JSON: {error}",
+                target.triple
+            ))
+        })?;
+        require_release_license_workspace_root(&repository_root, &metadata, target)?;
+        let selection = parse_scoped_cargo_tree_graph(&metadata, &tree_bytes, target.triple)?;
+        let packages: BTreeMap<_, _> = metadata
+            .packages
+            .iter()
+            .map(|package| (package.id.as_str(), package))
+            .collect();
+        for raw_id in selection.package_ids {
+            let package = packages.get(raw_id.as_str()).copied().ok_or_else(|| {
+                ReleaseError::internal(format!(
+                    "selected package disappeared from Cargo metadata for {}",
+                    target.triple
+                ))
+            })?;
+            let id = release_license_package_id(package);
+            match seeds.get_mut(&id) {
+                Some(seed) => {
+                    if !same_release_license_package(&seed.package, package) {
+                        return Err(ReleaseError::environment(format!(
+                            "Cargo metadata disagrees between release targets for {id}"
+                        )));
+                    }
+                    seed.targets.insert(target.triple.to_owned());
+                }
+                None => {
+                    seeds.insert(
+                        id,
+                        LicensePackageSeed {
+                            package: package.clone(),
+                            targets: BTreeSet::from([target.triple.to_owned()]),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let workspace_count = seeds
+        .values()
+        .filter(|seed| seed.package.source.is_none())
+        .count();
+    let registry_count = seeds.len().saturating_sub(workspace_count);
+    if seeds.len() != EXPECTED_LICENSE_PACKAGES
+        || workspace_count != EXPECTED_WORKSPACE_LICENSE_PACKAGES
+        || registry_count != EXPECTED_REGISTRY_LICENSE_PACKAGES
+    {
+        return Err(ReleaseError::negative(format!(
+            "scoped Cargo tree release-license union contains {} packages ({workspace_count} workspace, {registry_count} registry), expected {EXPECTED_LICENSE_PACKAGES} ({EXPECTED_WORKSPACE_LICENSE_PACKAGES} workspace, {EXPECTED_REGISTRY_LICENSE_PACKAGES} registry)",
+            seeds.len()
+        )));
+    }
+
+    let workspace_legal_text = read_workspace_legal_files(repository, policy)?;
+    let mut used_normalizations = BTreeSet::new();
+    let mut total_legal_bytes = 0_u64;
+    let mut baseline_packages = Vec::with_capacity(seeds.len());
+    let mut legal_text_by_package = BTreeMap::new();
+    for (id, seed) in &seeds {
+        let package = &seed.package;
+        let source = package
+            .source
+            .clone()
+            .unwrap_or_else(|| "workspace".to_owned());
+        let raw_expression = package.license.clone().ok_or_else(|| {
+            ReleaseError::negative(format!(
+                "release dependency {id} has no Cargo package.license expression"
+            ))
+        })?;
+        let normalized_expression =
+            reviewed_package_license_expression(package, policy, &mut used_normalizations)?;
+        let lock_checksum = release_package_lock_checksum(package, &lock_packages)?;
+        let legal_text = if package.source.is_none() {
+            workspace_legal_text.clone()
+        } else {
+            let manifest = package.manifest_path.as_deref().ok_or_else(|| {
+                ReleaseError::environment(format!(
+                    "registry release dependency {id} omitted manifest_path"
+                ))
+            })?;
+            let package_root = manifest.parent().ok_or_else(|| {
+                ReleaseError::environment(format!(
+                    "registry release dependency {id} has no package root"
+                ))
+            })?;
+            verify_registry_crate_archive(
+                package,
+                package_root,
+                lock_checksum.as_deref().ok_or_else(|| {
+                    ReleaseError::internal("registry package omitted its validated lock checksum")
+                })?,
+            )?;
+            scan_registry_legal_files(package_root, id)?
+        };
+        for bytes in legal_text.values() {
+            total_legal_bytes = total_legal_bytes
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                    ReleaseError::environment("legal-file size is not representable")
+                })?)
+                .ok_or_else(|| ReleaseError::environment("legal-file byte count overflowed"))?;
+            if total_legal_bytes > MAX_TOTAL_LEGAL_FILE_BYTES {
+                return Err(ReleaseError::environment(format!(
+                    "release-license legal text exceeds the {MAX_TOTAL_LEGAL_FILE_BYTES}-byte bound"
+                )));
+            }
+        }
+        let legal_files = legal_text
+            .iter()
+            .map(|(path, bytes)| ReleaseLegalFile {
+                path: path.clone(),
+                sha256: sha256_hex(bytes),
+            })
+            .collect();
+        baseline_packages.push(ReleaseLicensePackage {
+            id: id.clone(),
+            legal_files,
+            license_expression: raw_expression,
+            lock_checksum,
+            name: package.name.clone(),
+            sbom_license_expression: normalized_expression,
+            source,
+            targets: seed.targets.iter().cloned().collect(),
+            version: package.version.clone(),
+        });
+        legal_text_by_package.insert(id.clone(), legal_text);
+    }
+    let configured_normalizations: BTreeSet<_> = policy
+        .spdx_expression_normalizations
+        .keys()
+        .cloned()
+        .collect();
+    if used_normalizations != configured_normalizations {
+        let stale: Vec<_> = configured_normalizations
+            .difference(&used_normalizations)
+            .cloned()
+            .collect();
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_POLICY_FILE} contains stale slash-expression mappings: {}",
+            stale.join(", ")
+        )));
+    }
+
+    let baseline = ReleaseLicenseBaseline {
+        packages: baseline_packages,
+        schema: LICENSE_BASELINE_SCHEMA.to_owned(),
+    };
+    validate_required_legal_files(&baseline, policy)?;
+    let legal_file_count: usize = baseline
+        .packages
+        .iter()
+        .map(|package| package.legal_files.len())
+        .sum();
+    if legal_file_count != EXPECTED_LEGAL_FILES {
+        return Err(ReleaseError::negative(format!(
+            "scoped Cargo tree release-license union contains {legal_file_count} legal files, expected {EXPECTED_LEGAL_FILES}"
+        )));
+    }
+    Ok(ReleaseLicenseEvidence {
+        baseline,
+        legal_text_by_package,
+    })
+}
+
+fn parse_cargo_lock(bytes: &[u8]) -> Result<CargoLockFile, ReleaseError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| ReleaseError::negative(format!("Cargo.lock is not UTF-8: {error}")))?;
+    let lock: CargoLockFile = toml::from_str(text)
+        .map_err(|error| ReleaseError::negative(format!("Cargo.lock is invalid TOML: {error}")))?;
+    if lock.version != 4 {
+        return Err(ReleaseError::negative(format!(
+            "Cargo.lock format {} is not the reviewed format 4",
+            lock.version
+        )));
+    }
+    Ok(lock)
+}
+
+type CargoLockPackageKey = (String, String, Option<String>);
+
+fn cargo_lock_packages(
+    lock: &CargoLockFile,
+) -> Result<BTreeMap<CargoLockPackageKey, Option<String>>, ReleaseError> {
+    let mut packages = BTreeMap::new();
+    for package in &lock.package {
+        let key = (
+            package.name.clone(),
+            package.version.clone(),
+            package.source.clone(),
+        );
+        if packages.insert(key, package.checksum.clone()).is_some() {
+            return Err(ReleaseError::negative(format!(
+                "Cargo.lock contains duplicate package identity {}@{}",
+                package.name, package.version
+            )));
+        }
+    }
+    Ok(packages)
+}
+
+fn require_release_license_workspace_root(
+    repository: &Path,
+    metadata: &CargoMetadata,
+    target: &ReleaseTarget,
+) -> Result<(), ReleaseError> {
+    let reported = metadata.workspace_root.as_deref().ok_or_else(|| {
+        ReleaseError::environment(format!(
+            "Cargo metadata for {} omitted workspace_root",
+            target.triple
+        ))
+    })?;
+    let reported = fs::canonicalize(reported).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve Cargo workspace_root for {}: {error}",
+            target.triple
+        ))
+    })?;
+    if reported == repository {
+        Ok(())
+    } else {
+        Err(ReleaseError::environment(format!(
+            "Cargo metadata workspace_root for {} does not match the Forge repository",
+            target.triple
+        )))
+    }
+}
+
+fn same_release_license_package(left: &CargoPackage, right: &CargoPackage) -> bool {
+    left.name == right.name
+        && left.version == right.version
+        && left.license == right.license
+        && left.source == right.source
+        && left.manifest_path == right.manifest_path
+}
+
+fn release_license_package_id(package: &CargoPackage) -> String {
+    let package_key = release_license_package_key(package);
+    match &package.source {
+        Some(source) => format!("{source}#{package_key}"),
+        None => format!("workspace:{package_key}"),
+    }
+}
+
+fn release_license_package_key(package: &CargoPackage) -> String {
+    format!("{}@{}", package.name, package.version)
+}
+
+fn release_package_lock_checksum(
+    package: &CargoPackage,
+    lock_packages: &BTreeMap<CargoLockPackageKey, Option<String>>,
+) -> Result<Option<String>, ReleaseError> {
+    let key = (
+        package.name.clone(),
+        package.version.clone(),
+        package.source.clone(),
+    );
+    let checksum = lock_packages.get(&key).ok_or_else(|| {
+        ReleaseError::negative(format!(
+            "selected release dependency {} is absent from Cargo.lock",
+            release_license_package_id(package)
+        ))
+    })?;
+    if package.source.is_none() {
+        if checksum.is_some() {
+            return Err(ReleaseError::negative(format!(
+                "workspace release dependency {} unexpectedly has a Cargo.lock checksum",
+                release_license_package_id(package)
+            )));
+        }
+        return Ok(None);
+    }
+    let checksum = checksum.as_deref().ok_or_else(|| {
+        ReleaseError::negative(format!(
+            "registry release dependency {} has no Cargo.lock checksum",
+            release_license_package_id(package)
+        ))
+    })?;
+    if checksum.len() != 64
+        || !checksum
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(ReleaseError::negative(format!(
+            "registry release dependency {} has a malformed Cargo.lock checksum",
+            release_license_package_id(package)
+        )));
+    }
+    Ok(Some(checksum.to_owned()))
+}
+
+fn verify_registry_crate_archive(
+    package: &CargoPackage,
+    package_root: &Path,
+    lock_checksum: &str,
+) -> Result<(), ReleaseError> {
+    if !package
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("registry+"))
+    {
+        return Err(ReleaseError::negative(format!(
+            "release dependency {} has a lock checksum but is not a registry package",
+            release_license_package_id(package)
+        )));
+    }
+    let expected_package_directory = format!("{}-{}", package.name, package.version);
+    if package_root.file_name() != Some(OsStr::new(&expected_package_directory)) {
+        return Err(ReleaseError::environment(format!(
+            "unpacked registry source directory does not match package identity for {}",
+            release_license_package_id(package)
+        )));
+    }
+    let source_bucket = package_root.parent().ok_or_else(|| {
+        ReleaseError::environment("unpacked registry source root has no source bucket")
+    })?;
+    let source_bucket_name = source_bucket
+        .file_name()
+        .ok_or_else(|| ReleaseError::environment("unpacked registry source bucket has no name"))?;
+    let source_root = source_bucket.parent().ok_or_else(|| {
+        ReleaseError::environment("unpacked registry source bucket has no src parent")
+    })?;
+    if source_root.file_name() != Some(OsStr::new("src")) {
+        return Err(ReleaseError::environment(format!(
+            "unpacked registry source for {} is outside Cargo's unambiguous registry/src layout",
+            release_license_package_id(package)
+        )));
+    }
+    let registry_root = source_root.parent().ok_or_else(|| {
+        ReleaseError::environment("Cargo registry src directory has no registry parent")
+    })?;
+    let cache_root = registry_root.join("cache");
+    let cache_bucket = cache_root.join(source_bucket_name);
+    for (directory, label) in [
+        (registry_root, "Cargo registry root"),
+        (source_root, "Cargo registry source root"),
+        (source_bucket, "Cargo registry source bucket"),
+        (package_root, "unpacked registry package root"),
+        (cache_root.as_path(), "Cargo registry cache root"),
+        (cache_bucket.as_path(), "Cargo registry cache bucket"),
+    ] {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to inspect {label} for {}: {error}",
+                release_license_package_id(package)
+            ))
+        })?;
+        if source_entry_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(ReleaseError::environment(format!(
+                "{label} for {} is not a real non-reparse directory",
+                release_license_package_id(package)
+            )));
+        }
+    }
+
+    let expected_archive_name = format!("{expected_package_directory}.crate");
+    let mut matching_archive = None;
+    let entries = fs::read_dir(&cache_bucket).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to enumerate Cargo registry cache for {}: {error}",
+            release_license_package_id(package)
+        ))
+    })?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_REGISTRY_CACHE_ENTRIES {
+            return Err(ReleaseError::environment(format!(
+                "Cargo registry cache exceeds the {MAX_REGISTRY_CACHE_ENTRIES}-entry bound"
+            )));
+        }
+        let entry = entry.map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read Cargo registry cache entry for {}: {error}",
+                release_license_package_id(package)
+            ))
+        })?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            ReleaseError::environment("Cargo registry cache contains a non-UTF-8 entry name")
+        })?;
+        if name.eq_ignore_ascii_case(&expected_archive_name) {
+            if name != expected_archive_name || matching_archive.is_some() {
+                return Err(ReleaseError::environment(format!(
+                    "Cargo registry cache archive identity is ambiguous for {}",
+                    release_license_package_id(package)
+                )));
+            }
+            matching_archive = Some(entry.path());
+        }
+    }
+    let archive = matching_archive.ok_or_else(|| {
+        ReleaseError::environment(format!(
+            "Cargo registry cache archive is missing for {}; run the explicit locked target fetch before the offline release-license check",
+            release_license_package_id(package)
+        ))
+    })?;
+    let bytes = read_bounded_registry_archive(&archive, package)?;
+    let actual_checksum = sha256_hex(&bytes);
+    if actual_checksum != lock_checksum {
+        return Err(ReleaseError::negative(format!(
+            "Cargo registry cache archive SHA-256 disagrees with Cargo.lock for {}",
+            release_license_package_id(package)
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_registry_archive(
+    path: &Path,
+    package: &CargoPackage,
+) -> Result<Vec<u8>, ReleaseError> {
+    let before = fs::symlink_metadata(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to inspect Cargo registry archive for {}: {error}",
+            release_license_package_id(package)
+        ))
+    })?;
+    if source_entry_is_link_or_reparse(&before) || !before.is_file() {
+        return Err(ReleaseError::environment(format!(
+            "Cargo registry archive for {} is not a real non-reparse regular file",
+            release_license_package_id(package)
+        )));
+    }
+    if before.len() > MAX_REGISTRY_CRATE_ARCHIVE_BYTES {
+        return Err(ReleaseError::environment(format!(
+            "Cargo registry archive for {} exceeds the {MAX_REGISTRY_CRATE_ARCHIVE_BYTES}-byte bound",
+            release_license_package_id(package)
+        )));
+    }
+    let file = File::open(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to open Cargo registry archive for {}: {error}",
+            release_license_package_id(package)
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).map_err(|_| {
+        ReleaseError::environment("Cargo registry archive size is not representable")
+    })?);
+    file.take(MAX_REGISTRY_CRATE_ARCHIVE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read Cargo registry archive for {}: {error}",
+                release_license_package_id(package)
+            ))
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_REGISTRY_CRATE_ARCHIVE_BYTES {
+        return Err(ReleaseError::environment(format!(
+            "Cargo registry archive for {} grew above the {MAX_REGISTRY_CRATE_ARCHIVE_BYTES}-byte bound",
+            release_license_package_id(package)
+        )));
+    }
+    let after = fs::symlink_metadata(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to re-inspect Cargo registry archive for {}: {error}",
+            release_license_package_id(package)
+        ))
+    })?;
+    if source_entry_is_link_or_reparse(&after)
+        || !after.is_file()
+        || before.len() != after.len()
+        || after.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(ReleaseError::environment(format!(
+            "Cargo registry archive changed while it was read for {}",
+            release_license_package_id(package)
+        )));
+    }
+    Ok(bytes)
+}
+
+fn reviewed_package_license_expression(
+    package: &CargoPackage,
+    policy: &ReleaseLicensePolicy,
+    used_normalizations: &mut BTreeSet<String>,
+) -> Result<String, ReleaseError> {
+    let declared = package.license.as_deref().ok_or_else(|| {
+        ReleaseError::negative(format!(
+            "release dependency {} has no Cargo package.license expression",
+            release_license_package_id(package)
+        ))
+    })?;
+    let key = release_license_package_key(package);
+    let mapping = policy.spdx_expression_normalizations.get(&key);
+    let policy_expression = if declared.contains('/') {
+        let mapping = mapping.ok_or_else(|| {
+            ReleaseError::negative(format!(
+                "release dependency {key} has an unknown slash-separated license expression"
+            ))
+        })?;
+        if package.source.is_none() || mapping.upstream_declared != declared {
+            return Err(ReleaseError::negative(format!(
+                "reviewed slash-expression mapping does not exactly match {key}"
+            )));
+        }
+        if mapping.normalized_for_sbom.contains('/')
+            || mapping.normalized_for_sbom.trim().is_empty()
+        {
+            return Err(ReleaseError::negative(format!(
+                "reviewed slash-expression mapping for {key} has an invalid normalized expression"
+            )));
+        }
+        used_normalizations.insert(key.clone());
+        mapping.normalized_for_sbom.clone()
+    } else {
+        if mapping.is_some() {
+            return Err(ReleaseError::negative(format!(
+                "{LICENSE_POLICY_FILE} contains a stale slash-expression mapping for {key}"
+            )));
+        }
+        declared.to_owned()
+    };
+    let code_expression = package_license_expression(package)?;
+    if policy_expression != code_expression {
+        return Err(ReleaseError::negative(format!(
+            "reviewed policy and release SBOM normalization disagree for {key}"
+        )));
+    }
+    Ok(policy_expression)
+}
+
+fn read_workspace_legal_files(
+    repository: &Path,
+    policy: &ReleaseLicensePolicy,
+) -> Result<BTreeMap<String, Vec<u8>>, ReleaseError> {
+    let mut files = BTreeMap::new();
+    for relative in &policy.required_workspace_legal_files {
+        if !is_single_safe_component(relative) || !is_legal_basename(relative) {
+            return Err(ReleaseError::negative(format!(
+                "{LICENSE_POLICY_FILE} contains an unsafe workspace legal-file path"
+            )));
+        }
+        let bytes =
+            read_bounded_legal_file(&repository.join(relative), "Forge workspace", relative)?;
+        files.insert(relative.clone(), bytes);
+    }
+    Ok(files)
+}
+
+fn scan_registry_legal_files(
+    package_root: &Path,
+    package_id: &str,
+) -> Result<BTreeMap<String, Vec<u8>>, ReleaseError> {
+    let root_metadata = fs::symlink_metadata(package_root).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to inspect unpacked Cargo source root for {package_id}: {error}"
+        ))
+    })?;
+    if source_entry_is_link_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir() {
+        return Err(ReleaseError::environment(format!(
+            "unpacked Cargo source root for {package_id} is not a real non-reparse directory"
+        )));
+    }
+    let mut pending = vec![(package_root.to_path_buf(), String::new())];
+    let mut visited_entries = 0_usize;
+    let mut files = BTreeMap::new();
+    while let Some((directory, relative_directory)) = pending.pop() {
+        let directory_metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to re-inspect unpacked Cargo source directory for {package_id}: {error}"
+            ))
+        })?;
+        if source_entry_is_link_or_reparse(&directory_metadata) || !directory_metadata.is_dir() {
+            return Err(ReleaseError::environment(format!(
+                "unpacked Cargo source directory is not a real non-reparse directory: {package_id}:{relative_directory}"
+            )));
+        }
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to enumerate unpacked Cargo source for {package_id}: {error}"
+            ))
+        })?;
+        let mut entries = entries
+            .map(|entry| {
+                let entry = entry.map_err(|error| {
+                    ReleaseError::environment(format!(
+                        "failed to read an unpacked Cargo source entry for {package_id}: {error}"
+                    ))
+                })?;
+                let name = entry.file_name().into_string().map_err(|_| {
+                    ReleaseError::environment(format!(
+                        "unpacked Cargo source for {package_id} contains a non-UTF-8 path"
+                    ))
+                })?;
+                Ok((name, entry.path()))
+            })
+            .collect::<Result<Vec<_>, ReleaseError>>()?;
+        entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        for (name, path) in entries {
+            visited_entries = visited_entries.checked_add(1).ok_or_else(|| {
+                ReleaseError::environment("release-license scan entry count overflowed")
+            })?;
+            if visited_entries > MAX_LICENSE_SCAN_ENTRIES_PER_PACKAGE {
+                return Err(ReleaseError::environment(format!(
+                    "unpacked Cargo source for {package_id} exceeds the {MAX_LICENSE_SCAN_ENTRIES_PER_PACKAGE}-entry scan bound"
+                )));
+            }
+            let relative = if relative_directory.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative_directory}/{name}")
+            };
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                ReleaseError::environment(format!(
+                    "failed to inspect unpacked Cargo source entry {package_id}:{relative}: {error}"
+                ))
+            })?;
+            let file_type = metadata.file_type();
+            if source_entry_is_link_or_reparse(&metadata) {
+                return Err(ReleaseError::environment(format!(
+                    "unpacked Cargo source contains a symbolic link or reparse point: {package_id}:{relative}"
+                )));
+            }
+            if file_type.is_dir() {
+                pending.push((path, relative));
+            } else if file_type.is_file() {
+                if is_legal_basename(&name) {
+                    if files.len() >= MAX_LEGAL_FILES_PER_PACKAGE {
+                        return Err(ReleaseError::environment(format!(
+                            "unpacked Cargo source for {package_id} exceeds the {MAX_LEGAL_FILES_PER_PACKAGE}-legal-file bound"
+                        )));
+                    }
+                    let bytes = read_bounded_legal_file(&path, package_id, &relative)?;
+                    if files.insert(relative.clone(), bytes).is_some() {
+                        return Err(ReleaseError::environment(format!(
+                            "unpacked Cargo source repeated legal-file path {package_id}:{relative}"
+                        )));
+                    }
+                }
+            } else {
+                return Err(ReleaseError::environment(format!(
+                    "unpacked Cargo source contains a non-regular entry: {package_id}:{relative}"
+                )));
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(ReleaseError::negative(format!(
+            "registry release dependency {package_id} has no detected legal files"
+        )));
+    }
+    Ok(files)
+}
+
+fn is_single_safe_component(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    matches!(components.next(), Some(PathComponent::Normal(_))) && components.next().is_none()
+}
+
+fn is_legal_basename(name: &str) -> bool {
+    const PREFIXES: [&str; 7] = [
+        "license",
+        "licence",
+        "copying",
+        "notice",
+        "notices",
+        "copyright",
+        "unlicense",
+    ];
+    const CODE_SUFFIXES: [&str; 13] = [
+        ".c", ".cc", ".cpp", ".go", ".h", ".hpp", ".java", ".js", ".py", ".rs", ".swift", ".ts",
+        ".tsx",
+    ];
+    let name = name.to_ascii_lowercase();
+    PREFIXES.iter().any(|prefix| {
+        name == *prefix
+            || name.starts_with(&format!("{prefix}-"))
+            || name.starts_with(&format!("{prefix}_"))
+            || (name.starts_with(&format!("{prefix}."))
+                && !CODE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)))
+    })
+}
+
+fn read_bounded_legal_file(
+    path: &Path,
+    package_id: &str,
+    relative: &str,
+) -> Result<Vec<u8>, ReleaseError> {
+    let before = fs::symlink_metadata(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to inspect legal file {package_id}:{relative}: {error}"
+        ))
+    })?;
+    if source_entry_is_link_or_reparse(&before) || !before.file_type().is_file() {
+        return Err(ReleaseError::environment(format!(
+            "legal file is not a real non-reparse regular file: {package_id}:{relative}"
+        )));
+    }
+    if before.len() > MAX_LEGAL_FILE_BYTES {
+        return Err(ReleaseError::environment(format!(
+            "legal file {package_id}:{relative} exceeds the {MAX_LEGAL_FILE_BYTES}-byte bound"
+        )));
+    }
+    let file = File::open(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to open legal file {package_id}:{relative}: {error}"
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).map_err(|_| {
+        ReleaseError::environment(format!(
+            "legal file size is not representable for {package_id}:{relative}"
+        ))
+    })?);
+    file.take(MAX_LEGAL_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read legal file {package_id}:{relative}: {error}"
+            ))
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LEGAL_FILE_BYTES {
+        return Err(ReleaseError::environment(format!(
+            "legal file {package_id}:{relative} grew above the {MAX_LEGAL_FILE_BYTES}-byte bound"
+        )));
+    }
+    let after = fs::symlink_metadata(path).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to re-inspect legal file {package_id}:{relative}: {error}"
+        ))
+    })?;
+    if source_entry_is_link_or_reparse(&after)
+        || !after.file_type().is_file()
+        || before.len() != after.len()
+        || after.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(ReleaseError::environment(format!(
+            "legal file changed while it was read: {package_id}:{relative}"
+        )));
+    }
+    std::str::from_utf8(&bytes).map_err(|error| {
+        ReleaseError::negative(format!(
+            "legal file is not UTF-8: {package_id}:{relative}: {error}"
+        ))
+    })?;
+    Ok(bytes)
+}
+
+fn validate_required_legal_files(
+    baseline: &ReleaseLicenseBaseline,
+    policy: &ReleaseLicensePolicy,
+) -> Result<(), ReleaseError> {
+    let mut by_key = BTreeMap::new();
+    for package in &baseline.packages {
+        let key = format!("{}@{}", package.name, package.version);
+        if by_key.insert(key.clone(), package).is_some() {
+            return Err(ReleaseError::negative(format!(
+                "release-license closure contains duplicate package key {key}"
+            )));
+        }
+    }
+    for (key, required) in &policy.required_registry_legal_files {
+        let package = by_key.get(key).copied().ok_or_else(|| {
+            ReleaseError::negative(format!(
+                "{LICENSE_POLICY_FILE} requires absent registry package {key}"
+            ))
+        })?;
+        if package.source == "workspace" {
+            return Err(ReleaseError::negative(format!(
+                "{LICENSE_POLICY_FILE} classifies workspace package {key} as registry evidence"
+            )));
+        }
+        let observed: BTreeSet<_> = package
+            .legal_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        let required_set: BTreeSet<_> = required.iter().map(String::as_str).collect();
+        if required_set.len() != required.len() {
+            return Err(ReleaseError::negative(format!(
+                "{LICENSE_POLICY_FILE} duplicates a required legal-file path for {key}"
+            )));
+        }
+        let missing: Vec<_> = required_set.difference(&observed).copied().collect();
+        if !missing.is_empty() {
+            return Err(ReleaseError::negative(format!(
+                "required legal files are absent for {key}: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+    let workspace_required: BTreeSet<_> = policy
+        .required_workspace_legal_files
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for package in baseline
+        .packages
+        .iter()
+        .filter(|package| package.source == "workspace")
+    {
+        let observed: BTreeSet<_> = package
+            .legal_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        if observed != workspace_required {
+            return Err(ReleaseError::negative(format!(
+                "workspace release dependency {} has a changed Forge license-file set",
+                package.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_release_license_baseline_matches(
+    expected: &ReleaseLicenseBaseline,
+    observed: &ReleaseLicenseBaseline,
+) -> Result<(), ReleaseError> {
+    if expected.schema != LICENSE_BASELINE_SCHEMA {
+        return Err(ReleaseError::negative(format!(
+            "{LICENSE_BASELINE_FILE} has unsupported schema `{}`",
+            expected.schema
+        )));
+    }
+    if observed.schema != LICENSE_BASELINE_SCHEMA {
+        return Err(ReleaseError::internal(
+            "generated release-license baseline used the wrong schema",
+        ));
+    }
+    let expected_packages = unique_license_packages(&expected.packages, "checked-in baseline")?;
+    let observed_packages = unique_license_packages(&observed.packages, "observed closure")?;
+    let expected_ids: BTreeSet<_> = expected_packages.keys().copied().collect();
+    let observed_ids: BTreeSet<_> = observed_packages.keys().copied().collect();
+    let missing: Vec<_> = expected_ids.difference(&observed_ids).copied().collect();
+    let extra: Vec<_> = observed_ids.difference(&expected_ids).copied().collect();
+    if !missing.is_empty() || !extra.is_empty() {
+        return Err(ReleaseError::negative(format!(
+            "release-license package ID drift; missing [{}], extra [{}]",
+            missing.join(", "),
+            extra.join(", ")
+        )));
+    }
+    for id in expected_ids {
+        let expected_package = expected_packages.get(id).copied().ok_or_else(|| {
+            ReleaseError::internal("expected release-license package disappeared")
+        })?;
+        let observed_package = observed_packages.get(id).copied().ok_or_else(|| {
+            ReleaseError::internal("observed release-license package disappeared")
+        })?;
+        for (field, matches) in [
+            ("name", expected_package.name == observed_package.name),
+            (
+                "version",
+                expected_package.version == observed_package.version,
+            ),
+            ("source", expected_package.source == observed_package.source),
+            (
+                "Cargo.lock checksum",
+                expected_package.lock_checksum == observed_package.lock_checksum,
+            ),
+            (
+                "upstream license expression",
+                expected_package.license_expression == observed_package.license_expression,
+            ),
+            (
+                "normalized SBOM license expression",
+                expected_package.sbom_license_expression
+                    == observed_package.sbom_license_expression,
+            ),
+            (
+                "target membership",
+                expected_package.targets == observed_package.targets,
+            ),
+        ] {
+            if !matches {
+                return Err(ReleaseError::negative(format!(
+                    "release-license baseline mismatch for {id}: {field} changed"
+                )));
+            }
+        }
+        let expected_files = unique_legal_files(id, &expected_package.legal_files)?;
+        let observed_files = unique_legal_files(id, &observed_package.legal_files)?;
+        let expected_paths: BTreeSet<_> = expected_files.keys().copied().collect();
+        let observed_paths: BTreeSet<_> = observed_files.keys().copied().collect();
+        let missing_files: Vec<_> = expected_paths
+            .difference(&observed_paths)
+            .copied()
+            .collect();
+        let extra_files: Vec<_> = observed_paths
+            .difference(&expected_paths)
+            .copied()
+            .collect();
+        if !missing_files.is_empty() || !extra_files.is_empty() {
+            return Err(ReleaseError::negative(format!(
+                "release-license legal-file path drift for {id}; missing [{}], extra [{}]",
+                missing_files.join(", "),
+                extra_files.join(", ")
+            )));
+        }
+        for path in expected_paths {
+            let expected_file = expected_files
+                .get(path)
+                .copied()
+                .ok_or_else(|| ReleaseError::internal("expected legal file disappeared"))?;
+            let observed_file = observed_files
+                .get(path)
+                .copied()
+                .ok_or_else(|| ReleaseError::internal("observed legal file disappeared"))?;
+            if expected_file.sha256 != observed_file.sha256 {
+                return Err(ReleaseError::negative(format!(
+                    "release-license legal-file SHA-256 changed for {id}:{path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unique_license_packages<'a>(
+    packages: &'a [ReleaseLicensePackage],
+    label: &str,
+) -> Result<BTreeMap<&'a str, &'a ReleaseLicensePackage>, ReleaseError> {
+    let mut by_id = BTreeMap::new();
+    for package in packages {
+        if by_id.insert(package.id.as_str(), package).is_some() {
+            return Err(ReleaseError::negative(format!(
+                "{label} contains duplicate release-license package ID {}",
+                package.id
+            )));
+        }
+    }
+    Ok(by_id)
+}
+
+fn unique_legal_files<'a>(
+    package_id: &str,
+    files: &'a [ReleaseLegalFile],
+) -> Result<BTreeMap<&'a str, &'a ReleaseLegalFile>, ReleaseError> {
+    let mut by_path = BTreeMap::new();
+    for file in files {
+        if by_path.insert(file.path.as_str(), file).is_some() {
+            return Err(ReleaseError::negative(format!(
+                "release-license package {package_id} contains duplicate legal-file path {}",
+                file.path
+            )));
+        }
+    }
+    Ok(by_path)
+}
+
+fn render_release_license_bundle(
+    evidence: &ReleaseLicenseEvidence,
+) -> Result<Vec<u8>, ReleaseError> {
+    let workspace: Vec<_> = evidence
+        .baseline
+        .packages
+        .iter()
+        .filter(|package| package.source == "workspace")
+        .collect();
+    let registry: Vec<_> = evidence
+        .baseline
+        .packages
+        .iter()
+        .filter(|package| package.source != "workspace")
+        .collect();
+    let first_workspace = workspace.first().copied().ok_or_else(|| {
+        ReleaseError::internal("release-license evidence has no workspace package")
+    })?;
+    if workspace.iter().any(|package| {
+        package.license_expression != first_workspace.license_expression
+            || package.sbom_license_expression != first_workspace.sbom_license_expression
+            || package.legal_files != first_workspace.legal_files
+    }) {
+        return Err(ReleaseError::negative(
+            "Forge workspace packages disagree on the shared project licenses",
+        ));
+    }
+    let mut rendered = String::new();
+    rendered.push_str("FORGE LICENSES AND THIRD-PARTY NOTICES\n\n");
+    rendered.push_str(
+        "Scope: the five-target union selected by the reviewed scoped Cargo tree command.\n",
+    );
+    rendered.push_str(
+        "Development-only dependency edges are excluded. Each native release-build independently\n",
+    );
+    rendered.push_str(
+        "requires its compiler-artifact package set to equal this scoped graph before staging.\n",
+    );
+    rendered.push_str("Registry package identity comes from Cargo.lock, and each fetched .crate\n");
+    rendered.push_str(
+        "archive is required to match its Cargo.lock SHA-256. Legal text is separately\n",
+    );
+    rendered
+        .push_str("read from the current Cargo-unpacked source tree; the archive check is not\n");
+    rendered.push_str(
+        "claimed to prove those unpacked bytes, which are fixed by reviewed per-file SHA-256.\n",
+    );
+    rendered.push_str(
+        "Every detected LICENSE, LICENCE, COPYING, NOTICE, COPYRIGHT, and UNLICENSE file is\n",
+    );
+    rendered.push_str("reproduced per package.\n\n");
+    rendered.push_str(&format!(
+        "Packages: {} total ({} workspace, {} registry).\n\n",
+        evidence.baseline.packages.len(),
+        workspace.len(),
+        registry.len()
+    ));
+    rendered.push_str("== Forge workspace ==\n\nPackage IDs:\n");
+    for package in &workspace {
+        rendered.push_str("- ");
+        rendered.push_str(&package.id);
+        rendered.push('\n');
+    }
+    rendered.push_str("Upstream declared license expression: ");
+    rendered.push_str(&first_workspace.license_expression);
+    rendered.push('\n');
+    rendered.push_str("Normalized SBOM license expression: ");
+    rendered.push_str(&first_workspace.sbom_license_expression);
+    rendered.push_str("\n\n");
+    append_rendered_legal_files(&mut rendered, evidence, first_workspace)?;
+    rendered.push_str("== Third-party registry packages ==\n\n");
+    for package in registry {
+        rendered.push_str("## ");
+        rendered.push_str(&package.name);
+        rendered.push(' ');
+        rendered.push_str(&package.version);
+        rendered.push('\n');
+        rendered.push_str("Package ID: ");
+        rendered.push_str(&package.id);
+        rendered.push('\n');
+        rendered.push_str("Verified .crate archive SHA-256 (Cargo.lock): ");
+        rendered.push_str(package.lock_checksum.as_deref().ok_or_else(|| {
+            ReleaseError::internal("registry release-license package omitted lock checksum")
+        })?);
+        rendered.push('\n');
+        rendered.push_str("Upstream declared license expression: ");
+        rendered.push_str(&package.license_expression);
+        rendered.push('\n');
+        rendered.push_str("Normalized SBOM license expression: ");
+        rendered.push_str(&package.sbom_license_expression);
+        rendered.push('\n');
+        rendered.push_str("Release targets: ");
+        rendered.push_str(&package.targets.join(", "));
+        rendered.push_str("\n\n");
+        append_rendered_legal_files(&mut rendered, evidence, package)?;
+    }
+    while rendered.ends_with("\n\n") {
+        rendered.pop();
+    }
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(rendered.into_bytes())
+}
+
+fn append_rendered_legal_files(
+    rendered: &mut String,
+    evidence: &ReleaseLicenseEvidence,
+    package: &ReleaseLicensePackage,
+) -> Result<(), ReleaseError> {
+    let text_by_path = evidence
+        .legal_text_by_package
+        .get(&package.id)
+        .ok_or_else(|| ReleaseError::internal("release-license legal text disappeared"))?;
+    for file in &package.legal_files {
+        let raw = text_by_path.get(&file.path).ok_or_else(|| {
+            ReleaseError::internal("release-license legal-file bytes disappeared")
+        })?;
+        if sha256_hex(raw) != file.sha256 {
+            return Err(ReleaseError::internal(
+                "release-license legal-file bytes changed after collection",
+            ));
+        }
+        rendered.push_str("---- ");
+        rendered.push_str(&file.path);
+        rendered.push_str(" (SHA-256 ");
+        rendered.push_str(&file.sha256);
+        rendered.push_str(") ----\n");
+        rendered.push_str(&normalize_legal_text(raw, &package.id, &file.path)?);
+        rendered.push('\n');
+    }
+    Ok(())
+}
+
+fn normalize_legal_text(raw: &[u8], package_id: &str, path: &str) -> Result<String, ReleaseError> {
+    let raw = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(raw);
+    let text = std::str::from_utf8(raw).map_err(|error| {
+        ReleaseError::negative(format!(
+            "legal file is not UTF-8: {package_id}:{path}: {error}"
+        ))
+    })?;
+    let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    while normalized.ends_with('\n') {
+        normalized.pop();
+    }
+    normalized.push('\n');
+    Ok(normalized)
+}
+
+fn require_portable_release_license_output(label: &str, bytes: &[u8]) -> Result<(), ReleaseError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        ReleaseError::internal(format!("generated {label} is not UTF-8: {error}"))
+    })?;
+    if bytes.contains(&b'\r')
+        || !bytes.ends_with(b"\n")
+        || (label == LICENSE_NOTICES_FILE && bytes.ends_with(b"\n\n"))
+    {
+        return Err(ReleaseError::internal(format!(
+            "generated {label} is not canonical LF-terminated UTF-8"
+        )));
+    }
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "/private/tmp/",
+        "/tmp/",
+        "registry/src",
+        "registry/cache",
+        "registry\\src",
+        "registry\\cache",
+        "file:///",
+    ] {
+        if text.contains(forbidden) {
+            return Err(ReleaseError::internal(format!(
+                "generated {label} contains a machine-local path"
+            )));
+        }
+    }
+    if bytes
+        .windows(3)
+        .any(|window| window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'\\')
+    {
+        return Err(ReleaseError::internal(format!(
+            "generated {label} contains a Windows absolute path"
+        )));
+    }
+    if contains_rfc3339_timestamp(bytes) {
+        return Err(ReleaseError::internal(format!(
+            "generated {label} contains a generated timestamp"
+        )));
+    }
+    Ok(())
+}
+
+fn contains_rfc3339_timestamp(bytes: &[u8]) -> bool {
+    bytes.windows(11).any(|window| {
+        window[0..4].iter().all(u8::is_ascii_digit)
+            && window[4] == b'-'
+            && window[5..7].iter().all(u8::is_ascii_digit)
+            && window[7] == b'-'
+            && window[8..10].iter().all(u8::is_ascii_digit)
+            && window[10] == b'T'
+    })
 }
 
 fn render_manifest(
@@ -3364,10 +5247,10 @@ mod tests {
 
     const METADATA: &str = r#"{
       "packages": [
-        {"id":"path+file:///repo/crates/forge-cli#0.1.0-rc.2","name":"forge-cli","version":"0.1.0-rc.2","license":"MIT OR Apache-2.0","source":null,"checksum":null},
-        {"id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","name":"serde","version":"1.0.229","license":"MIT OR Apache-2.0","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":"dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c"},
-        {"id":"registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3","name":"build-helper","version":"1.2.3","license":"Apache-2.0 OR MIT","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":null},
-        {"id":"registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6","name":"test-only","version":"4.5.6","license":"MIT","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":null}
+        {"id":"path+file:///repo/crates/forge-cli#0.1.0-rc.2","name":"forge-cli","version":"0.1.0-rc.2","license":"MIT OR Apache-2.0","source":null,"manifest_path":"/repo/crates/forge-cli/Cargo.toml"},
+        {"id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","name":"serde","version":"1.0.229","license":"MIT OR Apache-2.0","source":"registry+https://github.com/rust-lang/crates.io-index"},
+        {"id":"registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3","name":"build-helper","version":"1.2.3","license":"Apache-2.0 OR MIT","source":"registry+https://github.com/rust-lang/crates.io-index"},
+        {"id":"registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6","name":"test-only","version":"4.5.6","license":"MIT","source":"registry+https://github.com/rust-lang/crates.io-index"}
       ],
       "workspace_members": ["path+file:///repo/crates/forge-cli#0.1.0-rc.2"],
       "resolve": {"nodes": [
@@ -3381,6 +5264,21 @@ mod tests {
         {"id":"registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6","deps":[]}
       ]}
     }"#;
+    const TREE: &str = "0@@forge-cli v0.1.0-rc.2 (/repo/crates/forge-cli)@@\n1@@serde v1.0.229@@\n1@@build-helper v1.2.3@@\n";
+    const CARGO_LOCK: &str = concat!(
+        "version = 4\n\n",
+        "[[package]]\nname = \"forge-cli\"\nversion = \"0.1.0-rc.2\"\n\n",
+        "[[package]]\nname = \"serde\"\nversion = \"1.0.229\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c\"\n\n",
+        "[[package]]\nname = \"build-helper\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+    );
+    const BUILD_MESSAGES: &str = concat!(
+        "{\"reason\":\"compiler-artifact\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229\"}\n",
+        "{\"reason\":\"build-script-executed\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3\"}\n",
+        "{\"reason\":\"compiler-artifact\",\"package_id\":\"registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3\"}\n",
+        "{\"reason\":\"compiler-message\",\"package_id\":\"path+file:///repo/crates/forge-cli#0.1.0-rc.2\"}\n",
+        "{\"reason\":\"compiler-artifact\",\"package_id\":\"path+file:///repo/crates/forge-cli#0.1.0-rc.2\"}\n",
+        "{\"reason\":\"build-finished\",\"success\":true}\n",
+    );
 
     #[test]
     fn release_cargo_preparation_preserves_linker_authority_and_offline_policy()
@@ -4065,6 +5963,12 @@ mod tests {
             .insert(RELEASE_TARGETS[0].triple.to_owned(), b"different".to_vec());
         assert!(before.require_same(&changed_metadata, "test").is_err());
 
+        let mut changed_tree = before.clone();
+        changed_tree
+            .tree_by_target
+            .insert(RELEASE_TARGETS[0].triple.to_owned(), b"different".to_vec());
+        assert!(before.require_same(&changed_tree, "test").is_err());
+
         let guard = worktree_guard();
         let mut changed_index = guard.clone();
         changed_index.index.push(0);
@@ -4093,6 +5997,95 @@ mod tests {
     }
 
     #[test]
+    fn scoped_cargo_tree_parser_is_strict_and_reconstructs_edges() -> Result<(), ReleaseError> {
+        let metadata: super::CargoMetadata = serde_json::from_str(METADATA)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let selection =
+            super::parse_scoped_cargo_tree_graph(&metadata, TREE.as_bytes(), "fixture")?;
+        assert_eq!(selection.package_ids.len(), 3);
+        assert_eq!(
+            selection
+                .edges
+                .get(&selection.root_id)
+                .ok_or_else(|| ReleaseError::internal("fixture root omitted its exact edges"))?
+                .len(),
+            2
+        );
+
+        let root = "0@@forge-cli v0.1.0-rc.2 (/repo/crates/forge-cli)@@\n";
+        let malformed = [
+            TREE.trim_end_matches('\n').to_owned(),
+            format!("{TREE}\n"),
+            TREE.replace('\n', "\r\n"),
+            TREE.replacen('0', "00", 1),
+            format!("{root}2@@serde v1.0.229@@\n"),
+            format!("{root}0@@serde v1.0.229@@\n"),
+            "0@forge-cli v0.1.0-rc.2@\n".to_owned(),
+            TREE.replace("serde v1.0.229", "serde v1.0.229 bogus"),
+            format!("{root}1@@forge-cli v0.1.0-rc.2 (/repo/crates/forge-cli)@@\n"),
+        ];
+        for tree in malformed {
+            assert!(
+                super::parse_scoped_cargo_tree_graph(&metadata, tree.as_bytes(), "fixture")
+                    .is_err(),
+                "malformed scoped Cargo tree graph was accepted: {tree:?}"
+            );
+        }
+
+        let mut ambiguous: super::CargoMetadata = serde_json::from_str(METADATA)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let mut duplicate = ambiguous.packages[1].clone();
+        duplicate.id = "git+https://example.invalid/serde#serde@1.0.229".to_owned();
+        duplicate.source = Some("git+https://example.invalid/serde".to_owned());
+        ambiguous.packages.push(duplicate);
+        assert!(
+            super::parse_scoped_cargo_tree_graph(&ambiguous, TREE.as_bytes(), "fixture").is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_build_message_parser_requires_scoped_graph_parity() -> Result<(), ReleaseError> {
+        let metadata: super::CargoMetadata = serde_json::from_str(METADATA)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let graph = super::parse_scoped_cargo_tree_graph(&metadata, TREE.as_bytes(), "fixture")?;
+        let artifacts = super::parse_cargo_build_artifacts(BUILD_MESSAGES.as_bytes(), "fixture")?;
+        super::require_native_build_graph_parity(&graph.package_ids, &artifacts, "fixture")?;
+
+        let mut missing = artifacts.clone();
+        missing.remove("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229");
+        assert!(
+            super::require_native_build_graph_parity(&graph.package_ids, &missing, "fixture")
+                .is_err()
+        );
+        let mut unexpected = artifacts;
+        unexpected.insert("registry+https://example.invalid#extra@1.0.0".to_owned());
+        assert!(
+            super::require_native_build_graph_parity(&graph.package_ids, &unexpected, "fixture")
+                .is_err()
+        );
+
+        for malformed in [
+            BUILD_MESSAGES.trim_end_matches('\n').to_owned(),
+            BUILD_MESSAGES.replace("\"success\":true", "\"success\":false"),
+            BUILD_MESSAGES.replace(
+                "\"compiler-artifact\",\"package_id\"",
+                "\"compiler-artifact\",\"omitted\"",
+            ),
+            format!(
+                "{BUILD_MESSAGES}{{\"reason\":\"compiler-artifact\",\"package_id\":\"late\"}}\n"
+            ),
+            BUILD_MESSAGES.replace("\"compiler-message\"", "\"future-message\""),
+        ] {
+            assert!(
+                super::parse_cargo_build_artifacts(malformed.as_bytes(), "fixture").is_err(),
+                "malformed Cargo build messages were accepted: {malformed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sbom_is_deterministic_and_target_bound() -> Result<(), ReleaseError> {
         let target = &RELEASE_TARGETS[0];
         let binary = fake_binary(target.triple);
@@ -4100,14 +6093,16 @@ mod tests {
         let first = render_sbom(
             target,
             METADATA.as_bytes(),
-            b"lock",
+            TREE.as_bytes(),
+            CARGO_LOCK.as_bytes(),
             &source_commit,
             &binary,
         )?;
         let second = render_sbom(
             target,
             METADATA.as_bytes(),
-            b"lock",
+            TREE.as_bytes(),
+            CARGO_LOCK.as_bytes(),
             &source_commit,
             &binary,
         )?;
@@ -4132,7 +6127,8 @@ mod tests {
             render_sbom(
                 target,
                 METADATA.as_bytes(),
-                b"different-lock",
+                TREE.as_bytes(),
+                format!("{CARGO_LOCK}\n").as_bytes(),
                 &source_commit,
                 &binary,
             )?
@@ -4144,7 +6140,8 @@ mod tests {
             render_sbom(
                 target,
                 METADATA.as_bytes(),
-                b"lock",
+                TREE.as_bytes(),
+                CARGO_LOCK.as_bytes(),
                 &source_commit,
                 &different_binary,
             )?
@@ -4159,7 +6156,8 @@ mod tests {
             render_sbom(
                 target,
                 metadata.as_bytes(),
-                b"lock",
+                TREE.as_bytes(),
+                CARGO_LOCK.as_bytes(),
                 &"a".repeat(40),
                 &fake_binary(target.triple),
             )
@@ -4192,7 +6190,6 @@ mod tests {
                 version: version.to_owned(),
                 license: Some(license.to_owned()),
                 source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
-                checksum: None,
                 manifest_path: None,
                 targets: Vec::new(),
             })
@@ -4213,6 +6210,302 @@ mod tests {
         assert!(expression("unknown", "3.4.7", "MIT/Apache-2.0").is_err());
         assert!(expression("ctrlc", "3.4.8", "MIT/Apache-2.0").is_err());
         assert!(expression("ctrlc", "3.4.7", "MIT/Zlib").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn release_license_baseline_rejects_package_and_field_drift() -> Result<(), ReleaseError> {
+        let repository = super::repository_root()?;
+        let bytes = fs::read(repository.join(super::LICENSE_BASELINE_FILE))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let expected: super::ReleaseLicenseBaseline = serde_json::from_slice(&bytes)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+
+        let mut missing = expected.clone();
+        missing.packages.pop();
+        assert!(super::require_release_license_baseline_matches(&expected, &missing).is_err());
+
+        let mut extra = expected.clone();
+        let mut extra_package = extra.packages[0].clone();
+        extra_package.id.push_str("-unexpected");
+        extra.packages.push(extra_package);
+        assert!(super::require_release_license_baseline_matches(&expected, &extra).is_err());
+
+        let mut changed_license = expected.clone();
+        changed_license.packages[0].license_expression = "MIT".to_owned();
+        assert!(
+            super::require_release_license_baseline_matches(&expected, &changed_license).is_err()
+        );
+
+        let mut changed_target = expected.clone();
+        changed_target.packages[0].targets.pop();
+        assert!(
+            super::require_release_license_baseline_matches(&expected, &changed_target).is_err()
+        );
+
+        let mut tampered_legal_file = expected.clone();
+        tampered_legal_file.packages[0].legal_files[0].sha256 = "0".repeat(64);
+        let error = match super::require_release_license_baseline_matches(
+            &expected,
+            &tampered_legal_file,
+        ) {
+            Err(error) => error,
+            Ok(()) => {
+                return Err(ReleaseError::internal(
+                    "tampered legal-file hash unexpectedly passed",
+                ));
+            }
+        };
+        assert!(error.to_string().contains("legal-file SHA-256 changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn release_license_policy_rejects_stale_or_inexact_slash_mappings() -> Result<(), ReleaseError>
+    {
+        let repository = super::repository_root()?;
+        let bytes = fs::read(repository.join(super::LICENSE_POLICY_FILE))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let policy = super::parse_release_license_policy(&bytes)?;
+        let package = |license: &str| super::CargoPackage {
+            id: "registry+https://github.com/rust-lang/crates.io-index#ctrlc@3.4.7".to_owned(),
+            name: "ctrlc".to_owned(),
+            version: "3.4.7".to_owned(),
+            license: Some(license.to_owned()),
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            manifest_path: None,
+            targets: Vec::new(),
+        };
+
+        let mut missing_mapping = policy.clone();
+        missing_mapping
+            .spdx_expression_normalizations
+            .remove("ctrlc@3.4.7");
+        assert!(
+            super::reviewed_package_license_expression(
+                &package("MIT/Apache-2.0"),
+                &missing_mapping,
+                &mut std::collections::BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        let mut wrong_mapping = policy.clone();
+        wrong_mapping
+            .spdx_expression_normalizations
+            .get_mut("ctrlc@3.4.7")
+            .ok_or_else(|| ReleaseError::internal("test policy omitted ctrlc mapping"))?
+            .normalized_for_sbom = "MIT AND Apache-2.0".to_owned();
+        assert!(
+            super::reviewed_package_license_expression(
+                &package("MIT/Apache-2.0"),
+                &wrong_mapping,
+                &mut std::collections::BTreeSet::new(),
+            )
+            .is_err()
+        );
+
+        assert!(
+            super::reviewed_package_license_expression(
+                &package("MIT OR Apache-2.0"),
+                &policy,
+                &mut std::collections::BTreeSet::new(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_crate_archive_is_required_unambiguous_and_lock_bound() -> Result<(), ReleaseError> {
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let package_root = temporary
+            .path()
+            .join("registry/src/index.example/fixture-1.0.0");
+        let cache_bucket = temporary.path().join("registry/cache/index.example");
+        fs::create_dir_all(&package_root)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::create_dir_all(&cache_bucket)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let archive = cache_bucket.join("fixture-1.0.0.crate");
+        let archive_bytes = b"fixture crate archive";
+        fs::write(&archive, archive_bytes)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let checksum = sha256_hex(archive_bytes);
+        let package = super::CargoPackage {
+            id: "registry+https://github.com/rust-lang/crates.io-index#fixture@1.0.0".to_owned(),
+            name: "fixture".to_owned(),
+            version: "1.0.0".to_owned(),
+            license: Some("MIT".to_owned()),
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            manifest_path: Some(package_root.join("Cargo.toml")),
+            targets: Vec::new(),
+        };
+        let lock_packages = std::collections::BTreeMap::from([(
+            (
+                package.name.clone(),
+                package.version.clone(),
+                package.source.clone(),
+            ),
+            Some(checksum.clone()),
+        )]);
+        assert_eq!(
+            super::release_package_lock_checksum(&package, &lock_packages)?,
+            Some(checksum.clone())
+        );
+        super::verify_registry_crate_archive(&package, &package_root, &checksum)?;
+
+        fs::write(&archive, b"tampered crate archive")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(super::verify_registry_crate_archive(&package, &package_root, &checksum).is_err());
+        fs::remove_file(&archive).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(super::verify_registry_crate_archive(&package, &package_root, &checksum).is_err());
+
+        fs::write(cache_bucket.join("Fixture-1.0.0.crate"), archive_bytes)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(super::verify_registry_crate_archive(&package, &package_root, &checksum).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_license_scan_rejects_symlinks_and_nonregular_entries() -> Result<(), ReleaseError> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(temporary.path().join("LICENSE"), b"license\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        symlink("LICENSE", temporary.path().join("linked-license"))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(
+            super::scan_registry_legal_files(temporary.path(), "registry#fixture@1.0.0").is_err()
+        );
+
+        fs::remove_file(temporary.path().join("linked-license"))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        nix::unistd::mkfifo(
+            &temporary.path().join("pipe"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(
+            super::scan_registry_legal_files(temporary.path(), "registry#fixture@1.0.0").is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicit locked fetch for all five release targets"]
+    fn scoped_release_graph_counts_and_errno_targets_are_frozen() -> Result<(), ReleaseError> {
+        let repository = super::repository_root()?;
+        let expected_counts = [86, 85, 86, 85, 88];
+        let mut union = std::collections::BTreeSet::new();
+        let mut workspace = std::collections::BTreeSet::new();
+        let mut registry = std::collections::BTreeSet::new();
+        let mut errno_targets = std::collections::BTreeSet::new();
+
+        for (target, expected_count) in RELEASE_TARGETS.iter().zip(expected_counts) {
+            let metadata_bytes = super::cargo_metadata(&repository, target)?;
+            let tree_bytes = super::cargo_tree(&repository, target)?;
+            let metadata: super::CargoMetadata = serde_json::from_slice(&metadata_bytes)
+                .map_err(|error| ReleaseError::internal(error.to_string()))?;
+            let selection =
+                super::parse_scoped_cargo_tree_graph(&metadata, &tree_bytes, target.triple)?;
+            assert_eq!(
+                selection.package_ids.len(),
+                expected_count,
+                "{}",
+                target.triple
+            );
+            let packages: std::collections::BTreeMap<_, _> = metadata
+                .packages
+                .iter()
+                .map(|package| (package.id.as_str(), package))
+                .collect();
+            for id in selection.package_ids {
+                let package = packages.get(id.as_str()).ok_or_else(|| {
+                    ReleaseError::internal("scoped graph package disappeared from metadata")
+                })?;
+                union.insert(id.clone());
+                if package.source.is_some() {
+                    registry.insert(id.clone());
+                } else {
+                    workspace.insert(id.clone());
+                }
+                if package.name == "errno" && package.version == "0.3.14" {
+                    errno_targets.insert(target.triple);
+                }
+            }
+        }
+
+        assert_eq!(union.len(), super::EXPECTED_LICENSE_PACKAGES);
+        assert_eq!(workspace.len(), super::EXPECTED_WORKSPACE_LICENSE_PACKAGES);
+        assert_eq!(registry.len(), super::EXPECTED_REGISTRY_LICENSE_PACKAGES);
+        assert_eq!(
+            errno_targets,
+            std::collections::BTreeSet::from(["aarch64-apple-darwin", "x86_64-apple-darwin",])
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicit locked fetch for all five release targets"]
+    fn checked_in_release_license_evidence_is_deterministic_and_generate_is_explicit()
+    -> Result<(), ReleaseError> {
+        let repository = super::repository_root()?;
+        let policy_before = fs::read(repository.join(super::LICENSE_POLICY_FILE))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let policy = super::parse_release_license_policy(&policy_before)?;
+        let evidence = super::collect_release_license_evidence(&repository, &policy)?;
+        let first = super::render_release_license_bundle(&evidence)?;
+        let second = super::render_release_license_bundle(&evidence)?;
+        assert_eq!(first, second);
+        assert_eq!(
+            super::sha256_hex(&first),
+            "82aee460ddacea87326b63f326bb62510e9e0df64ca79f41ca47c1a7ea68409d"
+        );
+        assert_eq!(
+            super::check_release_licenses(&repository)?.package_count,
+            96
+        );
+
+        let generated = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let report = super::generate_release_licenses(&repository, generated.path())?;
+        assert_eq!(report.package_count, 96);
+        assert_eq!(report.legal_file_count, 198);
+        assert_eq!(
+            fs::read(generated.path().join(super::LICENSE_BASELINE_FILE))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            fs::read(repository.join(super::LICENSE_BASELINE_FILE))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?
+        );
+        assert_eq!(
+            fs::read(generated.path().join(super::LICENSE_NOTICES_FILE))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first
+        );
+        assert!(!generated.path().join(super::LICENSE_POLICY_FILE).exists());
+        assert_eq!(
+            fs::read(repository.join(super::LICENSE_POLICY_FILE))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            policy_before
+        );
+
+        let release_source = include_str!("release.rs");
+        let finalize_body = release_source
+            .split("pub(crate) fn run_finalize")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) fn run_check").next())
+            .ok_or_else(|| ReleaseError::internal("could not isolate run_finalize source"))?;
+        assert!(!finalize_body.contains("generate_release_licenses"));
+        let main_source = include_str!("main.rs");
+        let verify_body = main_source
+            .split("fn run_verify")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_schema_export").next())
+            .ok_or_else(|| ReleaseError::internal("could not isolate run_verify source"))?;
+        assert!(verify_body.contains("check_release_licenses"));
+        assert!(!verify_body.contains("run_license_generate"));
         Ok(())
     }
 
@@ -4754,7 +7047,8 @@ mod tests {
             render_sbom(
                 &RELEASE_TARGETS[0],
                 metadata.as_bytes(),
-                b"lock",
+                TREE.as_bytes(),
+                CARGO_LOCK.as_bytes(),
                 &"a".repeat(40),
                 &fake_binary(RELEASE_TARGETS[0].triple),
             )
@@ -4773,7 +7067,8 @@ mod tests {
             render_sbom(
                 &RELEASE_TARGETS[0],
                 metadata.as_bytes(),
-                b"lock",
+                TREE.as_bytes(),
+                CARGO_LOCK.as_bytes(),
                 &"a".repeat(40),
                 &fake_binary(RELEASE_TARGETS[0].triple),
             )
@@ -4784,11 +7079,15 @@ mod tests {
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
             source_commit: "a".repeat(40),
-            cargo_lock: b"lock".to_vec(),
+            cargo_lock: CARGO_LOCK.as_bytes().to_vec(),
             license_notices: b"fixture third-party license notices\n".to_vec(),
             metadata_by_target: RELEASE_TARGETS
                 .iter()
                 .map(|target| (target.triple.to_owned(), METADATA.as_bytes().to_vec()))
+                .collect(),
+            tree_by_target: RELEASE_TARGETS
+                .iter()
+                .map(|target| (target.triple.to_owned(), TREE.as_bytes().to_vec()))
                 .collect(),
         }
     }

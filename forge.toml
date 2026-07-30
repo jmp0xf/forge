@@ -25,6 +25,7 @@ coverage = [
   "integration-test",
   "custom:schema-contract",
   "custom:fixture-contract",
+  "custom:license-contract",
   "custom:fuzz-contract",
   "custom:bootstrap",
 ]

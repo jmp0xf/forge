@@ -50,6 +50,12 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "release-check" => {
             run_release_command(release::run_check(rest))
         }
+        [command, rest @ ..] if command == "release-license-check" => {
+            run_release_command(release::run_license_check(rest))
+        }
+        [command, rest @ ..] if command == "release-license-generate" => {
+            run_release_command(release::run_license_generate(rest))
+        }
         _ => {
             eprintln!("invalid xtask arguments; run `cargo run -p xtask -- help`");
             ExitCode::from(EXIT_USAGE)
@@ -78,6 +84,7 @@ fn run_release_command(
         }
         Err(error) => {
             let code = match error.kind() {
+                release::ReleaseErrorKind::Negative => EXIT_NEGATIVE,
                 release::ReleaseErrorKind::Usage => EXIT_USAGE,
                 release::ReleaseErrorKind::Environment => EXIT_ENV_UNMET,
                 release::ReleaseErrorKind::Internal => EXIT_INTERNAL,
@@ -209,6 +216,21 @@ fn run_verify() -> ExitCode {
         Ok(repository) => repository,
         Err(error) => return report_error(EXIT_INTERNAL, &error),
     };
+    match release::check_release_licenses(&repository) {
+        Ok(report) => println!(
+            "verify: checked scoped Cargo tree fixed point of {} release-license packages and {} legal files",
+            report.package_count, report.legal_file_count
+        ),
+        Err(error) => {
+            let code = match error.kind() {
+                release::ReleaseErrorKind::Negative => EXIT_NEGATIVE,
+                release::ReleaseErrorKind::Usage => EXIT_USAGE,
+                release::ReleaseErrorKind::Environment => EXIT_ENV_UNMET,
+                release::ReleaseErrorKind::Internal => EXIT_INTERNAL,
+            };
+            return report_error(code, &error.to_string());
+        }
+    }
     match verify::run(&repository) {
         Ok(report) => {
             println!(
@@ -366,7 +388,9 @@ fn print_help() {
          diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate\n\
          release-build     build and stage one accepted release target\n\
          release-finalize  require all targets and write manifest/checksums\n\
-         release-check     verify the complete local release asset set"
+         release-check     verify the complete local release asset set\n\
+         release-license-check verify the checked-in dependency-license fixed point\n\
+         release-license-generate regenerate reviewable license evidence without policy changes"
     );
 }
 
