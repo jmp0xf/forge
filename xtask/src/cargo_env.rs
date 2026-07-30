@@ -4,6 +4,8 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 #[cfg(any(all(windows, target_env = "msvc"), test))]
+use std::path::{Path, PathBuf};
+#[cfg(any(all(windows, target_env = "msvc"), test))]
 use std::time::Duration;
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
@@ -11,6 +13,8 @@ use forge_core::domain::{Mutability, NetworkIntent};
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 use forge_core::path::RepoRelativePath;
 use forge_core::ports::EnvPolicy;
+#[cfg(all(windows, target_env = "msvc"))]
+use forge_core::ports::ProcessError;
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 use forge_core::ports::{ExecSpec, OutputPolicy, ProcessObservation, StdinPolicy};
 use forge_runtime::process::SynchronousProcessRunner;
@@ -18,6 +22,8 @@ use forge_runtime::process::SynchronousProcessRunner;
 const MSVC_PROBE_COMMAND: &str = "__forge-msvc-environment-probe";
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 const MSVC_PROBE_MAGIC: &[u8; 9] = b"FORGEMSV1";
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+const MSVC_PROBE_NOT_FOUND_MAGIC: &[u8; 9] = b"FORGEMSN1";
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 const MSVC_PROBE_HEADER_BYTES: usize = MSVC_PROBE_MAGIC.len() + 1;
 #[cfg(any(all(windows, target_env = "msvc"), test))]
@@ -32,6 +38,19 @@ const MSVC_PROBE_OUTPUT_HARD_LIMIT: u64 =
     (MSVC_PROBE_MAX_FRAME_BYTES + MSVC_PROBE_MAX_DIAGNOSTIC_BYTES) as u64;
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 const MSVC_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+const MSVC_VSWHERE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+const MSVC_VSWHERE_MAX_OUTPUT_BYTES: usize = 32 * 1024;
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+const MSVC_VSWHERE_OUTPUT_HARD_LIMIT: u64 =
+    (MSVC_VSWHERE_MAX_OUTPUT_BYTES + MSVC_PROBE_MAX_DIAGNOSTIC_BYTES) as u64;
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+const MSVC_EXPLICIT_INSTALL_ROOT_ENV: &str = "XTASK_MSVC_INSTALL_ROOT";
+#[cfg(all(windows, target_env = "msvc"))]
+const MSVC_VSWHERE_RELATIVE_PATH: &str = r"Microsoft Visual Studio\Installer\vswhere.exe";
+#[cfg(all(windows, target_env = "msvc"))]
+const MSVC_VSWHERE_PROGRAM_FILES_KEYS: &[&str] = &["ProgramFiles(x86)", "ProgramFiles"];
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 const MSVC_PROBE_BASE_INPUT_KEYS: &[&str] = &[
     "PATH",
@@ -169,23 +188,155 @@ fn extend_windows_msvc_environment(
     };
     let executable = env::current_exe().map_err(|error| {
         CargoEnvironmentError(format!(
-            "failed to resolve xtask for the bounded MSVC environment probe: {error}"
+            "failed to resolve xtask for the bounded MSVC environment probe ({:?})",
+            error.kind()
         ))
     })?;
-    let observation = runner
-        .run_with_output_hard_limit(
-            &msvc_probe_spec(executable.into_os_string(), target),
-            MSVC_PROBE_OUTPUT_HARD_LIMIT,
-        )
-        .map_err(|error| {
-            CargoEnvironmentError(format!("bounded MSVC environment probe failed: {error}"))
-        })?;
+    let mut observation = run_msvc_probe(runner, &executable, target, None)?;
+    if observation_reports_toolchain_not_found(&observation) {
+        let installation_root = discover_msvc_installation_with_vswhere(runner)?;
+        observation = run_msvc_probe(
+            runner,
+            &executable,
+            target,
+            Some(installation_root.as_os_str()),
+        )?;
+    }
     require_probe_success(&observation)?;
     let environment = decode_msvc_probe_frame(&observation.stdout)
         .map_err(|error| CargoEnvironmentError(format!("invalid MSVC probe output: {error}")))?;
     apply_msvc_probe_environment(policy, environment).map_err(|error| {
         CargoEnvironmentError(format!("invalid MSVC environment projection: {error}"))
     })
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn run_msvc_probe(
+    runner: &SynchronousProcessRunner,
+    executable: &Path,
+    target: &str,
+    installation_root: Option<&OsStr>,
+) -> Result<ProcessObservation, CargoEnvironmentError> {
+    runner
+        .run_with_output_hard_limit(
+            &msvc_probe_spec(executable.as_os_str().to_owned(), target, installation_root),
+            MSVC_PROBE_OUTPUT_HARD_LIMIT,
+        )
+        .map_err(|error| content_free_process_error("bounded MSVC environment probe", &error))
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn discover_msvc_installation_with_vswhere(
+    runner: &SynchronousProcessRunner,
+) -> Result<PathBuf, CargoEnvironmentError> {
+    let executable = trusted_vswhere_executable()?;
+    let observation = runner
+        .run_with_output_hard_limit(
+            &msvc_vswhere_spec(executable.into_os_string()),
+            MSVC_VSWHERE_OUTPUT_HARD_LIMIT,
+        )
+        .map_err(|error| content_free_process_error("bounded Visual Studio discovery", &error))?;
+    require_vswhere_success(&observation)?;
+    let installation_root = parse_vswhere_installation_path(&observation.stdout)?;
+    canonical_installation_root(&installation_root)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn trusted_vswhere_executable() -> Result<PathBuf, CargoEnvironmentError> {
+    for key in MSVC_VSWHERE_PROGRAM_FILES_KEYS {
+        let Some(program_files) = env::var_os(key) else {
+            continue;
+        };
+        let program_files = PathBuf::from(program_files);
+        if !program_files.is_absolute() {
+            return Err(CargoEnvironmentError(String::from(
+                "a Program Files root for Visual Studio discovery was not absolute",
+            )));
+        }
+        let canonical_root = std::fs::canonicalize(&program_files).map_err(|error| {
+            CargoEnvironmentError(format!(
+                "failed to resolve a Program Files root for Visual Studio discovery ({:?})",
+                error.kind()
+            ))
+        })?;
+        if !canonical_root.is_dir() {
+            return Err(CargoEnvironmentError(String::from(
+                "a Program Files root for Visual Studio discovery was not a directory",
+            )));
+        }
+
+        let candidate = program_files.join(MSVC_VSWHERE_RELATIVE_PATH);
+        let canonical_candidate = match std::fs::canonicalize(candidate) {
+            Ok(candidate) => candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CargoEnvironmentError(format!(
+                    "failed to resolve the Visual Studio discovery executable ({:?})",
+                    error.kind()
+                )));
+            }
+        };
+        if !canonical_candidate.is_file()
+            || !canonical_vswhere_is_confined(
+                &canonical_root,
+                &canonical_candidate,
+                Path::new(MSVC_VSWHERE_RELATIVE_PATH),
+            )
+        {
+            return Err(CargoEnvironmentError(String::from(
+                "the Visual Studio discovery executable was outside its trusted Program Files location",
+            )));
+        }
+        return Ok(canonical_candidate);
+    }
+
+    Err(CargoEnvironmentError(String::from(
+        "a trusted Visual Studio discovery executable was not available",
+    )))
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn canonical_vswhere_is_confined(
+    canonical_root: &Path,
+    canonical_candidate: &Path,
+    expected_relative_path: &Path,
+) -> bool {
+    canonical_candidate
+        .strip_prefix(canonical_root)
+        .is_ok_and(|relative| relative == expected_relative_path)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn canonical_installation_root(path: &Path) -> Result<PathBuf, CargoEnvironmentError> {
+    if !path.is_absolute() {
+        return Err(CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned a non-absolute installation root",
+        )));
+    }
+    let root = std::fs::canonicalize(path).map_err(|error| {
+        CargoEnvironmentError(format!(
+            "failed to resolve the Visual Studio installation root ({:?})",
+            error.kind()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned an installation root that was not a directory",
+        )));
+    }
+    Ok(root)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn content_free_process_error(stage: &str, error: &ProcessError) -> CargoEnvironmentError {
+    let reason = error
+        .reason()
+        .map_or("unspecified", |reason| reason.as_str());
+    CargoEnvironmentError(format!(
+        "{stage} failed: kind={}, reason={reason}, io_kind={:?}",
+        error.kind().as_str(),
+        error.io_kind()
+    ))
 }
 
 #[cfg(not(all(windows, target_env = "msvc")))]
@@ -233,24 +384,39 @@ struct MsvcProbeEnvironment {
 
 #[cfg(all(windows, target_env = "msvc"))]
 impl MsvcProbeEnvironment {
-    fn capture() -> Self {
-        Self {
-            values: capture_msvc_probe_values(env::var_os),
-        }
+    fn capture() -> Result<Self, CargoEnvironmentError> {
+        let installation_root = env::var_os(MSVC_EXPLICIT_INSTALL_ROOT_ENV)
+            .map(PathBuf::from)
+            .map(|path| canonical_installation_root(&path))
+            .transpose()?;
+        Ok(Self {
+            values: capture_msvc_probe_values(env::var_os, installation_root.as_deref()),
+        })
     }
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 fn capture_msvc_probe_values(
     mut get: impl FnMut(&'static str) -> Option<OsString>,
+    installation_root: Option<&Path>,
 ) -> BTreeMap<&'static str, OsString> {
-    let explicit_architecture = get("VSCMD_ARG_TGT_ARCH");
     let mut values = MSVC_PROBE_BASE_INPUT_KEYS
         .iter()
         .copied()
         .filter_map(|key| get(key).map(|value| (key, value)))
         .collect::<BTreeMap<_, _>>();
-    if let Some(architecture) = explicit_architecture {
+    if let Some(installation_root) = installation_root {
+        // `find-msvc-tools` 0.1.9 treats a known-but-different Developer Prompt target as an
+        // instruction to resolve the requested target directly under VSINSTALLDIR. The v0 probe
+        // supports only x64, so x86 is a stable, explicit mismatch. That path-based branch runs
+        // before COM and does not execute the crate's `cl.exe` or `vswhere.exe` fallbacks.
+        values.insert(
+            "VCINSTALLDIR",
+            installation_root.join("VC").into_os_string(),
+        );
+        values.insert("VSINSTALLDIR", installation_root.as_os_str().to_owned());
+        values.insert("VSCMD_ARG_TGT_ARCH", OsString::from("x86"));
+    } else if let Some(architecture) = get("VSCMD_ARG_TGT_ARCH") {
         values.insert("VSCMD_ARG_TGT_ARCH", architecture);
         values.extend(
             MSVC_PROBE_DEVELOPER_INPUT_KEYS
@@ -274,12 +440,16 @@ impl find_msvc_tools::EnvGetter for MsvcProbeEnvironment {
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
-fn msvc_probe_spec(executable: OsString, target: &str) -> ExecSpec {
+fn msvc_probe_spec(
+    executable: OsString,
+    target: &str,
+    installation_root: Option<&OsStr>,
+) -> ExecSpec {
     ExecSpec {
         program: executable,
         args: vec![OsString::from(MSVC_PROBE_COMMAND), OsString::from(target)],
         cwd: RepoRelativePath::root(),
-        env: msvc_probe_environment(),
+        env: msvc_probe_environment(installation_root),
         timeout: MSVC_PROBE_TIMEOUT,
         stdin: StdinPolicy::Closed,
         stdout: OutputPolicy::CaptureBounded {
@@ -297,12 +467,52 @@ fn msvc_probe_spec(executable: OsString, target: &str) -> ExecSpec {
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
-fn msvc_probe_environment() -> EnvPolicy {
-    msvc_probe_environment_for(env::var_os("VSCMD_ARG_TGT_ARCH").is_some())
+fn msvc_vswhere_spec(executable: OsString) -> ExecSpec {
+    ExecSpec {
+        program: executable,
+        args: [
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+            "-utf8",
+            "-nologo",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        cwd: RepoRelativePath::root(),
+        env: EnvPolicy::minimal(),
+        timeout: MSVC_VSWHERE_TIMEOUT,
+        stdin: StdinPolicy::Closed,
+        stdout: OutputPolicy::CaptureBounded {
+            max_bytes: MSVC_VSWHERE_MAX_OUTPUT_BYTES,
+        },
+        stderr: OutputPolicy::CaptureBounded {
+            max_bytes: MSVC_PROBE_MAX_DIAGNOSTIC_BYTES,
+        },
+        mutability: Mutability::ReadOnly,
+        network: NetworkIntent::OfflineRequested,
+        concurrency_key: Some(String::from("xtask-msvc-vswhere-probe")),
+    }
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
-fn msvc_probe_environment_for(developer_prompt_arch_is_explicit: bool) -> EnvPolicy {
+fn msvc_probe_environment(installation_root: Option<&OsStr>) -> EnvPolicy {
+    msvc_probe_environment_for(
+        env::var_os("VSCMD_ARG_TGT_ARCH").is_some(),
+        installation_root,
+    )
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn msvc_probe_environment_for(
+    developer_prompt_arch_is_explicit: bool,
+    installation_root: Option<&OsStr>,
+) -> EnvPolicy {
     let mut policy = EnvPolicy::minimal();
     policy.inherit.extend(
         MSVC_PROBE_BASE_INPUT_KEYS
@@ -310,7 +520,12 @@ fn msvc_probe_environment_for(developer_prompt_arch_is_explicit: bool) -> EnvPol
             .copied()
             .map(OsString::from),
     );
-    if developer_prompt_arch_is_explicit {
+    if let Some(installation_root) = installation_root {
+        policy.overrides.insert(
+            OsString::from(MSVC_EXPLICIT_INSTALL_ROOT_ENV),
+            installation_root.to_owned(),
+        );
+    } else if developer_prompt_arch_is_explicit {
         // `find-msvc-tools` checks VSCMD_ARG_TGT_ARCH before its `cl.exe` fallback. Inheriting this
         // group atomically therefore preserves a builder-selected Developer Command Prompt while
         // keeping that fallback unreachable. ProgramFiles remains excluded, so COM failure cannot
@@ -326,14 +541,82 @@ fn msvc_probe_environment_for(developer_prompt_arch_is_explicit: bool) -> EnvPol
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
-fn require_probe_success(observation: &ProcessObservation) -> Result<(), CargoEnvironmentError> {
-    if observation.exit_code == Some(0)
+fn parse_vswhere_installation_path(stdout: &[u8]) -> Result<PathBuf, CargoEnvironmentError> {
+    if stdout.is_empty() || stdout.len() > MSVC_VSWHERE_MAX_OUTPUT_BYTES {
+        return Err(CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned an empty or oversized installation root",
+        )));
+    }
+    let output = std::str::from_utf8(stdout).map_err(|_| {
+        CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned a non-UTF-8 installation root",
+        ))
+    })?;
+    let mut lines = output.lines();
+    let line = lines.next().ok_or_else(|| {
+        CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned no installation root",
+        ))
+    })?;
+    if line.is_empty() || line.trim() != line || line.contains('\0') || lines.next().is_some() {
+        return Err(CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned an invalid installation root record",
+        )));
+    }
+    let path = PathBuf::from(line);
+    if !path.is_absolute() {
+        return Err(CargoEnvironmentError(String::from(
+            "Visual Studio discovery returned a non-absolute installation root",
+        )));
+    }
+    Ok(path)
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn require_vswhere_success(observation: &ProcessObservation) -> Result<(), CargoEnvironmentError> {
+    if observation_completed_successfully(observation)
+        && observation.stdout_total_bytes == observation.stdout.len() as u64
+    {
+        return Ok(());
+    }
+    Err(CargoEnvironmentError(format!(
+        "Visual Studio discovery did not complete successfully: exit={:?}, signal={:?}, timed_out={}, interrupted={}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}",
+        observation.exit_code,
+        observation.signal,
+        observation.timed_out,
+        observation.interrupted,
+        observation.stdout_total_bytes,
+        observation.stdout_truncated,
+        observation.stderr_total_bytes,
+        observation.stderr_truncated
+    )))
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn observation_completed_successfully(observation: &ProcessObservation) -> bool {
+    observation.exit_code == Some(0)
         && observation.signal.is_none()
         && !observation.timed_out
         && !observation.interrupted
         && !observation.stdout_truncated
         && !observation.stderr_truncated
-    {
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn observation_reports_toolchain_not_found(observation: &ProcessObservation) -> bool {
+    observation.exit_code == Some(2)
+        && observation.signal.is_none()
+        && !observation.timed_out
+        && !observation.interrupted
+        && !observation.stdout_truncated
+        && !observation.stderr_truncated
+        && observation.stdout_total_bytes == MSVC_PROBE_NOT_FOUND_MAGIC.len() as u64
+        && observation.stdout == MSVC_PROBE_NOT_FOUND_MAGIC
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn require_probe_success(observation: &ProcessObservation) -> Result<(), CargoEnvironmentError> {
+    if observation_completed_successfully(observation) {
         return Ok(());
     }
     Err(CargoEnvironmentError(format!(
@@ -355,7 +638,6 @@ pub(crate) fn is_msvc_probe_command(command: &str) -> bool {
 
 #[cfg(all(windows, target_env = "msvc"))]
 pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironmentError> {
-    use std::io::Write as _;
     use std::os::windows::ffi::OsStrExt as _;
 
     if !supported_msvc_target(target) {
@@ -371,13 +653,17 @@ pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironment
     // Prompt values exist only as a group containing VSCMD_ARG_TGT_ARCH, so the crate never needs
     // its `cl.exe` architecture probe. Program Files is always unavailable, preventing its
     // `vswhere.exe` fallback after COM failure.
-    let probe_environment = MsvcProbeEnvironment::capture();
-    let tool = find_msvc_tools::find_tool_with_env(architecture, "link.exe", &probe_environment)
-        .ok_or_else(|| {
-            CargoEnvironmentError(String::from(
-                "MSVC toolchain environment was not discoverable through bounded local sources",
-            ))
-        })?;
+    let probe_environment = MsvcProbeEnvironment::capture()?;
+    let tool =
+        match find_msvc_tools::find_tool_with_env(architecture, "link.exe", &probe_environment) {
+            Some(tool) => tool,
+            None => {
+                write_msvc_probe_output(MSVC_PROBE_NOT_FOUND_MAGIC)?;
+                return Err(CargoEnvironmentError(String::from(
+                    "MSVC toolchain environment was not discoverable through bounded local sources",
+                )));
+            }
+        };
     let environment = tool
         .env()
         .into_iter()
@@ -389,12 +675,25 @@ pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironment
     let frame = encode_msvc_probe_frame(environment).map_err(|error| {
         CargoEnvironmentError(format!("failed to encode MSVC probe output: {error}"))
     })?;
+    write_msvc_probe_output(&frame)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn write_msvc_probe_output(bytes: &[u8]) -> Result<(), CargoEnvironmentError> {
+    use std::io::Write as _;
+
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&frame).map_err(|error| {
-        CargoEnvironmentError(format!("failed to write MSVC probe output: {error}"))
+    stdout.write_all(bytes).map_err(|error| {
+        CargoEnvironmentError(format!(
+            "failed to write MSVC probe output ({:?})",
+            error.kind()
+        ))
     })?;
     stdout.flush().map_err(|error| {
-        CargoEnvironmentError(format!("failed to flush MSVC probe output: {error}"))
+        CargoEnvironmentError(format!(
+            "failed to flush MSVC probe output ({:?})",
+            error.kind()
+        ))
     })
 }
 
@@ -637,6 +936,7 @@ pub(crate) fn is_cargo_build_environment_key(key: &OsStr) -> bool {
             | "RUSTC_WORKSPACE_WRAPPER"
             | "RUSTDOC"
             | "RUSTFLAGS"
+            | "CARGO_BUILD_TARGET_DIR"
             | "CARGO_ENCODED_RUSTFLAGS"
             | "RUSTUP_TOOLCHAIN"
             | "SDKROOT"
@@ -664,6 +964,7 @@ pub(crate) fn is_cargo_build_environment_key(key: &OsStr) -> bool {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use forge_core::domain::{Mutability, NetworkIntent};
@@ -671,18 +972,44 @@ mod tests {
     use forge_runtime::process::empty_process_output_digests;
 
     use super::{
-        MSVC_PROBE_HEADER_BYTES, MSVC_PROBE_MAGIC, MSVC_PROBE_MAX_DIAGNOSTIC_BYTES,
-        MSVC_PROBE_MAX_FRAME_BYTES, MSVC_PROBE_MAX_VALUE_UNITS, MSVC_PROBE_OUTPUT_HARD_LIMIT,
-        MSVC_PROBE_TIMEOUT, MsvcEnvironmentKey, apply_msvc_probe_environment,
+        MSVC_EXPLICIT_INSTALL_ROOT_ENV, MSVC_PROBE_HEADER_BYTES, MSVC_PROBE_MAGIC,
+        MSVC_PROBE_MAX_DIAGNOSTIC_BYTES, MSVC_PROBE_MAX_FRAME_BYTES, MSVC_PROBE_MAX_VALUE_UNITS,
+        MSVC_PROBE_NOT_FOUND_MAGIC, MSVC_PROBE_OUTPUT_HARD_LIMIT, MSVC_PROBE_TIMEOUT,
+        MSVC_VSWHERE_MAX_OUTPUT_BYTES, MSVC_VSWHERE_OUTPUT_HARD_LIMIT, MSVC_VSWHERE_TIMEOUT,
+        MsvcEnvironmentKey, apply_msvc_probe_environment, canonical_vswhere_is_confined,
         capture_msvc_probe_values, decode_msvc_probe_frame, encode_msvc_probe_frame,
         is_cargo_build_environment_key, is_msvc_probe_input_key, msvc_probe_environment_for,
-        msvc_probe_spec, require_probe_success, supported_msvc_target,
+        msvc_probe_spec, msvc_vswhere_spec, observation_reports_toolchain_not_found,
+        parse_vswhere_installation_path, require_probe_success, require_vswhere_success,
+        supported_msvc_target,
     };
+
+    fn observation(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> ProcessObservation {
+        let (stdout_digest, stderr_digest) = empty_process_output_digests();
+        ProcessObservation {
+            exit_code: Some(exit_code),
+            signal: None,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            stdout_digest,
+            stderr_digest,
+            stdout_total_bytes: stdout.len() as u64,
+            stderr_total_bytes: stderr.len() as u64,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: Duration::from_millis(1),
+            timed_out: false,
+            interrupted: false,
+        }
+    }
 
     #[test]
     fn build_environment_allows_toolchain_controls_but_not_registry_tokens() {
         assert!(is_cargo_build_environment_key(OsStr::new(
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+        )));
+        assert!(is_cargo_build_environment_key(OsStr::new(
+            "CARGO_BUILD_TARGET_DIR"
         )));
         assert!(is_cargo_build_environment_key(OsStr::new("RUSTC_WRAPPER")));
         assert!(is_cargo_build_environment_key(OsStr::new("ProgramFiles")));
@@ -707,7 +1034,7 @@ mod tests {
 
     #[test]
     fn msvc_probe_process_contract_is_bounded_noninteractive_and_local() {
-        let spec = msvc_probe_spec(OsString::from("xtask.exe"), "x86_64-pc-windows-msvc");
+        let spec = msvc_probe_spec(OsString::from("xtask.exe"), "x86_64-pc-windows-msvc", None);
 
         assert_eq!(
             spec.args,
@@ -739,8 +1066,49 @@ mod tests {
     }
 
     #[test]
+    fn msvc_vswhere_process_contract_is_bounded_noninteractive_and_local() {
+        let spec = msvc_vswhere_spec(OsString::from("vswhere.exe"));
+
+        assert_eq!(
+            spec.args,
+            [
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+                "-utf8",
+                "-nologo",
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(spec.stdin, StdinPolicy::Closed);
+        assert_eq!(spec.timeout, MSVC_VSWHERE_TIMEOUT);
+        assert_eq!(
+            spec.stdout,
+            OutputPolicy::CaptureBounded {
+                max_bytes: MSVC_VSWHERE_MAX_OUTPUT_BYTES
+            }
+        );
+        assert_eq!(
+            spec.stderr,
+            OutputPolicy::CaptureBounded {
+                max_bytes: MSVC_PROBE_MAX_DIAGNOSTIC_BYTES
+            }
+        );
+        assert_eq!(spec.mutability, Mutability::ReadOnly);
+        assert_eq!(spec.network, NetworkIntent::OfflineRequested);
+        assert_eq!(
+            MSVC_VSWHERE_OUTPUT_HARD_LIMIT,
+            (MSVC_VSWHERE_MAX_OUTPUT_BYTES + MSVC_PROBE_MAX_DIAGNOSTIC_BYTES) as u64
+        );
+    }
+
+    #[test]
     fn msvc_probe_input_blocks_subprocess_fallbacks_and_gates_developer_prompt() {
-        let default_environment = msvc_probe_environment_for(false);
+        let default_environment = msvc_probe_environment_for(false, None);
         for key in ["ProgramFiles", "ProgramFiles(x86)"] {
             assert!(
                 !is_msvc_probe_input_key(key),
@@ -776,7 +1144,7 @@ mod tests {
                 "developer prompt input {key} was inherited without an explicit architecture"
             );
         }
-        let developer_environment = msvc_probe_environment_for(true);
+        let developer_environment = msvc_probe_environment_for(true, None);
         for key in developer_prompt_keys {
             assert!(
                 developer_environment.inherit.contains(OsStr::new(key)),
@@ -790,18 +1158,157 @@ mod tests {
             ("VSTEL_MSBuildProjectFullPath", OsString::from("project")),
             ("VSINSTALLDIR", OsString::from("vs-install")),
         ]);
-        let captured = capture_msvc_probe_values(|key| ambient.get(key).cloned());
+        let captured = capture_msvc_probe_values(|key| ambient.get(key).cloned(), None);
         assert_eq!(captured.len(), 1);
         assert_eq!(captured.get("PATH"), Some(&OsString::from("ambient-path")));
 
         ambient.insert("VSCMD_ARG_TGT_ARCH", OsString::from("x64"));
-        let captured = capture_msvc_probe_values(|key| ambient.get(key).cloned());
+        let captured = capture_msvc_probe_values(|key| ambient.get(key).cloned(), None);
         for key in developer_prompt_keys {
             assert!(
                 captured.contains_key(key),
                 "helper snapshot did not atomically capture {key}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_install_root_uses_private_override_and_forces_path_based_lookup() {
+        let installation_root = Path::new("trusted-visual-studio");
+        let policy = msvc_probe_environment_for(true, Some(installation_root.as_os_str()));
+
+        for key in [
+            "VCINSTALLDIR",
+            "VSTEL_MSBuildProjectFullPath",
+            "VSCMD_ARG_TGT_ARCH",
+            "VSINSTALLDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+        ] {
+            assert!(
+                !policy.inherit.contains(OsStr::new(key)),
+                "explicit-root probe unexpectedly inherited {key}"
+            );
+        }
+        assert_eq!(
+            policy
+                .overrides
+                .get(OsStr::new(MSVC_EXPLICIT_INSTALL_ROOT_ENV)),
+            Some(&installation_root.as_os_str().to_owned())
+        );
+
+        let ambient = BTreeMap::from([
+            ("PATH", OsString::from("ambient-path")),
+            ("VCINSTALLDIR", OsString::from("ambient-vc")),
+            (
+                "VSTEL_MSBuildProjectFullPath",
+                OsString::from("ambient-project"),
+            ),
+            ("VSCMD_ARG_TGT_ARCH", OsString::from("x64")),
+            ("VSINSTALLDIR", OsString::from("ambient-vs")),
+            ("ProgramFiles", OsString::from("ambient-program-files")),
+        ]);
+        let captured =
+            capture_msvc_probe_values(|key| ambient.get(key).cloned(), Some(installation_root));
+
+        assert_eq!(captured.get("PATH"), Some(&OsString::from("ambient-path")));
+        assert_eq!(
+            captured.get("VCINSTALLDIR"),
+            Some(&installation_root.join("VC").into_os_string())
+        );
+        assert_eq!(
+            captured.get("VSINSTALLDIR"),
+            Some(&installation_root.as_os_str().to_owned())
+        );
+        assert_eq!(
+            captured.get("VSCMD_ARG_TGT_ARCH"),
+            Some(&OsString::from("x86"))
+        );
+        assert!(!captured.contains_key("VSTEL_MSBuildProjectFullPath"));
+        assert!(!captured.contains_key("ProgramFiles"));
+    }
+
+    #[test]
+    fn vswhere_installation_path_parser_requires_one_absolute_utf8_record() {
+        let absolute = std::env::temp_dir().join("Visual Studio");
+        let mut valid = absolute.as_os_str().to_string_lossy().into_owned();
+        valid.push_str("\r\n");
+        assert_eq!(
+            parse_vswhere_installation_path(valid.as_bytes()).ok(),
+            Some(absolute)
+        );
+
+        for invalid in [
+            Vec::new(),
+            b"relative-installation\r\n".to_vec(),
+            b"/first\n/second\n".to_vec(),
+            b" /leading-space\n".to_vec(),
+            b"/trailing-space \n".to_vec(),
+            b"/embedded\0nul\n".to_vec(),
+            vec![0xff],
+        ] {
+            assert!(parse_vswhere_installation_path(&invalid).is_err());
+        }
+        assert!(
+            parse_vswhere_installation_path(&vec![b'a'; MSVC_VSWHERE_MAX_OUTPUT_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_vswhere_confinement_requires_the_exact_relative_location() {
+        let root = PathBuf::from("canonical-program-files");
+        let expected = Path::new("installer").join("vswhere.exe");
+
+        assert!(canonical_vswhere_is_confined(
+            &root,
+            &root.join(&expected),
+            &expected
+        ));
+        assert!(!canonical_vswhere_is_confined(
+            &root,
+            &root.join("other").join("vswhere.exe"),
+            &expected
+        ));
+        assert!(!canonical_vswhere_is_confined(
+            &root,
+            &PathBuf::from("outside").join(&expected),
+            &expected
+        ));
+    }
+
+    #[test]
+    fn toolchain_not_found_fallback_requires_the_exact_bounded_marker() {
+        let missing = observation(2, MSVC_PROBE_NOT_FOUND_MAGIC, b"private diagnostic");
+        assert!(observation_reports_toolchain_not_found(&missing));
+
+        let mut wrong_exit = observation(2, MSVC_PROBE_NOT_FOUND_MAGIC, b"private diagnostic");
+        wrong_exit.exit_code = Some(1);
+        assert!(!observation_reports_toolchain_not_found(&wrong_exit));
+
+        let mut extra_output = observation(2, MSVC_PROBE_NOT_FOUND_MAGIC, b"private diagnostic");
+        extra_output.stdout.push(0);
+        extra_output.stdout_total_bytes += 1;
+        assert!(!observation_reports_toolchain_not_found(&extra_output));
+
+        let mut truncated = missing;
+        truncated.stdout_truncated = true;
+        assert!(!observation_reports_toolchain_not_found(&truncated));
+    }
+
+    #[test]
+    fn vswhere_failure_diagnostic_does_not_replay_child_output() {
+        let failed = observation(7, b"sensitive-install-root", b"sensitive-local-path");
+        let error = require_vswhere_success(&failed)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert!(error.contains("exit=Some(7)"));
+        assert!(error.contains("stdout_bytes=22"));
+        assert!(error.contains("stderr_bytes=20"));
+        assert!(!error.contains("sensitive-install-root"));
+        assert!(!error.contains("sensitive-local-path"));
     }
 
     #[test]
