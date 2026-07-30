@@ -4,7 +4,7 @@
 - Date: 2026-07-30
 - Deciders: Forge maintainers
 - Supersedes: ADR-0029
-- Superseded by: None
+- Superseded by: ADR-0042（仅 SLSA Statement subject 的长度编码）
 
 ## Context
 

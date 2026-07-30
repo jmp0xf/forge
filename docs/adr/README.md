@@ -55,5 +55,6 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0039](0039-preserve-current-typed-unknown-receipt-facts.md) | Accepted | 保留当前 Receipt 的 typed unknown 事实 |
 | [0040](0040-fail-closed-on-unbound-project-tool-configuration.md) | Accepted | 项目工具外部配置未闭合时安全失败 |
 | [0041](0041-publish-license-complete-rc2-through-external-authority.md) | Accepted | 通过外部权威发布许可证完整的 rc.2 |
+| [0042](0042-use-standard-in-toto-subject-descriptors.md) | Accepted | 使用标准 in-toto subject 描述符 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。
