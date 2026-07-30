@@ -22,10 +22,10 @@ use forge_runtime::fs::RepositoryWriter;
 use forge_runtime::git::{GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
 use forge_runtime::process::SynchronousProcessRunner;
 use forge_schema::{
-    ReleaseArtifactData, ReleaseArtifactKindData, ReleaseAuthorityStatusData,
+    ReleaseArtifactKindV2Data, ReleaseArtifactV2Data, ReleaseAuthorityStatusData,
     ReleaseCandidateStatusData, ReleaseChannelData, ReleaseDescriptorData, ReleaseDistributionData,
-    ReleaseManifestData, ReleasePredicateTypeData, ReleaseProvenanceData,
-    ReleaseProvenanceStatusData, ReleaseRollbackData, ReleaseRollbackStatusData, ReleaseSha256Data,
+    ReleaseManifestV2Data, ReleasePredicateTypeData, ReleaseProvenanceStatusData,
+    ReleaseProvenanceV2Data, ReleaseRollbackData, ReleaseRollbackStatusData, ReleaseSha256Data,
     ReleaseSigningData, ReleaseSubjectSetData, SchemaKind,
 };
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LICENSE_NOTICES_FILE: &str = "THIRD-PARTY-LICENSES.txt";
 const MANIFEST_FILE: &str = "release-manifest.json";
 const CHECKSUMS_FILE: &str = "SHA256SUMS";
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -46,7 +47,7 @@ const MAX_GIT_INDEX_ENTRIES: usize = 200_000;
 const MAX_HASH_OBJECT_ARGUMENT_UNITS: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
-const FINALIZED_ASSET_COUNT: u16 = 12;
+const FINALIZED_ASSET_COUNT: u16 = 13;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const CARGO_METADATA_TIMEOUT: Duration = Duration::from_secs(300);
 const CARGO_BUILD_TIMEOUT: Duration = Duration::from_secs(1_800);
@@ -64,7 +65,7 @@ const REJECTED_RELEASE_GIT_ENV: &[&str] = &[
 ];
 
 pub(crate) const BUILD_HELP: &str = "usage: xtask release-build --target <TRIPLE> --output-dir <DIR>\n\nBuilds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. Run the compiled xtask directly when a nested `cargo run` is unsuitable.";
-pub(crate) const FINALIZE_HELP: &str = "usage: xtask release-finalize --output-dir <DIR>\n\nRequires all five target binaries and SBOMs, then writes release-manifest.json and SHA256SUMS without overwriting different bytes.";
+pub(crate) const FINALIZE_HELP: &str = "usage: xtask release-finalize --output-dir <DIR>\n\nRequires all five target binaries and SBOMs, then copies the source-bound license notices and writes release-manifest.json and SHA256SUMS without overwriting different bytes.";
 pub(crate) const CHECK_HELP: &str = "usage: xtask release-check --output-dir <DIR>\n\nRecomputes the complete local asset set, binary formats, SBOMs, manifest, and SHA-256 checksums. Success is local consistency evidence, not provenance, signature, approval, upload, or publication.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,6 +388,7 @@ impl WorktreeGuard {
 struct RepositorySnapshot {
     source_commit: String,
     cargo_lock: Vec<u8>,
+    license_notices: Vec<u8>,
     metadata_by_target: BTreeMap<String, Vec<u8>>,
 }
 
@@ -408,7 +410,7 @@ impl RepositorySnapshot {
             Ok(())
         } else {
             Err(ReleaseError::environment(format!(
-                "isolated source commit, Cargo.lock, or target-filtered Cargo metadata changed during {operation}"
+                "isolated source commit, Cargo.lock, license notices, or target-filtered Cargo metadata changed during {operation}"
             )))
         }
     }
@@ -460,6 +462,7 @@ impl ReleaseSource {
         })?;
         validate_visible_root(&checkout, "isolated source checkout")?;
         let source_tree = capture_source_tree(&checkout)?;
+        let license_notices = read_candidate_license_notices(&checkout)?;
         let metadata_by_target = capture_cargo_metadata(checkout.root(), targets)?;
         validate_cargo_metadata_source_boundaries(
             checkout.root(),
@@ -470,6 +473,7 @@ impl ReleaseSource {
         let snapshot = RepositorySnapshot {
             source_commit: isolated_guard.source_commit,
             cargo_lock: isolated_guard.cargo_lock,
+            license_notices,
             metadata_by_target,
         };
         if capture_source_tree(&checkout)? != source_tree {
@@ -522,6 +526,7 @@ impl ReleaseSource {
             &RepositorySnapshot {
                 source_commit: self.snapshot.source_commit.clone(),
                 cargo_lock: self.snapshot.cargo_lock.clone(),
+                license_notices: read_candidate_license_notices(&self.checkout)?,
                 metadata_by_target,
             },
             operation,
@@ -537,6 +542,29 @@ impl ReleaseSource {
         )?;
         validate_visible_root(&self.checkout, "isolated source checkout")
     }
+}
+
+fn read_candidate_license_notices(source: &RepositoryWriter) -> Result<Vec<u8>, ReleaseError> {
+    validate_visible_root(source, "isolated source checkout")?;
+    let notices = source
+        .read_optional_bounded(LICENSE_NOTICES_FILE, MAX_SOURCE_FILE_BYTES)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read source-bound {LICENSE_NOTICES_FILE}: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ReleaseError::environment(format!(
+                "release source is missing required {LICENSE_NOTICES_FILE}"
+            ))
+        })?;
+    validate_visible_root(source, "isolated source checkout")?;
+    if notices.is_empty() {
+        return Err(ReleaseError::environment(format!(
+            "release source {LICENSE_NOTICES_FILE} must not be empty"
+        )));
+    }
+    Ok(notices)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1921,10 +1949,12 @@ fn stage_built(
 fn finalize(output: &RepositoryWriter, snapshot: &RepositorySnapshot) -> Result<(), ReleaseError> {
     validate_finalize_directory(output)?;
     validate_staged_assets(output, snapshot)?;
-    let manifest = render_manifest(output)?;
-    let checksums = render_checksums(output, &manifest)?;
+    let manifest = render_manifest(output, &snapshot.license_notices)?;
+    let checksums = render_checksums(output, &snapshot.license_notices, &manifest)?;
+    preflight_write_once_or_same(output, LICENSE_NOTICES_FILE, &snapshot.license_notices)?;
     preflight_write_once_or_same(output, MANIFEST_FILE, &manifest)?;
     preflight_write_once_or_same(output, CHECKSUMS_FILE, &checksums)?;
+    write_once_or_same(output, LICENSE_NOTICES_FILE, &snapshot.license_notices)?;
     write_once_or_same(output, MANIFEST_FILE, &manifest)?;
     write_once_or_same(output, CHECKSUMS_FILE, &checksums)?;
     validate_complete_assets(output, snapshot)?;
@@ -1943,13 +1973,19 @@ fn validate_complete_assets(
 ) -> Result<(), ReleaseError> {
     validate_exact_asset_set(output)?;
     validate_staged_assets(output, snapshot)?;
+    require_exact_bytes(
+        output,
+        LICENSE_NOTICES_FILE,
+        &snapshot.license_notices,
+        "third-party license notices",
+    )?;
 
-    let manifest = render_manifest(output)?;
+    let manifest = render_manifest(output, &snapshot.license_notices)?;
     require_exact_bytes(output, MANIFEST_FILE, &manifest, "release manifest")?;
     require_exact_bytes(
         output,
         CHECKSUMS_FILE,
-        &render_checksums(output, &manifest)?,
+        &render_checksums(output, &snapshot.license_notices, &manifest)?,
         "release checksums",
     )?;
     validate_exact_asset_set(output)?;
@@ -2266,31 +2302,25 @@ fn known_stage_names() -> BTreeSet<String> {
         .collect()
 }
 
-fn finalized_asset_names() -> BTreeSet<String> {
+fn manifest_artifact_names() -> BTreeSet<String> {
     let mut names = known_stage_names();
+    names.insert(LICENSE_NOTICES_FILE.to_owned());
+    names
+}
+
+fn finalized_asset_names() -> BTreeSet<String> {
+    let mut names = manifest_artifact_names();
     names.insert(MANIFEST_FILE.to_owned());
     names.insert(CHECKSUMS_FILE.to_owned());
     names
 }
 
 fn validate_stage_directory(output: &RepositoryWriter) -> Result<(), ReleaseError> {
-    if read_output_optional(output, MANIFEST_FILE, MAX_BINARY_BYTES, "release manifest")?.is_some()
-        || read_output_optional(
-            output,
-            CHECKSUMS_FILE,
-            MAX_BINARY_BYTES,
-            "release checksums",
-        )?
-        .is_some()
-    {
-        return Err(ReleaseError::environment(
-            "release output is already finalized and cannot be restaged in place",
-        ));
-    }
-    Ok(())
+    require_directory_subset(output, &known_stage_names(), "staged release")
 }
 
 fn validate_finalize_directory(output: &RepositoryWriter) -> Result<(), ReleaseError> {
+    require_directory_subset(output, &finalized_asset_names(), "release finalization")?;
     let mut missing = Vec::new();
     for name in known_stage_names() {
         if read_output_optional(output, &name, MAX_BINARY_BYTES, "staged asset")?.is_none() {
@@ -2307,20 +2337,84 @@ fn validate_finalize_directory(output: &RepositoryWriter) -> Result<(), ReleaseE
 }
 
 fn validate_exact_asset_set(output: &RepositoryWriter) -> Result<(), ReleaseError> {
-    let mut missing = Vec::new();
-    for name in finalized_asset_names() {
-        if read_output_optional(output, &name, MAX_BINARY_BYTES, "finalized asset")?.is_none() {
-            missing.push(name);
-        }
+    let expected = finalized_asset_names();
+    let actual = visible_output_asset_names(output, expected.len())?;
+    if actual == expected {
+        Ok(())
+    } else {
+        let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+        let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
+        Err(ReleaseError::environment(format!(
+            "release output does not contain the exact finalized asset set; missing=[{}], unexpected=[{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        )))
     }
-    if missing.is_empty() {
+}
+
+fn require_directory_subset(
+    output: &RepositoryWriter,
+    allowed: &BTreeSet<String>,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    let actual = visible_output_asset_names(output, allowed.len())?;
+    let unexpected = actual.difference(allowed).cloned().collect::<Vec<_>>();
+    if unexpected.is_empty() {
         Ok(())
     } else {
         Err(ReleaseError::environment(format!(
-            "release output is missing required finalized assets: [{}]",
-            missing.join(", ")
+            "{label} output contains unexpected entries: [{}]",
+            unexpected.join(", ")
         )))
     }
+}
+
+fn visible_output_asset_names(
+    output: &RepositoryWriter,
+    max_entries: usize,
+) -> Result<BTreeSet<String>, ReleaseError> {
+    validate_visible_root(output, "release output")?;
+    let entries = fs::read_dir(output.root()).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to enumerate pinned release output {}: {error}",
+            output.root().display()
+        ))
+    })?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to enumerate a release output entry: {error}"
+            ))
+        })?;
+        if names.len() == max_entries {
+            return Err(ReleaseError::environment(format!(
+                "release output contains more than {max_entries} allowed entries"
+            )));
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to inspect release output entry {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(ReleaseError::environment(format!(
+                "release output entry is not a real regular file: {}",
+                entry.path().display()
+            )));
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            ReleaseError::environment("release output contains a non-UTF-8 entry name")
+        })?;
+        if !names.insert(name.clone()) {
+            return Err(ReleaseError::environment(format!(
+                "release output enumerated duplicate entry `{name}`"
+            )));
+        }
+    }
+    validate_visible_root(output, "release output")?;
+    Ok(names)
 }
 
 fn binary_asset_name(target: &ReleaseTarget) -> String {
@@ -2751,6 +2845,7 @@ struct CargoPackage {
     id: String,
     name: String,
     version: String,
+    license: Option<String>,
     source: Option<String>,
     checksum: Option<String>,
     #[serde(default)]
@@ -2811,10 +2906,16 @@ struct BomComponent {
     bom_ref: String,
     name: String,
     version: String,
+    licenses: Vec<BomLicenseChoice>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hashes: Vec<BomHash>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     properties: Vec<BomProperty>,
+}
+
+#[derive(Debug, Serialize)]
+struct BomLicenseChoice {
+    expression: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2835,6 +2936,58 @@ struct BomDependency {
     #[serde(rename = "ref")]
     reference: String,
     depends_on: Vec<String>,
+}
+
+fn package_license_expression(package: &CargoPackage) -> Result<String, ReleaseError> {
+    let raw_expression = package.license.as_deref().ok_or_else(|| {
+        ReleaseError::environment(format!(
+            "release dependency {} {} has no Cargo package.license expression",
+            package.name, package.version
+        ))
+    })?;
+    let expression = match (
+        package.name.as_str(),
+        package.version.as_str(),
+        raw_expression,
+    ) {
+        // These five published crates predate Cargo's SPDX `OR` spelling. Bind each compatibility
+        // rewrite to the exact package version reviewed for the frozen five-target closure.
+        ("ctrlc", "3.4.7", "MIT/Apache-2.0")
+        | ("fs2", "0.4.3", "MIT/Apache-2.0")
+        | ("winapi", "0.3.9", "MIT/Apache-2.0") => "MIT OR Apache-2.0",
+        ("same-file", "1.0.6", "Unlicense/MIT") | ("walkdir", "2.5.0", "Unlicense/MIT") => {
+            "Unlicense OR MIT"
+        }
+        // Keep the machine expression surface closed over the audited release closure. A new
+        // expression therefore requires an explicit dependency-license review instead of silently
+        // becoming release evidence merely because it is syntactically plausible.
+        (
+            _,
+            _,
+            expression @ ("(MIT OR Apache-2.0) AND Unicode-3.0"
+            | "Apache-2.0"
+            | "Apache-2.0 OR BSL-1.0"
+            | "Apache-2.0 OR MIT"
+            | "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+            | "BSD-2-Clause"
+            | "BSD-2-Clause OR Apache-2.0 OR MIT"
+            | "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+            | "CC0-1.0 OR MIT-0 OR Apache-2.0"
+            | "MIT"
+            | "MIT OR Apache-2.0"
+            | "MIT-0"
+            | "Unicode-3.0"
+            | "Unlicense OR MIT"
+            | "Zlib"),
+        ) => expression,
+        _ => {
+            return Err(ReleaseError::environment(format!(
+                "release dependency {} {} has an invalid, unrecognized, or unreviewed Cargo package.license expression",
+                package.name, package.version
+            )));
+        }
+    };
+    Ok(expression.to_owned())
 }
 
 fn render_sbom(
@@ -2976,6 +3129,9 @@ fn render_sbom(
             })?,
             name: package.name.clone(),
             version: package.version.clone(),
+            licenses: vec![BomLicenseChoice {
+                expression: package_license_expression(package)?,
+            }],
             hashes,
             properties,
         });
@@ -3014,6 +3170,9 @@ fn render_sbom(
                 bom_ref: root_ref,
                 name: "forge".to_owned(),
                 version: RELEASE_VERSION.to_owned(),
+                licenses: vec![BomLicenseChoice {
+                    expression: package_license_expression(root)?,
+                }],
                 hashes: vec![BomHash {
                     alg: "SHA-256",
                     content: binary_sha256.clone(),
@@ -3056,18 +3215,21 @@ fn is_release_dependency(dependency: &CargoDependency) -> bool {
             .any(|kind| kind.kind.as_deref() != Some("dev"))
 }
 
-fn render_manifest(output: &RepositoryWriter) -> Result<Vec<u8>, ReleaseError> {
-    let mut artifacts = Vec::with_capacity(RELEASE_TARGETS.len() * 2);
+fn render_manifest(
+    output: &RepositoryWriter,
+    license_notices: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let mut artifacts = Vec::with_capacity(RELEASE_TARGETS.len() * 2 + 1);
     for target in &RELEASE_TARGETS {
         for (name, kind) in [
-            (binary_asset_name(target), ReleaseArtifactKindData::Binary),
+            (binary_asset_name(target), ReleaseArtifactKindV2Data::Binary),
             (
                 sbom_asset_name(target),
-                ReleaseArtifactKindData::CyclonedxSbom,
+                ReleaseArtifactKindV2Data::CyclonedxSbom,
             ),
         ] {
             let bytes = read_output_required(output, &name, MAX_BINARY_BYTES, "release artifact")?;
-            artifacts.push(ReleaseArtifactData {
+            artifacts.push(ReleaseArtifactV2Data {
                 name,
                 kind,
                 target: target.triple.to_owned(),
@@ -3078,6 +3240,15 @@ fn render_manifest(output: &RepositoryWriter) -> Result<Vec<u8>, ReleaseError> {
             });
         }
     }
+    artifacts.push(ReleaseArtifactV2Data {
+        name: LICENSE_NOTICES_FILE.to_owned(),
+        kind: ReleaseArtifactKindV2Data::LicenseNotices,
+        target: "all".to_owned(),
+        length: license_notices.len() as u64,
+        sha256: ReleaseSha256Data::new(sha256_hex(license_notices)).map_err(|error| {
+            ReleaseError::internal(format!("generated invalid SHA-256 digest: {error}"))
+        })?,
+    });
     artifacts.sort_by(|left, right| left.name.cmp(&right.name));
     let subjects: Vec<_> = finalized_asset_names().into_iter().collect();
     if subjects.len() != usize::from(FINALIZED_ASSET_COUNT) {
@@ -3086,21 +3257,21 @@ fn render_manifest(output: &RepositoryWriter) -> Result<Vec<u8>, ReleaseError> {
             subjects.len()
         )));
     }
-    let artifacts: [ReleaseArtifactData; 10] =
+    let artifacts: [ReleaseArtifactV2Data; 11] =
         artifacts.try_into().map_err(|artifacts: Vec<_>| {
             ReleaseError::internal(format!(
-                "release artifact allowlist has {} entries, expected 10",
+                "release artifact allowlist has {} entries, expected 11",
                 artifacts.len()
             ))
         })?;
-    let subjects: [String; 12] = subjects.try_into().map_err(|subjects: Vec<_>| {
+    let subjects: [String; 13] = subjects.try_into().map_err(|subjects: Vec<_>| {
         ReleaseError::internal(format!(
-            "release subject allowlist has {} entries, expected 12",
+            "release subject allowlist has {} entries, expected 13",
             subjects.len()
         ))
     })?;
     to_pretty_json(
-        &ReleaseManifestData {
+        &ReleaseManifestV2Data {
             schema: SchemaKind::ReleaseManifest.id(),
             release: ReleaseDescriptorData {
                 version: RELEASE_VERSION.to_owned(),
@@ -3109,7 +3280,7 @@ fn render_manifest(output: &RepositoryWriter) -> Result<Vec<u8>, ReleaseError> {
                 status: ReleaseCandidateStatusData::LocalReviewCandidate,
             },
             artifacts,
-            provenance: ReleaseProvenanceData {
+            provenance: ReleaseProvenanceV2Data {
                 status: ReleaseProvenanceStatusData::RequiredExternal,
                 predicate_type: ReleasePredicateTypeData::SlsaProvenanceV1,
                 signing: ReleaseSigningData::SigstoreKeylessOidc,
@@ -3127,25 +3298,36 @@ fn render_manifest(output: &RepositoryWriter) -> Result<Vec<u8>, ReleaseError> {
     )
 }
 
-fn render_checksums(output: &RepositoryWriter, manifest: &[u8]) -> Result<Vec<u8>, ReleaseError> {
-    let names = known_stage_names();
+fn render_checksums(
+    output: &RepositoryWriter,
+    license_notices: &[u8],
+    manifest: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let mut entries = Vec::with_capacity(RELEASE_TARGETS.len() * 2 + 2);
+    for name in manifest_artifact_names() {
+        let digest = if name == LICENSE_NOTICES_FILE {
+            sha256_hex(license_notices)
+        } else {
+            let bytes = read_output_required(
+                output,
+                &name,
+                MAX_BINARY_BYTES,
+                "checksummed release artifact",
+            )?;
+            sha256_hex(&bytes)
+        };
+        entries.push((name, digest));
+    }
+    entries.push((MANIFEST_FILE.to_owned(), sha256_hex(manifest)));
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
     let mut rendered = String::new();
-    for name in names {
-        let bytes = read_output_required(
-            output,
-            &name,
-            MAX_BINARY_BYTES,
-            "checksummed release artifact",
-        )?;
-        rendered.push_str(&sha256_hex(&bytes));
+    for (name, digest) in entries {
+        rendered.push_str(&digest);
         rendered.push_str("  ");
         rendered.push_str(&name);
         rendered.push('\n');
     }
-    rendered.push_str(&sha256_hex(manifest));
-    rendered.push_str("  ");
-    rendered.push_str(MANIFEST_FILE);
-    rendered.push('\n');
     Ok(rendered.into_bytes())
 }
 
@@ -3175,17 +3357,17 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        CHECKSUMS_FILE, MANIFEST_FILE, RELEASE_TARGETS, ReleaseError, ReleaseErrorKind,
-        RepositorySnapshot, WorktreeGuard, binary_asset_name, check, finalize, render_sbom,
-        sha256_hex, stage_built, validate_binary_format,
+        CHECKSUMS_FILE, LICENSE_NOTICES_FILE, MANIFEST_FILE, RELEASE_TARGETS, ReleaseError,
+        ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, binary_asset_name, check, finalize,
+        render_sbom, sha256_hex, stage_built, validate_binary_format,
     };
 
     const METADATA: &str = r#"{
       "packages": [
-        {"id":"path+file:///repo/crates/forge-cli#0.1.0-rc.2","name":"forge-cli","version":"0.1.0-rc.2","source":null,"checksum":null},
-        {"id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","name":"serde","version":"1.0.229","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":"dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c"},
-        {"id":"registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3","name":"build-helper","version":"1.2.3","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":null},
-        {"id":"registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6","name":"test-only","version":"4.5.6","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":null}
+        {"id":"path+file:///repo/crates/forge-cli#0.1.0-rc.2","name":"forge-cli","version":"0.1.0-rc.2","license":"MIT OR Apache-2.0","source":null,"checksum":null},
+        {"id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","name":"serde","version":"1.0.229","license":"MIT OR Apache-2.0","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":"dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c"},
+        {"id":"registry+https://github.com/rust-lang/crates.io-index#build-helper@1.2.3","name":"build-helper","version":"1.2.3","license":"Apache-2.0 OR MIT","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":null},
+        {"id":"registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6","name":"test-only","version":"4.5.6","license":"MIT","source":"registry+https://github.com/rust-lang/crates.io-index","checksum":null}
       ],
       "workspace_members": ["path+file:///repo/crates/forge-cli#0.1.0-rc.2"],
       "resolve": {"nodes": [
@@ -3873,6 +4055,10 @@ mod tests {
         changed_lock.cargo_lock.push(0);
         assert!(before.require_same(&changed_lock, "test").is_err());
 
+        let mut changed_notices = before.clone();
+        changed_notices.license_notices.push(0);
+        assert!(before.require_same(&changed_notices, "test").is_err());
+
         let mut changed_metadata = before.clone();
         changed_metadata
             .metadata_by_target
@@ -3933,6 +4119,9 @@ mod tests {
         assert!(text.contains("serde"));
         assert!(text.contains("build-helper"));
         assert!(!text.contains("test-only"));
+        assert!(text.contains("\"expression\": \"MIT OR Apache-2.0\""));
+        assert!(text.contains("\"expression\": \"Apache-2.0 OR MIT\""));
+        assert!(!text.contains("Apache-2.0/MIT"));
         assert!(!text.contains("file:///repo"));
         assert!(text.contains(&source_commit));
         assert!(text.contains(&sha256_hex(&binary)));
@@ -3964,6 +4153,70 @@ mod tests {
     }
 
     #[test]
+    fn sbom_fails_closed_for_missing_or_invalid_release_license_expressions() {
+        let target = &RELEASE_TARGETS[0];
+        let render = |metadata: &str| {
+            render_sbom(
+                target,
+                metadata.as_bytes(),
+                b"lock",
+                &"a".repeat(40),
+                &fake_binary(target.triple),
+            )
+        };
+        let missing = METADATA.replacen("\"license\":\"MIT OR Apache-2.0\",", "", 1);
+        assert!(render(&missing).is_err());
+
+        let unknown = METADATA.replacen(
+            "\"license\":\"MIT OR Apache-2.0\"",
+            "\"license\":\"Not-A-License\"",
+            1,
+        );
+        assert!(render(&unknown).is_err());
+
+        let malformed = METADATA.replacen(
+            "\"license\":\"MIT OR Apache-2.0\"",
+            "\"license\":\"MIT OR\"",
+            1,
+        );
+        assert!(render(&malformed).is_err());
+    }
+
+    #[test]
+    fn legacy_slash_license_compatibility_is_bound_to_the_reviewed_package_versions()
+    -> Result<(), ReleaseError> {
+        let expression = |name: &str, version: &str, license: &str| {
+            super::package_license_expression(&super::CargoPackage {
+                id: format!("registry#{name}@{version}"),
+                name: name.to_owned(),
+                version: version.to_owned(),
+                license: Some(license.to_owned()),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+                checksum: None,
+                manifest_path: None,
+                targets: Vec::new(),
+            })
+        };
+
+        for (name, version) in [("ctrlc", "3.4.7"), ("fs2", "0.4.3"), ("winapi", "0.3.9")] {
+            assert_eq!(
+                expression(name, version, "MIT/Apache-2.0")?,
+                "MIT OR Apache-2.0"
+            );
+        }
+        for (name, version) in [("same-file", "1.0.6"), ("walkdir", "2.5.0")] {
+            assert_eq!(
+                expression(name, version, "Unlicense/MIT")?,
+                "Unlicense OR MIT"
+            );
+        }
+        assert!(expression("unknown", "3.4.7", "MIT/Apache-2.0").is_err());
+        assert!(expression("ctrlc", "3.4.8", "MIT/Apache-2.0").is_err());
+        assert!(expression("ctrlc", "3.4.7", "MIT/Zlib").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn complete_release_round_trip_is_deterministic_and_tamper_evident() -> Result<(), ReleaseError>
     {
         let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
@@ -3990,11 +4243,11 @@ mod tests {
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
         let manifest_json: serde_json::Value = serde_json::from_slice(&manifest)
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
-        let _: forge_schema::ReleaseManifestData = serde_json::from_slice(&manifest)
+        let _: forge_schema::ReleaseManifestV2Data = serde_json::from_slice(&manifest)
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
-        assert_eq!(manifest_json["schema"], "forge.release-manifest/v1");
+        assert_eq!(manifest_json["schema"], "forge.release-manifest/v2");
         let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../docs/schemas/release-manifest-v1.schema.json");
+            .join("../docs/schemas/release-manifest-v2.schema.json");
         let checked_in_schema: serde_json::Value =
             serde_json::from_slice(&fs::read(&schema_path).map_err(|error| {
                 ReleaseError::internal(format!(
@@ -4026,13 +4279,14 @@ mod tests {
         );
         assert_eq!(
             manifest_json["artifacts"].as_array().map(Vec::len),
-            Some(10)
+            Some(11)
         );
         let subjects = manifest_json["provenance"]["subjects"]
             .as_array()
             .ok_or_else(|| ReleaseError::internal("manifest subjects were not an array"))?;
-        assert_eq!(subjects.len(), 12);
+        assert_eq!(subjects.len(), 13);
         assert!(subjects.iter().any(|name| name == CHECKSUMS_FILE));
+        assert!(subjects.iter().any(|name| name == LICENSE_NOTICES_FILE));
         assert!(subjects.iter().any(|name| name == MANIFEST_FILE));
         let artifact_names: Vec<_> = manifest_json["artifacts"]
             .as_array()
@@ -4041,11 +4295,36 @@ mod tests {
             .filter_map(|artifact| artifact["name"].as_str())
             .collect();
         assert!(artifact_names.windows(2).all(|pair| pair[0] < pair[1]));
+        let notices = manifest_json["artifacts"]
+            .as_array()
+            .and_then(|artifacts| {
+                artifacts
+                    .iter()
+                    .find(|artifact| artifact["name"] == LICENSE_NOTICES_FILE)
+            })
+            .ok_or_else(|| ReleaseError::internal("manifest omitted license notices"))?;
+        assert_eq!(notices["kind"], "license-notices");
+        assert_eq!(notices["target"], "all");
+        assert_eq!(
+            fs::read(output.join(LICENSE_NOTICES_FILE))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            snapshot.license_notices
+        );
+        let checksum_text = String::from_utf8(checksums.clone())
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let checksum_names = checksum_text
+            .lines()
+            .map(|line| line.split_once("  ").map(|(_, name)| name))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ReleaseError::internal("checksum fixture line was malformed"))?;
+        assert_eq!(checksum_names.len(), 12);
+        assert!(checksum_names.windows(2).all(|pair| pair[0] < pair[1]));
 
         let mut invalid_manifest = manifest_json.clone();
         invalid_manifest["artifacts"][0]["sha256"] = serde_json::json!("not-a-digest");
         assert!(
-            serde_json::from_value::<forge_schema::ReleaseManifestData>(invalid_manifest).is_err()
+            serde_json::from_value::<forge_schema::ReleaseManifestV2Data>(invalid_manifest)
+                .is_err()
         );
 
         finalize(&output_writer, &snapshot)?;
@@ -4070,7 +4349,7 @@ mod tests {
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
         assert!(
             check(&output_writer, &snapshot).is_err(),
-            "the tolerant v1 reader must not weaken exact candidate checking"
+            "the tolerant v2 reader must not weaken exact candidate checking"
         );
         fs::write(output.join(MANIFEST_FILE), &manifest)
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
@@ -4081,6 +4360,12 @@ mod tests {
             fs::read(&tampered).map_err(|error| ReleaseError::internal(error.to_string()))?;
         bytes.push(0);
         fs::write(&tampered, bytes).map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(check(&output_writer, &snapshot).is_err());
+
+        fs::write(&tampered, fake_binary(RELEASE_TARGETS[0].triple))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(output.join(LICENSE_NOTICES_FILE), b"tampered notices\n")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
         assert!(check(&output_writer, &snapshot).is_err());
         Ok(())
     }
@@ -4194,20 +4479,19 @@ mod tests {
         )
         .map_err(|error| ReleaseError::internal(error.to_string()))?;
         assert!(finalize(&finalize_writer, &snapshot).is_err());
+        assert!(!finalize_output.join(LICENSE_NOTICES_FILE).exists());
         assert!(!finalize_output.join(MANIFEST_FILE).exists());
         Ok(())
     }
 
     #[test]
-    fn non_candidate_files_are_never_manifest_or_checksum_inputs() -> Result<(), ReleaseError> {
+    fn non_candidate_files_are_rejected_from_the_exact_release_set() -> Result<(), ReleaseError> {
         let temporary = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
         let repository = temporary.path().join("repository");
         let output = temporary.path().join("dist");
         fs::create_dir(&repository).map_err(|error| ReleaseError::internal(error.to_string()))?;
         fs::create_dir(&output).map_err(|error| ReleaseError::internal(error.to_string()))?;
         let output_writer = super::open_output_directory(&repository, &output)?;
-        fs::write(output.join("operator-notes.txt"), b"not a release asset")
-            .map_err(|error| ReleaseError::internal(error.to_string()))?;
         let snapshot = snapshot();
 
         for target in &RELEASE_TARGETS {
@@ -4220,6 +4504,10 @@ mod tests {
         }
         finalize(&output_writer, &snapshot)?;
         check(&output_writer, &snapshot)?;
+        fs::write(output.join("operator-notes.txt"), b"not a release asset")
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert!(check(&output_writer, &snapshot).is_err());
+        assert!(finalize(&output_writer, &snapshot).is_err());
 
         let manifest = fs::read_to_string(output.join(MANIFEST_FILE))
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
@@ -4497,6 +4785,7 @@ mod tests {
         RepositorySnapshot {
             source_commit: "a".repeat(40),
             cargo_lock: b"lock".to_vec(),
+            license_notices: b"fixture third-party license notices\n".to_vec(),
             metadata_by_target: RELEASE_TARGETS
                 .iter()
                 .map(|target| (target.triple.to_owned(), METADATA.as_bytes().to_vec()))
@@ -4533,11 +4822,16 @@ mod tests {
         .map_err(|error| ReleaseError::internal(error.to_string()))?;
         fs::write(
             repository.join("forge-cli/Cargo.toml"),
-            b"[package]\nname = \"forge-cli\"\nversion = \"0.1.0-rc.2\"\nedition = \"2024\"\n\n[[bin]]\nname = \"forge\"\npath = \"src/main.rs\"\n",
+            b"[package]\nname = \"forge-cli\"\nversion = \"0.1.0-rc.2\"\nedition = \"2024\"\nlicense = \"MIT OR Apache-2.0\"\n\n[[bin]]\nname = \"forge\"\npath = \"src/main.rs\"\n",
         )
         .map_err(|error| ReleaseError::internal(error.to_string()))?;
         fs::write(repository.join("forge-cli/src/main.rs"), b"fn main() {}\n")
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        fs::write(
+            repository.join(LICENSE_NOTICES_FILE),
+            b"fixture third-party license notices\n",
+        )
+        .map_err(|error| ReleaseError::internal(error.to_string()))?;
         run_git(&repository, &["init"])?;
         run_git(&repository, &["add", "."])?;
         run_git(
