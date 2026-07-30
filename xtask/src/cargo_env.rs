@@ -189,12 +189,13 @@ fn extend_windows_msvc_environment(
     let Some(target) = windows_msvc_target(compilation_target) else {
         return Ok(());
     };
-    let executable = env::current_exe().map_err(|error| {
+    let current_executable = env::current_exe().map_err(|error| {
         CargoEnvironmentError(format!(
             "failed to resolve xtask for the bounded MSVC environment probe ({:?})",
             error.kind()
         ))
     })?;
+    let executable = msvc_probe_executable(current_executable, cfg!(test))?;
     let mut observation = run_msvc_probe(runner, &executable, target, None)?;
     if observation_reports_toolchain_not_found(&observation) {
         let installation_root = discover_msvc_installation_with_vswhere(runner)?;
@@ -538,6 +539,48 @@ fn msvc_probe_spec(
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
+fn msvc_probe_executable(
+    current_executable: PathBuf,
+    test_harness: bool,
+) -> Result<PathBuf, CargoEnvironmentError> {
+    if !test_harness {
+        return Ok(current_executable);
+    }
+
+    // A binary unit test's `current_exe` is Cargo's test harness under `target/<profile>/deps`,
+    // not the real xtask entry point. Re-executing that harness interprets the hidden probe
+    // command as a test-name filter and emits harness text instead of the binary protocol. Cargo
+    // builds the ordinary binary alongside the integration-test targets, so select that sibling
+    // explicitly while keeping production self-reexecution unchanged.
+    let harness_name = current_executable
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            CargoEnvironmentError(String::from(
+                "failed to identify the xtask unit-test harness for the MSVC probe",
+            ))
+        })?;
+    let dependencies_directory = current_executable.parent().ok_or_else(|| {
+        CargoEnvironmentError(String::from(
+            "failed to locate the xtask unit-test harness directory for the MSVC probe",
+        ))
+    })?;
+    if !harness_name.starts_with("xtask-")
+        || dependencies_directory.file_name() != Some(OsStr::new("deps"))
+    {
+        return Err(CargoEnvironmentError(String::from(
+            "the MSVC probe was invoked from an unrecognized xtask unit-test harness",
+        )));
+    }
+    let profile_directory = dependencies_directory.parent().ok_or_else(|| {
+        CargoEnvironmentError(String::from(
+            "failed to locate the Cargo profile directory for the MSVC probe",
+        ))
+    })?;
+    Ok(profile_directory.join(format!("xtask{}", env::consts::EXE_SUFFIX)))
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
 fn msvc_vswhere_spec(executable: OsString) -> ExecSpec {
     // Setup Configuration's COM server needs ProgramData to enumerate installed instances. When
     // it is absent, vswhere deliberately reports success with no matches instead of surfacing the
@@ -694,7 +737,9 @@ fn observation_reports_toolchain_not_found(observation: &ProcessObservation) -> 
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 fn require_probe_success(observation: &ProcessObservation) -> Result<(), CargoEnvironmentError> {
-    if observation_completed_successfully(observation) {
+    if observation_completed_successfully(observation)
+        && observation.stdout_total_bytes == observation.stdout.len() as u64
+    {
         return Ok(());
     }
     Err(CargoEnvironmentError(format!(
@@ -1254,7 +1299,7 @@ mod tests {
         MsvcEnvironmentKey, apply_msvc_probe_environment, canonical_vswhere_is_confined,
         capture_msvc_probe_values, decode_msvc_probe_frame, encode_msvc_probe_frame,
         is_cargo_build_environment_key, is_msvc_probe_input_key, materialize_msvc_tool_environment,
-        msvc_probe_environment_for, msvc_probe_spec, msvc_vswhere_spec,
+        msvc_probe_environment_for, msvc_probe_executable, msvc_probe_spec, msvc_vswhere_spec,
         observation_reports_toolchain_not_found, parse_vswhere_installation_path,
         require_probe_success, require_vswhere_success, supported_msvc_target,
     };
@@ -1574,6 +1619,37 @@ mod tests {
             MSVC_PROBE_OUTPUT_HARD_LIMIT,
             (MSVC_PROBE_MAX_FRAME_BYTES + MSVC_PROBE_MAX_DIAGNOSTIC_BYTES) as u64
         );
+    }
+
+    #[test]
+    fn msvc_probe_reexecutes_the_real_binary_from_a_unit_test_harness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let profile = Path::new("target").join("debug");
+        let harness = profile.join("deps").join(format!(
+            "xtask-0123456789abcdef{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert_eq!(
+            msvc_probe_executable(harness, true)?,
+            profile.join(format!("xtask{}", std::env::consts::EXE_SUFFIX))
+        );
+
+        let production = PathBuf::from(format!("installed-xtask{}", std::env::consts::EXE_SUFFIX));
+        assert_eq!(
+            msvc_probe_executable(production.clone(), false)?,
+            production
+        );
+        assert!(
+            msvc_probe_executable(
+                Path::new("target").join("debug").join(format!(
+                    "xtask-0123456789abcdef{}",
+                    std::env::consts::EXE_SUFFIX
+                )),
+                true,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -2022,6 +2098,16 @@ mod tests {
         assert!(error.contains("exit=Some(7)"));
         assert!(error.contains("stderr_bytes=30"));
         assert!(!error.contains("sensitive-local-toolchain-path"));
+    }
+
+    #[test]
+    fn msvc_probe_success_requires_the_complete_captured_stdout() {
+        let complete = observation(0, MSVC_PROBE_MAGIC, b"");
+        assert!(require_probe_success(&complete).is_ok());
+
+        let mut incomplete = complete;
+        incomplete.stdout_total_bytes += 1;
+        assert!(require_probe_success(&incomplete).is_err());
     }
 
     #[test]
