@@ -3975,8 +3975,32 @@ fn newest_current_failure_controls_coverage_over_an_older_current_pass()
 #[test]
 fn changed_project_command_and_policy_are_explicit_stale_reasons()
 -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let fixture = TestWorkspace::clean_rust_repository("evidence-command-policy-stale")?;
-    let run = fixture.run_forge(&["evidence", "run", "check", "--json"])?;
+    let wrapper_directory = fixture.root.join("support/toolchain-bin");
+    fs::create_dir(&wrapper_directory)?;
+
+    let cargo_wrapper = wrapper_directory.join("cargo");
+    let real_cargo = executable_on_path("cargo")?;
+    let cargo_script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"--version\" ] && [ \"${{2-}}\" = \"--verbose\" ]; then\n  printf '%s\\n' 'cargo 1.85.0 (fixture 2025-02-17)' 'release: 1.85.0' 'host: fixture-host'\n  exit 0\nfi\nif [ \"${{1-}}\" = \"fmt\" ] && [ \"${{2-}}\" = \"--version\" ]; then\n  printf '%s\\n' 'rustfmt 1.8.0-stable (fixture 2025-02-17)'\n  exit 0\nfi\nif [ \"${{1-}}\" = \"clippy\" ] && [ \"${{2-}}\" = \"--version\" ]; then\n  printf '%s\\n' 'clippy 0.1.85 (fixture 2025-02-17)'\n  exit 0\nfi\nexec {real_cargo} \"$@\"\n",
+        real_cargo = shell_single_quote(&real_cargo)?,
+    );
+    fs::write(&cargo_wrapper, cargo_script)?;
+    fs::set_permissions(&cargo_wrapper, fs::Permissions::from_mode(0o700))?;
+
+    let rustc_wrapper = wrapper_directory.join("rustc");
+    let real_rustc = executable_on_path("rustc")?;
+    let rustc_script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"-vV\" ]; then\n  printf '%s\\n' 'rustc 1.85.0 (fixture 2025-02-17)' 'binary: rustc' 'release: 1.85.0' 'host: fixture-host'\n  exit 0\nfi\nexec {real_rustc} \"$@\"\n",
+        real_rustc = shell_single_quote(&real_rustc)?,
+    );
+    fs::write(&rustc_wrapper, rustc_script)?;
+    fs::set_permissions(&rustc_wrapper, fs::Permissions::from_mode(0o700))?;
+
+    let run = fixture
+        .run_forge_with_path_prefix(&["evidence", "run", "check", "--json"], &wrapper_directory)?;
     assert_eq!(
         run.status.code(),
         Some(0),
@@ -3990,7 +4014,8 @@ fn changed_project_command_and_policy_are_explicit_stale_reasons()
     )?;
     let state_before = fixture.private_state_snapshot()?;
 
-    let show = fixture.run_forge(&["evidence", "show", "--json"])?;
+    let show =
+        fixture.run_forge_with_path_prefix(&["evidence", "show", "--json"], &wrapper_directory)?;
 
     assert_eq!(
         show.status.code(),
