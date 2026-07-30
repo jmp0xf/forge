@@ -539,6 +539,15 @@ impl StateLock {
     }
 }
 
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // Closing only this descriptor is insufficient when a forked child or `dup` still holds
+        // the same open-file description. Release the lock explicitly at the guard boundary;
+        // closing `_file` remains the platform fallback because `Drop` cannot report failure.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
 /// A state layout, path-safety, persistence, or locking failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -1381,6 +1390,24 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{AtomicStateStore, GitStateLayout, StateError};
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_lock_unlocks_a_duplicated_file_description() -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let git_dir = temporary.path().join("git");
+        fs::create_dir(&git_dir)?;
+        let layout = GitStateLayout::new(&git_dir, &git_dir);
+        let store = AtomicStateStore::new(layout)?;
+
+        let first_lock = store.try_lock()?;
+        let duplicate = fs2::FileExt::duplicate(&first_lock._file)?;
+        drop(first_lock);
+
+        let _second_lock = store.try_lock()?;
+        drop(duplicate);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
