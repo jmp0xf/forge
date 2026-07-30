@@ -468,6 +468,12 @@ fn msvc_probe_spec(
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 fn msvc_vswhere_spec(executable: OsString) -> ExecSpec {
+    // Setup Configuration's COM server needs ProgramData to enumerate installed instances. When
+    // it is absent, vswhere deliberately reports success with no matches instead of surfacing the
+    // COM failure. Keep this exception local to the trusted, bounded vswhere probe rather than
+    // widening the environment inherited by every project command.
+    let mut environment = EnvPolicy::minimal();
+    environment.inherit.insert(OsString::from("ProgramData"));
     ExecSpec {
         program: executable,
         args: [
@@ -486,7 +492,7 @@ fn msvc_vswhere_spec(executable: OsString) -> ExecSpec {
         .map(OsString::from)
         .collect(),
         cwd: RepoRelativePath::root(),
-        env: EnvPolicy::minimal(),
+        env: environment,
         timeout: MSVC_VSWHERE_TIMEOUT,
         stdin: StdinPolicy::Closed,
         stdout: OutputPolicy::CaptureBounded {
@@ -1102,6 +1108,15 @@ mod tests {
         );
         assert_eq!(spec.mutability, Mutability::ReadOnly);
         assert_eq!(spec.network, NetworkIntent::OfflineRequested);
+        assert!(spec.env.inherit.contains(OsStr::new("ProgramData")));
+        assert!(
+            !EnvPolicy::minimal()
+                .inherit
+                .contains(OsStr::new("ProgramData"))
+        );
+        for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            assert!(!spec.env.inherit.contains(OsStr::new(key)));
+        }
         assert_eq!(
             MSVC_VSWHERE_OUTPUT_HARD_LIMIT,
             (MSVC_VSWHERE_MAX_OUTPUT_BYTES + MSVC_PROBE_MAX_DIAGNOSTIC_BYTES) as u64
