@@ -16,7 +16,7 @@ acceptance is not complete.
 | Detection | Strict `forge.toml`, repository/runner/Rust/Go/mixed discovery, deterministic command resolution, risk and policy provenance |
 | Integration | Default-dry-run `init`, managed `AGENTS.md`/host adapters, adapter drift/sync, explicit make/just/task runners, and create-only GitHub CI generation |
 | Navigation | `doctor`, deterministic read-only `next`, `explain`, schema/version/completion output |
-| Local evidence | Receipt/Evidence v2 run/show/verify/export, content-free dual-stream diagnostic summaries, dependency invalidation with typed-unknown fact preservation, immutable state, bounded retention, and v1 historical readers |
+| Local evidence | Receipt/Evidence v2 run/show/verify/export, content-free dual-stream diagnostic summaries, dependency invalidation with typed-unknown fact preservation and fail-closed handling of unbound Cargo/Go configuration, immutable state, bounded retention, and v1 historical readers |
 | In-repository hardening | Direct project-native CI gates plus a bounded unified verifier, an exact 20-invariant executable-test/CI/external-required marker ledger, 28 public fixtures, schema/golden/compatibility tests, dogfood fixed point, fuzz corpora, bounded mutation config, and opt-in large-repository benchmark |
 | Local release candidates | Create-only `0.1.0-rc.1` five-target assembler, exact-commit isolated source binding, executable checks, CycloneDX SBOMs, release manifest, SHA-256 checksums, and explicit external authority/rollback gates |
 
@@ -55,9 +55,40 @@ typed infrastructure failure may affect local state, but a semantically non-supp
 otherwise looks passing falls back to the opaque non-proving representation rather than becoming a
 valid or passing newest Receipt.
 
+ADR-0040 closes an external configuration invalidation gap without reading private configuration
+content. Cargo commands remain environment-known only when their cwd-to-root and Cargo-home
+configuration discovery chain is provably empty and argv has no explicit `--config`. Forge-native
+Go commands remain environment-known only for the isolated single-module defaults; explicit Go and
+go.work commands are typed environment-unknown in v0. These commands still execute and preserve
+their other facts, but an unknown environment cannot satisfy Evidence.
+
+Windows Git execution has a narrower explicit path boundary than Forge's internal native-path
+representation. Every Git launch validates its canonical working directory. Its effective ordinary
+drive-letter or UNC spelling must contain fewer than 260 UTF-16 code units; verbatim disk and UNC
+forms are measured as their ordinary projection, while generic-verbatim and device namespaces fail
+closed. Invoking Forge at a qualifying short repository root still permits tracked Unicode
+descendants beyond that limit. This does not claim arbitrary long-root support, and writable UNC
+qualification remains opt-in and unrun.
+
+Windows release-candidate assembly discovers Visual Studio from a canonical installation identity,
+then gives external MSVC tools only a revalidated ordinary drive spelling below the legacy path
+limit. The installation root must re-canonicalize to the same identity through an ordinary drive
+spelling below 260 UTF-16 units. The selected tool and Visual-Studio-root-derived `PATH`, `LIB`, and
+`INCLUDE` entries must be ordinary drive-absolute, traversal-free, NUL-free, and below that limit;
+the exact inherited suffix and derived non-Visual-Studio SDK entries remain compatible. UNC,
+device, generic-verbatim, or overlong installation roots, and unsafe Visual-Studio-owned
+descendants, fail closed. A standard hosted runner can exercise this boundary but cannot qualify
+every supported or future Visual Studio layout.
+
+Dropping a file-backed `StateLock` attempts `fs2::FileExt::unlock` before its descriptor is closed;
+because `Drop` cannot report failure, descriptor close remains the fallback. The Unix regression
+keeps a duplicated descriptor for the same open-file description alive and requires immediate
+reacquisition after guard destruction, exercising the lifetime mechanism also inherited across
+`fork` without claiming a forked-child integration test.
+
 ## Receipt and Evidence v2
 
-ADRs 0019-0026, 0032, and 0039 resolve and extend the earlier M6 decisions:
+ADRs 0019-0026, 0032, 0039, and 0040 resolve and extend the earlier M6 decisions:
 
 - `forge.worktree-comparison/v1` uses the invocation's immutable `HEAD` as the local worktree
   baseline, never guesses an upstream, default branch, PR target, or merge authority;
@@ -83,6 +114,12 @@ ADRs 0019-0026, 0032, and 0039 resolve and extend the earlier M6 decisions:
   remain accurately projectable but never proving. Receipt/Evidence schemas and identities remain
   unchanged; `forge.evidence-behavior/v8` makes v7 receipts stale rather than silently applying the
   new reader behavior to them.
+- Project-command environment acquisition uses
+  `forge.project-command-environment-acquisition/v1`. Standard Cargo configuration or incomplete
+  Go isolation becomes typed environment unknown without reading configuration content. Schemas,
+  identities, canonical JSON, toolchain probes, and validity v2 remain unchanged;
+  `forge.evidence-behavior/v9` makes v8 receipts stale instead of applying the stronger acquisition
+  rule retroactively.
 - Detected Rust projects add both generic and `custom:rust-*` coverage expectations. Missing
   expectations are projected as gaps after Receipt evaluation, while policy-driven local
   sufficiency remains unchanged; `cargo check --all-targets` does not claim that
@@ -174,48 +211,51 @@ including Windows Job Object behavior when run on Windows. Cross-compilation is 
 
 ### Local verification
 
-On 2026-07-30, the complete executable gate ran against the exact code/CI tree subsequently
-committed as `f7c1adf`; the only concurrent uncommitted change was this status-only handoff. On
-macOS 26.5.2 arm64 with Rust/Cargo 1.96.0 and Git 2.51.0, the project-owned normal local gate
-`env RUSTUP_AUTO_INSTALL=0 cargo run --locked -p xtask -- verify` exited 0. It checked 13 checked-in
-schemas and 28 deterministic fixtures/105 generated files without writing, then passed all eight
-required child steps and the final advisory fuzz Clippy step:
+The executable and workflow qualification below is bound to commit
+`5c92a012d3da83016a9214f7e184c5023b07e926`. Before the external run, the focused macOS 26.5.2
+arm64 recheck used Rust/Cargo 1.96.0 and Git 2.51.0 and produced these exit-0 observations:
 
-| Child step | Result | Observed duration |
-|---|---|---:|
-| root format check | passed | 603 ms |
-| root workspace check | passed | 86,346 ms |
-| root strict Clippy | passed | 12,322 ms |
-| root workspace tests | passed | 308,176 ms |
-| fuzz format check | passed | 674 ms |
-| fuzz workspace check | passed | 769 ms |
-| fuzz workspace tests | passed | 42 ms |
-| bootstrap `forge version` | passed | 52,477 ms |
-| fuzz Clippy (advisory) | passed | 226 ms |
+- `cargo test --locked -p xtask --no-fail-fast` passed 82 unit tests and every xtask integration
+  suite, including release-candidate environment construction;
+- strict host, `x86_64-pc-windows-gnu`, and `x86_64-pc-windows-msvc` xtask Clippy checks passed;
+- `cargo +1.85.0 check --locked -p xtask --all-targets` passed the declared MSRV surface;
+- the runtime state suite passed with the explicit-unlock regression, and formatting plus
+  `git diff --check` passed.
 
-Before the unified gate, the same code tree separately passed all 163 `forge-cli` binary unit tests,
-the typed-unknown run/show/verify round-trip, the v8 behavior fixed vector, strict `forge-cli`
-Clippy, and `git diff --check`. The workspace gate then reran the complete root test and strict lint
-surfaces, including the architecture-invariant ledger and state tests. These checks do not qualify a
-different OS, target, filesystem, CI control plane, or release authority. Rust 1.85.0 and stable
-fixture checks previously passed at `fc7fc49`, but that older result does not qualify `f7c1adf`.
+These checks targeted the Windows fixes without treating cross-compilation as runtime proof. The
+documentation-only readiness follow-up does not change executable, workflow, fixture,
+configuration, or versioned machine-contract behavior. Its final full local gate is recorded in the
+PR handoff because a document cannot bind evidence to its own not-yet-created commit.
 
 ### GitHub Actions
 
-Pull-request run [`30469270759`](https://github.com/jmp0xf/forge/actions/runs/30469270759) targeted
-`fc7fc49` after the CI update. For each of its 16 job records, the API returned `steps = null` and
-`logs_url = null`; GitHub marked all 15 non-optional jobs failed and skipped the opt-in mutation job.
-Therefore no checkout, build, test, Linux/Windows unified verifier, MSRV, native target, strict
-fixture, or fuzz command executed. This is an external pre-run failure, not a code-test failure and
-not qualification evidence. The connector does not expose the run-level UI annotation; the
-zero-step signature matches earlier run `30382132956`, whose UI explicitly reported account
-payment/spending-limit rejection, but that cause remains an inference for the current run until the
-repository owner confirms it or a fresh run creates real steps and logs.
+Pull-request run [`30520650330`](https://github.com/jmp0xf/forge/actions/runs/30520650330),
+attempt 1, reported head SHA `5c92a012d3da83016a9214f7e184c5023b07e926` and succeeded from
+2026-07-30 06:46:24Z through 07:08:09Z. The debug log records that GitHub checked out the synthetic
+PR merge ref at `cd9dff3caeede4b6cb4eb2235effc8974895f8d3`. All 15 non-mutation jobs
+configured for pull requests succeeded. The opt-in performance step and bounded mutation job were
+skipped because the pull-request event did not request those campaigns.
 
-Historical runs `30374770619`, `30377585092`, and `30379720907` remain useful regression evidence:
-they drove the Windows rename/topology and long-path fixture corrections and last confirmed all 117
-then-current Windows runtime tests. They predate the immutable-state confinement and unified verifier
-changes and cannot qualify `fc7fc49` or a later candidate.
+| Qualification surface | Job IDs | Result |
+|---|---|---|
+| Unified project verifier, Ubuntu and Windows | `90800017536`, `90800017581` | passed |
+| Direct root and fuzz contract | `90800017591` | passed |
+| Rust 1.85 MSRV | `90800017559` | passed |
+| Five native targets | `90800017614`, `90800017633`, `90800017624`, `90800017626`, `90800017729` | passed |
+| Strict fixture exitability | `90800017596` | passed |
+| Critical fuzz campaigns | `90800017595` | passed |
+| Schema and generated drift | `90800017599` | passed |
+| Host adapters | `90800017562` | passed |
+| Repository dogfood fixed point | `90800017619` | passed |
+| Candidate authority boundary | `90800017555` | passed |
+
+The Windows unified job passed 13 schemas, 28 fixtures, all eight required verifier steps, and the
+advisory fuzz lint. Its fuzz workspace check passed, closing the earlier hosted MSVC `<cassert>`
+failure. The native Windows job passed locked check, strict Clippy, all workspace tests,
+release-candidate assembly, and execution of the resulting `forge 0.1.0-rc.1` binary. This is
+candidate-controlled evidence for that run, merge ref, runner image, and observed toolchain; it is
+not proof of required-check configuration, independent review, signing, promotion, or release
+authority.
 
 ## Historical local calibration and hardening evidence
 
@@ -259,34 +299,47 @@ none.
 
 The following boundaries are intentionally not inferred from local implementation or test assets:
 
-1. **Current-candidate verification.** Every handoff must rerun the project-owned normal local gate
-   and applicable targeted campaigns, then report exact commands, exits, platform/tool versions,
-   and gaps. The current macOS ledger is above; it is not evidence for a later commit. The strict CI
-   job additionally provisions fixed `just`, `task`, and Go versions and fails closed if any
-   fixture-native command is unavailable. No current external job reached that gate.
+1. **Current-candidate verification.** The focused local checks and exact code/CI run are recorded
+   above. Run `30520650330` executed all 15 non-mutation jobs configured for pull requests
+   successfully for head commit `5c92a01` through its then-current PR merge ref; the opt-in
+   performance step and mutation job were skipped because the pull-request event requested neither
+   campaign. The strict fixture job provisioned pinned Go, `just`, and `task` versions and passed
+   every declared project-native command after fixture installation and uninstall. This evidence
+   is commit-, merge-ref-, and runner-bound. The final status-only follow-up does not change the
+   qualified executable/CI tree, but its own full local gate and CI run belong in the PR handoff.
+   Any later executable, workflow, fixture, schema, configuration, or machine-contract change
+   requires fresh qualification.
 2. **Filesystem threat model and security review.** Repository/release writes and immutable state
-   mutation now use separate handle-confined capabilities with fail-closed identity, ACL, scan,
-   recovery, and budget checks. They are not a malicious-same-principal sandbox or a multi-file
-   transaction. The current candidate still needs real Windows NTFS runtime evidence; ReFS,
-   SMB/UNC, other Windows versions, and independent security review remain open. `SECURITY.md`
-   still lacks a usable private reporting channel.
+   mutation use separate handle-confined capabilities with fail-closed identity, ACL, scan,
+   recovery, and resource-bound checks. They are not a malicious-same-principal sandbox or a
+   multi-file transaction. The passing `windows-2025` jobs provide one hosted native Windows run,
+   but the workflow does not separately assert NTFS, ReFS, SMB, or UNC semantics. Hermetic tests
+   cover a qualifying short Git-launchable working directory with a tracked Unicode descendant
+   beyond the classic `MAX_PATH` limit, plus typed no-write rejection of an overlong Git working
+   directory before Git is spawned. They do not provide arbitrary long-root support; device and
+   generic-verbatim repository roots are deliberately rejected rather than treated as supported.
+   The opt-in writable UNC test did not run; ReFS, SMB/UNC, nonstandard or overlong Visual Studio
+   installations, other Windows versions/configurations, and independent security review remain
+   unqualified. `SECURITY.md` still lacks a usable private reporting channel.
 3. **Declared MSRV verification.** The workspace declares Rust 1.85. The current candidate passed
-   the read-only fixture check under local Rust 1.85.0, but its locked root check/test,
-   schema/fixture drift set, and fuzz check/test did not execute in CI. A future passing job proves
-   those commands for only that exact commit, not required-check configuration or future
-   compatibility.
+   the locked root workspace check and tests, schema and fixture drift checks, and fuzz workspace
+   check and tests under Rust 1.85.0 in job `90800017559`. That job qualifies only those commands
+   on its Ubuntu runner; the five native-target jobs use stable Rust, so Rust 1.85 support across
+   every native target, downstream feature combination, or future dependency resolution is not
+   inferred.
 4. **Performance qualification.** The local calibration above did not meet the warm `next` or
    `adapters check` goals. Keep those targets unchanged, separate host Git cost from Forge overhead,
    and obtain repeatable results on calibrated release runners and representative real repositories.
-5. **Cross-platform evidence.** Two unified-verifier jobs are configured to exercise Linux and
-   Windows orchestration; five native jobs cover locked root check, strict Clippy, tests,
-   release-candidate assembly, and execution on x86_64/aarch64 Linux musl, x86_64/aarch64 macOS,
-   and x86_64 Windows MSVC. None ran for the current candidate. The local aarch64-musl attempt could
-   not link because
-   `aarch64-linux-musl-gcc` is unavailable, so it is not a pass. A future green matrix remains
-   evidence only for its exact runner/filesystem, not universal TTY, UNC, downstream, or platform
-   compatibility; the two-binary compatibility harness remains Unix-only and writable UNC
-   qualification remains opt-in.
+5. **Cross-platform evidence.** Run `30520650330` passed both unified-verifier jobs on
+   `ubuntu-24.04` and `windows-2025` and all five native jobs on x86_64/aarch64 Linux musl,
+   x86_64/aarch64 macOS, and x86_64 Windows MSVC. The Windows unified job ran the complete
+   project-owned verifier, including the root and fuzz workspaces under the materialized MSVC
+   environment; the native Windows job passed locked check, strict Clippy, tests,
+   release-candidate assembly, and execution. Each result qualifies only the reported head and PR
+   merge ref on that hosted runner and its observed filesystem/toolchain layout. It does not
+   establish universal TTY, writable UNC, ReFS, SMB, downstream, or other platform compatibility;
+   the two-binary compatibility harness remains Unix-only and writable UNC qualification remains
+   opt-in and unrun.
 6. **Independent CI and review.** A successful GitHub Actions run proves that the checked-in jobs
    executed for one commit. It does not prove that those checks are required by branch protection,
    that the workflow cannot be weakened by the candidate under review, or that maintainers reviewed
@@ -307,6 +360,12 @@ The following boundaries are intentionally not inferred from local implementatio
    physically separate Authority Set are v0.3 requirements rather than v0 release blockers; they
    must exist before Forge can claim trusted self-hosting. Independent CI, review, release,
    signing, and promotion authority still cannot be inferred from this candidate's local results.
+9. **External tool configuration closure.** v0 fails closed instead of reading potentially private
+   Cargo configuration or claiming that indirect wrapper/linker dependencies are bound. Cargo
+   repositories with standard config files, explicit Go commands, and Go workspaces therefore need
+   a future privacy-safe parser, indirect-tool binding, and before/after stability qualification
+   before their Receipts can become proving. This limitation reduces evidence reuse; it does not
+   weaken command execution or promote unknown facts.
 
 Do not weaken tests, alter release/signing/ownership/authority boundaries, or change a versioned
 machine contract without the required authorization, migration, and ADR process.
