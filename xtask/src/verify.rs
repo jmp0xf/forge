@@ -1,7 +1,13 @@
 //! One project-owned entry point for the complete local verification contract.
 
+#[cfg(windows)]
+use std::collections::BTreeMap;
+#[cfg(any(windows, test))]
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
+#[cfg(windows)]
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 #[cfg(any(windows, test))]
@@ -22,12 +28,69 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(44 * 60);
 const RETAINED_STREAM_BYTES: usize = 256 * 1024;
 const FAILURE_DISPLAY_BYTES: usize = 16 * 1024;
 const COMPLETE_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-// Windows cannot replace a running `xtask.exe`. Keep nested Cargo output in one reusable target
-// directory, with a second stable candidate for an xtask that was itself built in the first.
+// Windows cannot replace a running `xtask.exe`. Derive two reusable candidates from Cargo's
+// effective target directory so repository Cargo configuration remains authoritative.
 #[cfg(any(windows, test))]
-const WINDOWS_VERIFY_TARGET_PRIMARY: &str = "target/xtask-verify-a";
+const WINDOWS_VERIFY_TARGET_PRIMARY: &str = "xtask-verify-a";
 #[cfg(any(windows, test))]
-const WINDOWS_VERIFY_TARGET_SECONDARY: &str = "target/xtask-verify-b";
+const WINDOWS_VERIFY_TARGET_SECONDARY: &str = "xtask-verify-b";
+#[cfg(any(windows, test))]
+const CARGO_METADATA_OUTPUT_BYTES: usize = 1024 * 1024;
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsVerifyTargetDirectories {
+    by_cwd: BTreeMap<&'static str, Option<WindowsVerifyTargetDirectory>>,
+}
+
+#[cfg(windows)]
+impl WindowsVerifyTargetDirectories {
+    fn for_cwd(
+        &self,
+        cwd: &'static str,
+    ) -> Result<Option<&WindowsVerifyTargetDirectory>, VerifyError> {
+        self.by_cwd.get(cwd).map(Option::as_ref).ok_or_else(|| {
+            VerifyError::internal(
+                "a built-in verification working directory has no prepared Cargo target",
+            )
+        })
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsVerifyTargetDirectory {
+    target_spelling: PathBuf,
+    target_identity: PathBuf,
+    candidate_spelling: PathBuf,
+    candidate_identity: PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsVerifyTargetDirectory {
+    fn revalidated_spelling(&self) -> Result<&Path, VerifyError> {
+        let target_identity =
+            existing_directory_identity(&self.target_spelling)?.ok_or_else(|| {
+                VerifyError::environment(
+                    "the prepared Cargo target directory disappeared before a verification step",
+                )
+            })?;
+        let candidate_identity = existing_directory_identity(&self.candidate_spelling)?
+            .ok_or_else(|| {
+                VerifyError::environment(
+                    "the prepared nested Cargo target disappeared before a verification step",
+                )
+            })?;
+        revalidate_windows_verify_target_directory(self, &target_identity, &candidate_identity)?;
+        Ok(&self.candidate_spelling)
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct CargoMetadataTargetDirectory {
+    target_directory: PathBuf,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Enforcement {
@@ -181,6 +244,9 @@ pub(crate) fn run(repository: &Path) -> Result<VerifyReport, VerifyError> {
             "failed to prepare the verification Cargo environment: {error}"
         ))
     })?;
+    #[cfg(windows)]
+    let windows_target_directories =
+        prepare_windows_verify_target_directories(&runner, &cargo_env, started)?;
     let mut report = VerifyReport {
         required_steps: 0,
         advisory_steps_passed: 0,
@@ -222,7 +288,14 @@ pub(crate) fn run(repository: &Path) -> Result<VerifyReport, VerifyError> {
             VerifyError::environment(format!("failed to flush verification progress: {error}"))
         })?;
 
-        let spec = step_spec(repository, step, remaining, &cargo_env)?;
+        #[cfg(windows)]
+        let cargo_target_directory = windows_target_directories
+            .for_cwd(step.cwd)?
+            .map(WindowsVerifyTargetDirectory::revalidated_spelling)
+            .transpose()?;
+        #[cfg(not(windows))]
+        let cargo_target_directory = None;
+        let spec = step_spec(step, remaining, &cargo_env, cargo_target_directory)?;
         match runner.run_with_output_hard_limit(&spec, COMPLETE_OUTPUT_BYTES) {
             Ok(observation) if observation_passed(&observation) => {
                 println!(
@@ -263,10 +336,10 @@ pub(crate) fn run(repository: &Path) -> Result<VerifyReport, VerifyError> {
 }
 
 fn step_spec(
-    repository: &Path,
     step: &VerifyStep,
     timeout: Duration,
     cargo_env: &EnvPolicy,
+    cargo_target_directory: Option<&Path>,
 ) -> Result<ExecSpec, VerifyError> {
     let cwd = RepoRelativePath::new(step.cwd).map_err(|error| {
         VerifyError::internal(format!(
@@ -274,20 +347,17 @@ fn step_spec(
             step.cwd
         ))
     })?;
-    #[cfg(windows)]
-    let env = {
-        let mut env = cargo_env.clone();
+    let mut env = cargo_env.clone();
+    if let Some(cargo_target_directory) = cargo_target_directory {
+        // `CARGO_BUILD_TARGET_DIR` and `CARGO_TARGET_DIR` both project Cargo's effective
+        // `build.target-dir`. Once the original value has been resolved through `cargo metadata`,
+        // keep exactly one authority for the isolated nested build.
+        remove_cargo_build_target_dir(&mut env);
         env.overrides.insert(
             OsString::from("CARGO_TARGET_DIR"),
-            windows_verify_target_dir(repository)?.into_os_string(),
+            cargo_target_directory.as_os_str().to_owned(),
         );
-        env
-    };
-    #[cfg(not(windows))]
-    let env = {
-        let _ = repository;
-        cargo_env.clone()
-    };
+    }
     Ok(ExecSpec {
         program: OsString::from("cargo"),
         args: step.args.iter().map(OsString::from).collect(),
@@ -308,37 +378,322 @@ fn step_spec(
     })
 }
 
+fn remove_cargo_build_target_dir(env: &mut EnvPolicy) {
+    // Windows environment names are case-insensitive. Remove every spelling here as well as the
+    // canonical spelling so an ambient mixed-case key cannot remain a second target authority.
+    env.inherit.retain(|key| {
+        !key.to_string_lossy()
+            .eq_ignore_ascii_case("CARGO_BUILD_TARGET_DIR")
+    });
+    env.overrides.retain(|key, _| {
+        !key.to_string_lossy()
+            .eq_ignore_ascii_case("CARGO_BUILD_TARGET_DIR")
+    });
+}
+
 #[cfg(windows)]
-fn windows_verify_target_dir(repository: &Path) -> Result<PathBuf, VerifyError> {
-    let repository = repository.canonicalize().map_err(|error| {
+fn prepare_windows_verify_target_directories(
+    runner: &SynchronousProcessRunner,
+    cargo_env: &EnvPolicy,
+    started: Instant,
+) -> Result<WindowsVerifyTargetDirectories, VerifyError> {
+    let current_executable = canonical_current_executable()?;
+    let mut by_cwd = BTreeMap::new();
+
+    for cwd in unique_verify_working_directories() {
+        let remaining = OPERATION_TIMEOUT
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                VerifyError::negative(
+                    "Cargo target-directory discovery did not complete before the bounded verification budget expired",
+                )
+            })?;
+        let spec = cargo_metadata_spec(cwd, remaining, cargo_env)?;
+        let observation = runner
+            .run_with_output_hard_limit(&spec, CARGO_METADATA_OUTPUT_BYTES as u64)
+            .map_err(|error| {
+                let reason = error
+                    .reason()
+                    .map_or("unspecified", |reason| reason.as_str());
+                VerifyError::environment(format!(
+                    "Cargo target-directory discovery for `{cwd}` could not complete: kind={}, reason={reason}",
+                    error.kind().as_str()
+                ))
+            })?;
+        if !observation_passed(&observation) {
+            let label = format!("Cargo target-directory discovery for `{cwd}`");
+            let message = failed_observation_message(&label, &observation);
+            if observation.timed_out || observation.interrupted {
+                return Err(VerifyError::environment(message));
+            }
+            return Err(VerifyError::negative(message));
+        }
+        if observation.stdout_truncated
+            || observation.stdout_total_bytes != observation.stdout.len() as u64
+        {
+            return Err(VerifyError::environment(format!(
+                "Cargo target-directory discovery for `{cwd}` returned incomplete stdout"
+            )));
+        }
+
+        let selected = with_cargo_target_discovery_context(
+            cwd,
+            (|| {
+                let target_directory = parse_cargo_target_directory(&observation.stdout)?;
+                let target_identity = existing_directory_identity(&target_directory)?;
+                match target_identity {
+                    Some(target_identity) => select_windows_verify_target_dir(
+                        &target_directory,
+                        &target_identity,
+                        &current_executable,
+                        prepare_candidate_identity,
+                    ),
+                    None => Ok(None),
+                }
+            })(),
+        )?;
+        by_cwd.insert(cwd, selected);
+    }
+
+    Ok(WindowsVerifyTargetDirectories { by_cwd })
+}
+
+#[cfg(any(windows, test))]
+fn with_cargo_target_discovery_context<T>(
+    cwd: &str,
+    result: Result<T, VerifyError>,
+) -> Result<T, VerifyError> {
+    result.map_err(|error| VerifyError {
+        kind: error.kind,
+        message: format!(
+            "Cargo target-directory discovery for `{cwd}` failed while validating its effective target: {}",
+            error.message
+        ),
+    })
+}
+
+#[cfg(windows)]
+fn canonical_current_executable() -> Result<PathBuf, VerifyError> {
+    let executable = std::env::current_exe().map_err(|error| {
         VerifyError::environment(format!(
-            "failed to resolve the repository before selecting a nested Cargo target directory: {error}"
+            "failed to identify the running xtask executable ({:?})",
+            error.kind()
         ))
     })?;
-    let current_executable = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| {
+    fs::canonicalize(executable).map_err(|error| {
+        VerifyError::environment(format!(
+            "failed to resolve the running xtask executable ({:?})",
+            error.kind()
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn existing_directory_identity(path: &Path) -> Result<Option<PathBuf>, VerifyError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(VerifyError::environment(format!(
+                "failed to inspect a Cargo target directory ({:?})",
+                error.kind()
+            )));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(VerifyError::environment(
+            "Cargo metadata identified a target directory that is not a directory",
+        ));
+    }
+    fs::canonicalize(path).map(Some).map_err(|error| {
+        VerifyError::environment(format!(
+            "failed to resolve a Cargo target directory ({:?})",
+            error.kind()
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn prepare_candidate_identity(candidate: &Path) -> Result<PathBuf, VerifyError> {
+    match fs::create_dir(candidate) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(VerifyError::environment(format!(
+                "failed to create a nested Cargo target candidate ({:?})",
+                error.kind()
+            )));
+        }
+    }
+    let metadata = fs::metadata(candidate).map_err(|error| {
+        VerifyError::environment(format!(
+            "failed to inspect a nested Cargo target candidate ({:?})",
+            error.kind()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(VerifyError::environment(
+            "a nested Cargo target candidate is not a directory",
+        ));
+    }
+    fs::canonicalize(candidate).map_err(|error| {
+        VerifyError::environment(format!(
+            "failed to resolve a nested Cargo target candidate ({:?})",
+            error.kind()
+        ))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn unique_verify_working_directories() -> Vec<&'static str> {
+    VERIFY_STEPS
+        .iter()
+        .map(|step| step.cwd)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn cargo_metadata_spec(
+    cwd: &'static str,
+    timeout: Duration,
+    cargo_env: &EnvPolicy,
+) -> Result<ExecSpec, VerifyError> {
+    let cwd = RepoRelativePath::new(cwd).map_err(|error| {
+        VerifyError::internal(format!("invalid built-in Cargo metadata cwd: {error}"))
+    })?;
+    Ok(ExecSpec {
+        program: OsString::from("cargo"),
+        args: ["metadata", "--format-version", "1", "--no-deps", "--locked"]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        cwd,
+        env: cargo_env.clone(),
+        timeout,
+        stdin: StdinPolicy::Closed,
+        stdout: OutputPolicy::CaptureBounded {
+            max_bytes: CARGO_METADATA_OUTPUT_BYTES,
+        },
+        stderr: OutputPolicy::CaptureBounded {
+            max_bytes: FAILURE_DISPLAY_BYTES,
+        },
+        mutability: Mutability::ExternalSideEffect,
+        network: NetworkIntent::Inherit,
+        concurrency_key: Some(String::from("xtask-verify-metadata")),
+    })
+}
+
+#[cfg(any(windows, test))]
+fn parse_cargo_target_directory(bytes: &[u8]) -> Result<PathBuf, VerifyError> {
+    let metadata: CargoMetadataTargetDirectory =
+        serde_json::from_slice(bytes).map_err(|error| {
             VerifyError::environment(format!(
-                "failed to resolve the running xtask executable before selecting a nested Cargo target directory: {error}"
+                "Cargo metadata JSON could not be parsed (line={}, column={})",
+                error.line(),
+                error.column()
             ))
         })?;
-    Ok(select_windows_verify_target_dir(
-        &repository,
-        &current_executable,
+    if !metadata.target_directory.is_absolute() {
+        return Err(VerifyError::environment(
+            "Cargo metadata returned a non-absolute target directory",
+        ));
+    }
+    Ok(metadata.target_directory)
+}
+
+#[cfg(any(windows, test))]
+fn select_windows_verify_target_dir<F>(
+    target_spelling: &Path,
+    target_identity: &Path,
+    current_executable_identity: &Path,
+    mut prepare_identity: F,
+) -> Result<Option<WindowsVerifyTargetDirectory>, VerifyError>
+where
+    F: FnMut(&Path) -> Result<PathBuf, VerifyError>,
+{
+    if !target_spelling.is_absolute()
+        || !target_identity.is_absolute()
+        || !current_executable_identity.is_absolute()
+    {
+        return Err(VerifyError::internal(
+            "Windows nested Cargo target selection requires absolute paths",
+        ));
+    }
+    if !current_executable_identity.starts_with(target_identity) {
+        return Ok(None);
+    }
+
+    for name in [
+        WINDOWS_VERIFY_TARGET_PRIMARY,
+        WINDOWS_VERIFY_TARGET_SECONDARY,
+    ] {
+        let candidate = target_spelling.join(name);
+        let candidate_identity = prepare_identity(&candidate)?;
+        if !candidate_identity.is_absolute() {
+            return Err(VerifyError::internal(
+                "a nested Cargo target candidate resolved to a non-absolute path",
+            ));
+        }
+        if !is_fixed_windows_verify_target_child(&candidate_identity, target_identity, name) {
+            return Err(VerifyError::environment(
+                "a nested Cargo target candidate resolved through an unexpected filesystem alias",
+            ));
+        }
+        if !current_executable_identity.starts_with(&candidate_identity) {
+            return Ok(Some(WindowsVerifyTargetDirectory {
+                target_spelling: target_spelling.to_path_buf(),
+                target_identity: target_identity.to_path_buf(),
+                candidate_spelling: candidate,
+                candidate_identity,
+            }));
+        }
+    }
+
+    Err(VerifyError::environment(
+        "both nested Cargo target candidates contain the running xtask executable",
     ))
 }
 
 #[cfg(any(windows, test))]
-fn select_windows_verify_target_dir(repository: &Path, current_executable: &Path) -> PathBuf {
-    debug_assert!(repository.is_absolute());
-    debug_assert!(current_executable.is_absolute());
+fn is_fixed_windows_verify_target_child(
+    candidate_identity: &Path,
+    target_identity: &Path,
+    expected_name: &str,
+) -> bool {
+    candidate_identity.parent() == Some(target_identity)
+        && candidate_identity
+            .file_name()
+            .and_then(|candidate_name| candidate_name.to_str())
+            .is_some_and(|candidate_name| candidate_name.eq_ignore_ascii_case(expected_name))
+}
 
-    let primary = repository.join(WINDOWS_VERIFY_TARGET_PRIMARY);
-    if current_executable.starts_with(&primary) {
-        repository.join(WINDOWS_VERIFY_TARGET_SECONDARY)
-    } else {
-        primary
+#[cfg(any(windows, test))]
+fn revalidate_windows_verify_target_directory(
+    prepared: &WindowsVerifyTargetDirectory,
+    current_target_identity: &Path,
+    current_candidate_identity: &Path,
+) -> Result<(), VerifyError> {
+    let expected_name = prepared
+        .candidate_spelling
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| VerifyError::internal("a prepared Cargo target has no fixed child name"))?;
+    if current_target_identity != prepared.target_identity
+        || current_candidate_identity != prepared.candidate_identity
+        || !is_fixed_windows_verify_target_child(
+            current_candidate_identity,
+            current_target_identity,
+            expected_name,
+        )
+    {
+        return Err(VerifyError::environment(
+            "a prepared nested Cargo target changed filesystem identity before a verification step",
+        ));
     }
+    Ok(())
 }
 
 fn observation_passed(observation: &ProcessObservation) -> bool {
@@ -434,8 +789,9 @@ fn write_retained(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use forge_core::domain::{Mutability, NetworkIntent};
@@ -444,9 +800,11 @@ mod tests {
     use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, cargo_environment};
 
     use super::{
-        COMPLETE_OUTPUT_BYTES, Enforcement, FAILURE_DISPLAY_BYTES, OPERATION_TIMEOUT,
-        RETAINED_STREAM_BYTES, VERIFY_STEPS, WINDOWS_VERIFY_TARGET_PRIMARY,
-        WINDOWS_VERIFY_TARGET_SECONDARY, select_windows_verify_target_dir, step_spec,
+        CARGO_METADATA_OUTPUT_BYTES, COMPLETE_OUTPUT_BYTES, Enforcement, FAILURE_DISPLAY_BYTES,
+        OPERATION_TIMEOUT, RETAINED_STREAM_BYTES, VERIFY_STEPS, WINDOWS_VERIFY_TARGET_PRIMARY,
+        WINDOWS_VERIFY_TARGET_SECONDARY, cargo_metadata_spec, parse_cargo_target_directory,
+        revalidate_windows_verify_target_directory, select_windows_verify_target_dir, step_spec,
+        unique_verify_working_directories, with_cargo_target_discovery_context,
     };
 
     #[test]
@@ -530,13 +888,9 @@ mod tests {
     #[test]
     fn every_step_uses_argv_closed_stdin_and_a_bounded_process_contract()
     -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(windows)]
-        let repository = std::env::current_dir()?.canonicalize()?;
-        #[cfg(not(windows))]
-        let repository = Path::new("/repository").to_path_buf();
         let cargo_env = cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host);
         for step in VERIFY_STEPS {
-            let spec = step_spec(&repository, step, Duration::from_secs(7), &cargo_env)?;
+            let spec = step_spec(step, Duration::from_secs(7), &cargo_env, None)?;
             assert_eq!(spec.program, OsStr::new("cargo"));
             assert_eq!(spec.stdin, StdinPolicy::Closed);
             assert_eq!(spec.mutability, Mutability::ExternalSideEffect);
@@ -549,28 +903,12 @@ mod tests {
                 }
             );
             assert_eq!(spec.stderr, spec.stdout);
-            #[cfg(not(windows))]
             assert!(
                 !spec
                     .env
                     .overrides
                     .contains_key(OsStr::new("CARGO_TARGET_DIR"))
             );
-            #[cfg(windows)]
-            {
-                let target_dir = spec
-                    .env
-                    .overrides
-                    .get(OsStr::new("CARGO_TARGET_DIR"))
-                    .ok_or("Windows verify step must isolate its nested Cargo target")?;
-                let target_dir = Path::new(target_dir);
-                assert!(target_dir.is_absolute());
-                assert!(target_dir.starts_with(&repository));
-                assert!(
-                    target_dir.ends_with(WINDOWS_VERIFY_TARGET_PRIMARY)
-                        || target_dir.ends_with(WINDOWS_VERIFY_TARGET_SECONDARY)
-                );
-            }
             assert_eq!(
                 spec.env
                     .overrides
@@ -583,29 +921,271 @@ mod tests {
     }
 
     #[test]
-    fn windows_target_selection_is_stable_and_avoids_the_running_candidate() {
-        #[cfg(windows)]
-        let repository = Path::new(r"C:\repository");
-        #[cfg(not(windows))]
-        let repository = Path::new("/repository");
-        #[cfg(windows)]
-        let outside_executable = Path::new(r"C:\outside\target\debug\xtask.exe");
-        #[cfg(not(windows))]
-        let outside_executable = Path::new("/outside/target/debug/xtask");
-        let primary = repository.join(WINDOWS_VERIFY_TARGET_PRIMARY);
-        let secondary = repository.join(WINDOWS_VERIFY_TARGET_SECONDARY);
+    fn cargo_metadata_specs_cover_each_distinct_working_directory_with_the_prepared_environment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let working_directories = unique_verify_working_directories();
+        assert_eq!(working_directories, vec![".", "fuzz"]);
 
-        assert_eq!(
-            select_windows_verify_target_dir(repository, outside_executable),
-            primary
+        let mut cargo_env =
+            cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host);
+        cargo_env.overrides.insert(
+            OsString::from("FORGE_TEST_CARGO_ENV"),
+            OsString::from("preserved"),
         );
-        assert_eq!(
-            select_windows_verify_target_dir(repository, &primary.join("debug/xtask.exe")),
-            secondary
+        let specs = working_directories
+            .iter()
+            .map(|cwd| cargo_metadata_spec(cwd, Duration::from_secs(11), &cargo_env))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].cwd.as_path(), Path::new("."));
+        assert_eq!(specs[1].cwd.as_path(), Path::new("fuzz"));
+        for spec in specs {
+            assert_eq!(spec.program, OsStr::new("cargo"));
+            assert_eq!(
+                spec.args,
+                ["metadata", "--format-version", "1", "--no-deps", "--locked",]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(spec.env, cargo_env);
+            assert_eq!(spec.timeout, Duration::from_secs(11));
+            assert_eq!(spec.stdin, StdinPolicy::Closed);
+            assert_eq!(
+                spec.stdout,
+                OutputPolicy::CaptureBounded {
+                    max_bytes: CARGO_METADATA_OUTPUT_BYTES,
+                }
+            );
+            assert_eq!(
+                spec.stderr,
+                OutputPolicy::CaptureBounded {
+                    max_bytes: FAILURE_DISPLAY_BYTES,
+                }
+            );
+            assert_eq!(spec.mutability, Mutability::ExternalSideEffect);
+            assert_eq!(spec.network, NetworkIntent::Inherit);
+            assert_eq!(
+                spec.concurrency_key.as_deref(),
+                Some("xtask-verify-metadata")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_metadata_parser_requires_an_absolute_target_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let absolute = std::env::current_dir()?.join("synthetic-cargo-target");
+        let complete = serde_json::to_vec(&serde_json::json!({
+            "packages": [],
+            "target_directory": absolute,
+        }))?;
+        assert_eq!(parse_cargo_target_directory(&complete)?, absolute);
+
+        let relative = br#"{"target_directory":"target"}"#;
+        assert!(parse_cargo_target_directory(relative).is_err());
+        let missing = br#"{"packages":[]}"#;
+        assert!(parse_cargo_target_directory(missing).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_target_validation_errors_preserve_kind_and_identify_the_working_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = match with_cargo_target_discovery_context::<()>(
+            "fuzz",
+            Err(super::VerifyError::environment("synthetic target failure")),
+        ) {
+            Ok(()) => return Err("synthetic target failure unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), super::VerifyErrorKind::Environment);
+        assert!(error.to_string().contains("`fuzz`"));
+        assert!(error.to_string().contains("synthetic target failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn step_target_override_changes_only_the_effective_target_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cargo_env =
+            cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host);
+        cargo_env.overrides.insert(
+            OsString::from("FORGE_TEST_CARGO_ENV"),
+            OsString::from("preserved"),
         );
-        assert_eq!(
-            select_windows_verify_target_dir(repository, &secondary.join("debug/xtask.exe")),
-            primary
+        cargo_env.overrides.insert(
+            OsString::from("CARGO_TARGET_DIR"),
+            OsString::from("previous"),
         );
+        cargo_env
+            .inherit
+            .insert(OsString::from("CARGO_BUILD_TARGET_DIR"));
+        cargo_env
+            .inherit
+            .insert(OsString::from("Cargo_Build_Target_Dir"));
+        cargo_env.overrides.insert(
+            OsString::from("CARGO_BUILD_TARGET_DIR"),
+            OsString::from("previous-build"),
+        );
+        cargo_env.overrides.insert(
+            OsString::from("cargo_build_target_dir"),
+            OsString::from("previous-build-lowercase"),
+        );
+        #[cfg(windows)]
+        let selected = Path::new(r"C:\target\xtask-verify-a");
+        #[cfg(not(windows))]
+        let selected = Path::new("/target/xtask-verify-a");
+
+        let spec = step_spec(
+            &VERIFY_STEPS[0],
+            Duration::from_secs(7),
+            &cargo_env,
+            Some(selected),
+        )?;
+        let mut expected = cargo_env.clone();
+        expected.overrides.insert(
+            OsString::from("CARGO_TARGET_DIR"),
+            selected.as_os_str().to_owned(),
+        );
+        expected
+            .inherit
+            .remove(OsStr::new("CARGO_BUILD_TARGET_DIR"));
+        expected
+            .inherit
+            .remove(OsStr::new("Cargo_Build_Target_Dir"));
+        expected
+            .overrides
+            .remove(OsStr::new("CARGO_BUILD_TARGET_DIR"));
+        expected
+            .overrides
+            .remove(OsStr::new("cargo_build_target_dir"));
+        assert_eq!(spec.env, expected);
+        assert_eq!(
+            spec.env
+                .overrides
+                .get(OsStr::new("FORGE_TEST_CARGO_ENV"))
+                .map(OsString::as_os_str),
+            Some(OsStr::new("preserved"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_target_selection_is_stable_and_avoids_candidate_junctions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(windows)]
+        let target_spelling = Path::new(r"C:\spelling\target");
+        #[cfg(not(windows))]
+        let target_spelling = Path::new("/spelling/target");
+        #[cfg(windows)]
+        let target_identity = Path::new(r"C:\identity\target");
+        #[cfg(not(windows))]
+        let target_identity = Path::new("/identity/target");
+        let current_executable = target_identity.join("debug/xtask.exe");
+        let primary = target_spelling.join(WINDOWS_VERIFY_TARGET_PRIMARY);
+        let secondary = target_spelling.join(WINDOWS_VERIFY_TARGET_SECONDARY);
+
+        let mut identities = BTreeMap::new();
+        identities.insert(
+            WINDOWS_VERIFY_TARGET_PRIMARY,
+            target_identity.join(WINDOWS_VERIFY_TARGET_PRIMARY),
+        );
+        identities.insert(
+            WINDOWS_VERIFY_TARGET_SECONDARY,
+            target_identity.join(WINDOWS_VERIFY_TARGET_SECONDARY),
+        );
+        let selected = select_windows_verify_target_dir(
+            target_spelling,
+            target_identity,
+            &current_executable,
+            |candidate| candidate_identity(candidate, &identities),
+        )?
+        .ok_or("the primary nested target was not selected")?;
+        assert_eq!(selected.candidate_spelling, primary.clone());
+        revalidate_windows_verify_target_directory(
+            &selected,
+            target_identity,
+            &target_identity.join(WINDOWS_VERIFY_TARGET_PRIMARY),
+        )?;
+        assert!(
+            revalidate_windows_verify_target_directory(
+                &selected,
+                target_identity,
+                &target_identity.join(WINDOWS_VERIFY_TARGET_SECONDARY),
+            )
+            .is_err()
+        );
+        #[cfg(windows)]
+        let replaced_target = Path::new(r"C:\replacement\target");
+        #[cfg(not(windows))]
+        let replaced_target = Path::new("/replacement/target");
+        assert!(
+            revalidate_windows_verify_target_directory(
+                &selected,
+                replaced_target,
+                &replaced_target.join(WINDOWS_VERIFY_TARGET_PRIMARY),
+            )
+            .is_err()
+        );
+
+        let primary_identity = target_identity.join(WINDOWS_VERIFY_TARGET_PRIMARY);
+        let current_in_primary = primary_identity.join("debug/xtask.exe");
+        let selected = select_windows_verify_target_dir(
+            target_spelling,
+            target_identity,
+            &current_in_primary,
+            |candidate| candidate_identity(candidate, &identities),
+        )?
+        .ok_or("the secondary nested target was not selected")?;
+        assert_eq!(selected.candidate_spelling, secondary);
+
+        identities.insert(WINDOWS_VERIFY_TARGET_PRIMARY, target_identity.to_path_buf());
+        assert!(
+            select_windows_verify_target_dir(
+                target_spelling,
+                target_identity,
+                &current_executable,
+                |candidate| candidate_identity(candidate, &identities),
+            )
+            .is_err()
+        );
+
+        #[cfg(windows)]
+        let outside = Path::new(r"C:\outside\xtask.exe");
+        #[cfg(not(windows))]
+        let outside = Path::new("/outside/xtask");
+        let mut calls = 0;
+        assert_eq!(
+            select_windows_verify_target_dir(target_spelling, target_identity, outside, |_| {
+                calls += 1;
+                Err(super::VerifyError::internal(
+                    "candidate preparation must not run",
+                ))
+            },)
+            .ok(),
+            Some(None)
+        );
+        assert_eq!(calls, 0);
+
+        fn candidate_identity(
+            candidate: &Path,
+            identities: &BTreeMap<&str, PathBuf>,
+        ) -> Result<PathBuf, super::VerifyError> {
+            let name = candidate
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| super::VerifyError::internal("invalid synthetic candidate"))?;
+            identities
+                .get(name)
+                .cloned()
+                .ok_or_else(|| super::VerifyError::internal("missing synthetic identity"))
+        }
+
+        assert!(primary.ends_with(WINDOWS_VERIFY_TARGET_PRIMARY));
+        Ok(())
     }
 }
