@@ -103,7 +103,8 @@ enum MsvcEnvironmentKey {
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 impl MsvcEnvironmentKey {
-    const COUNT: usize = 3;
+    const ALL: [Self; 3] = [Self::Path, Self::Lib, Self::Include];
+    const COUNT: usize = Self::ALL.len();
 
     const fn name(self) -> &'static str {
         match self {
@@ -671,14 +672,24 @@ pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironment
                 )));
             }
         };
-    let environment = tool
-        .env()
+    // `Tool::env` is a delta to the environment supplied to `find_tool_with_env`, not a complete
+    // snapshot. Some valid discovery branches therefore return an empty delta. Materialize the
+    // three variables required by downstream MSVC tools before crossing the helper boundary.
+    let environment = match materialize_msvc_tool_environment(
+        &probe_environment.values,
+        tool.env().into_iter().cloned(),
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            write_msvc_probe_output(MSVC_PROBE_NOT_FOUND_MAGIC)?;
+            return Err(CargoEnvironmentError(format!(
+                "MSVC toolchain environment was incomplete: {error}"
+            )));
+        }
+    };
+    let environment = environment
         .into_iter()
-        .filter_map(|(key, value)| {
-            canonical_msvc_tool_environment_key(key)
-                .map(|key| (key, value.encode_wide().collect::<Vec<_>>()))
-        })
-        .collect::<Vec<_>>();
+        .map(|(key, value)| (key, value.encode_wide().collect::<Vec<_>>()));
     let frame = encode_msvc_probe_frame(environment).map_err(|error| {
         CargoEnvironmentError(format!("failed to encode MSVC probe output: {error}"))
     })?;
@@ -871,15 +882,73 @@ fn validate_msvc_value(
 }
 
 #[cfg(any(all(windows, target_env = "msvc"), test))]
+fn materialize_msvc_tool_environment<I>(
+    captured: &BTreeMap<&'static str, OsString>,
+    tool_environment: I,
+) -> Result<BTreeMap<MsvcEnvironmentKey, OsString>, MsvcProbeProtocolError>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut environment = MsvcEnvironmentKey::ALL
+        .into_iter()
+        .filter_map(|key| captured.get(key.name()).cloned().map(|value| (key, value)))
+        .collect::<BTreeMap<_, _>>();
+    let mut tool_projection = BTreeMap::new();
+    for (key, value) in tool_environment {
+        let Some(key) = canonical_msvc_tool_environment_key(&key) else {
+            continue;
+        };
+        if tool_projection.insert(key, value).is_some() {
+            return Err(MsvcProbeProtocolError::new(format!(
+                "MSVC tool environment repeats the {} value",
+                key.name()
+            )));
+        }
+    }
+    environment.extend(tool_projection);
+    require_complete_msvc_environment(|key| environment.get(&key).map(|value| !value.is_empty()))?;
+    Ok(environment)
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn require_complete_msvc_environment(
+    mut value_is_present_and_nonempty: impl FnMut(MsvcEnvironmentKey) -> Option<bool>,
+) -> Result<(), MsvcProbeProtocolError> {
+    for key in MsvcEnvironmentKey::ALL {
+        match value_is_present_and_nonempty(key) {
+            None => {
+                return Err(MsvcProbeProtocolError::new(format!(
+                    "MSVC environment is missing {}",
+                    key.name()
+                )));
+            }
+            Some(false) => {
+                return Err(MsvcProbeProtocolError::new(format!(
+                    "MSVC environment contains an empty {}",
+                    key.name()
+                )));
+            }
+            Some(true) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
 fn apply_msvc_probe_environment(
     policy: &mut EnvPolicy,
     environment: BTreeMap<MsvcEnvironmentKey, Vec<u16>>,
 ) -> Result<(), MsvcProbeProtocolError> {
-    for (key, value) in environment {
-        validate_msvc_value(key, &value)?;
-        policy
-            .overrides
-            .insert(OsString::from(key.name()), os_string_from_utf16(&value)?);
+    require_complete_msvc_environment(|key| environment.get(&key).map(|value| !value.is_empty()))?;
+    let projection = environment
+        .into_iter()
+        .map(|(key, value)| {
+            validate_msvc_value(key, &value)?;
+            Ok((OsString::from(key.name()), os_string_from_utf16(&value)?))
+        })
+        .collect::<Result<Vec<_>, MsvcProbeProtocolError>>()?;
+    for (key, value) in projection {
+        policy.overrides.insert(key, value);
     }
     Ok(())
 }
@@ -898,7 +967,7 @@ fn os_string_from_utf16(value: &[u16]) -> Result<OsString, MsvcProbeProtocolErro
     })
 }
 
-#[cfg(all(windows, target_env = "msvc"))]
+#[cfg(any(all(windows, target_env = "msvc"), test))]
 fn canonical_msvc_tool_environment_key(key: &OsStr) -> Option<MsvcEnvironmentKey> {
     let key = key.to_str()?;
     if key.eq_ignore_ascii_case("PATH") {
@@ -985,10 +1054,10 @@ mod tests {
         MSVC_VSWHERE_MAX_OUTPUT_BYTES, MSVC_VSWHERE_OUTPUT_HARD_LIMIT, MSVC_VSWHERE_TIMEOUT,
         MsvcEnvironmentKey, apply_msvc_probe_environment, canonical_vswhere_is_confined,
         capture_msvc_probe_values, decode_msvc_probe_frame, encode_msvc_probe_frame,
-        is_cargo_build_environment_key, is_msvc_probe_input_key, msvc_probe_environment_for,
-        msvc_probe_spec, msvc_vswhere_spec, observation_reports_toolchain_not_found,
-        parse_vswhere_installation_path, require_probe_success, require_vswhere_success,
-        supported_msvc_target,
+        is_cargo_build_environment_key, is_msvc_probe_input_key, materialize_msvc_tool_environment,
+        msvc_probe_environment_for, msvc_probe_spec, msvc_vswhere_spec,
+        observation_reports_toolchain_not_found, parse_vswhere_installation_path,
+        require_probe_success, require_vswhere_success, supported_msvc_target,
     };
 
     fn observation(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> ProcessObservation {
@@ -1329,6 +1398,82 @@ mod tests {
     }
 
     #[test]
+    fn msvc_tool_environment_materializes_the_captured_base_and_tool_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let captured = BTreeMap::from([
+            ("PATH", OsString::from("captured-path")),
+            ("LIB", OsString::from("captured-lib")),
+            ("INCLUDE", OsString::from("captured-include")),
+        ]);
+        let materialized = materialize_msvc_tool_environment(
+            &captured,
+            [
+                (OsString::from("Path"), OsString::from("tool-path")),
+                (OsString::from("UNRELATED"), OsString::from("ignored-value")),
+            ],
+        )?;
+
+        assert_eq!(materialized.len(), MsvcEnvironmentKey::COUNT);
+        assert_eq!(
+            materialized.get(&MsvcEnvironmentKey::Path),
+            Some(&OsString::from("tool-path"))
+        );
+        assert_eq!(
+            materialized.get(&MsvcEnvironmentKey::Lib),
+            Some(&OsString::from("captured-lib"))
+        );
+        assert_eq!(
+            materialized.get(&MsvcEnvironmentKey::Include),
+            Some(&OsString::from("captured-include"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn msvc_tool_environment_rejects_missing_empty_and_duplicate_values_without_replay() {
+        let private_value = "private-toolchain-value";
+        let incomplete = BTreeMap::from([
+            ("PATH", OsString::from(private_value)),
+            ("LIB", OsString::from("captured-lib")),
+        ]);
+        let error = materialize_msvc_tool_environment(&incomplete, [])
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("INCLUDE"));
+        assert!(!error.contains(private_value));
+
+        let complete = BTreeMap::from([
+            ("PATH", OsString::from("captured-path")),
+            ("LIB", OsString::from("captured-lib")),
+            ("INCLUDE", OsString::from(private_value)),
+        ]);
+        let error = materialize_msvc_tool_environment(
+            &complete,
+            [(OsString::from("include"), OsString::new())],
+        )
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(error.contains("empty INCLUDE"));
+        assert!(!error.contains(private_value));
+
+        let error = materialize_msvc_tool_environment(
+            &complete,
+            [
+                (OsString::from("PATH"), OsString::from("first")),
+                (OsString::from("Path"), OsString::from("second")),
+            ],
+        )
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(error.contains("repeats the PATH value"));
+        assert!(!error.contains("first"));
+        assert!(!error.contains("second"));
+    }
+
+    #[test]
     fn msvc_probe_protocol_round_trips_utf16_code_units() -> Result<(), Box<dyn std::error::Error>>
     {
         let expected = BTreeMap::from([
@@ -1445,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn msvc_projection_is_three_keys_only_and_never_overrides_a_linker()
+    fn msvc_projection_is_complete_and_never_overrides_a_linker()
     -> Result<(), Box<dyn std::error::Error>> {
         let linker = OsString::from("repository-linker.exe");
         let linker_key = OsString::from("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER");
@@ -1483,5 +1628,42 @@ mod tests {
         );
         assert_eq!(policy.overrides.len(), 4);
         Ok(())
+    }
+
+    #[test]
+    fn msvc_projection_rejects_incomplete_values_atomically() {
+        let linker_key = OsString::from("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER");
+        let mut policy = EnvPolicy::minimal();
+        policy
+            .overrides
+            .insert(linker_key, OsString::from("repository-linker.exe"));
+        let original = policy.clone();
+
+        let missing_include = BTreeMap::from([
+            (
+                MsvcEnvironmentKey::Path,
+                "prepared-path".encode_utf16().collect(),
+            ),
+            (
+                MsvcEnvironmentKey::Lib,
+                "prepared-lib".encode_utf16().collect(),
+            ),
+        ]);
+        assert!(apply_msvc_probe_environment(&mut policy, missing_include).is_err());
+        assert_eq!(policy, original);
+
+        let empty_include = BTreeMap::from([
+            (
+                MsvcEnvironmentKey::Path,
+                "prepared-path".encode_utf16().collect(),
+            ),
+            (
+                MsvcEnvironmentKey::Lib,
+                "prepared-lib".encode_utf16().collect(),
+            ),
+            (MsvcEnvironmentKey::Include, Vec::new()),
+        ]);
+        assert!(apply_msvc_probe_environment(&mut policy, empty_include).is_err());
+        assert_eq!(policy, original);
     }
 }
