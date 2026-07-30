@@ -66,7 +66,11 @@ cargo test -p xtask --test fixture_projects
 cargo test -p xtask --test compatibility_harness
 ```
 
-Native Windows runs include a required local UTF-16 path test beyond the classic `MAX_PATH` limit.
+Native Windows runs include a required local test with an ordinary short repository root and `.git`
+directory plus a tracked Unicode descendant whose full UTF-16 path exceeds the classic `MAX_PATH`
+limit. This qualifies long repository contents, not an overlong Git working directory: Forge v0
+fails before spawning Git for Windows when the canonical working-directory spelling reaches 260
+UTF-16 units and directs the caller to select a shorter repository root with `--dir`.
 UNC behavior needs a real externally provisioned writable share and is therefore an explicit
 qualification check, not a hermetic default test. From PowerShell:
 

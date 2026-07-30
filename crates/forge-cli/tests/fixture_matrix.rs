@@ -9,9 +9,6 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt as _;
-
 use serde::Serialize;
 use serde_json::Value;
 
@@ -664,25 +661,91 @@ mod windows_wide_path_fixture {
     use std::path::{Component, Path, PathBuf, Prefix};
     use std::process::{Command, Output};
 
+    use forge_core::RepoRelativePath;
+    use forge_core::ports::GitPort as _;
+    use forge_runtime::git::GitCli;
     use serde_json::Value;
 
-    use super::{FixtureWorkspace, display_output, required_array};
+    use super::{FixtureWorkspace, display_output, required_array, snapshot_tree};
 
-    pub(super) const CLASSIC_MAX_PATH_UNITS: usize = 260;
+    const CLASSIC_MAX_PATH_UNITS: usize = 260;
     const MIN_TEST_PATH_UNITS: usize = CLASSIC_MAX_PATH_UNITS + 64;
     const MAX_TEST_PATH_UNITS: usize = 1_024;
     const UNC_ROOT_ENV: &str = "FORGE_WINDOWS_UNC_TEST_ROOT";
     const GIT_BOOTSTRAP_WORKTREE: &str = "git-bootstrap-worktree";
-    pub(super) const GIT_METADATA_DIRECTORY: &str = "git-metadata";
     const WIDE_TRACKED_NAME: &str = "tracked path-路径-🧪.txt";
 
     #[test]
     fn windows_long_utf16_path_survives_detection_init_and_write()
     -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureWorkspace::from_generated("non-utf8-path")?;
+        exercise_wide_fixture(fixture)
+    }
+
+    #[test]
+    fn windows_overlong_repository_root_fails_typed_and_without_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let parent = std::env::temp_dir().join("forge-fixture-matrix-tests");
         fs::create_dir_all(&parent)?;
-        let fixture = long_fixture_at("non-utf8-path", &parent)?;
-        exercise_wide_fixture(fixture)
+        let mut fixture = FixtureWorkspace::from_generated_with_layout(
+            "non-utf8-path",
+            &parent,
+            Path::new(GIT_BOOTSTRAP_WORKTREE),
+        )?;
+        let human_agents = b"# Human guidance\r\n\r\nKeep this byte-for-byte.\r\n";
+        fs::write(fixture.worktree.join("AGENTS.md"), human_agents)?;
+        fixture.initialize_git()?;
+
+        let overlong_worktree = fixture.root.join(overlong_worktree_relative());
+        fs::create_dir_all(
+            overlong_worktree
+                .parent()
+                .ok_or("overlong worktree has no parent")?,
+        )?;
+        fs::rename(&fixture.worktree, &overlong_worktree)?;
+        fixture.worktree = overlong_worktree;
+        let canonical_worktree = fs::canonicalize(&fixture.worktree)?;
+        assert!(
+            native_path_units(&canonical_worktree)? >= CLASSIC_MAX_PATH_UNITS,
+            "negative fixture repository root did not cross the Git for Windows cwd boundary"
+        );
+        assert!(fixture.worktree.join(".git").is_dir());
+        let before = fixture.snapshot_worktree()?;
+        let git_dir = fixture.worktree.join(".git");
+        assert!(!git_dir.join("forge").exists());
+        let mut git_before = Vec::new();
+        snapshot_tree(&git_dir, &git_dir, &mut git_before)?;
+
+        let rejected = run_forge_with_explicit_dir(
+            &fixture,
+            &["init", "--apply", "--adapter", "claude", "--json"],
+        )?;
+
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{}",
+            display_output(&rejected)
+        );
+        let document: Value = serde_json::from_slice(&rejected.stdout)?;
+        assert_eq!(document["schema"], "forge.diagnostic/v1");
+        assert_eq!(document["ok"], false);
+        let diagnostics = required_array(&document, "diagnostics")?;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["code"], "FGE2001");
+        assert!(
+            diagnostics[0]["why"]
+                .as_str()
+                .is_some_and(|why| why.contains("cannot launch Git for Windows"))
+        );
+        assert_eq!(fixture.snapshot_worktree()?, before);
+        assert_eq!(fs::read(fixture.worktree.join("AGENTS.md"))?, human_agents);
+        assert!(!fixture.worktree.join(".forge").exists());
+        assert!(!git_dir.join("forge").exists());
+        let mut git_after = Vec::new();
+        snapshot_tree(&git_dir, &git_dir, &mut git_after)?;
+        assert_eq!(git_after, git_before, "rejected init changed Git metadata");
+        Ok(())
     }
 
     #[test]
@@ -704,7 +767,11 @@ mod windows_wide_path_fixture {
             .into());
         }
 
-        let fixture = long_fixture_at("non-utf8-path", &parent)?;
+        let fixture = FixtureWorkspace::from_generated_with_layout(
+            "non-utf8-path",
+            &parent,
+            Path::new("worktree"),
+        )?;
         if !is_qualifying_unc(&fs::canonicalize(&fixture.worktree)?) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -725,93 +792,88 @@ mod windows_wide_path_fixture {
         )));
     }
 
-    #[test]
-    fn windows_fixture_launch_paths_remove_only_the_verbatim_namespace() {
-        assert_eq!(
-            without_verbatim_prefix(Path::new(r"\\?\C:\forge-tests\root")),
-            PathBuf::from(r"C:\forge-tests\root")
-        );
-        assert_eq!(
-            without_verbatim_prefix(Path::new(r"\\?\UNC\server\forge-tests\root")),
-            PathBuf::from(r"\\server\forge-tests\root")
-        );
-        assert_eq!(
-            without_verbatim_prefix(Path::new(r"C:\forge-tests\root")),
-            PathBuf::from(r"C:\forge-tests\root")
-        );
-    }
-
     fn exercise_wide_fixture(fixture: FixtureWorkspace) -> Result<(), Box<dyn std::error::Error>> {
         let canonical_worktree = fs::canonicalize(&fixture.worktree)?;
-        let measured_path = canonical_worktree.join("Cargo.toml");
-        let measured_units = wide_units(&measured_path);
+        let root_units = native_path_units(&canonical_worktree)?;
         assert!(
-            (MIN_TEST_PATH_UNITS..MAX_TEST_PATH_UNITS).contains(&measured_units),
-            "fixture path has {measured_units} UTF-16 units; expected {MIN_TEST_PATH_UNITS}..{MAX_TEST_PATH_UNITS}"
+            root_units < CLASSIC_MAX_PATH_UNITS,
+            "fixture Git working directory has {root_units} UTF-16 units; expected fewer than {CLASSIC_MAX_PATH_UNITS}"
         );
 
-        let tracked_units = WIDE_TRACKED_NAME.encode_utf16().collect::<Vec<_>>();
-        let tracked_name = OsString::from_wide(&tracked_units);
-        assert_eq!(
-            tracked_name.encode_wide().collect::<Vec<_>>(),
-            tracked_units
+        let tracked_relative = wide_tracked_relative();
+        let tracked_path = fixture.worktree.join(&tracked_relative);
+        let measured_units = native_path_units(&canonical_worktree.join(&tracked_relative))?;
+        assert!(
+            (MIN_TEST_PATH_UNITS..MAX_TEST_PATH_UNITS).contains(&measured_units),
+            "tracked descendant has {measured_units} UTF-16 units; expected {MIN_TEST_PATH_UNITS}..{MAX_TEST_PATH_UNITS}"
         );
-        let tracked_path = fixture.worktree.join(&tracked_name);
+        fs::create_dir_all(
+            tracked_path
+                .parent()
+                .ok_or("tracked descendant has no parent")?,
+        )?;
         let tracked_contents = b"Windows native path content must survive\n";
         fs::write(&tracked_path, tracked_contents)?;
 
         let human_agents = b"# Human guidance\r\n\r\nKeep this byte-for-byte.\r\n";
         fs::write(fixture.worktree.join("AGENTS.md"), human_agents)?;
-        initialize_git_then_move_to_long_path(&fixture)?;
+        fixture.initialize_git()?;
 
-        assert!(fixture.worktree.join(".git").is_file());
+        assert!(fixture.worktree.join(".git").is_dir());
         assert!(fs::read(&fixture.global_git_config)?.is_empty());
-        let git_dir_launch = fixture.root.join(GIT_METADATA_DIRECTORY);
-        let expected_git_dir = fs::canonicalize(&git_dir_launch)?;
-        let gitfile = fs::read_to_string(fixture.worktree.join(".git"))?;
-        let mut gitfile_lines = gitfile.lines();
-        let gitfile_target = gitfile_lines
-            .next()
-            .and_then(|line| line.strip_prefix("gitdir: "))
-            .ok_or("relocated worktree has an invalid .git gitfile")?;
-        assert!(gitfile_lines.next().is_none());
-        let gitfile_target = PathBuf::from(gitfile_target);
-        let gitfile_target = if gitfile_target.is_absolute() {
-            gitfile_target
-        } else {
-            fixture.worktree.join(gitfile_target)
-        };
-        assert_eq!(fs::canonicalize(gitfile_target)?, expected_git_dir);
+        let git_dir = fs::canonicalize(fixture.git_dir(&fixture.worktree)?)?;
+        assert_eq!(git_dir, fs::canonicalize(fixture.worktree.join(".git"))?);
+        assert!(git_dir.starts_with(&canonical_worktree));
+        assert!(native_path_units(&git_dir)? < CLASSIC_MAX_PATH_UNITS);
 
-        // Validate the repository metadata from its short Git directory. The Forge preview below
-        // intentionally owns the first Git access that must resolve the relocated long worktree.
-        let bare = fixture.git_stdout_in(
-            &git_dir_launch,
-            &["config", "--local", "--type=bool", "--get", "core.bare"],
+        let status = fixture.git_stdout_in(
+            &fixture.worktree,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=all",
+            ],
         )?;
-        assert_eq!(String::from_utf8(bare)?.trim(), "false");
-        let head =
-            fixture.git_stdout_in(&git_dir_launch, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-        assert!(!String::from_utf8(head)?.trim().is_empty());
-        let git_dir = fs::canonicalize(fixture.git_dir(&git_dir_launch)?)?;
-        assert_eq!(git_dir, expected_git_dir);
-        assert!(git_dir.starts_with(fs::canonicalize(&fixture.root)?));
-        assert!(wide_units(&git_dir) < CLASSIC_MAX_PATH_UNITS);
         assert!(
-            !fixture.root.join(GIT_BOOTSTRAP_WORKTREE).exists(),
-            "short Git bootstrap worktree remained after relocation"
+            String::from_utf8(status)?
+                .lines()
+                .all(|line| line.starts_with("# ")),
+            "fresh wide-descendant fixture was not clean"
         );
 
         let tracked =
-            fixture.git_stdout_in(&git_dir_launch, &["ls-files", "--cached", "-z", "--"])?;
+            fixture.git_stdout_in(&fixture.worktree, &["ls-files", "--cached", "-z", "--"])?;
+        let expected_git_path = tracked_relative
+            .to_str()
+            .ok_or("wide tracked path was not Unicode")?
+            .replace('\\', "/")
+            .into_bytes();
         assert!(
             tracked
                 .split(|byte| *byte == 0)
-                .any(|path| path == WIDE_TRACKED_NAME.as_bytes()),
-            "Git did not preserve the UTF-8 index spelling of the native wide path"
+                .any(|path| path == expected_git_path.as_slice()),
+            "Git did not preserve the UTF-8 index spelling of the deep native wide path"
+        );
+        let expected_forge_path = RepoRelativePath::new(&tracked_relative)?;
+        let forge_file_set = GitCli::new().file_set(&canonical_worktree)?;
+        assert!(
+            forge_file_set.tracked.contains(&expected_forge_path),
+            "Forge's typed Git inventory dropped the deep native wide path"
         );
 
-        let before_preview = fixture.snapshot_worktree()?;
+        let before_inventory = fixture.snapshot_worktree()?;
+        let inventory = run_forge_with_explicit_dir(&fixture, &["explain", "--json"])?;
+        assert_eq!(
+            inventory.status.code(),
+            Some(0),
+            "{}",
+            display_output(&inventory)
+        );
+        let inventory_document: Value = serde_json::from_slice(&inventory.stdout)?;
+        assert_eq!(inventory_document["ok"], true);
+        assert_eq!(fixture.snapshot_worktree()?, before_inventory);
+
         let preview =
             run_forge_with_explicit_dir(&fixture, &["init", "--adapter", "claude", "--json"])?;
         assert_eq!(
@@ -825,7 +887,7 @@ mod windows_wide_path_fixture {
             .as_str()
             .ok_or("init preview omitted the repository-root display path")?;
         assert_eq!(fs::canonicalize(reported_worktree)?, canonical_worktree);
-        assert_eq!(fixture.snapshot_worktree()?, before_preview);
+        assert_eq!(fixture.snapshot_worktree()?, before_inventory);
 
         let applied = run_forge_with_explicit_dir(
             &fixture,
@@ -883,104 +945,17 @@ mod windows_wide_path_fixture {
         Ok(())
     }
 
-    fn long_fixture_at(
-        id: &str,
-        existing_parent: &Path,
-    ) -> Result<FixtureWorkspace, Box<dyn std::error::Error>> {
-        let parent = without_verbatim_prefix(&fs::canonicalize(existing_parent)?);
-        if !parent.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows fixture parent did not canonicalize to an absolute path",
-            )
-            .into());
+    fn wide_tracked_relative() -> PathBuf {
+        let mut relative = PathBuf::from("windows-wide-descendant");
+        for index in 0..4 {
+            relative.push(wide_component(index));
         }
-        FixtureWorkspace::from_generated_with_layout(id, &parent, &long_worktree_relative())
+        relative.push(WIDE_TRACKED_NAME);
+        relative
     }
 
-    fn initialize_git_then_move_to_long_path(
-        fixture: &FixtureWorkspace,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let bootstrap_worktree = fixture.root.join(GIT_BOOTSTRAP_WORKTREE);
-        let bootstrap_units = wide_units(&bootstrap_worktree);
-        if bootstrap_units >= CLASSIC_MAX_PATH_UNITS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Git bootstrap path has {bootstrap_units} UTF-16 units; expected fewer than {CLASSIC_MAX_PATH_UNITS}"
-                ),
-            )
-            .into());
-        }
-
-        fs::rename(&fixture.worktree, &bootstrap_worktree).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "move long fixture worktree to short Git bootstrap path {}: {error}",
-                    bootstrap_worktree.display()
-                ),
-            )
-        })?;
-        let initialize_result = (|| {
-            fixture.run_git_in(
-                &fixture.root,
-                &[
-                    "init",
-                    "--quiet",
-                    "--separate-git-dir",
-                    GIT_METADATA_DIRECTORY,
-                    GIT_BOOTSTRAP_WORKTREE,
-                ],
-            )?;
-            fixture.run_git_in(&bootstrap_worktree, &["add", "--all", "--"])?;
-            fixture.commit_in(&bootstrap_worktree, "fixture baseline")
-        })();
-        if let Err(initialize_error) = initialize_result {
-            return match fs::rename(&bootstrap_worktree, &fixture.worktree) {
-                Ok(()) => Err(io::Error::other(format!(
-                    "initialize fixture Git repository at short path; restored original worktree: {initialize_error}"
-                ))
-                .into()),
-                Err(restore_error) => Err(io::Error::other(format!(
-                    "initialize fixture Git repository at short path: {initialize_error}; restoring {} to {} also failed: {restore_error}",
-                    bootstrap_worktree.display(),
-                    fixture.worktree.display()
-                ))
-                .into()),
-            };
-        }
-        fs::rename(&bootstrap_worktree, &fixture.worktree).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "move initialized fixture from {} to long worktree {}: {error}",
-                    bootstrap_worktree.display(),
-                    fixture.worktree.display()
-                ),
-            )
-        })?;
-        Ok(())
-    }
-
-    fn without_verbatim_prefix(path: &Path) -> PathBuf {
-        const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-        const UNC: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
-
-        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if !units.starts_with(VERBATIM) {
-            return path.to_path_buf();
-        }
-        if units[VERBATIM.len()..].starts_with(UNC) {
-            let mut native = vec![b'\\' as u16, b'\\' as u16];
-            native.extend_from_slice(&units[VERBATIM.len() + UNC.len()..]);
-            return PathBuf::from(OsString::from_wide(&native));
-        }
-        PathBuf::from(OsString::from_wide(&units[VERBATIM.len()..]))
-    }
-
-    fn long_worktree_relative() -> PathBuf {
-        let mut relative = PathBuf::from("windows-wide");
+    fn overlong_worktree_relative() -> PathBuf {
+        let mut relative = PathBuf::from("windows-overlong-root");
         for index in 0..4 {
             relative.push(wide_component(index));
         }
@@ -998,8 +973,40 @@ mod windows_wide_path_fixture {
         OsString::from_wide(&units)
     }
 
-    fn wide_units(path: &Path) -> usize {
-        path.as_os_str().encode_wide().count()
+    fn native_path_units(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+        let units = path.as_os_str().encode_wide().count();
+        let prefix = match path.components().next() {
+            Some(Component::Prefix(prefix)) => prefix.kind(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows fixture path has no disk or UNC prefix",
+                )
+                .into());
+            }
+        };
+        match prefix {
+            Prefix::Disk(_) | Prefix::UNC(_, _) => Ok(units),
+            Prefix::VerbatimDisk(_) => units.checked_sub(4).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid verbatim disk fixture path",
+                )
+                .into()
+            }),
+            Prefix::VerbatimUNC(_, _) => units.checked_sub(6).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid verbatim UNC fixture path",
+                )
+                .into()
+            }),
+            Prefix::Verbatim(_) | Prefix::DeviceNS(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "generic verbatim and device namespace fixture roots are unsupported",
+            )
+            .into()),
+        }
     }
 
     fn is_qualifying_unc(path: &Path) -> bool {
@@ -1020,7 +1027,7 @@ mod windows_wide_path_fixture {
     ) -> Result<Output, Box<dyn std::error::Error>> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
         command
-            .current_dir(&fixture.root)
+            .current_dir(std::env::temp_dir())
             .arg("--dir")
             .arg(&fixture.worktree)
             .args(arguments);
@@ -2135,34 +2142,18 @@ impl FixtureWorkspace {
             .arg("--no-pager")
             .arg("--no-optional-locks");
         #[cfg(windows)]
-        let requires_explicit_repository = cwd.as_os_str().encode_wide().count()
-            >= windows_wide_path_fixture::CLASSIC_MAX_PATH_UNITS;
-        #[cfg(windows)]
         {
             command
-                // CreateProcess applies a stricter current-directory limit than ordinary native file
-                // APIs, so always launch Git from the runner's short temp directory.
+                // Keep the process cwd short, including for an externally provisioned UNC fixture.
+                // `-C` remains the normal Git discovery path and the positive long-path case keeps
+                // this selected repository root below Git for Windows' startup boundary.
                 .current_dir(std::env::temp_dir())
                 .arg("--no-pager")
                 .arg("--no-optional-locks")
                 .arg("-c")
-                .arg("core.longpaths=true");
-            if requires_explicit_repository {
-                // The wide-path fixture keeps its non-bare Git directory under the short fixture
-                // root and moves only the worktree here with Rust. These options let subsequent
-                // Git commands access that repository without Git's pre-configuration `-C`
-                // directory change or an overlong explicit GIT_DIR.
-                let mut git_dir = OsString::from("--git-dir=");
-                git_dir.push(
-                    self.root
-                        .join(windows_wide_path_fixture::GIT_METADATA_DIRECTORY),
-                );
-                let mut work_tree = OsString::from("--work-tree=");
-                work_tree.push(cwd);
-                command.arg(git_dir).arg(work_tree);
-            } else {
-                command.arg("-C").arg(cwd);
-            }
+                .arg("core.longpaths=true")
+                .arg("-C")
+                .arg(cwd);
         }
         command
             .arg("-c")

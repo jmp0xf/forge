@@ -259,7 +259,6 @@ const RESTRICTED_ENVIRONMENT: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct SynchronousProcessRunner {
     repository_root: PathBuf,
-    root_cwd_alias: Option<PathBuf>,
     termination_grace: Duration,
     cancellation: Arc<AtomicBool>,
 }
@@ -287,29 +286,9 @@ impl SynchronousProcessRunner {
 
         Ok(Self {
             repository_root,
-            root_cwd_alias: None,
             termination_grace: TERMINATION_GRACE,
             cancellation: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    /// Binds a runner to one canonical root while retaining an equivalent spelling for spawning
-    /// commands at that exact root.
-    ///
-    /// Some platform process APIs impose a stricter working-directory spelling limit than their
-    /// filesystem APIs. The alias is therefore kept verbatim after proving that it resolves to the
-    /// same directory as `repository_root`. Confinement and directory checks continue to use the
-    /// canonical root; only the final value passed to `Command::current_dir` may use the alias.
-    #[cfg(any(windows, test))]
-    pub(crate) fn new_with_verified_root_alias(
-        repository_root: impl AsRef<Path>,
-        root_cwd_alias: impl AsRef<Path>,
-    ) -> Result<Self, ProcessError> {
-        let mut runner = Self::new(repository_root)?;
-        let root_cwd_alias = root_cwd_alias.as_ref().to_path_buf();
-        runner.verify_root_cwd_alias(&root_cwd_alias)?;
-        runner.root_cwd_alias = Some(root_cwd_alias);
-        Ok(runner)
     }
 
     /// Replaces the default cancellation flag with one shared by the caller.
@@ -445,56 +424,7 @@ impl SynchronousProcessRunner {
                 ),
             ));
         }
-        if resolved == self.repository_root {
-            if let Some(alias) = &self.root_cwd_alias {
-                // Revalidate immediately before every use. A generic alias path could otherwise
-                // be replaced after construction and redirect a later command outside the root.
-                self.verify_root_cwd_alias(alias)?;
-                return Ok(alias.clone());
-            }
-        }
         Ok(resolved)
-    }
-
-    fn verify_root_cwd_alias(&self, alias: &Path) -> Result<(), ProcessError> {
-        if !alias.is_absolute() {
-            return Err(ProcessError::new(
-                ProcessErrorKind::InvalidRepositoryRoot,
-                "validate equivalent process runner root alias",
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "process runner root alias is not absolute",
-                ),
-            ));
-        }
-        let resolved_alias = alias.canonicalize().map_err(|error| {
-            ProcessError::new(
-                ProcessErrorKind::InvalidRepositoryRoot,
-                "resolve equivalent process runner root alias",
-                error,
-            )
-        })?;
-        if resolved_alias != self.repository_root {
-            return Err(ProcessError::new(
-                ProcessErrorKind::InvalidRepositoryRoot,
-                "validate equivalent process runner root alias",
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "process runner root alias resolves to a different directory",
-                ),
-            ));
-        }
-        if !resolved_alias.is_dir() {
-            return Err(ProcessError::new(
-                ProcessErrorKind::InvalidRepositoryRoot,
-                "validate equivalent process runner root alias",
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "process runner root alias does not resolve to a directory",
-                ),
-            ));
-        }
-        Ok(())
     }
 
     fn execute<W>(
@@ -2100,7 +2030,6 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
-    use std::path::Path;
     use std::process::Command as ProcessCommand;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Barrier};
@@ -2144,52 +2073,6 @@ mod tests {
             )
             .with_args(args),
         )
-    }
-
-    #[test]
-    fn verified_root_alias_is_used_only_for_the_equivalent_root() -> Result<(), Box<dyn Error>> {
-        let root = tempdir()?;
-        let canonical_root = root.path().canonicalize()?;
-        let root_name = canonical_root
-            .file_name()
-            .ok_or_else(|| io::Error::other("temporary root has no final component"))?;
-        let alias = canonical_root
-            .parent()
-            .ok_or_else(|| io::Error::other("temporary root has no parent"))?
-            .join(".")
-            .join(root_name);
-        let nested = canonical_root.join("nested");
-        fs::create_dir(&nested)?;
-
-        let runner =
-            SynchronousProcessRunner::new_with_verified_root_alias(&canonical_root, &alias)?;
-
-        assert_eq!(runner.repository_root(), canonical_root);
-        assert_eq!(runner.resolve_cwd(Path::new(""))?, alias);
-        assert_eq!(
-            runner.resolve_cwd(Path::new("nested"))?,
-            nested.canonicalize()?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn root_alias_must_resolve_to_the_bound_directory() -> Result<(), Box<dyn Error>> {
-        let root = tempdir()?;
-        let different = tempdir()?;
-
-        let error =
-            SynchronousProcessRunner::new_with_verified_root_alias(root.path(), different.path())
-                .err()
-                .ok_or("different directory unexpectedly qualified as a root alias")?;
-
-        assert_eq!(error.kind(), ProcessErrorKind::InvalidRepositoryRoot);
-        assert!(
-            error
-                .to_string()
-                .contains("resolves to a different directory")
-        );
-        Ok(())
     }
 
     #[cfg(unix)]
