@@ -141,6 +141,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
+      - name: Fetch the locked five-target dependency closure
+        run: cargo +stable fetch --locked
+      - name: Check reviewed release-license integration contracts
+        run: |
+          cargo +stable test --locked -p xtask release::tests::scoped_release_graph_counts_and_errno_targets_are_frozen -- --ignored --exact
+          cargo +stable test --locked -p xtask release::tests::checked_in_release_license_evidence_is_deterministic_and_generate_is_explicit -- --ignored --exact
       - name: Run the project-owned verification entry point
         run: cargo +stable run --locked -p xtask -- verify
 
