@@ -1,10 +1,10 @@
 # ADR-0029：发布可审查、可回滚的 v0 候选版本
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-07-28
 - Deciders: Forge maintainers
 - Supersedes: None
-- Superseded by: None
+- Superseded by: ADR-0041
 
 ## Context
 
