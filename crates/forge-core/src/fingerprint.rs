@@ -44,8 +44,8 @@ pub const PROCESS_OUTPUT_UNAVAILABLE_PROTOCOL_VERSION: &str = "forge.process-out
 /// Fixed-size, content-free diagnostic summary recorded for each command observation.
 pub const COMMAND_DIAGNOSTIC_SUMMARY_PROTOCOL_VERSION: &str = "forge.command-diagnostic-summary/v1";
 
-/// Complete local-evidence behavior composition frozen by ADR-0020 and extended by ADR-0039.
-pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v8";
+/// Complete local-evidence behavior composition frozen by ADR-0020 and extended by ADR-0040.
+pub const EVIDENCE_BEHAVIOR_PROTOCOL_VERSION: &str = "forge.evidence-behavior/v9";
 
 // Existing behavior identifiers are repeated here as composition inputs because their defining
 // modules deliberately keep implementation domains private. A change to any implementation must
@@ -55,6 +55,8 @@ const SCOPE_ACQUISITION_PROTOCOL_VERSION: &str = "forge.scope-acquisition/v1";
 const SCOPE_DIGEST_INPUT_VERSION: &str = "forge.scope-digest-input/v1";
 const SCOPE_DIGEST_DOMAIN: &[u8] = b"forge.scope-digest/v1";
 pub const ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION: &str = "forge.environment-fingerprint/v1";
+const PROJECT_COMMAND_ENVIRONMENT_ACQUISITION_PROTOCOL_VERSION: &str =
+    "forge.project-command-environment-acquisition/v1";
 const EFFECTIVE_POLICY_DIGEST_DOMAIN: &[u8] = b"forge.effective-policy-digest/v1";
 const PROCESS_OUTPUT_DIGEST_DOMAIN: &[u8] = b"forge.process-output/v1\0";
 const PROCESS_OUTPUT_UNAVAILABLE_DIGEST_DOMAIN: &[u8] = b"forge.process-output-unavailable/v1\0";
@@ -510,6 +512,10 @@ pub fn evidence_behavior_digest<H: Hasher + ?Sized>(hasher: &H) -> Digest {
             behavior_component(
                 "environment-fingerprint",
                 ENVIRONMENT_FINGERPRINT_PROTOCOL_VERSION.as_bytes(),
+            ),
+            behavior_component(
+                "project-command-environment-acquisition",
+                PROJECT_COMMAND_ENVIRONMENT_ACQUISITION_PROTOCOL_VERSION.as_bytes(),
             ),
             behavior_component("policy-digest-domain", EFFECTIVE_POLICY_DIGEST_DOMAIN),
             behavior_component("process-output-digest-domain", PROCESS_OUTPUT_DIGEST_DOMAIN),
@@ -2001,10 +2007,10 @@ mod tests {
     }
 
     #[test]
-    fn evidence_behavior_digest_is_pinned_to_typed_unknown_projection_and_coverage_v2() {
+    fn evidence_behavior_digest_is_pinned_to_external_config_closure_v1() {
         assert_eq!(
             EVIDENCE_BEHAVIOR_PROTOCOL_VERSION,
-            "forge.evidence-behavior/v8"
+            "forge.evidence-behavior/v9"
         );
         assert_eq!(
             RECEIPT_VALIDITY_PROTOCOL_VERSION,
@@ -2024,7 +2030,7 @@ mod tests {
         );
         assert_eq!(
             evidence_behavior_digest(&FixtureHasher).as_str(),
-            "fixture:bbeb4658e06b862d"
+            "fixture:34b382de113b1dd9"
         );
     }
 

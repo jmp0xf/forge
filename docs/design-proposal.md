@@ -1189,6 +1189,7 @@ v0 `init` **不默认生成 runner**。避免把工具偏好强加给存量仓�
 - success predicate 可确定；
 - 输出截断不影响判定；
 - 网络和副作用状态如实记录。
+- 标准工具隐式读取的外部配置已被禁用、纳入完整依赖闭包，或明确标为 unknown。
 
 否则只能形成 observation，不满足证据要求。
 
@@ -1276,7 +1277,10 @@ cargo fmt --all
 - 显式配置可以覆盖；
 - Forge 不穷举 feature 笛卡尔积；
 - rust-toolchain 变化使相关 Receipt 失效；
-- Cargo version、rustc version、target triple 和关键配置摘要进入 toolchain/environment digest。
+- Cargo version、rustc version 和 target triple 进入 toolchain digest；净化环境进入 environment
+  digest。v0 不摘要可能含秘密的 Cargo 配置内容：从命令 cwd 到文件系统根或 Cargo home 发现
+  `.cargo/config{,.toml}`、出现显式 `--config`，或无法完整检查发现链时，environment 为 typed
+  unknown，Receipt 只能作为 observation。
 
 ### 14.4 Changed 影响范围
 
@@ -2018,6 +2022,9 @@ source/provenance
 
 显示字符串不是摘要输入；避免 quoting 差异造成错误碰撞。
 
+标准工具外部配置的闭合状态属于独立的 environment acquisition dependency，不并入 Command
+Digest；无法完整取得时使用 typed unknown，不能把“不知道”编码成一个可比较的命令摘要。
+
 ### 21.4 Receipt
 
 ```rust
@@ -2077,6 +2084,7 @@ TTL 只能作为额外保守限制，不能替代依赖比较。以下任一变�
 - CommandSpec；
 - 工具版本；
 - 相关环境；
+- 标准工具隐式读取的配置出现或其闭合状态变为 unknown；
 - effective policy；
 - 比较 base；
 - task acceptance（若 evidence 绑定任务）；
@@ -3030,6 +3038,7 @@ ADR 全部位于 `docs/adr/`：
 | 0037 | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
 | 0038 | v0 不持久化任意项目命令的 stdout/stderr 内容 |
 | 0039 | 保留当前 Receipt 的 typed unknown 事实 |
+| 0040 | 项目工具外部配置未闭合时安全失败 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 

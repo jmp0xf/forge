@@ -40,7 +40,9 @@ use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::FileSystemError;
 use forge_runtime::git::GitCli;
 use forge_runtime::hash::Blake3Hasher;
-use forge_runtime::process::{SynchronousProcessRunner, process_environment_dependency_digest};
+use forge_runtime::process::{
+    SynchronousProcessRunner, project_command_environment_dependency_digest,
+};
 use forge_runtime::scope::{
     ScopeAcquisitionError, acquire_repository_scope_controlled,
     prepare_repository_scope_candidate_controlled,
@@ -874,8 +876,13 @@ impl ReceiptEvaluator<'_> {
         let spec = ExecSpec::from_project_command(command);
         let command_dependency = command_dependency_digest(&self.hasher, command, provenance)
             .unwrap_or(DependencyValue::Unknown);
-        let environment = process_environment_dependency_digest(&spec, &self.hasher)
-            .unwrap_or(DependencyValue::Unknown);
+        let environment = project_command_environment_dependency_digest(
+            self.runner,
+            command,
+            &spec,
+            &self.hasher,
+        )
+        .unwrap_or(DependencyValue::Unknown);
         let toolchain =
             required_probes_for_command(command).map_or(DependencyValue::Unknown, |probes| {
                 let request =

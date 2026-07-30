@@ -233,6 +233,20 @@ impl TestWorkspace {
         Ok(command.output()?)
     }
 
+    fn run_forge_with_cargo_home(
+        &self,
+        arguments: &[&str],
+        cargo_home: &Path,
+    ) -> Result<Output, Box<dyn std::error::Error>> {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_forge"));
+        command
+            .current_dir(&self.worktree)
+            .args(arguments)
+            .env("CARGO_HOME", cargo_home);
+        self.configure_git_environment(&mut command);
+        Ok(command.output()?)
+    }
+
     #[cfg(unix)]
     fn run_forge_with_path_prefix(
         &self,
@@ -3111,6 +3125,80 @@ fn typed_unknown_dependency_round_trips_without_erasing_known_receipt_facts()
     assert_eq!(
         verified["data"]["stale_receipts"][0]["validity"]["reasons"],
         validity["reasons"]
+    );
+    Ok(())
+}
+
+#[test]
+fn external_cargo_configuration_invalidates_a_previously_proving_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = TestWorkspace::clean_rust_repository("evidence-external-cargo-config")?;
+    let cargo_home = fixture.root.join("support/cargo-home");
+    fs::create_dir(&cargo_home)?;
+
+    let run =
+        fixture.run_forge_with_cargo_home(&["evidence", "run", "check", "--json"], &cargo_home)?;
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&run.stdout)?;
+    assert_eq!(
+        receipt["data"]["dependencies"]["environment"]["state"],
+        "known"
+    );
+    assert_eq!(
+        receipt["data"]["dependencies"]["toolchain"]["state"],
+        "known"
+    );
+
+    let before = fixture.run_forge_with_cargo_home(&["evidence", "show", "--json"], &cargo_home)?;
+    assert_eq!(before.status.code(), Some(0));
+    let before: Value = serde_json::from_slice(&before.stdout)?;
+    assert_eq!(required_array(&before["data"], "valid_receipts")?.len(), 1);
+
+    fs::write(
+        cargo_home.join("config.toml"),
+        b"[build]\nrustflags = [\"-C\", \"debuginfo=1\"]\n",
+    )?;
+    let show = fixture.run_forge_with_cargo_home(&["evidence", "show", "--json"], &cargo_home)?;
+    assert_eq!(
+        show.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&show.stdout),
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown: Value = serde_json::from_slice(&show.stdout)?;
+    assert!(required_array(&shown["data"], "valid_receipts")?.is_empty());
+    let stale = required_array(&shown["data"], "stale_receipts")?;
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0]["validity"]["dependency_validity"], "unknown");
+    assert_eq!(stale[0]["validity"]["applicability"], "eligible");
+    assert_eq!(
+        stale[0]["validity"]["reasons"],
+        serde_json::json!([{
+            "code": "dependency-unknown",
+            "dependency": "environment"
+        }])
+    );
+
+    fs::write(
+        cargo_home.join("config.toml"),
+        b"[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n",
+    )?;
+    let verify =
+        fixture.run_forge_with_cargo_home(&["evidence", "verify", "--json"], &cargo_home)?;
+    assert_eq!(verify.status.code(), Some(2));
+    assert!(verify.stderr.is_empty());
+    let verified: Value = serde_json::from_slice(&verify.stdout)?;
+    assert_eq!(verified["data"]["local_state"], "unknown");
+    assert_eq!(
+        verified["data"]["stale_receipts"][0]["validity"]["reasons"],
+        stale[0]["validity"]["reasons"]
     );
     Ok(())
 }

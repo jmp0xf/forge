@@ -26,6 +26,11 @@ Evidence bundle. Receipt validity binds repository, scope, command, toolchain, e
 Forge behavior dependencies. Receipt/Evidence v1 remain readable only as historical, non-proving observations. Local
 Evidence always remains separate from CI, review, merge, deployment, and release authority.
 
+Forge fails closed when a standard tool can read execution configuration that v0 cannot bind without exposing private
+content. Cargo commands with discovered `config{,.toml}` or explicit `--config`, explicit Go commands, and Go workspace
+commands therefore remain useful observations but have an unknown environment dependency and cannot satisfy Evidence.
+Configuration-free Cargo commands and Forge's isolated single-module Go defaults retain a known environment boundary.
+
 `init` remains a dry-run by default and does not generate a runner unless explicitly requested. The implemented
 `--with-runner make|just|task` path adds only a reviewable managed `verify` target backed by already resolved native
 commands. `--with-ci github` explicitly plans a create-only `.github/workflows/verify.yml`: an active manual workflow

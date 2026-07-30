@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use forge_core::Digest;
 use forge_core::evidence::DependencyValue;
 use forge_core::fingerprint::environment_dependency_digest;
 use forge_core::ports::{
     DEFAULT_CAPTURE_LIMIT_BYTES, EnvPolicy, ExecSpec, Hasher, ProcessError, ProcessErrorKind,
     ProcessObservation, ProcessPort, StdinPolicy,
 };
+use forge_core::{CommandSource, CommandSpec, Digest};
 
 /// Default maximum number of bytes retained in memory for each output stream.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = DEFAULT_CAPTURE_LIMIT_BYTES;
@@ -27,6 +27,13 @@ pub const DEFAULT_OUTPUT_LIMIT_BYTES: usize = DEFAULT_CAPTURE_LIMIT_BYTES;
 /// The spool keeps large machine-readable output off the heap, but remains explicitly bounded so
 /// an unexpectedly large child cannot consume unbounded local disk space.
 pub const DEFAULT_SPOOLED_STDOUT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Behavior identifier for acquiring the complete project-command environment dependency.
+///
+/// This is separate from the canonical environment-map encoding: it also covers whether Forge can
+/// exclude standardized external configuration sources that are not represented by the map.
+pub const PROJECT_COMMAND_ENVIRONMENT_ACQUISITION_PROTOCOL_VERSION: &str =
+    "forge.project-command-environment-acquisition/v1";
 
 /// Process-tree isolation backend compiled for the current target.
 ///
@@ -95,29 +102,133 @@ pub const fn process_tree_capability() -> ProcessTreeCapability {
     }
 }
 
-/// Fingerprints the exact sanitized environment that the runner would supply to `spec`.
+/// Fingerprints one project's actual child environment only when its standardized configuration
+/// boundary is complete enough for reusable evidence.
 ///
-/// Raw values never leave this boundary. Privacy-unsafe names and invalid process environment
-/// entries become a typed process error, so callers can record an unknown dependency while still
-/// deciding separately whether executing the observation is allowed.
-pub fn process_environment_dependency_digest<H: Hasher + ?Sized>(
+/// Commands still execute when this returns [`DependencyValue::Unknown`]. The unknown value only
+/// prevents a Receipt from proving current Evidence. Cargo configuration is searched outside the
+/// argv/environment map, so any discovered configuration file or explicit `--config` fails closed
+/// until Forge can bind its complete, privacy-safe tool closure. Native Go commands remain known
+/// only when the provider has disabled user configuration and implicit flags/toolchain/workspace
+/// selection. Run and readback must call this same boundary.
+pub fn project_command_environment_dependency_digest<H: Hasher + ?Sized>(
+    runner: &SynchronousProcessRunner,
+    command: &CommandSpec,
     spec: &ExecSpec,
     hasher: &H,
 ) -> Result<DependencyValue<Digest>, ProcessError> {
-    let environment = sanitized_environment(std::env::vars_os(), &spec.env).map_err(|error| {
+    let environment = dependency_environment(spec)?;
+    if command.program == OsStr::new("cargo")
+        && !cargo_configuration_boundary_is_complete(runner, spec, &environment)
+    {
+        return Ok(DependencyValue::Unknown);
+    }
+    if command.program == OsStr::new("go")
+        && !go_configuration_boundary_is_complete(command, &environment)
+    {
+        return Ok(DependencyValue::Unknown);
+    }
+    digest_dependency_environment(&environment, hasher)
+}
+
+fn dependency_environment(spec: &ExecSpec) -> Result<BTreeMap<OsString, OsString>, ProcessError> {
+    sanitized_environment(std::env::vars_os(), &spec.env).map_err(|error| {
         ProcessError::new(
             ProcessErrorKind::InvalidEnvironment,
             "build command environment fingerprint",
             error,
         )
-    })?;
-    environment_dependency_digest(hasher, &environment).map_err(|error| {
+    })
+}
+
+fn digest_dependency_environment<H: Hasher + ?Sized>(
+    environment: &BTreeMap<OsString, OsString>,
+    hasher: &H,
+) -> Result<DependencyValue<Digest>, ProcessError> {
+    environment_dependency_digest(hasher, environment).map_err(|error| {
         ProcessError::new(
             ProcessErrorKind::InvalidEnvironment,
             "fingerprint command environment",
             io::Error::new(io::ErrorKind::InvalidInput, error),
         )
     })
+}
+
+fn cargo_configuration_boundary_is_complete(
+    runner: &SynchronousProcessRunner,
+    spec: &ExecSpec,
+    environment: &BTreeMap<OsString, OsString>,
+) -> bool {
+    if spec.args.iter().any(|argument| {
+        argument == OsStr::new("--config")
+            || argument
+                .to_str()
+                .is_none_or(|argument| argument.starts_with("--config="))
+    }) {
+        return false;
+    }
+
+    let Ok(cwd) = runner.resolve_cwd(spec.cwd.as_path()) else {
+        return false;
+    };
+    if cwd
+        .ancestors()
+        .any(|ancestor| cargo_config_exists_or_is_uncertain(&ancestor.join(".cargo")))
+    {
+        return false;
+    }
+
+    let Some(cargo_home) = cargo_home(environment) else {
+        return false;
+    };
+    !cargo_config_exists_or_is_uncertain(&cargo_home)
+}
+
+fn cargo_home(environment: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+    if let Some(path) = environment_value(environment, "CARGO_HOME") {
+        let path = PathBuf::from(path);
+        return path.is_absolute().then_some(path);
+    }
+
+    #[cfg(windows)]
+    let home = environment_value(environment, "USERPROFILE")
+        .or_else(|| environment_value(environment, "HOME"));
+    #[cfg(not(windows))]
+    let home = environment_value(environment, "HOME");
+    let path = PathBuf::from(home?).join(".cargo");
+    path.is_absolute().then_some(path)
+}
+
+fn cargo_config_exists_or_is_uncertain(directory: &Path) -> bool {
+    ["config", "config.toml"].iter().any(|name| {
+        match std::fs::symlink_metadata(directory.join(name)) {
+            Ok(_) => true,
+            Err(error) => error.kind() != io::ErrorKind::NotFound,
+        }
+    })
+}
+
+fn go_configuration_boundary_is_complete(
+    command: &CommandSpec,
+    environment: &BTreeMap<OsString, OsString>,
+) -> bool {
+    matches!(
+        &command.source,
+        CommandSource::LanguageDefault { provider, .. } if provider == "go"
+    ) && environment_value(environment, "GOENV") == Some(OsStr::new("off"))
+        && environment_value(environment, "GOTOOLCHAIN") == Some(OsStr::new("local"))
+        && environment_value(environment, "GOFLAGS").is_some_and(OsStr::is_empty)
+        && environment_value(environment, "GOWORK") == Some(OsStr::new("off"))
+}
+
+fn environment_value<'a>(
+    environment: &'a BTreeMap<OsString, OsString>,
+    name: &str,
+) -> Option<&'a OsStr> {
+    environment
+        .iter()
+        .find(|(candidate, _)| environment_policy_key_eq(candidate, OsStr::new(name)))
+        .map(|(_, value)| value.as_os_str())
 }
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
@@ -1845,8 +1956,9 @@ mod tests {
     use super::platform;
     use super::{
         DEFAULT_OUTPUT_LIMIT_BYTES, OutputStream, SharedOutputHardLimit, SynchronousProcessRunner,
-        TerminationMode, drain_bounded, drain_bounded_with_hard_limit, is_windows_batch_program,
-        private_anonymous_tempfile, process_environment_dependency_digest, sanitized_environment,
+        TerminationMode, dependency_environment, digest_dependency_environment, drain_bounded,
+        drain_bounded_with_hard_limit, is_windows_batch_program, private_anonymous_tempfile,
+        project_command_environment_dependency_digest, sanitized_environment,
     };
     use crate::hash::Blake3Hasher;
 
@@ -2865,11 +2977,176 @@ mod tests {
             .overrides
             .insert(OsString::from("SAFE_FLAG"), OsString::from("second"));
 
-        let first = process_environment_dependency_digest(&first, &Blake3Hasher)?;
-        let second = process_environment_dependency_digest(&second, &Blake3Hasher)?;
+        let first = digest_dependency_environment(&dependency_environment(&first)?, &Blake3Hasher)?;
+        let second =
+            digest_dependency_environment(&dependency_environment(&second)?, &Blake3Hasher)?;
 
         assert!(matches!(first, DependencyValue::Known(_)));
         assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_environment_fails_closed_when_standard_configuration_can_apply()
+    -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let worktree = root.path().join("worktree");
+        let cargo_home = root.path().join("cargo-home");
+        fs::create_dir(&worktree)?;
+        fs::create_dir(&cargo_home)?;
+        let runner = SynchronousProcessRunner::new(&worktree)?;
+        let command = CommandSpec::new(
+            "runtime.process.cargo-environment",
+            Intent::Check,
+            "cargo",
+            RepoRelativePath::root(),
+            CommandSource::LanguageDefault {
+                provider: "rust".into(),
+                rule: "cargo-check".into(),
+            },
+        )
+        .with_args(["check"]);
+        let mut execution = ExecSpec::from_project_command(&command);
+        execution.env = EnvPolicy {
+            inherit: BTreeSet::new(),
+            overrides: BTreeMap::from([(
+                OsString::from("CARGO_HOME"),
+                cargo_home.as_os_str().to_owned(),
+            )]),
+        };
+
+        assert!(matches!(
+            project_command_environment_dependency_digest(
+                &runner,
+                &command,
+                &execution,
+                &Blake3Hasher,
+            )?,
+            DependencyValue::Known(_)
+        ));
+
+        for name in ["config", "config.toml"] {
+            fs::write(cargo_home.join(name), b"[build]\njobs = 1\n")?;
+            assert_eq!(
+                project_command_environment_dependency_digest(
+                    &runner,
+                    &command,
+                    &execution,
+                    &Blake3Hasher,
+                )?,
+                DependencyValue::Unknown,
+                "Cargo configuration `{name}` was treated as a closed dependency"
+            );
+            fs::remove_file(cargo_home.join(name))?;
+        }
+
+        fs::create_dir(root.path().join(".cargo"))?;
+        fs::write(root.path().join(".cargo/config.toml"), b"")?;
+        assert_eq!(
+            project_command_environment_dependency_digest(
+                &runner,
+                &command,
+                &execution,
+                &Blake3Hasher,
+            )?,
+            DependencyValue::Unknown,
+            "an ancestor Cargo configuration was not discovered"
+        );
+        fs::remove_dir_all(root.path().join(".cargo"))?;
+
+        let configured = command
+            .clone()
+            .with_args(["check", "--config", "build.jobs=1"]);
+        let mut configured_execution = ExecSpec::from_project_command(&configured);
+        configured_execution.env = execution.env.clone();
+        assert_eq!(
+            project_command_environment_dependency_digest(
+                &runner,
+                &configured,
+                &configured_execution,
+                &Blake3Hasher,
+            )?,
+            DependencyValue::Unknown,
+            "an explicit Cargo configuration was treated as closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn go_environment_is_known_only_for_the_isolated_native_provider() -> Result<(), Box<dyn Error>>
+    {
+        let root = tempdir()?;
+        let runner = SynchronousProcessRunner::new(root.path())?;
+        let mut command = CommandSpec::new(
+            "runtime.process.go-environment",
+            Intent::Test,
+            "go",
+            RepoRelativePath::root(),
+            CommandSource::LanguageDefault {
+                provider: "go".into(),
+                rule: "go-test".into(),
+            },
+        )
+        .with_args(["test", "./..."]);
+        command.env = BTreeMap::from([
+            (OsString::from("GOENV"), OsString::from("off")),
+            (OsString::from("GOFLAGS"), OsString::new()),
+            (OsString::from("GOTOOLCHAIN"), OsString::from("local")),
+            (OsString::from("GOWORK"), OsString::from("off")),
+        ]);
+        let mut execution = ExecSpec::from_project_command(&command);
+        execution.env.inherit.clear();
+        assert!(matches!(
+            project_command_environment_dependency_digest(
+                &runner,
+                &command,
+                &execution,
+                &Blake3Hasher,
+            )?,
+            DependencyValue::Known(_)
+        ));
+
+        for name in ["GOENV", "GOFLAGS", "GOTOOLCHAIN", "GOWORK"] {
+            let mut incomplete = execution.clone();
+            incomplete.env.overrides.remove(OsStr::new(name));
+            assert_eq!(
+                project_command_environment_dependency_digest(
+                    &runner,
+                    &command,
+                    &incomplete,
+                    &Blake3Hasher,
+                )?,
+                DependencyValue::Unknown,
+                "missing isolation control `{name}` was treated as closed"
+            );
+        }
+
+        let mut workspace = execution.clone();
+        workspace.env.overrides.insert(
+            OsString::from("GOWORK"),
+            root.path().join("go.work").into_os_string(),
+        );
+        assert_eq!(
+            project_command_environment_dependency_digest(
+                &runner,
+                &command,
+                &workspace,
+                &Blake3Hasher,
+            )?,
+            DependencyValue::Unknown
+        );
+
+        let mut configured = command.clone();
+        configured.source = CommandSource::ExplicitConfig;
+        assert_eq!(
+            project_command_environment_dependency_digest(
+                &runner,
+                &configured,
+                &execution,
+                &Blake3Hasher,
+            )?,
+            DependencyValue::Unknown
+        );
         Ok(())
     }
 
@@ -2885,7 +3162,8 @@ mod tests {
             )]),
         };
 
-        let Err(error) = process_environment_dependency_digest(&command, &Blake3Hasher) else {
+        let environment = dependency_environment(&command)?;
+        let Err(error) = digest_dependency_environment(&environment, &Blake3Hasher) else {
             return Err("secret-like environment unexpectedly fingerprinted".into());
         };
         assert_eq!(error.kind(), ProcessErrorKind::InvalidEnvironment);

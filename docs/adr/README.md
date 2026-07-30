@@ -53,5 +53,6 @@ ADR 记录已经接受、需要跨重构保持稳定的架构决定。设计总�
 | [0037](0037-pin-github-checkout-v7-on-node24.md) | Accepted | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
 | [0038](0038-do-not-persist-arbitrary-project-command-output-in-v0.md) | Accepted | v0 不持久化任意项目命令的 stdout/stderr 内容 |
 | [0039](0039-preserve-current-typed-unknown-receipt-facts.md) | Accepted | 保留当前 Receipt 的 typed unknown 事实 |
+| [0040](0040-fail-closed-on-unbound-project-tool-configuration.md) | Accepted | 项目工具外部配置未闭合时安全失败 |
 
 使用 [`0000-template.md`](0000-template.md) 创建新记录。

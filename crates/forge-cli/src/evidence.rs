@@ -36,7 +36,8 @@ use forge_runtime::control::OperationBudget;
 use forge_runtime::git::GitCli;
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::process::{
-    SynchronousProcessRunner, empty_process_output_digests, process_environment_dependency_digest,
+    SynchronousProcessRunner, empty_process_output_digests,
+    project_command_environment_dependency_digest,
 };
 use forge_runtime::scope::{ScopeAcquisitionError, acquire_repository_scope_controlled};
 use forge_runtime::state::{
@@ -223,8 +224,9 @@ where
         |command, spec| {
             let command_dependency = command_dependency_digest(&hasher, command, provenance)
                 .unwrap_or(DependencyValue::Unknown);
-            let environment = process_environment_dependency_digest(spec, &hasher)
-                .unwrap_or(DependencyValue::Unknown);
+            let environment =
+                project_command_environment_dependency_digest(&runner, command, spec, &hasher)
+                    .unwrap_or(DependencyValue::Unknown);
             let toolchain =
                 required_probes_for_command(command).map_or(DependencyValue::Unknown, |probes| {
                     let request = ToolchainProbeRequest::for_probes(
