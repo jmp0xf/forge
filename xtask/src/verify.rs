@@ -11,7 +11,7 @@ use forge_core::path::RepoRelativePath;
 use forge_core::ports::{ExecSpec, OutputPolicy, ProcessObservation, StdinPolicy};
 use forge_runtime::process::SynchronousProcessRunner;
 
-use crate::cargo_env::{CargoNetworkMode, cargo_environment};
+use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, cargo_environment};
 
 // The enclosing Forge command has a 45-minute project timeout. Reserve one minute for repository
 // discovery, command setup, and Receipt persistence when this entry point is dogfooded through
@@ -259,7 +259,7 @@ fn step_spec(
         program: OsString::from("cargo"),
         args: step.args.iter().map(OsString::from).collect(),
         cwd,
-        env: cargo_environment(CargoNetworkMode::Inherit),
+        env: cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host),
         timeout,
         stdin: StdinPolicy::Closed,
         stdout: OutputPolicy::CaptureBounded {

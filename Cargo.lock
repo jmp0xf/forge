@@ -1625,6 +1625,7 @@ name = "xtask"
 version = "0.1.0-rc.1"
 dependencies = [
  "blake3",
+ "find-msvc-tools",
  "forge-core",
  "forge-runtime",
  "forge-schema",

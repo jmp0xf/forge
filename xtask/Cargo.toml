@@ -21,6 +21,9 @@ tempfile.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+find-msvc-tools.workspace = true
+
 [dev-dependencies]
 jsonschema.workspace = true
 

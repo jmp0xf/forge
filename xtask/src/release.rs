@@ -30,7 +30,7 @@ use forge_schema::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cargo_env::{CargoNetworkMode, cargo_environment};
+use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, cargo_environment};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -1659,7 +1659,10 @@ fn cargo_build(
         repository,
         cargo_program(),
         arguments,
-        cargo_environment(CargoNetworkMode::Offline),
+        cargo_environment(
+            CargoNetworkMode::Offline,
+            CargoCompilationTarget::Target(target.triple),
+        ),
         CARGO_BUILD_TIMEOUT,
         MAX_BUILD_STREAM_BYTES,
         MAX_BUILD_STREAM_BYTES,
@@ -1718,7 +1721,10 @@ fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, 
         .into_iter()
         .map(OsString::from)
         .collect(),
-        cargo_environment(CargoNetworkMode::Offline),
+        cargo_environment(
+            CargoNetworkMode::Offline,
+            CargoCompilationTarget::Target(target.triple),
+        ),
         CARGO_METADATA_TIMEOUT,
         MAX_METADATA_BYTES,
         MAX_DIAGNOSTIC_BYTES,
