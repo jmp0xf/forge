@@ -27,6 +27,7 @@ find-msvc-tools.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true
+serde_yaml_ng.workspace = true
 
 [[bin]]
 name = "xtask-compat-fixture"

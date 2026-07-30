@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
+
 #[derive(Debug, Clone, Copy)]
 struct InvariantTestAnchor {
     path: &'static str,
@@ -1231,6 +1233,126 @@ fn primary_verification_workflow_does_not_depend_on_forge() -> Result<(), Box<dy
     Ok(())
 }
 
+fn yaml_key(value: &str) -> YamlValue {
+    YamlValue::String(value.to_owned())
+}
+
+fn yaml_mapping<'a>(
+    value: &'a YamlValue,
+    context: &str,
+) -> Result<&'a YamlMapping, Box<dyn std::error::Error>> {
+    value
+        .as_mapping()
+        .ok_or_else(|| format!("{context} must be a YAML mapping").into())
+}
+
+fn workflow_value<'a>(
+    mapping: &'a YamlMapping,
+    key: &str,
+    context: &str,
+) -> Result<&'a YamlValue, Box<dyn std::error::Error>> {
+    mapping
+        .get(yaml_key(key))
+        .ok_or_else(|| format!("{context} is missing `{key}`").into())
+}
+
+fn reject_authority_keys_and_secrets(
+    value: &YamlValue,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match value {
+        YamlValue::Mapping(mapping) => {
+            for (key, child) in mapping {
+                if let Some(key) = key.as_str() {
+                    let child_path = format!("{path}.{key}");
+                    if key == "permissions" {
+                        return Err(format!(
+                            "candidate workflow must not declare nested permissions at `{child_path}`"
+                        )
+                        .into());
+                    }
+                    if key == "secrets" {
+                        return Err(format!(
+                            "candidate workflow must not declare secrets at `{child_path}`"
+                        )
+                        .into());
+                    }
+                    if key == "environment" {
+                        return Err(format!(
+                            "candidate workflow must not use a protected environment at `{child_path}`"
+                        )
+                        .into());
+                    }
+                    reject_authority_keys_and_secrets(child, &child_path)?;
+                } else {
+                    reject_authority_keys_and_secrets(key, path)?;
+                    reject_authority_keys_and_secrets(child, path)?;
+                }
+            }
+        }
+        YamlValue::Sequence(sequence) => {
+            for (index, child) in sequence.iter().enumerate() {
+                reject_authority_keys_and_secrets(child, &format!("{path}[{index}]"))?;
+            }
+        }
+        YamlValue::String(text) if text.to_ascii_lowercase().contains("secrets") => {
+            return Err(
+                format!("candidate workflow must not reference a secret at `{path}`").into(),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn assert_candidate_workflow_authority_boundary(
+    workflow: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let document: YamlValue = serde_yaml_ng::from_str(workflow)?;
+    let root = yaml_mapping(&document, "workflow")?;
+
+    let permissions = yaml_mapping(
+        workflow_value(root, "permissions", "workflow")?,
+        "workflow permissions",
+    )?;
+    if permissions.len() != 1
+        || permissions
+            .get(yaml_key("contents"))
+            .and_then(YamlValue::as_str)
+            != Some("read")
+    {
+        return Err("workflow permissions must be exactly `contents: read`".into());
+    }
+
+    let events = yaml_mapping(workflow_value(root, "on", "workflow")?, "workflow triggers")?;
+    let actual_events = events
+        .keys()
+        .map(|key| {
+            key.as_str()
+                .map(str::to_owned)
+                .ok_or("workflow trigger names must be strings")
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let allowed_events = BTreeSet::from([
+        "pull_request".to_owned(),
+        "push".to_owned(),
+        "workflow_dispatch".to_owned(),
+    ]);
+    if actual_events != allowed_events {
+        return Err(
+            "candidate verification may use only the reviewed pull_request, main push, and manual triggers"
+                .into(),
+        );
+    }
+
+    for (key, value) in root {
+        if key.as_str() != Some("permissions") {
+            reject_authority_keys_and_secrets(value, key.as_str().unwrap_or("workflow"))?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn candidate_repository_has_no_release_authority_workflow() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1259,6 +1381,7 @@ fn candidate_repository_has_no_release_authority_workflow() -> Result<(), Box<dy
     );
 
     let workflow = fs::read_to_string(workflows.join("verify.yml"))?;
+    assert_candidate_workflow_authority_boundary(&workflow)?;
     for forbidden in [
         "write-all",
         "pull_request_target:",
@@ -1299,6 +1422,7 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
     let workflow = fs::read_to_string(root.join(".github/workflows/verify.yml"))?;
 
     assert!(workflow.contains("permissions:\n  contents: read\n"));
+    assert_candidate_workflow_authority_boundary(&workflow)?;
     assert!(workflow.contains(
         "group: verify-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.mutation }}"
     ));
@@ -1426,6 +1550,49 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
         "native product targets must not imply a musl C++ fuzz toolchain; the pinned nightly campaign owns fuzz execution"
     );
     Ok(())
+}
+
+#[test]
+fn candidate_workflow_authority_parser_rejects_yaml_spelling_bypasses() {
+    let valid = r#"name: verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: cargo test
+"#;
+    let valid_result = assert_candidate_workflow_authority_boundary(valid);
+    assert!(
+        valid_result.is_ok(),
+        "reviewed read-only workflow should pass: {valid_result:?}"
+    );
+
+    for invalid in [
+        valid.replace(
+            "    runs-on: ubuntu-24.04",
+            "    permissions: { contents: write }\n    runs-on: ubuntu-24.04",
+        ),
+        valid.replace(
+            "    runs-on: ubuntu-24.04",
+            "    permissions:\n      contents: write # comment\n    runs-on: ubuntu-24.04",
+        ),
+        valid.replace("cargo test", "echo ${{ secrets.RELEASE_TOKEN }}"),
+        valid.replace("cargo test", "echo ${{ secrets['RELEASE_TOKEN'] }}"),
+        valid.replace("  workflow_dispatch:\n", "  pull_request_target:\n"),
+        valid.replace("  contents: read", "  contents: read\n  id-token: write"),
+    ] {
+        assert!(
+            assert_candidate_workflow_authority_boundary(&invalid).is_err(),
+            "authority-bearing workflow spelling unexpectedly passed:\n{invalid}"
+        );
+    }
 }
 
 fn rust_source_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
