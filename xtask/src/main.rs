@@ -37,6 +37,9 @@ fn main() -> ExitCode {
         [command] if command == "check-fixtures" => run_check_fixtures(),
         [command] if command == "verify" => run_verify(),
         [command] if command == "generate-fixtures" => run_generate_fixtures(),
+        [command, target] if cargo_env::is_msvc_probe_command(command) => {
+            run_msvc_probe_helper(target)
+        }
         [command, rest @ ..] if command == "diff-plans" => run_diff_plans(rest),
         [command, rest @ ..] if command == "release-build" => {
             run_release_command(release::run_build(rest))
@@ -51,6 +54,13 @@ fn main() -> ExitCode {
             eprintln!("invalid xtask arguments; run `cargo run -p xtask -- help`");
             ExitCode::from(EXIT_USAGE)
         }
+    }
+}
+
+fn run_msvc_probe_helper(target: &str) -> ExitCode {
+    match cargo_env::run_msvc_probe_helper(target) {
+        Ok(()) => ExitCode::from(EXIT_OK),
+        Err(error) => report_error(EXIT_ENV_UNMET, &error.to_string()),
     }
 }
 

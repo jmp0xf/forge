@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use forge_core::domain::{Mutability, NetworkIntent};
 use forge_core::path::RepoRelativePath;
-use forge_core::ports::{ExecSpec, OutputPolicy, ProcessObservation, StdinPolicy};
+use forge_core::ports::{EnvPolicy, ExecSpec, OutputPolicy, ProcessObservation, StdinPolicy};
 use forge_runtime::process::SynchronousProcessRunner;
 
-use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, cargo_environment};
+use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, prepared_cargo_environment};
 
 // The enclosing Forge command has a 45-minute project timeout. Reserve one minute for repository
 // discovery, command setup, and Receipt persistence when this entry point is dogfooded through
@@ -167,10 +167,20 @@ pub(crate) struct VerifyReport {
 }
 
 pub(crate) fn run(repository: &Path) -> Result<VerifyReport, VerifyError> {
+    let started = Instant::now();
     let runner = SynchronousProcessRunner::new(repository).map_err(|error| {
         VerifyError::environment(format!("failed to initialize verification runner: {error}"))
     })?;
-    let started = Instant::now();
+    let cargo_env = prepared_cargo_environment(
+        &runner,
+        CargoNetworkMode::Inherit,
+        CargoCompilationTarget::Host,
+    )
+    .map_err(|error| {
+        VerifyError::environment(format!(
+            "failed to prepare the verification Cargo environment: {error}"
+        ))
+    })?;
     let mut report = VerifyReport {
         required_steps: 0,
         advisory_steps_passed: 0,
@@ -212,7 +222,7 @@ pub(crate) fn run(repository: &Path) -> Result<VerifyReport, VerifyError> {
             VerifyError::environment(format!("failed to flush verification progress: {error}"))
         })?;
 
-        let spec = step_spec(repository, step, remaining)?;
+        let spec = step_spec(repository, step, remaining, &cargo_env)?;
         match runner.run_with_output_hard_limit(&spec, COMPLETE_OUTPUT_BYTES) {
             Ok(observation) if observation_passed(&observation) => {
                 println!(
@@ -256,6 +266,7 @@ fn step_spec(
     repository: &Path,
     step: &VerifyStep,
     timeout: Duration,
+    cargo_env: &EnvPolicy,
 ) -> Result<ExecSpec, VerifyError> {
     let cwd = RepoRelativePath::new(step.cwd).map_err(|error| {
         VerifyError::internal(format!(
@@ -265,7 +276,7 @@ fn step_spec(
     })?;
     #[cfg(windows)]
     let env = {
-        let mut env = cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host);
+        let mut env = cargo_env.clone();
         env.overrides.insert(
             OsString::from("CARGO_TARGET_DIR"),
             windows_verify_target_dir(repository)?.into_os_string(),
@@ -275,7 +286,7 @@ fn step_spec(
     #[cfg(not(windows))]
     let env = {
         let _ = repository;
-        cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host)
+        cargo_env.clone()
     };
     Ok(ExecSpec {
         program: OsString::from("cargo"),
@@ -430,6 +441,8 @@ mod tests {
     use forge_core::domain::{Mutability, NetworkIntent};
     use forge_core::ports::{OutputPolicy, StdinPolicy};
 
+    use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, cargo_environment};
+
     use super::{
         COMPLETE_OUTPUT_BYTES, Enforcement, FAILURE_DISPLAY_BYTES, OPERATION_TIMEOUT,
         RETAINED_STREAM_BYTES, VERIFY_STEPS, WINDOWS_VERIFY_TARGET_PRIMARY,
@@ -521,8 +534,9 @@ mod tests {
         let repository = std::env::current_dir()?.canonicalize()?;
         #[cfg(not(windows))]
         let repository = Path::new("/repository").to_path_buf();
+        let cargo_env = cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host);
         for step in VERIFY_STEPS {
-            let spec = step_spec(&repository, step, Duration::from_secs(7))?;
+            let spec = step_spec(&repository, step, Duration::from_secs(7), &cargo_env)?;
             assert_eq!(spec.program, OsStr::new("cargo"));
             assert_eq!(spec.stdin, StdinPolicy::Closed);
             assert_eq!(spec.mutability, Mutability::ExternalSideEffect);

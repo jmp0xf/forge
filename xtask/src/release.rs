@@ -30,7 +30,7 @@ use forge_schema::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, cargo_environment};
+use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, prepared_cargo_environment};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -1655,14 +1655,17 @@ fn cargo_build(
     .collect::<Vec<_>>();
     arguments.push(target_directory.as_os_str().to_owned());
     let label = format!("Cargo release build for {}", target.triple);
+    let environment = prepared_release_cargo_environment(
+        repository,
+        CargoNetworkMode::Offline,
+        CargoCompilationTarget::Target(target.triple),
+        &label,
+    )?;
     let observation = run_bounded_process(
         repository,
         cargo_program(),
         arguments,
-        cargo_environment(
-            CargoNetworkMode::Offline,
-            CargoCompilationTarget::Target(target.triple),
-        ),
+        environment,
         CARGO_BUILD_TIMEOUT,
         MAX_BUILD_STREAM_BYTES,
         MAX_BUILD_STREAM_BYTES,
@@ -1706,6 +1709,12 @@ fn read_built_binary(
 fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, ReleaseError> {
     require_no_external_cargo_configuration(repository)?;
     let label = format!("Cargo metadata for {}", target.triple);
+    let environment = prepared_release_cargo_environment(
+        repository,
+        CargoNetworkMode::Offline,
+        CargoCompilationTarget::Target(target.triple),
+        &label,
+    )?;
     let observation = run_bounded_process(
         repository,
         cargo_program(),
@@ -1721,10 +1730,7 @@ fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, 
         .into_iter()
         .map(OsString::from)
         .collect(),
-        cargo_environment(
-            CargoNetworkMode::Offline,
-            CargoCompilationTarget::Target(target.triple),
-        ),
+        environment,
         CARGO_METADATA_TIMEOUT,
         MAX_METADATA_BYTES,
         MAX_DIAGNOSTIC_BYTES,
@@ -1736,6 +1742,24 @@ fn cargo_metadata(repository: &Path, target: &ReleaseTarget) -> Result<Vec<u8>, 
     let observation = observation?;
     later_configuration_boundary?;
     require_process_success(observation, &label)
+}
+
+fn prepared_release_cargo_environment(
+    repository: &Path,
+    network: CargoNetworkMode,
+    compilation_target: CargoCompilationTarget<'_>,
+    label: &str,
+) -> Result<EnvPolicy, ReleaseError> {
+    let runner = SynchronousProcessRunner::new(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to initialize the MSVC environment probe before {label}: {error}"
+        ))
+    })?;
+    prepared_cargo_environment(&runner, network, compilation_target).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to prepare the Cargo environment before {label}: {error}"
+        ))
+    })
 }
 
 fn require_no_external_cargo_configuration(repository: &Path) -> Result<(), ReleaseError> {
@@ -3175,6 +3199,35 @@ mod tests {
         {"id":"registry+https://github.com/rust-lang/crates.io-index#test-only@4.5.6","deps":[]}
       ]}
     }"#;
+
+    #[test]
+    fn release_cargo_preparation_preserves_linker_authority_and_offline_policy()
+    -> Result<(), ReleaseError> {
+        let repository = tempdir().map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let environment = super::prepared_release_cargo_environment(
+            repository.path(),
+            crate::cargo_env::CargoNetworkMode::Offline,
+            crate::cargo_env::CargoCompilationTarget::Target("x86_64-pc-windows-gnu"),
+            "release Cargo environment test",
+        )?;
+
+        assert_eq!(
+            environment
+                .overrides
+                .get(std::ffi::OsStr::new("CARGO_NET_OFFLINE")),
+            Some(&OsString::from("true"))
+        );
+        assert_eq!(
+            environment
+                .overrides
+                .get(std::ffi::OsStr::new("RUSTUP_AUTO_INSTALL")),
+            Some(&OsString::from("0"))
+        );
+        assert!(!environment.overrides.contains_key(std::ffi::OsStr::new(
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
+        )));
+        Ok(())
+    }
 
     #[test]
     fn sha256_uses_the_standard_known_vector() {
