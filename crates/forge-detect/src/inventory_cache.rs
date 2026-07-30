@@ -1,5 +1,6 @@
 //! Versioned codec and complete dependency key for the shared clean-commit inventory cache.
 
+use std::borrow::Cow;
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
@@ -153,6 +154,37 @@ pub fn index_projection_digest_controlled(
     control: &dyn OperationControl,
 ) -> Result<Option<Digest>, OperationControlError> {
     control.checkpoint()?;
+    let mut already_ordered = true;
+    let mut compared_path_bytes = 0usize;
+    for entries in index_entries.windows(2) {
+        // Ordering work grows with the compared native encodings, not merely the entry count.
+        let comparison_bytes = entries[0]
+            .path
+            .as_path()
+            .as_os_str()
+            .len()
+            .saturating_add(entries[1].path.as_path().as_os_str().len());
+        if !entries[0]
+            .path
+            .cmp(&entries[1].path)
+            .then_with(|| entries[0].stage.cmp(&entries[1].stage))
+            .is_lt()
+        {
+            already_ordered = false;
+        }
+        compared_path_bytes = compared_path_bytes.saturating_add(comparison_bytes);
+        if compared_path_bytes >= CONTROL_CHUNK_BYTES {
+            control.checkpoint()?;
+            compared_path_bytes %= CONTROL_CHUNK_BYTES;
+        }
+        if !already_ordered {
+            break;
+        }
+    }
+    if already_ordered {
+        return digest_ordered_index_projection(index_entries.iter(), hasher, control);
+    }
+    control.checkpoint()?;
     let mut ordered = index_entries.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
         left.path
@@ -160,10 +192,17 @@ pub fn index_projection_digest_controlled(
             .then_with(|| left.stage.cmp(&right.stage))
     });
     control.checkpoint()?;
-    let mut encoded = Vec::new();
+    digest_ordered_index_projection(ordered, hasher, control)
+}
+
+fn digest_ordered_index_projection<'a>(
+    ordered: impl IntoIterator<Item = &'a GitIndexEntry>,
+    hasher: &dyn Hasher,
+    control: &dyn OperationControl,
+) -> Result<Option<Digest>, OperationControlError> {
+    let mut encoded = ControlledProjectionEncoder::new(control);
     let mut previous = None;
     for entry in ordered {
-        control.checkpoint()?;
         if entry.stage != 0
             || !matches!(entry.tag, GitIndexTag::Cached)
             || !matches!(entry.mode.as_bytes(), b"100644" | b"100755")
@@ -172,21 +211,16 @@ pub fn index_projection_digest_controlled(
             return Ok(None);
         }
         previous = Some(&entry.path);
-        append_field_controlled(&mut encoded, b"mode", entry.mode.as_bytes(), control)?;
-        append_field_controlled(
-            &mut encoded,
-            b"object-id",
-            entry.object_id.as_bytes(),
-            control,
-        )?;
+        encoded.append_field(b"mode", entry.mode.as_bytes())?;
+        encoded.append_field(b"object-id", entry.object_id.as_bytes())?;
         let path = match native_path_bytes(entry.path.as_path()) {
             Ok(path) => path,
             Err(CacheCodecError::Invalid) => return Ok(None),
             Err(CacheCodecError::Control(error)) => return Err(error),
         };
-        append_field_controlled(&mut encoded, b"path", &path, control)?;
+        encoded.append_field(b"path", &path)?;
     }
-    control.checkpoint()?;
+    let encoded = encoded.finish()?;
     let digest = hasher.digest(&[INDEX_PROJECTION_DOMAIN, &encoded]);
     control.checkpoint()?;
     Ok(Some(digest))
@@ -387,21 +421,47 @@ fn append_field(target: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     target.extend_from_slice(value);
 }
 
-fn append_field_controlled(
-    target: &mut Vec<u8>,
-    name: &[u8],
-    value: &[u8],
-    control: &dyn OperationControl,
-) -> Result<(), OperationControlError> {
-    control.checkpoint()?;
-    target.extend_from_slice(&(name.len() as u128).to_be_bytes());
-    target.extend_from_slice(name);
-    target.extend_from_slice(&(value.len() as u128).to_be_bytes());
-    for chunk in value.chunks(CONTROL_CHUNK_BYTES) {
-        control.checkpoint()?;
-        target.extend_from_slice(chunk);
+struct ControlledProjectionEncoder<'a> {
+    bytes: Vec<u8>,
+    bytes_since_checkpoint: usize,
+    control: &'a dyn OperationControl,
+}
+
+impl<'a> ControlledProjectionEncoder<'a> {
+    fn new(control: &'a dyn OperationControl) -> Self {
+        Self {
+            bytes: Vec::new(),
+            bytes_since_checkpoint: 0,
+            control,
+        }
     }
-    Ok(())
+
+    fn append_field(&mut self, name: &[u8], value: &[u8]) -> Result<(), OperationControlError> {
+        self.extend(&(name.len() as u128).to_be_bytes())?;
+        self.extend(name)?;
+        self.extend(&(value.len() as u128).to_be_bytes())?;
+        self.extend(value)
+    }
+
+    fn extend(&mut self, mut bytes: &[u8]) -> Result<(), OperationControlError> {
+        while !bytes.is_empty() {
+            if self.bytes_since_checkpoint == 0 {
+                self.control.checkpoint()?;
+            }
+            let remaining = CONTROL_CHUNK_BYTES - self.bytes_since_checkpoint;
+            let count = remaining.min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
+            self.bytes_since_checkpoint =
+                (self.bytes_since_checkpoint + count) % CONTROL_CHUNK_BYTES;
+            bytes = &bytes[count..];
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<u8>, OperationControlError> {
+        self.control.checkpoint()?;
+        Ok(self.bytes)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -671,25 +731,26 @@ impl Read for ControlledSliceReader<'_> {
 }
 
 #[cfg(unix)]
-fn native_path_bytes(path: &Path) -> Result<Vec<u8>, CacheCodecError> {
+fn native_path_bytes(path: &Path) -> Result<Cow<'_, [u8]>, CacheCodecError> {
     use std::os::unix::ffi::OsStrExt as _;
-    Ok(path.as_os_str().as_bytes().to_vec())
+    Ok(Cow::Borrowed(path.as_os_str().as_bytes()))
 }
 
 #[cfg(windows)]
-fn native_path_bytes(path: &Path) -> Result<Vec<u8>, CacheCodecError> {
+fn native_path_bytes(path: &Path) -> Result<Cow<'_, [u8]>, CacheCodecError> {
     use std::os::windows::ffi::OsStrExt as _;
-    Ok(path
-        .as_os_str()
-        .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect())
+    Ok(Cow::Owned(
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn native_path_bytes(path: &Path) -> Result<Vec<u8>, CacheCodecError> {
+fn native_path_bytes(path: &Path) -> Result<Cow<'_, [u8]>, CacheCodecError> {
     path.to_str()
-        .map(|path| path.as_bytes().to_vec())
+        .map(|path| Cow::Borrowed(path.as_bytes()))
         .ok_or(CacheCodecError::Invalid)
 }
 
@@ -928,6 +989,67 @@ mod tests {
             )
             .is_none(),
             "an unborn repository has no commit-addressed cache key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_projection_fast_path_preserves_unsorted_projection_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hasher = TestHasher;
+        let ordered = ordinary_index(&["a", "b", "c"])?;
+        let unsorted = ordinary_index(&["c", "a", "b"])?;
+
+        assert_eq!(
+            index_projection_digest(&ordered, &hasher),
+            index_projection_digest(&unsorted, &hasher)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_projection_stops_before_hashing_after_a_bounded_chunk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let paths = (0..1_024)
+            .map(|index| format!("src/generated/{index:04}.rs"))
+            .collect::<Vec<_>>();
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let index = ordinary_index(&path_refs)?;
+        let hasher = CountingHasher {
+            calls: Cell::new(0),
+        };
+        let control = FailAtCheckpoint::new(3, OperationControlError::Interrupted);
+
+        let result = index_projection_digest_controlled(&index, &hasher, &control);
+
+        assert_eq!(result.err(), Some(OperationControlError::Interrupted));
+        assert_eq!(hasher.calls.get(), 0, "encoding continued into digest work");
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_projection_scan_observes_operation_control() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let paths = (0..2_048)
+            .map(|index| format!("src/generated/{index:04}.rs"))
+            .collect::<Vec<_>>();
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut index = ordinary_index(&path_refs)?;
+        // A non-cacheable first entry makes the test distinguish scan checkpoints from the
+        // encoder's first checkpoint: without a bounded scan this returns `Ok(None)` immediately.
+        index[0].tag = GitIndexTag::SkipWorktree;
+        let hasher = CountingHasher {
+            calls: Cell::new(0),
+        };
+        let control = FailAtCheckpoint::new(2, OperationControlError::Interrupted);
+
+        let result = index_projection_digest_controlled(&index, &hasher, &control);
+
+        assert_eq!(result.err(), Some(OperationControlError::Interrupted));
+        assert_eq!(
+            hasher.calls.get(),
+            0,
+            "order scan continued into digest work"
         );
         Ok(())
     }
