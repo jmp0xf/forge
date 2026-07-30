@@ -31,9 +31,10 @@ All notable changes will be documented here.
   harness serving as the N-1 skeleton, `init --dry-run --json` dogfood fixed-point checks, four fuzz targets, mutation
   configuration, and an opt-in 100,000-file benchmark, without claiming a released-predecessor comparison.
 - Machine-readable doctor skip reasons and provenance/confidence metadata for every selected `next` context path.
-- A create-only local `0.1.0-rc.1` release assembler for the five supported targets, with exact-commit isolated source
-  binding, executable-format checks, deterministic target-bound CycloneDX 1.6 SBOMs, a complete artifact manifest,
-  SHA-256 checksums, and an explicit external SLSA/Sigstore/ownership/rollback gate.
+- A create-only local `0.1.0-rc.2` release assembler for the five supported targets, with exact-commit isolated source
+  binding, executable-format checks, deterministic target-bound CycloneDX 1.6 SBOMs with license expressions, a
+  source-bound checked-in third-party license corpus, a v2 artifact manifest, SHA-256 checksums, and an explicit
+  external SLSA/Sigstore/ownership/rollback gate.
 
 ### Changed
 
@@ -48,8 +49,13 @@ All notable changes will be documented here.
   and facts that require hosting or other external authority.
 - Windows generated-runner support is explicit: Task is supported and Make/Just fail with a typed recovery
   diagnostic instead of producing platform-incompatible output.
+- ADR-0041 supersedes the unpublished rc.1 contract: the fixed release set is now 13 files, manifest v2 records 11
+  artifacts and 13 provenance subjects, and final authority is split across isolated build, finalize, and protected
+  attestation domains in the external Authority repository.
 
 ### Removed
+
+- The unpublished `0.1.0-rc.1` candidate path; no rc.1 tag, Release, signature, or public asset is created.
 
 ### Security
 

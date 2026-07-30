@@ -47,10 +47,14 @@ physically separate authority set required by the design.
 See the [v0 implementation status](docs/v0-implementation-status.md) for the precise local boundary and remaining
 release and authority work.
 
-The repository also contains a candidate-controlled, local-only `0.1.0-rc.1` asset assembler for the five frozen
+The repository also contains a candidate-controlled, local-only `0.1.0-rc.2` asset assembler for the five frozen
 targets. It builds from an isolated exact-commit checkout, validates executable formats, emits target-bound CycloneDX
-SBOMs, and finalizes an exact manifest plus `SHA256SUMS`; it never tags, signs, attests, uploads, publishes, or
-authorizes a release. See the [release-candidate runbook](docs/release.md).
+SBOMs with machine-readable license expressions, copies the source-bound checked-in third-party license corpus, and
+finalizes the exact 13-file set with a v2 manifest plus `SHA256SUMS`. It never tags, signs, attests, uploads, publishes,
+or authorizes a release. Final qualification belongs to the physically separate
+[`jmp0xf/forge-release-authority`](https://github.com/jmp0xf/forge-release-authority) repository, whose build,
+finalization, and protected-attestation permission domains remain isolated. See the
+[release-candidate runbook](docs/release.md).
 
 ## Install from source
 
@@ -149,7 +153,7 @@ crates/forge-runtime  Git/filesystem/process/state implementations
 crates/forge-detect   repository, runner, Rust, and Go discovery
 crates/forge-render   managed blocks, change plans, and host adapter rendering
 crates/forge-cli      binary composition, I/O discipline, and exit-code mapping
-xtask                 schema export, fixture generation, and compatibility checks
+xtask                 schema/fixture checks, compatibility, release licenses, and local candidate assembly
 fixtures              versioned public fixture definitions and generated repositories
 fuzz                   separate cargo-fuzz workspace and regression corpora
 ```

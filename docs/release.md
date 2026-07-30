@@ -1,12 +1,15 @@
 # Forge v0 release-candidate runbook
 
-This runbook assembles reviewable local assets for `0.1.0-rc.1`. It does not grant release authority and does not
-perform a tag, upload, signature, attestation, or GitHub Release mutation. The frozen contract and its trust boundary
-are in [ADR-0029](adr/0029-publish-reviewable-v0-release-candidates.md).
+This runbook assembles reviewable local assets for `0.1.0-rc.2`. It does not grant release authority and does not
+perform a tag, upload, signature, attestation, or GitHub Release mutation. `0.1.0-rc.1` was never tagged or published
+and is not a distributable predecessor. The current contract and its trust boundary are in
+[ADR-0041](adr/0041-publish-license-complete-rc2-through-external-authority.md), which supersedes ADR-0029.
 
 The Forge candidate repository must not contain a release or signing workflow. The physically separate Authority Set
-may consume the candidate manifest and the twelve fixed files, but its policy, protected workflow, signing identity,
-approval, tag, upload, publication, and withdrawal permissions must remain outside the candidate write set.
+is the independent public
+[`jmp0xf/forge-release-authority`](https://github.com/jmp0xf/forge-release-authority) repository. Its policy,
+independent verifier, protected workflow, signing identity, approval, tag, upload, publication, and withdrawal
+permissions must remain outside the candidate write set.
 
 ## Fixed matrix
 
@@ -17,6 +20,16 @@ Build exactly one `forge` binary for each target:
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
+
+The exact staged asset names are:
+
+| Target | Binary | SBOM |
+|---|---|---|
+| `x86_64-unknown-linux-musl` | `forge-0.1.0-rc.2-x86_64-unknown-linux-musl` | `forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json` |
+| `aarch64-unknown-linux-musl` | `forge-0.1.0-rc.2-aarch64-unknown-linux-musl` | `forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json` |
+| `x86_64-apple-darwin` | `forge-0.1.0-rc.2-x86_64-apple-darwin` | `forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json` |
+| `aarch64-apple-darwin` | `forge-0.1.0-rc.2-aarch64-apple-darwin` | `forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json` |
+| `x86_64-pc-windows-msvc` | `forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe` | `forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json` |
 
 The Linux artifacts must be static 64-bit ELF files without a `PT_INTERP` loader. The local structural check establishes
 only that an ELF is static-compatible; the protected builder, external provenance, and native E2E must establish that
@@ -49,7 +62,7 @@ boundary. Review the checkout, create a dedicated output directory outside it, a
 
 ```text
 git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
-mkdir -p /absolute/path/to/forge-0.1.0-rc.1-dist
+mkdir -p /absolute/path/to/forge-0.1.0-rc.2-dist
 RUSTUP_AUTO_INSTALL=0 cargo build --locked --offline -p xtask
 ```
 
@@ -57,7 +70,7 @@ On Windows PowerShell, use the native path and environment syntax:
 
 ```text
 git status --porcelain=v2 --untracked-files=all --ignore-submodules=none
-New-Item -ItemType Directory -Force C:\forge-0.1.0-rc.1-dist
+New-Item -ItemType Directory -Force C:\forge-0.1.0-rc.2-dist
 $env:RUSTUP_AUTO_INSTALL = "0"
 cargo build --locked --offline -p xtask
 ```
@@ -66,11 +79,11 @@ On a runner with the exact target and linker already installed, build and stage 
 line so the same argument contract works in POSIX shells and PowerShell:
 
 ```text
-target/debug/xtask release-build --target x86_64-unknown-linux-musl --output-dir /absolute/path/to/forge-0.1.0-rc.1-dist
+target/debug/xtask release-build --target x86_64-unknown-linux-musl --output-dir /absolute/path/to/forge-0.1.0-rc.2-dist
 ```
 
 ```text
-.\target\debug\xtask.exe release-build --target x86_64-pc-windows-msvc --output-dir C:\forge-0.1.0-rc.1-dist
+.\target\debug\xtask.exe release-build --target x86_64-pc-windows-msvc --output-dir C:\forge-0.1.0-rc.2-dist
 ```
 
 Repeat on appropriate trusted runners for all five targets, transferring only the fixed named binary/SBOM pairs between
@@ -90,35 +103,64 @@ shared Git directories, and be a real directory rather than a symlink. An output
 rejected before any candidate write. Forge pins the
 accepted directory through `RepositoryWriter`; candidate file reads and create-only writes remain relative to that
 handle. It likewise pins the fresh temporary Cargo target root before the build and reads the resulting binary through
-that handle without following symlinks. The candidate namespace is the fixed twelve names defined below. Other
-directory entries are never manifest, checksum, or provenance inputs, but a dedicated empty directory is still
-recommended. Never upload with a directory glob.
+that handle without following symlinks. The staging namespace is the ten fixed binary/SBOM names; the finalized
+namespace is the thirteen names defined below. Unknown directory entries fail closed. Use a dedicated empty directory,
+and never upload with a directory glob.
 
 Staging refuses unknown targets, mismatched executable structures, a directory that was already finalized, and a
 same-name asset with different bytes. Repeating the same target with exactly the same binary and derived SBOM is an
-idempotent no-op. Each binary/SBOM pair and manifest/checksum pair is fully preflighted before either missing sibling is
-created, so a known collision does not leave a new partial pair. It never overwrites a different file. Each target-bound
+idempotent no-op. Each binary/SBOM pair and the notice/manifest/checksum finalization set are fully preflighted before
+the first missing file in that set is created, so a known collision does not leave a new partial set. It never
+overwrites a different file. Each target-bound
 CycloneDX 1.6 SBOM selects exactly the workspace-member `forge-cli` release graph, includes build dependencies but
 excludes dev-only dependencies, and binds:
 
 - the exact Git source commit;
 - the `Cargo.lock` SHA-256;
 - the binary SHA-256 and byte length;
-- the exact target triple.
+- the exact target triple; and
+- a machine-readable license expression for every component.
 
 A selected local package with no registry source must be an exact workspace member; external path dependencies are
 rejected because their source bytes are not covered by this Git snapshot and lockfile claim.
 
-The SBOM deliberately has no timestamp or host path.
+The SBOM deliberately has no timestamp or host path. Its license fields are an audit index, not a substitute for the
+complete license and notice text distributed with the binary.
 
 The pair is not a multi-file transaction. If another process wins a create after preflight, Forge rereads that one
 name: identical bytes are accepted and different bytes fail without replacement. A concurrent failure can therefore
 leave a sibling that this invocation already created successfully; inspect the error and rerun only after verifying the
 fixed names and bytes.
 
-### Failure residue and local limits
+## License closure
 
-A failure before the first candidate write does not create an asset. Binary/SBOM and manifest/checksum pairs are
+The source tree contains `LICENSE-MIT`, `LICENSE-APACHE`, and a checked-in `THIRD-PARTY-LICENSES.txt`. The third-party
+file binds the exact union of the five target-specific `forge-cli` release graphs, preserving normal and build edges and
+excluding pure dev-only edges. It includes a package/version/source/Cargo.lock-checksum/license-expression ledger,
+the selected complete license and notice text, and the mapping from every package to those texts.
+
+The read-only drift gate is:
+
+```text
+cargo run --locked -p xtask -- release-license-check
+```
+
+After an intentional dependency change, generate a review candidate with:
+
+```text
+cargo run --locked -p xtask -- release-license-generate
+```
+
+Generation is a maintainer write. Review the complete diff, package mapping, expressions, copyright statements,
+license texts, and notices before accepting it. A changed release graph, lock checksum, expression, selected text, or
+notice must fail `release-license-check` until the checked-in corpus is regenerated and reviewed. `release-finalize`
+copies the accepted `THIRD-PARTY-LICENSES.txt` bytes from the already bound isolated source; it never scans the network,
+Cargo cache, user registry directory, or build host for license material.
+
+## Failure residue and local limits
+
+A failure before the first candidate write does not create an asset. Binary/SBOM pairs and the
+notice/manifest/checksum set are
 preflighted before their first write, but the complete command is not a transaction: a concurrent create or a final
 source/root revalidation failure can return nonzero after one or more create-only files were safely written. A nonzero
 command therefore never accepts the directory as a candidate. Do not overwrite or guess which files are valid; inspect
@@ -138,67 +180,91 @@ disposable after interruption or failure.
 After all five binary/SBOM pairs are in one directory:
 
 ```text
-target/debug/xtask release-finalize --output-dir /absolute/path/to/forge-0.1.0-rc.1-dist
-target/debug/xtask release-check --output-dir /absolute/path/to/forge-0.1.0-rc.1-dist
+target/debug/xtask release-finalize --output-dir /absolute/path/to/forge-0.1.0-rc.2-dist
+target/debug/xtask release-check --output-dir /absolute/path/to/forge-0.1.0-rc.2-dist
 ```
 
 On Windows:
 
 ```text
-.\target\debug\xtask.exe release-finalize --output-dir C:\forge-0.1.0-rc.1-dist
-.\target\debug\xtask.exe release-check --output-dir C:\forge-0.1.0-rc.1-dist
+.\target\debug\xtask.exe release-finalize --output-dir C:\forge-0.1.0-rc.2-dist
+.\target\debug\xtask.exe release-check --output-dir C:\forge-0.1.0-rc.2-dist
 ```
 
 Finalization requires all ten fixed staged files and writes, without replacing different bytes:
 
-- `release-manifest.json`, a `forge.release-manifest/v1` document with target, type, byte length, and SHA-256 for each
-  binary and SBOM;
-- `SHA256SUMS`, covering those ten files and `release-manifest.json` in lexical order.
+- `THIRD-PARTY-LICENSES.txt`, copied byte-for-byte from the source-bound checked-in file;
+- `release-manifest.json`, a `forge.release-manifest/v2` document whose 11 artifacts record target, kind, byte length,
+  and SHA-256 for each binary, SBOM, and the license/notice file;
+- `SHA256SUMS`, covering those 11 artifacts and `release-manifest.json` in lexical order, for exactly 12 lines.
 
-The v1 compatibility reader ignores future optional object fields and maps future enum values to a non-authorizing
-`unknown` state. That makes same-major documents readable; it does not make them current candidates.
+The historical v1 schema and reader remain unchanged for the unpublished rc.1 candidate. v1 compatibility reading
+does not make a document acceptable as an rc.2 candidate; current acceptance requires the strict v2 contract.
 `release-finalize` and `release-check` independently rebuild the canonical manifest and require exact bytes.
 
-`release-check` revalidates the fixed twelve-file candidate namespace, executable structures, source-bound locked
+`release-check` revalidates the fixed thirteen-file candidate namespace, executable structures, source-bound locked
 dependency graphs, byte-for-byte SBOMs, manifest, and all SHA-256 values. A successful result means only that the
-candidate-controlled local assets are internally consistent. It does not claim that unrelated directory entries are
-release assets.
+candidate-controlled local assets are internally consistent; unrelated directory entries are rejected. It does not
+grant any external authority.
 
 The exact external-provenance subject set is:
 
 - five fixed target binary names;
 - the five matching `.cdx.json` names;
+- `THIRD-PARTY-LICENSES.txt`;
 - `release-manifest.json`;
 - `SHA256SUMS`.
 
-The external builder must independently bind the exact name, byte length, and SHA-256 of all twelve finalized files.
-The manifest's `provenance.subjects` array freezes those names but does not self-assert their external digests. Upload
-those twelve explicit paths; do not use `*`, recursive directory upload, or filesystem enumeration as authority.
+The external Authority verifier must independently bind the exact name, byte length, and SHA-256 of all thirteen
+finalized files. The manifest's `provenance.subjects` array freezes those names but does not self-assert their external
+digests. Upload those thirteen explicit paths; do not use `*`, recursive directory upload, or filesystem enumeration
+as authority.
 
 ## External release gate
 
-Before any public release, the externally controlled Authority Set must provide and preserve evidence for all of the
-following:
+The Authority workflow isolates three permission domains:
+
+1. Five native build jobs may checkout and execute the exact Forge candidate. They receive no OIDC token, protected
+   environment, secret, or release permission.
+2. The finalize job may execute the candidate `release-finalize` and `release-check` commands. It likewise receives no
+   OIDC token, protected environment, or GitHub Release write permission.
+3. The protected attest job may receive OIDC and attestation-write permission, but it checks out and executes only the
+   Authority repository and its independent verifier. It must not checkout Forge, run Cargo/xtask, or execute any
+   candidate binary.
+
+The protected identity is the immutable Authority repository identity recorded in ADR-0041, with issuer
+`https://token.actions.githubusercontent.com` and environment `forge-release`. Before any public release, that
+Authority Set must provide and preserve evidence for all of the following:
 
 1. Required Cargo gates and native/basic E2E passed on each platform tier, including Windows path/process behavior,
    exact on-disk asset-name spelling on case-insensitive filesystems, the declared macOS baseline, and both static musl
    architectures. Handle-relative reads on Windows do not by themselves prove the original directory-entry casing.
-2. An independently protected builder generated SLSA provenance v1 whose subjects are exactly all twelve finalized
-   local assets, including `release-manifest.json` and `SHA256SUMS`.
-3. The provenance/signature used Sigstore keyless OIDC and matched a frozen issuer, subject, protected GitHub
-   Environment, approval rule, and transparency-log policy outside the candidate write set.
-4. Named release approver, security approver, rollback owner, security contact, and withdrawal permissions were filled
-   in and exercised. They are intentionally unassigned in the local manifest today.
+2. The independent Authority verifier accepted exactly all thirteen finalized files, manifest v2, the 12 checksum
+   entries, SBOM contents and licenses, executable structures, builder records, and SLSA predicate without importing a
+   Forge crate or delegating final judgment to `release-check`.
+3. SLSA provenance v1 and Sigstore keyless attestation covered exactly those thirteen subjects and matched the frozen
+   issuer, immutable subject, protected GitHub Environment, approval rule, and transparency-log policy outside the
+   candidate write set.
+4. The named release approver, security approver, rollback owner, private-vulnerability triage owner, and withdrawal
+   permissions were confirmed on the protected platform boundary. The current single owner assignment is
+   accountability, not evidence of independent second-person review.
 5. The protected builder froze and recorded the compiler, wrappers, linker, dependency cache and relevant environment;
    local source/lock/binary binding alone does not prove those inputs.
-6. Owner/legal confirmed distributable license and notice text. This repository currently declares
-   `MIT OR Apache-2.0` without a checked-in license text; if compliance requires another asset, create a new ADR and
-   candidate rather than changing this twelve-file RC in place.
+6. Owner/legal explicitly confirmed the right to distribute original contributions under the project license, reviewed
+   the exact dependency/license ledger and notices, and confirmed that the thirteen-file distribution needs no other
+   license artifact. Candidate text, chat, or a PR description is not that confirmation. If compliance requires a
+   changed asset set, create a new ADR and candidate rather than changing rc.2 in place.
 7. The exact reviewed assets were attached to a new immutable GitHub Release; no file from an existing version was
    replaced.
 
 Do not treat `release-check`, local Receipts, candidate CI, a draft GitHub Release, or a candidate-generated hash as any
 of those external facts.
+
+After protected qualification and attestation, the authorized operator must download and independently reverify the
+thirteen explicit files, then create the `v0.1.0-rc.2` tag and a draft prerelease without reusing an existing name,
+upload each file by exact path, reread the remote assets, and only then publish the prerelease. v0 does not store a
+long-lived personal access token in Actions. Tag, Release, and asset creation are create-only; never delete and rebuild
+the same version or replace an existing asset.
 
 ## Install a reviewed asset
 
@@ -206,8 +272,8 @@ Verify the downloaded file against independently verified `SHA256SUMS` and prove
 executable bit and move it to a directory already selected by the user:
 
 ```text
-chmod +x forge-0.1.0-rc.1-<TRIPLE>
-./forge-0.1.0-rc.1-<TRIPLE> version
+chmod +x forge-0.1.0-rc.2-<TRIPLE>
+./forge-0.1.0-rc.2-<TRIPLE> version
 ```
 
 The Windows asset already ends in `.exe`. Installation does not run `forge init`, install project dependencies, or
@@ -215,9 +281,10 @@ modify a repository.
 
 ## Retention and rollback
 
-Retain the current published release and its immediate predecessor, including their original assets, provenance, and
-signatures. Never rebuild or resign an old version in place.
+After Forge has a real predecessor, retain the current published release and its immediate predecessor, including
+their original assets, provenance, and signatures. Never rebuild or resign an old version in place.
 
-For an incident, stop distribution or mark the affected GitHub Release withdrawn, restore documentation to the
-independently verified N−1 assets, and publish a new reviewed candidate for the fix. `0.1.0-rc.1` has no published N−1;
-its only honest rollback is withdrawal and halted distribution until a new candidate clears the external gate.
+`0.1.0-rc.1` was never published, so rc.2 has no real N-1. For an rc.2 incident, stop distribution or mark the affected
+GitHub Release withdrawn and halt installation guidance until a new reviewed candidate clears the complete external
+gate. Do not redirect users to rc.1. For later releases with a real independently verified predecessor, rollback may
+restore documentation to that preserved N-1 while a corrected candidate is qualified.

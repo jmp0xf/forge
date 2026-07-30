@@ -2421,6 +2421,13 @@ branch protection
 
 候选仓库内可以有公开自检，但不能把它称为最终裁判。
 
+v0 的最终 Authority Set 由独立公开仓库
+[`jmp0xf/forge-release-authority`](https://github.com/jmp0xf/forge-release-authority) 承载，并把权限分成三个
+互不混用的域：五平台 build jobs 可以执行精确候选但没有 OIDC、secret 或发布权限；finalize job 可以执行
+候选的本地组装与检查但没有 OIDC、受保护 environment 或发布写权限；protected attest job 可以取得 OIDC
+和 attestation write，但只能执行 Authority 自己的独立 verifier，不得 checkout Forge、运行 Cargo/xtask
+或执行候选二进制。候选代码因此不能进入拥有签名身份的进程。
+
 ### 23.8 N−1 兼容
 
 `xtask diff-plans` 对公开 fixtures 比较：
@@ -2606,16 +2613,24 @@ cargo test --workspace
 
 ### 25.4 可分发性
 
-ADR-0029 已冻结首个 v0 候选的可分发边界：
+ADR-0041 已取代 ADR-0029，冻结首个公开 v0 候选的可分发边界：
 
-- 首个候选固定为 `0.1.0-rc.1`，只通过 GitHub Release 分发；v0 RC 不发布到 crates.io，
-  也不承诺 Homebrew、Scoop 或自动更新通道；
-- 本地候选包含五个冻结目标的原始二进制和 CycloneDX SBOM，以及
-  `release-manifest.json` 与 `SHA256SUMS`；Linux 一级目标使用 musl 静态链接；
+- 未发布的 `0.1.0-rc.1` 终止；首个公开候选固定为 `0.1.0-rc.2`，只通过不可变 GitHub prerelease
+  分发。v0 RC 不发布到 crates.io，也不承诺 Homebrew、Scoop 或自动更新通道；
+- 本地候选包含五个冻结目标的原始二进制和五个 CycloneDX 1.6 SBOM、源码绑定的
+  `THIRD-PARTY-LICENSES.txt`、`release-manifest.json` 与 `SHA256SUMS`，共十三个最终文件；Linux 一级
+  目标使用 musl 静态链接，SBOM component 含机器可读 license expression；
+- rc.2 使用 `forge.release-manifest/v2`：`artifacts` 固定记录十一个二进制/SBOM/notice 文件，
+  `provenance.subjects` 固定记录全部十三个文件；`SHA256SUMS` 覆盖十一个 artifact 和 manifest，共十二行；
+- checked-in license gate 绑定与 SBOM 相同的五 target release closure。依赖、lock checksum、license
+  expression、已选许可证文本或 notice 漂移时必须重新生成并人工审查；`release-finalize` 只复制已绑定的
+  源码字节，不从网络、Cargo cache 或 registry 工作目录临时取材；
 - 仓库内 `xtask` 只组装和核验 `local-review-candidate`，不得签名、上传、发布或授权；
-- 最终 SLSA provenance、签名、审批、不可变发布和撤回权限属于候选仓库之外的 Authority Set。
+- 最终独立复验、SLSA provenance、Sigstore 签名、审批、不可变发布和撤回权限属于
+  `jmp0xf/forge-release-authority` 的三个隔离权限域。
 
-完整目标矩阵、资产名、构建隔离、失败残留和回滚规则见 ADR-0029 与 `docs/release.md`。
+完整目标矩阵、资产名、构建隔离、许可证闭包、失败残留、外部权威和首发回滚规则见 ADR-0041 与
+`docs/release.md`。
 
 ### 25.5 无遥测默认
 
@@ -3027,7 +3042,7 @@ ADR 全部位于 `docs/adr/`：
 | 0026 | 声明 Provider 命名空间覆盖与缺口 |
 | 0027 | 显式生成只创建不覆盖的 GitHub CI 工作流（已由 0037 取代） |
 | 0028 | 仓库写入固定目录句柄（通用能力保留；Windows 细节沿 0031、0033、0034 演进） |
-| 0029 | 发布可审查、可回滚的 v0 候选版本 |
+| 0029 | 发布可审查、可回滚的 v0 候选版本（已由 0041 取代） |
 | 0030 | 分离 release manifest 的兼容读取与候选验收 |
 | 0031 | Windows 使用原生同目录句柄重命名（已由 0033 取代） |
 | 0032 | 记录不含输出内容的命令诊断摘要 |
@@ -3039,6 +3054,7 @@ ADR 全部位于 `docs/adr/`：
 | 0038 | v0 不持久化任意项目命令的 stdout/stderr 内容 |
 | 0039 | 保留当前 Receipt 的 typed unknown 事实 |
 | 0040 | 项目工具外部配置未闭合时安全失败 |
+| 0041 | 通过外部权威发布许可证完整的 rc.2 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 

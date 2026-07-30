@@ -18,7 +18,7 @@ acceptance is not complete.
 | Navigation | `doctor`, deterministic read-only `next`, `explain`, schema/version/completion output |
 | Local evidence | Receipt/Evidence v2 run/show/verify/export, content-free dual-stream diagnostic summaries, dependency invalidation with typed-unknown fact preservation and fail-closed handling of unbound Cargo/Go configuration, immutable state, bounded retention, and v1 historical readers |
 | In-repository hardening | Direct project-native CI gates plus a bounded unified verifier, an exact 20-invariant executable-test/CI/external-required marker ledger, 28 public fixtures, schema/golden/compatibility tests, dogfood fixed point, fuzz corpora, bounded mutation config, and opt-in large-repository benchmark |
-| Local release candidates | Create-only `0.1.0-rc.1` five-target assembler, exact-commit isolated source binding, executable checks, CycloneDX SBOMs, release manifest, SHA-256 checksums, and explicit external authority/rollback gates |
+| Local release candidates | ADR-0041 rc.2 migration in progress: create-only five-target assembly, exact-commit isolated source binding, executable checks, license-bearing CycloneDX SBOMs, source-bound third-party notices, manifest v2, SHA-256 checksums, and explicit external authority/rollback gates |
 
 Default `init` still does not generate a runner, CI, configuration, ADR, runbook, or ownership file.
 Runner generation occurs only after an explicit choice and creates a project-native managed `verify`
@@ -61,6 +61,17 @@ configuration discovery chain is provably empty and argv has no explicit `--conf
 Go commands remain environment-known only for the isolated single-module defaults; explicit Go and
 go.work commands are typed environment-unknown in v0. These commands still execute and preserve
 their other facts, but an unknown environment cannot satisfy Evidence.
+
+ADR-0041 supersedes the unpublished rc.1 release contract. The first public candidate is rc.2 with
+five binaries, five license-bearing CycloneDX SBOMs, `THIRD-PARTY-LICENSES.txt`, manifest v2, and
+`SHA256SUMS`: 13 final files, 11 manifest artifacts and provenance subjects for all 13 files, with
+12 lexical checksum lines. Finalization copies the checked-in, source-bound notice bytes rather than
+discovering them from a network or Cargo cache. The candidate repository still has no release or
+signing workflow; final qualification is assigned to the independent
+`jmp0xf/forge-release-authority` repository with isolated build, finalize, and protected-attestation
+permission domains. The local rc.2 migration is in progress. No external qualification,
+owner/legal confirmation, protected attestation, immutable publication, or release follows from
+this status text.
 
 Windows Git execution has a narrower explicit path boundary than Forge's internal native-path
 representation. Every Git launch validates its canonical working directory. Its effective ordinary
@@ -207,12 +218,14 @@ The public fixture and N-1 harness are candidate-controlled self-checks. The two
 remains Unix-only; portable runtime tests separately exercise the platform process-tree backend,
 including Windows Job Object behavior when run on Windows. Cross-compilation is not runtime proof.
 
-## Current-candidate verification
+## Recorded pre-rc.2 verification
 
 ### Local verification
 
-The executable and workflow qualification below is bound to commit
-`5c92a012d3da83016a9214f7e184c5023b07e926`. Before the external run, the focused macOS 26.5.2
+The executable and workflow qualification below is historical evidence bound to commit
+`5c92a012d3da83016a9214f7e184c5023b07e926`. It predates the rc.2 version, license, manifest-v2,
+and Authority-policy migration and therefore does not qualify the current candidate. Before that external run, the
+focused macOS 26.5.2
 arm64 recheck used Rust/Cargo 1.96.0 and Git 2.51.0 and produced these exit-0 observations:
 
 - `cargo test --locked -p xtask --no-fail-fast` passed 82 unit tests and every xtask integration
@@ -222,10 +235,9 @@ arm64 recheck used Rust/Cargo 1.96.0 and Git 2.51.0 and produced these exit-0 ob
 - the runtime state suite passed with the explicit-unlock regression, and formatting plus
   `git diff --check` passed.
 
-These checks targeted the Windows fixes without treating cross-compilation as runtime proof. The
-documentation-only readiness follow-up does not change executable, workflow, fixture,
-configuration, or versioned machine-contract behavior. Its final full local gate is recorded in the
-PR handoff because a document cannot bind evidence to its own not-yet-created commit.
+These checks targeted the Windows fixes without treating cross-compilation as runtime proof. Later
+executable, dependency, schema, release-contract, and documentation changes require a fresh full
+local gate and exact-head CI before rc.2 readiness can be assessed.
 
 ### GitHub Actions
 
@@ -299,16 +311,14 @@ none.
 
 The following boundaries are intentionally not inferred from local implementation or test assets:
 
-1. **Current-candidate verification.** The focused local checks and exact code/CI run are recorded
-   above. Run `30520650330` executed all 15 non-mutation jobs configured for pull requests
-   successfully for head commit `5c92a01` through its then-current PR merge ref; the opt-in
-   performance step and mutation job were skipped because the pull-request event requested neither
-   campaign. The strict fixture job provisioned pinned Go, `just`, and `task` versions and passed
-   every declared project-native command after fixture installation and uninstall. This evidence
-   is commit-, merge-ref-, and runner-bound. The final status-only follow-up does not change the
-   qualified executable/CI tree, but its own full local gate and CI run belong in the PR handoff.
-   Any later executable, workflow, fixture, schema, configuration, or machine-contract change
-   requires fresh qualification.
+1. **Current-candidate verification.** Run `30520650330` remains useful historical evidence for
+   head commit `5c92a01` and its then-current PR merge ref, but the rc.2 version, dependency,
+   license-corpus, schema-v2, release assembly, documentation, and external-policy migration came
+   later. Run the complete local gate and all applicable exact-head CI jobs again, preserving the
+   strict fixture availability ledger and every native release-candidate result. The opt-in
+   performance and mutation campaigns remain separately identified; neither may be inferred from a
+   skipped job. Any subsequent executable, workflow, fixture, schema, configuration, dependency,
+   license, or machine-contract change requires fresh qualification.
 2. **Filesystem threat model and security review.** Repository/release writes and immutable state
    mutation use separate handle-confined capabilities with fail-closed identity, ACL, scan,
    recovery, and resource-bound checks. They are not a malicious-same-principal sandbox or a
@@ -344,22 +354,25 @@ The following boundaries are intentionally not inferred from local implementatio
    executed for one commit. It does not prove that those checks are required by branch protection,
    that the workflow cannot be weakened by the candidate under review, or that maintainers reviewed
    and approved the result.
-7. **Distribution and release.** Version selection and the local raw-binary/SBOM/manifest/checksum
-   assembly plus rollback procedure are implemented as candidate-controlled checks. Native CI is
-   evidence only for its exact commit and runner: independent musl static-link confirmation, macOS
-   minimum-version behavior, Windows runtime dependencies, release asset name/case handling,
-   distributable license/notice text, external provenance and signing, immutable GitHub publication,
-   release/security/rollback ownership, OIDC identities, approvals, and withdrawal authority remain
-   unproven, unassigned, or externally unauthorized.
+7. **Distribution and release.** ADR-0041 fixes the rc.2 local distribution contract at 13 files:
+   five binaries, five SBOMs with license expressions, `THIRD-PARTY-LICENSES.txt`, manifest v2, and
+   `SHA256SUMS`. The source-bound license corpus and local assembly are candidate-controlled checks,
+   not owner/legal or external proof. Independent musl static-link confirmation, macOS
+   minimum-version behavior, Windows runtime dependencies, exact asset-name/case handling, license
+   review, Authority verification, protected SLSA/Sigstore attestation, platform ownership and
+   protection receipts, immutable GitHub prerelease publication, remote reread, and withdrawal
+   authority remain release gates. None is passed merely because the local implementation or
+   external repository exists.
    The local isolated clone is time-bounded but its copied Git object database is not byte-bounded;
    use a capacity-controlled builder and treat an interrupted clone as disposable temporary state.
-   This implementation task did not authorize a tag, signature, attestation, upload, publication,
-   or release.
+   This status records no completed tag, signature, attestation, upload, publication, or release;
+   each still depends on the external gates above.
 8. **No self-authorization claim.** v0 remains ordinary dogfooding: candidate-controlled tests and
-   the public N-1 harness are reviewable self-checks, not final authority. Held-out tests and the
-   physically separate Authority Set are v0.3 requirements rather than v0 release blockers; they
-   must exist before Forge can claim trusted self-hosting. Independent CI, review, release,
-   signing, and promotion authority still cannot be inferred from this candidate's local results.
+   the public N-1 harness are reviewable self-checks, not final authority. The physically separate
+   Authority Set and its independent verifier are rc.2 release gates; broader candidate-invisible
+   held-out tests remain a v0.3 trusted-self-hosting requirement. rc.1 was never public, so rc.2 has
+   no real N-1. Independent CI, review, owner/legal approval, release, signing, and promotion
+   authority still cannot be inferred from this candidate's local results.
 9. **External tool configuration closure.** v0 fails closed instead of reading potentially private
    Cargo configuration or claiming that indirect wrapper/linker dependencies are bound. Cargo
    repositories with standard config files, explicit Go commands, and Go workspaces therefore need

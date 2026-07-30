@@ -153,9 +153,12 @@ cargo run -p xtask -- diff-plans \
 That comparison is candidate-controlled public evidence. It is not the external held-out authority or a release
 approval.
 
+`0.1.0-rc.1` was never tagged or published, so it is not a known-good baseline. The first public candidate,
+`0.1.0-rc.2`, has no real N-1; an incident must halt distribution until a newer candidate clears the complete gate.
+
 ## Release-candidate assets
 
-The repository can locally assemble and verify the frozen `0.1.0-rc.1` GitHub Release asset set without mutating any
+The repository can locally assemble and verify the frozen `0.1.0-rc.2` GitHub Release asset set without mutating any
 external hosting or release system. Start from a clean Git checkout and create a dedicated real output directory
 outside the checkout; an output inside the repository (including `.git/`) is rejected, and the release commands
 intentionally do not create the directory:
@@ -169,10 +172,24 @@ target/debug/xtask release-finalize --output-dir /absolute/path/to/dist
 target/debug/xtask release-check --output-dir /absolute/path/to/dist
 ```
 
-All five targets must be staged before finalization. The exact matrix, external SLSA/Sigstore gate, unassigned
-ownership and license/notice requirements, Windows/PowerShell commands, fixed twelve-subject upload rule, and N−1
-rollback procedure are documented in [`docs/release.md`](docs/release.md). These local commands never tag, sign,
-attest, upload, publish, or authorize a release.
+Before assembling a candidate, require the checked-in release dependency/license corpus to match the exact five-target
+closure:
+
+```bash
+cargo run --locked -p xtask -- release-license-check
+```
+
+After an intentional dependency change, `cargo run --locked -p xtask -- release-license-generate` updates that corpus
+for review; it is a maintainer write, not a finalization step. Review the complete diff and all selected license,
+copyright, and notice text. `release-finalize` copies the accepted source-bound bytes and never discovers license text
+from the network, Cargo cache, or registry working directory.
+
+All five targets must be staged before finalization. The exact 13-file set is five binaries, five matching CycloneDX
+SBOMs, `THIRD-PARTY-LICENSES.txt`, `release-manifest.json`, and `SHA256SUMS`; manifest v2 records 11 artifacts and all
+13 provenance subjects, while `SHA256SUMS` has 12 lexical entries. The exact matrix, Windows/PowerShell commands,
+external SLSA/Sigstore and owner/legal gates, three isolated Authority permission domains, and first-release rollback
+procedure are documented in [`docs/release.md`](docs/release.md). These local commands never tag, sign, attest, upload,
+publish, or authorize a release.
 
 ## Change discipline
 
