@@ -4,6 +4,10 @@ This runbook assembles reviewable local assets for `0.1.0-rc.1`. It does not gra
 perform a tag, upload, signature, attestation, or GitHub Release mutation. The frozen contract and its trust boundary
 are in [ADR-0029](adr/0029-publish-reviewable-v0-release-candidates.md).
 
+The Forge candidate repository must not contain a release or signing workflow. The physically separate Authority Set
+may consume the candidate manifest and the twelve fixed files, but its policy, protected workflow, signing identity,
+approval, tag, upload, publication, and withdrawal permissions must remain outside the candidate write set.
+
 ## Fixed matrix
 
 Build exactly one `forge` binary for each target:

@@ -191,7 +191,7 @@ const V0_INVARIANT_COVERAGE: &[InvariantCoverage] = &[
         tests: &[
             anchor!(
                 "xtask/tests/architecture_invariants.rs",
-                "primary_verification_workflow_keeps_authority_read_only_and_dependencies_immutable"
+                "candidate_repository_has_no_release_authority_workflow"
             ),
             anchor!(
                 "crates/forge-cli/tests/cli_contract.rs",
@@ -1227,6 +1227,67 @@ fn primary_verification_workflow_does_not_depend_on_forge() -> Result<(), Box<dy
         !workflow
             .lines()
             .any(|line| line.trim_start().starts_with("- run: forge "))
+    );
+    Ok(())
+}
+
+#[test]
+fn candidate_repository_has_no_release_authority_workflow() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = repository_root()?;
+    let workflows = root.join(".github/workflows");
+    let mut names = Vec::new();
+
+    for entry in fs::read_dir(&workflows)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "workflow file name is not valid UTF-8")?;
+        assert!(
+            file_type.is_file(),
+            "workflow directory entry must be a regular file: {name}"
+        );
+        names.push(name);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        ["verify.yml"],
+        "the v0 candidate repository may contain only its read-only verification workflow; release authority belongs in the external Authority Set"
+    );
+
+    let workflow = fs::read_to_string(workflows.join("verify.yml"))?;
+    for forbidden in [
+        "write-all",
+        "pull_request_target:",
+        "id-token:",
+        "secrets:",
+        "environment:",
+        "actions/upload-artifact",
+        "actions/attest",
+        "attestations:",
+        "artifact-metadata:",
+        "release-finalize",
+        "release-check",
+        "gh release",
+        "/releases",
+        "git tag",
+        "git push",
+        "cosign",
+        "sigstore",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "candidate workflow must not gain external authority through `{forbidden}`"
+        );
+    }
+    assert!(
+        !workflow
+            .lines()
+            .any(|line| line.trim_end().ends_with(": write")),
+        "candidate workflow permissions must remain read-only"
     );
     Ok(())
 }
