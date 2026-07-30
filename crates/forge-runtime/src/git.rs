@@ -56,6 +56,18 @@ pub struct GitCli {
     operation_budget: OperationBudget,
 }
 
+#[derive(Debug)]
+struct PreparedGitRunner {
+    runner: SynchronousProcessRunner,
+    used_root_alias: bool,
+}
+
+#[derive(Debug)]
+struct GitCommandOutput {
+    stdout: Vec<u8>,
+    used_root_alias: bool,
+}
+
 impl Default for GitCli {
     fn default() -> Self {
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -270,9 +282,11 @@ impl GitCli {
         spec.stdout = OutputPolicy::CaptureBounded {
             max_bytes: stdout_limit,
         };
-        let runner = SynchronousProcessRunner::new(start)
-            .map_err(|error| map_execution_error(operation, error))?
+        let runner = self
+            .prepare_runner(start, operation, &spec)?
+            .runner
             .with_cancellation_flag(Arc::clone(&self.cancellation));
+        self.recap_timeout(operation, &mut spec)?;
         runner
             .run(&spec)
             .map_err(|error| map_execution_error(operation, error))
@@ -289,6 +303,15 @@ impl GitCli {
     }
 
     fn run(&self, start: &Path, operation: GitOperation) -> Result<Vec<u8>, GitError> {
+        self.run_with_launch_context(start, operation)
+            .map(|output| output.stdout)
+    }
+
+    fn run_with_launch_context(
+        &self,
+        start: &Path,
+        operation: GitOperation,
+    ) -> Result<GitCommandOutput, GitError> {
         if operation.uses_spool() {
             return Err(GitError::new(
                 GitErrorKind::InvalidData,
@@ -300,13 +323,20 @@ impl GitCli {
             ));
         }
         self.fail_if_cancelled(operation)?;
-        let runner = SynchronousProcessRunner::new(start)
-            .map_err(|error| map_execution_error(operation, error))?
+        let mut spec = self.exec_spec(operation)?;
+        let prepared = self.prepare_runner(start, operation, &spec)?;
+        let used_root_alias = prepared.used_root_alias;
+        let runner = prepared
+            .runner
             .with_cancellation_flag(Arc::clone(&self.cancellation));
+        self.recap_timeout(operation, &mut spec)?;
         let observation = runner
-            .run(&self.exec_spec(operation)?)
+            .run(&spec)
             .map_err(|error| map_execution_error(operation, error))?;
-        checked_stdout(operation, observation)
+        Ok(GitCommandOutput {
+            stdout: checked_stdout(operation, observation)?,
+            used_root_alias,
+        })
     }
 
     fn run_spooled(
@@ -325,11 +355,71 @@ impl GitCli {
             ));
         }
         self.fail_if_cancelled(operation)?;
-        SynchronousProcessRunner::new(root)
-            .map_err(|error| map_execution_error(operation, error))?
-            .with_cancellation_flag(Arc::clone(&self.cancellation))
-            .run_spooled_stdout(&self.exec_spec(operation)?)
+        let mut spec = self.exec_spec(operation)?;
+        let runner = self
+            .prepare_runner(root, operation, &spec)?
+            .runner
+            .with_cancellation_flag(Arc::clone(&self.cancellation));
+        self.recap_timeout(operation, &mut spec)?;
+        runner
+            .run_spooled_stdout(&spec)
             .map_err(|error| map_execution_error(operation, error))
+    }
+
+    fn prepare_runner(
+        &self,
+        start: &Path,
+        operation: GitOperation,
+        spec: &ExecSpec,
+    ) -> Result<PreparedGitRunner, GitError> {
+        let runner = SynchronousProcessRunner::new(start)
+            .map_err(|error| map_execution_error(operation, error))?;
+        #[cfg(not(windows))]
+        {
+            let _ = spec;
+            Ok(PreparedGitRunner {
+                runner,
+                used_root_alias: false,
+            })
+        }
+        #[cfg(windows)]
+        {
+            if !windows_git_cwd::requires_alias(runner.repository_root()) {
+                return Ok(PreparedGitRunner {
+                    runner,
+                    used_root_alias: false,
+                });
+            }
+            if spec
+                .env
+                .overrides
+                .keys()
+                .any(|key| git_environment_key_eq(key, "GIT_CEILING_DIRECTORIES"))
+            {
+                return Err(GitError::new(
+                    GitErrorKind::UnsafeEnvironment,
+                    operation.name(),
+                    "an overlong Windows Git working directory requires a short path alias, which cannot preserve the spelling-sensitive GIT_CEILING_DIRECTORIES boundary; unset it or invoke Forge from a shorter equivalent path",
+                ));
+            }
+            let alias =
+                windows_git_cwd::short_alias(runner.repository_root()).map_err(|error| {
+                    GitError::new(
+                        GitErrorKind::Io,
+                        operation.name(),
+                        format!("prepare a bounded Windows Git working-directory alias: {error}"),
+                    )
+                })?;
+            let runner = SynchronousProcessRunner::new_with_verified_root_alias(
+                runner.repository_root(),
+                &alias,
+            )
+            .map_err(|error| map_execution_error(operation, error))?;
+            Ok(PreparedGitRunner {
+                runner,
+                used_root_alias: true,
+            })
+        }
     }
 
     fn fail_if_cancelled(&self, operation: GitOperation) -> Result<(), GitError> {
@@ -343,15 +433,27 @@ impl GitCli {
         Ok(())
     }
 
+    /// Rechecks the fixed operation budget after filesystem/native launch preparation and before
+    /// the process runner receives its child timeout.
+    fn recap_timeout(&self, operation: GitOperation, spec: &mut ExecSpec) -> Result<(), GitError> {
+        spec.timeout = self
+            .operation_budget
+            .checkpoint()
+            .map_err(|error| operation_control_git_error(operation, error))?
+            .cap(spec.timeout);
+        Ok(())
+    }
+
     fn resolve_path(&self, start: &Path, operation: GitOperation) -> Result<PathBuf, GitError> {
-        let bytes = self.run(start, operation)?;
-        parse_absolute_git_path(bytes, operation.name()).map_err(|error| {
+        let output = self.run_with_launch_context(start, operation)?;
+        let path = parse_absolute_git_path(output.stdout, operation.name()).map_err(|error| {
             GitError::new(
                 GitErrorKind::InvalidData,
                 operation.name(),
                 error.to_string(),
             )
-        })
+        })?;
+        restore_git_path_spelling(path, output.used_root_alias, operation)
     }
 
     fn object_format(&self, root: &Path) -> Result<GitObjectFormat, GitError> {
@@ -402,9 +504,223 @@ impl GitCli {
 
     /// Reads the exact raw index through one bounded, no-follow file descriptor.
     pub fn index_snapshot_bytes(&self, root: &Path, max_bytes: usize) -> Result<Vec<u8>, GitError> {
-        let index_path = parse_index_snapshot_path(self.run(root, GitOperation::IndexPath)?)?;
+        let output = self.run_with_launch_context(root, GitOperation::IndexPath)?;
+        let index_path = parse_index_snapshot_path(output.stdout)?;
+        let index_path =
+            restore_git_path_spelling(index_path, output.used_root_alias, GitOperation::IndexPath)?;
         read_index_snapshot_file_controlled(&index_path, max_bytes, &self.operation_budget)
     }
+}
+
+#[cfg(windows)]
+mod windows_git_cwd {
+    #![allow(unsafe_code)]
+
+    use std::ffi::OsString;
+    use std::io;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    // Windows directory APIs conservatively reserve twelve UTF-16 units below MAX_PATH for a
+    // final 8.3 component and NUL. Rust removes a verbatim namespace before passing `current_dir`
+    // to CreateProcess, so keep the effective native spelling at 247 units or fewer.
+    const CREATE_PROCESS_CWD_UNIT_LIMIT: usize = 260 - 12;
+    // Win32 extended-length paths are bounded at 32,767 UTF-16 code units excluding the NUL.
+    const EXTENDED_PATH_BUFFER_UNIT_LIMIT: usize = 32_768;
+
+    pub(super) fn requires_alias(path: &Path) -> bool {
+        effective_native_units(path) >= CREATE_PROCESS_CWD_UNIT_LIMIT
+    }
+
+    pub(super) fn short_alias(path: &Path) -> io::Result<PathBuf> {
+        let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if input.is_empty() || input.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows Git working directory is empty or contains NUL",
+            ));
+        }
+        if input.len() >= EXTENDED_PATH_BUFFER_UNIT_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows Git working directory exceeds the extended-path bound",
+            ));
+        }
+        input.push(0);
+
+        // SAFETY: `input` is NUL terminated and remains live for both calls. The first call uses a
+        // null output pointer with a zero capacity to obtain the required bounded allocation.
+        let required = unsafe { GetShortPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+        if required == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let capacity = usize::try_from(required)
+            .ok()
+            .and_then(|required| required.checked_add(1))
+            .filter(|capacity| *capacity <= EXTENDED_PATH_BUFFER_UNIT_LIMIT)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Windows short-path result exceeds the extended-path bound",
+                )
+            })?;
+        let mut output = vec![0_u16; capacity];
+        let capacity_u32 = u32::try_from(capacity).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows short-path buffer exceeds the Win32 API bound",
+            )
+        })?;
+        // SAFETY: `output` is writable for `capacity_u32` UTF-16 units, while `input` remains a
+        // valid NUL-terminated source. The returned length is validated before truncation.
+        let written =
+            unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), capacity_u32) };
+        if written == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let written = usize::try_from(written).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows short-path length exceeds the addressable bound",
+            )
+        })?;
+        if written >= output.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows short-path length changed during bounded acquisition",
+            ));
+        }
+        output.truncate(written);
+        if output.is_empty() || output.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows short-path result is empty or contains NUL",
+            ));
+        }
+        validate_alias(PathBuf::from(OsString::from_wide(&output)))
+    }
+
+    pub(super) fn validate_alias(alias: PathBuf) -> io::Result<PathBuf> {
+        if !alias.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows short-path result is not absolute",
+            ));
+        }
+        if requires_alias(&alias) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the volume did not provide a short alias within the CreateProcess working-directory bound",
+            ));
+        }
+        if !alias.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows short-path result does not name a directory",
+            ));
+        }
+        Ok(alias)
+    }
+
+    fn effective_native_units(path: &Path) -> usize {
+        const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        const VERBATIM_UNC_PREFIX: &[u16] = &[
+            b'\\' as u16,
+            b'\\' as u16,
+            b'?' as u16,
+            b'\\' as u16,
+            b'U' as u16,
+            b'N' as u16,
+            b'C' as u16,
+            b'\\' as u16,
+        ];
+
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if units.starts_with(VERBATIM_UNC_PREFIX) {
+            // `\\?\UNC\server\share` becomes `\\server\share` at the process API boundary.
+            units.len() - VERBATIM_UNC_PREFIX.len() + 2
+        } else if units.starts_with(VERBATIM_PREFIX) {
+            units.len() - VERBATIM_PREFIX.len()
+        } else {
+            units.len()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_cwd_unit_limit() -> usize {
+        CREATE_PROCESS_CWD_UNIT_LIMIT
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_effective_native_units(path: &Path) -> usize {
+        effective_native_units(path)
+    }
+}
+
+#[cfg(windows)]
+fn restore_git_path_spelling(
+    path: PathBuf,
+    used_root_alias: bool,
+    operation: GitOperation,
+) -> Result<PathBuf, GitError> {
+    if !used_root_alias {
+        return Ok(path);
+    }
+    if matches!(operation, GitOperation::IndexPath) {
+        return restore_index_path_parent_spelling(path, operation);
+    }
+    path.canonicalize().map_err(|error| {
+        map_io_error(
+            operation,
+            "restore the canonical Windows path returned through a short working-directory alias",
+            error,
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn restore_git_path_spelling(
+    path: PathBuf,
+    _used_root_alias: bool,
+    _operation: GitOperation,
+) -> Result<PathBuf, GitError> {
+    Ok(path)
+}
+
+/// Restores long spelling for an index path without following its final component.
+///
+/// The raw-index reader deliberately opens the final component with no-follow semantics. Resolving
+/// the complete path here would turn an index symlink or reparse point into its target before that
+/// boundary can reject it.
+#[cfg(any(windows, test))]
+fn restore_index_path_parent_spelling(
+    path: PathBuf,
+    operation: GitOperation,
+) -> Result<PathBuf, GitError> {
+    let parent = path.parent().ok_or_else(|| {
+        GitError::new(
+            GitErrorKind::InvalidData,
+            operation.name(),
+            "Git index path has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        GitError::new(
+            GitErrorKind::InvalidData,
+            operation.name(),
+            "Git index path has no final component",
+        )
+    })?;
+    let parent = parent.canonicalize().map_err(|error| {
+        map_io_error(
+            operation,
+            "restore the canonical Windows parent returned through a short working-directory alias",
+            error,
+        )
+    })?;
+    Ok(parent.join(file_name))
 }
 
 fn operation_control_git_error(operation: GitOperation, error: OperationControlError) -> GitError {
@@ -1316,10 +1632,12 @@ fn path_buf_from_git_bytes(bytes: Vec<u8>) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::fs;
     use std::io;
     use std::path::Path;
+    #[cfg(windows)]
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -1341,8 +1659,150 @@ mod tests {
     #[cfg(unix)]
     use super::{
         parse_index_snapshot_path, read_index_snapshot_file,
-        read_index_snapshot_file_after_inspection,
+        read_index_snapshot_file_after_inspection, restore_index_path_parent_spelling,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_cwd_limit_counts_the_native_spelling_after_verbatim_removal() {
+        let limit = super::windows_git_cwd::process_cwd_unit_limit();
+        let below = PathBuf::from(format!(r"C:\{}", "a".repeat(limit - 4)));
+        let at_limit = PathBuf::from(format!(r"C:\{}", "a".repeat(limit - 3)));
+        let verbatim_at_limit = PathBuf::from(format!(r"\\?\C:\{}", "a".repeat(limit - 3)));
+        let unc_at_limit = PathBuf::from(format!(
+            r"\\server\share\{}",
+            "a".repeat(limit - r"\\server\share\".encode_utf16().count())
+        ));
+        let verbatim_unc_at_limit = PathBuf::from(format!(
+            r"\\?\UNC\server\share\{}",
+            "a".repeat(limit - r"\\server\share\".encode_utf16().count())
+        ));
+
+        assert_eq!(
+            super::windows_git_cwd::test_effective_native_units(&below),
+            limit - 1
+        );
+        assert_eq!(
+            super::windows_git_cwd::test_effective_native_units(&at_limit),
+            limit
+        );
+        assert_eq!(
+            super::windows_git_cwd::test_effective_native_units(&verbatim_at_limit),
+            limit
+        );
+        assert_eq!(
+            super::windows_git_cwd::test_effective_native_units(&unc_at_limit),
+            limit
+        );
+        assert_eq!(
+            super::windows_git_cwd::test_effective_native_units(&verbatim_unc_at_limit),
+            limit
+        );
+        assert!(!super::windows_git_cwd::requires_alias(&below));
+        assert!(super::windows_git_cwd::requires_alias(&at_limit));
+        assert!(super::windows_git_cwd::requires_alias(&verbatim_at_limit));
+        assert!(super::windows_git_cwd::requires_alias(&unc_at_limit));
+        assert!(super::windows_git_cwd::requires_alias(
+            &verbatim_unc_at_limit
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_short_alias_is_absolute_bounded_and_equivalent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let canonical_root = root.path().canonicalize()?;
+
+        let alias = super::windows_git_cwd::short_alias(&canonical_root)?;
+
+        assert!(alias.is_absolute());
+        assert!(!super::windows_git_cwd::requires_alias(&alias));
+        assert_eq!(alias.canonicalize()?, canonical_root);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_short_alias_validation_fails_closed_for_unshortened_and_oversized_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limit = super::windows_git_cwd::process_cwd_unit_limit();
+        let unshortened = PathBuf::from(format!(r"C:\{}", "a".repeat(limit - 3)));
+        let error = super::windows_git_cwd::validate_alias(unshortened)
+            .err()
+            .ok_or("an overlong alias spelling was accepted")?;
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("did not provide a short alias"));
+
+        let oversized = PathBuf::from(format!(r"C:\{}", "a".repeat(32_768)));
+        let error = super::windows_git_cwd::short_alias(&oversized)
+            .err()
+            .ok_or("an oversized short-path input was accepted")?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("extended-path bound"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_path_restoration_is_alias_scoped_and_canonical()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let canonical_root = root.path().canonicalize()?;
+        let root_name = canonical_root
+            .file_name()
+            .ok_or_else(|| io::Error::other("temporary root has no final component"))?;
+        let alternate_spelling = canonical_root
+            .parent()
+            .ok_or_else(|| io::Error::other("temporary root has no parent"))?
+            .join(".")
+            .join(root_name);
+
+        assert_eq!(
+            super::restore_git_path_spelling(
+                alternate_spelling.clone(),
+                true,
+                GitOperation::RepositoryRoot,
+            )?,
+            canonical_root
+        );
+        assert_eq!(
+            super::restore_git_path_spelling(
+                alternate_spelling.clone(),
+                false,
+                GitOperation::RepositoryRoot,
+            )?,
+            alternate_spelling
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overlong_windows_git_cwd_rejects_a_spelling_sensitive_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let mut start = root.path().to_path_buf();
+        while !super::windows_git_cwd::requires_alias(&start.canonicalize()?) {
+            start.push("forge-git-cwd-boundary-component-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            fs::create_dir(&start)?;
+        }
+        let git = GitCli::new();
+        let mut spec = git.exec_spec(GitOperation::RepositoryRoot)?;
+        spec.env.overrides.insert(
+            OsString::from("GIT_CEILING_DIRECTORIES"),
+            root.path().as_os_str().to_os_string(),
+        );
+
+        let error = git
+            .prepare_runner(&start, GitOperation::RepositoryRoot, &spec)
+            .err()
+            .ok_or("overlong Git cwd unexpectedly accepted a spelling-sensitive ceiling")?;
+
+        assert_eq!(error.kind(), GitErrorKind::UnsafeEnvironment);
+        assert!(error.detail().contains("GIT_CEILING_DIRECTORIES"));
+        Ok(())
+    }
 
     #[test]
     fn git_execution_uses_the_shared_bounded_noninteractive_policy()
@@ -1382,6 +1842,32 @@ mod tests {
             result,
             Err(ref error) if error.kind() == GitErrorKind::TimedOut
         ));
+    }
+
+    #[test]
+    fn launch_preparation_rechecks_deadline_and_cancellation_before_spawn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut expired_spec = GitCli::new().exec_spec(GitOperation::RepositoryRoot)?;
+        let expired = GitCli::new().with_operation_budget(OperationBudget::until(
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let error = expired
+            .recap_timeout(GitOperation::RepositoryRoot, &mut expired_spec)
+            .err()
+            .ok_or("expired launch preparation unexpectedly retained a child timeout")?;
+        assert_eq!(error.kind(), GitErrorKind::TimedOut);
+
+        let cancellation = Arc::new(AtomicBool::new(true));
+        let cancelled = GitCli::new()
+            .with_operation_budget(OperationBudget::unlimited(Arc::clone(&cancellation)));
+        let mut cancelled_spec = GitCli::new().exec_spec(GitOperation::RepositoryRoot)?;
+        let error = cancelled
+            .recap_timeout(GitOperation::RepositoryRoot, &mut cancelled_spec)
+            .err()
+            .ok_or("cancelled launch preparation unexpectedly retained a child timeout")?;
+        assert_eq!(error.kind(), GitErrorKind::Interrupted);
+        Ok(())
     }
 
     #[test]
@@ -1607,6 +2093,31 @@ mod tests {
             .ok_or("symbolic-link index unexpectedly produced a raw snapshot")?;
         assert_eq!(error.kind(), GitErrorKind::InvalidData);
         assert_eq!(error.operation(), "index-snapshot");
+        assert!(error.detail().contains("symbolic link"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_index_path_restoration_preserves_the_no_follow_final_component()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir()?;
+        let real_index = directory.path().join("index.real");
+        let linked_index = directory.path().join("index");
+        fs::write(&real_index, b"DIRCopaque-index-bytes")?;
+        symlink("index.real", &linked_index)?;
+
+        let restored =
+            restore_index_path_parent_spelling(linked_index.clone(), GitOperation::IndexPath)?;
+        assert_eq!(restored, directory.path().canonicalize()?.join("index"));
+        assert_ne!(restored.canonicalize()?, restored);
+
+        let error = read_index_snapshot_file(&restored, 1024)
+            .err()
+            .ok_or("restored index symlink unexpectedly produced a raw snapshot")?;
+        assert_eq!(error.kind(), GitErrorKind::InvalidData);
         assert!(error.detail().contains("symbolic link"));
         Ok(())
     }
