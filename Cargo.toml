@@ -15,7 +15,9 @@ base64 = "=0.22.1"
 blake3 = "=1.8.5"
 clap = { version = "=4.6.4", features = ["derive"] }
 clap_complete = "=4.6.7"
-ctrlc = "=3.5.2"
+# 3.5.1+ adds the Apple-only dispatch2/objc2 chain whose upstream license notes unresolved
+# SDK-derived redistribution uncertainty. Keep the last pipe-based release for the v0 binary.
+ctrlc = "=3.4.7"
 find-msvc-tools = "=0.1.9"
 fs2 = "=0.4.3"
 ignore = "=0.4.25"
