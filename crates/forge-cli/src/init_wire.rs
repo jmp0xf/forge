@@ -20,6 +20,7 @@ const ROLLBACK_GUIDANCE: &str = "After an apply that began with a clean worktree
 pub enum InitPlanWireError {
     MissingPreimage { path: RepoRelativePath },
     UnexpectedPreimage { path: RepoRelativePath },
+    MissingManagedBlockIdentity { path: RepoRelativePath },
 }
 
 impl fmt::Display for InitPlanWireError {
@@ -33,6 +34,11 @@ impl fmt::Display for InitPlanWireError {
             Self::UnexpectedPreimage { path } => write!(
                 formatter,
                 "file creation for `{}` unexpectedly has an expected preimage",
+                path.as_path().display()
+            ),
+            Self::MissingManagedBlockIdentity { path } => write!(
+                formatter,
+                "managed-block replacement for `{}` contains a whole-file identity",
                 path.as_path().display()
             ),
         }
@@ -51,7 +57,7 @@ pub fn project_init_plan_to_wire(
         left.path
             .cmp(&right.path)
             .then_with(|| edit_kind_rank(left.kind).cmp(&edit_kind_rank(right.kind)))
-            .then_with(|| left.desired.kind.cmp(&right.desired.kind))
+            .then_with(|| left.desired.id().cmp(right.desired.id()))
     });
 
     let mut assumptions = plan.assumptions.iter().collect::<Vec<_>>();
@@ -105,6 +111,11 @@ fn project_edit(edit: &FileEdit) -> Result<FileEditData, InitPlanWireError> {
             })
         }
         FileEditKind::ReplaceManagedBlock => {
+            let desired = edit.desired.managed_block().ok_or_else(|| {
+                InitPlanWireError::MissingManagedBlockIdentity {
+                    path: edit.path.clone(),
+                }
+            })?;
             let expected_preimage = edit.expected_preimage.clone().ok_or_else(|| {
                 InitPlanWireError::MissingPreimage {
                     path: edit.path.clone(),
@@ -112,7 +123,7 @@ fn project_edit(edit: &FileEdit) -> Result<FileEditData, InitPlanWireError> {
             })?;
             Ok(FileEditData::ReplaceManagedBlock {
                 path,
-                block_id: ManagedBlockId::new(edit.desired.kind.id()),
+                block_id: ManagedBlockId::new(desired.kind.id()),
                 expected_preimage,
                 content_base64,
             })
@@ -175,11 +186,12 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use forge_core::{Assumption, Confidence, Digest, Provenance, RepoId, RepoRelativePath};
+    use forge_render::managed_block::LineEnding;
     use forge_render::{
-        AdapterTarget, ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, FileEditReason,
-        ManagedBlockKind, RollbackPlan, SkippedChange, SkippedReason,
+        AdapterTarget, ChangePlan, DesiredFile, DesiredManagedBlock, FileEdit, FileEditKind,
+        FileEditReason, ManagedBlockKind, RollbackPlan, SkippedChange, SkippedReason,
     };
-    use forge_schema::{ConfidenceData, FileEditData, PathEncoding};
+    use forge_schema::{ConfidenceData, FileEditData};
 
     use super::{InitPlanWireError, project_init_plan_to_wire};
 
@@ -197,6 +209,7 @@ mod tests {
                 replacement_edit(claude_path.clone(), claude_content.clone()),
                 create_edit(agents_path.clone(), agents_content.clone()),
             ],
+            gaps: Vec::new(),
             assumptions: vec![
                 assumption("z assumption", "rule.z", Confidence::Low),
                 assumption("a assumption", "rule.a", Confidence::High),
@@ -296,6 +309,8 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
+        use forge_schema::PathEncoding;
+
         let root = PathBuf::from(OsString::from_vec(b"/repo-\xff".to_vec()));
         let edit_path = RepoRelativePath::new(OsString::from_vec(b"AGENTS-\xfe.md".to_vec()))?;
         let plan = plan_with_edit(create_edit(edit_path.clone(), b"content".to_vec()));
@@ -320,11 +335,12 @@ mod tests {
         FileEdit {
             kind: FileEditKind::Create,
             reason: FileEditReason::MissingFile,
+            fallback_line_ending: LineEnding::Lf,
             path,
-            desired: DesiredManagedBlock {
+            desired: DesiredFile::ManagedBlock(DesiredManagedBlock {
                 kind: ManagedBlockKind::ProjectIndex,
                 body: String::from("body"),
-            },
+            }),
             expected_preimage: None,
             preview_postimage: content,
             expected_postimage: Digest::new("blake3:postimage"),
@@ -336,11 +352,12 @@ mod tests {
         FileEdit {
             kind: FileEditKind::ReplaceManagedBlock,
             reason: FileEditReason::AssetChanged,
+            fallback_line_ending: LineEnding::Lf,
             path,
-            desired: DesiredManagedBlock {
+            desired: DesiredFile::ManagedBlock(DesiredManagedBlock {
                 kind: ManagedBlockKind::ClaudePointer,
                 body: String::from("body"),
-            },
+            }),
             expected_preimage: Some(Digest::new("blake3:preimage")),
             preview_postimage: content,
             expected_postimage: Digest::new("blake3:postimage"),
@@ -354,6 +371,7 @@ mod tests {
             repository: RepoId::new("repo/example"),
             model_digest: Digest::new("blake3:model"),
             edits: vec![edit],
+            gaps: Vec::new(),
             assumptions: Vec::new(),
             skipped: Vec::new(),
             rollback: RollbackPlan::default(),

@@ -1,0 +1,4 @@
+<!-- forge:begin block=outer schema=1 hash=fuzz:0 -->
+<!-- forge:begin block=inner schema=1 hash=fuzz:0 -->
+<!-- forge:end block=inner -->
+<!-- forge:end block=outer -->

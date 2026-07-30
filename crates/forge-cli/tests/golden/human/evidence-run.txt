@@ -1,0 +1,6 @@
+intent: check
+outcome: pass
+commands observed: 1
+receipt applicability: observation-only (non-proving)
+  - toolchain dependency is unknown
+receipt object: <RECEIPT_OBJECT>

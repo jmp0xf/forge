@@ -1,0 +1,4 @@
+error[FGE0004]: unknown schema kind `not-a-schema`
+  --> schema argument
+  why: machine contract names are versioned and cannot be guessed
+  next: run `forge schema` to list supported schema identifiers

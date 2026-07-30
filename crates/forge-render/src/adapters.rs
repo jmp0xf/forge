@@ -1,16 +1,19 @@
 //! Deterministic, repository-derived host adapter bodies.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use forge_core::domain::{
     CommandEnforcement, CommandResolution, CommandSpec, Confidence, Intent, Mutability,
     ProjectModel,
 };
+use forge_core::fingerprint::{is_secret_like_name, validate_argv_privacy};
+use forge_core::portable_relative_utf8_path;
 
 pub const AGENTS_MAX_LINES: usize = 120;
 pub const AGENTS_MAX_BYTES: usize = 8 * 1024;
+const AUTHORITATIVE_DIRECTORY_MIN_FILES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdapterRenderError {
@@ -31,12 +34,25 @@ pub(crate) fn render_agents_body(model: &ProjectModel) -> Result<String, Adapter
     lines.push(String::new());
     lines.push(String::from("## Project-native commands"));
     let commands = renderable_commands(model);
-    if commands.is_empty() {
+    if commands.lines.is_empty() {
         lines.push(String::from(
             "- No resolved command is safe to reproduce here; stop before guessing argv.",
         ));
     } else {
-        lines.extend(commands);
+        lines.extend(commands.lines);
+    }
+
+    if !commands.receipt_intents.is_empty() {
+        lines.push(String::new());
+        lines.push(String::from("## Optional local Receipts"));
+        lines.extend(commands.receipt_intents.into_iter().map(|intent| {
+            format!(
+                "- `forge evidence run {intent}` executes the same resolved `{intent}` command set and records a scope-bound local Receipt."
+            )
+        }));
+        lines.push(String::from(
+            "- A local Receipt is optional evidence, never CI, review, release, or approval authority.",
+        ));
     }
 
     lines.push(String::new());
@@ -78,11 +94,72 @@ fn authoritative_paths(model: &ProjectModel) -> BTreeSet<String> {
             insert_safe_path(&mut paths, asset.path.as_path());
         }
     }
-    paths
+    compact_authoritative_paths(paths)
 }
 
-fn renderable_commands(model: &ProjectModel) -> Vec<String> {
-    let mut rendered = Vec::new();
+/// Replaces a large family of exact files with its deepest shared directory entry.
+///
+/// The exact model remains available through `forge explain`; AGENTS is a bounded navigation
+/// index. Keeping small groups exact while collapsing eight or more descendants avoids spending
+/// most of the adapter budget on generated fixtures, ADR series, or large monorepo manifests.
+fn compact_authoritative_paths(paths: BTreeSet<PathBuf>) -> BTreeSet<String> {
+    let mut candidates = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+    for path in &paths {
+        let mut ancestor = path.parent();
+        while let Some(directory) = ancestor {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            candidates
+                .entry(directory.to_path_buf())
+                .or_default()
+                .insert(path.clone());
+            ancestor = directory.parent();
+        }
+    }
+
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_by(|(left_path, _), (right_path, _)| {
+        right_path
+            .components()
+            .count()
+            .cmp(&left_path.components().count())
+            .then_with(|| left_path.cmp(right_path))
+    });
+
+    let mut covered = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    for (directory, descendants) in candidates {
+        let uncovered = descendants
+            .iter()
+            .filter(|path| !covered.contains(*path))
+            .count();
+        if uncovered < AUTHORITATIVE_DIRECTORY_MIN_FILES {
+            continue;
+        }
+        covered.extend(descendants);
+        if let Some(directory) = safe_relative_text(&directory) {
+            directories.insert(format!("{directory}/"));
+        }
+    }
+
+    let mut compacted = paths
+        .into_iter()
+        .filter(|path| !covered.contains(path))
+        .filter_map(|path| safe_relative_text(&path))
+        .collect::<BTreeSet<_>>();
+    compacted.extend(directories);
+    compacted
+}
+
+struct RenderedCommands {
+    lines: Vec<String>,
+    receipt_intents: Vec<&'static str>,
+}
+
+fn renderable_commands(model: &ProjectModel) -> RenderedCommands {
+    let mut lines = Vec::new();
+    let mut receipt_intents = Vec::new();
     for intent in Intent::ALL {
         let Some(command_set) = model.commands.get(&intent) else {
             continue;
@@ -95,19 +172,36 @@ fn renderable_commands(model: &ProjectModel) -> Vec<String> {
         let Some(commands) = command_set.executable_commands() else {
             continue;
         };
-        for (index, command) in commands.iter().enumerate() {
-            if let Some(line) = render_command(
-                intent,
-                index,
-                commands.len(),
-                command,
-                &model.repository.root,
-            ) {
-                rendered.push(line);
-            }
+        let rendered = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                render_command(
+                    intent,
+                    index,
+                    commands.len(),
+                    command,
+                    &model.repository.root,
+                )
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(rendered) = rendered else {
+            continue;
+        };
+        lines.extend(rendered);
+        if commands.iter().all(|command| {
+            matches!(
+                command.mutability,
+                Mutability::ReadOnly | Mutability::ExternalSideEffect
+            )
+        }) {
+            receipt_intents.push(intent_name(intent));
         }
     }
-    rendered
+    RenderedCommands {
+        lines,
+        receipt_intents,
+    }
 }
 
 fn render_command(
@@ -120,6 +214,7 @@ fn render_command(
     if !is_publishable(command.confidence) {
         return None;
     }
+    validate_argv_privacy(std::iter::once(&command.program).chain(command.args.iter())).ok()?;
     let mut tokens = Vec::with_capacity(command.args.len() + 1);
     tokens.push(render_token(&command.program)?);
     for argument in &command.args {
@@ -154,7 +249,7 @@ fn render_environment(command: &CommandSpec, repository_root: &Path) -> Option<V
         let name = name.to_str()?;
         let value = value.to_str()?;
         if !valid_environment_name(name)
-            || suspected_secret_name(name)
+            || is_secret_like_name(name)
             || value.chars().any(char::is_control)
             || value.contains('`')
         {
@@ -187,7 +282,7 @@ fn render_gowork(value: &str, repository_root: &Path) -> Option<String> {
             format!("<repo>/{relative}")
         });
     }
-    safe_relative_text(path).map(str::to_owned)
+    safe_relative_text(path)
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -196,24 +291,6 @@ fn valid_environment_name(name: &str) -> bool {
         .next()
         .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-}
-
-fn suspected_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "CREDENTIAL",
-        "AUTH",
-        "COOKIE",
-        "SESSION",
-        "PRIVATE_KEY",
-        "ACCESS_KEY",
-    ]
-    .iter()
-    .any(|marker| upper.contains(marker))
 }
 
 fn render_token(value: &OsStr) -> Option<String> {
@@ -228,15 +305,15 @@ fn render_token(value: &OsStr) -> Option<String> {
     Some(format!("`{value}`"))
 }
 
-fn insert_safe_path(paths: &mut BTreeSet<String>, path: &Path) {
-    if let Some(path) = safe_relative_text(path) {
+fn insert_safe_path(paths: &mut BTreeSet<PathBuf>, path: &Path) {
+    if safe_relative_text(path).is_some() {
         paths.insert(path.to_owned());
     }
 }
 
-fn safe_relative_text(path: &Path) -> Option<&str> {
-    let value = path.to_str()?;
-    (!path.is_absolute() && !looks_host_specific(value) && !value.contains('`')).then_some(value)
+fn safe_relative_text(path: &Path) -> Option<String> {
+    let value = portable_relative_utf8_path(path)?;
+    (!looks_host_specific(&value) && !value.contains('`')).then_some(value)
 }
 
 fn looks_host_specific(value: &str) -> bool {
@@ -279,5 +356,83 @@ fn enforce_limit(body: &str) -> Result<(), AdapterRenderError> {
         Err(AdapterRenderError::LimitExceeded { lines, bytes })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use forge_core::{CommandSource, CommandSpec, Confidence, Intent, RepoRelativePath};
+
+    use super::{compact_authoritative_paths, render_command};
+
+    #[test]
+    fn large_path_families_collapse_to_the_deepest_useful_directory() {
+        let mut paths = BTreeSet::from([PathBuf::from("README.md")]);
+        for index in 0..8 {
+            paths.insert(
+                PathBuf::from("docs")
+                    .join("adr")
+                    .join(format!("{index:04}.md")),
+            );
+        }
+
+        assert_eq!(
+            compact_authoritative_paths(paths),
+            BTreeSet::from([String::from("README.md"), String::from("docs/adr/")])
+        );
+    }
+
+    #[test]
+    fn small_path_families_remain_exact() {
+        let paths = (0..7)
+            .map(|index| {
+                PathBuf::from("crates")
+                    .join(format!("member-{index}"))
+                    .join("Cargo.toml")
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = (0..7)
+            .map(|index| format!("crates/member-{index}/Cargo.toml"))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(compact_authoritative_paths(paths), expected);
+    }
+
+    #[test]
+    fn command_cwd_uses_portable_repository_separators() -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = CommandSpec::new(
+            "workspace-check",
+            Intent::Check,
+            "cargo",
+            RepoRelativePath::new(PathBuf::from("crates").join("forge-core"))?,
+            CommandSource::ExplicitConfig,
+        );
+        command.confidence = Confidence::High;
+
+        let rendered = render_command(Intent::Check, 0, 1, &command, Path::new("/repo"))
+            .ok_or("portable command was not rendered")?;
+        assert!(rendered.contains("cwd `crates/forge-core`"));
+        Ok(())
+    }
+
+    #[test]
+    fn secret_like_argv_is_omitted_from_generated_adapter_guidance() {
+        let mut command = CommandSpec::new(
+            "private-argv",
+            Intent::Check,
+            "tool",
+            RepoRelativePath::root(),
+            CommandSource::ExplicitConfig,
+        )
+        .with_args(["--token=literal-must-not-render"]);
+        command.confidence = Confidence::High;
+
+        assert_eq!(
+            render_command(Intent::Check, 0, 1, &command, Path::new("/repo")),
+            None
+        );
     }
 }

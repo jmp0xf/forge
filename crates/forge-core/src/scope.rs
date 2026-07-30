@@ -1,15 +1,10 @@
 //! Canonical aggregation of already-prepared repository scope identities.
 //!
-//! This module deliberately performs no Git or filesystem access. A future acquisition layer must
+//! This module deliberately performs no Git or filesystem access. The acquisition layer must
 //! first determine the complete intent scope, read every dirty/untracked file or symlink target,
 //! and construct [`PreparedScope`] only when every input is known. An acquisition or read failure
 //! must be represented as [`DependencyValue::Unknown`]; it must never be replaced with an empty,
 //! partial, mtime-only, or size-only scope.
-
-#![allow(
-    dead_code,
-    reason = "the Git acquisition layer and authoritative receipt builder are not yet frozen"
-)]
 
 use forge_schema::Digest;
 use thiserror::Error;
@@ -25,14 +20,14 @@ const SCOPE_DIGEST_INPUT_VERSION: &str = "forge.scope-digest-input/v1";
 
 /// One validated Git object identity in the repository's configured object format.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScopeObjectId {
+pub struct ScopeObjectId {
     object_format: GitObjectFormat,
     lowercase_hex: Vec<u8>,
 }
 
 impl ScopeObjectId {
     /// Validates and canonicalizes an object ID supplied by the Git acquisition layer.
-    pub(crate) fn new(
+    pub fn new(
         object_format: GitObjectFormat,
         hexadecimal: &[u8],
     ) -> Result<Self, ScopeDigestError> {
@@ -54,8 +49,14 @@ impl ScopeObjectId {
     }
 
     #[must_use]
-    const fn object_format(&self) -> GitObjectFormat {
+    pub const fn object_format(&self) -> GitObjectFormat {
         self.object_format
+    }
+
+    /// Returns the canonical full object ID for versioned comparison contracts.
+    #[must_use]
+    pub fn lowercase_hex(&self) -> &[u8] {
+        &self.lowercase_hex
     }
 }
 
@@ -64,14 +65,14 @@ impl ScopeObjectId {
 /// Object format remains explicit for an unborn repository because it governs any staged blob
 /// identities and separates otherwise-empty SHA-1 and SHA-256 repositories.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeHead {
+pub enum ScopeHead {
     Commit(ScopeObjectId),
     Unborn(GitObjectFormat),
 }
 
 impl ScopeHead {
     #[must_use]
-    const fn object_format(&self) -> GitObjectFormat {
+    pub const fn object_format(&self) -> GitObjectFormat {
         match self {
             Self::Commit(object_id) => object_id.object_format(),
             Self::Unborn(object_format) => *object_format,
@@ -81,7 +82,7 @@ impl ScopeHead {
 
 /// A canonical Git file mode that may appear in an input scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ScopeMode {
+pub enum ScopeMode {
     Regular,
     Executable,
     Symlink,
@@ -116,7 +117,7 @@ impl TryFrom<GitMode> for ScopeMode {
 
 /// Dirty-state bits retained for a Gitlink boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GitlinkDirtyState {
+pub struct GitlinkDirtyState {
     commit_changed: bool,
     tracked_changes: bool,
     untracked_changes: bool,
@@ -124,11 +125,7 @@ pub(crate) struct GitlinkDirtyState {
 
 impl GitlinkDirtyState {
     #[must_use]
-    pub(crate) const fn new(
-        commit_changed: bool,
-        tracked_changes: bool,
-        untracked_changes: bool,
-    ) -> Self {
+    pub const fn new(commit_changed: bool, tracked_changes: bool, untracked_changes: bool) -> Self {
         Self {
             commit_changed,
             tracked_changes,
@@ -144,7 +141,7 @@ impl GitlinkDirtyState {
 
 /// The complete, already-computed identity of one scope entry's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScopeContentIdentity {
+pub enum ScopeContentIdentity {
     /// An unchanged tracked file or symlink, identified by its index blob.
     IndexBlob(ScopeObjectId),
     /// Complete bytes of a dirty/untracked file, or the link content of a symlink.
@@ -164,7 +161,7 @@ impl ScopeContentIdentity {
     /// Parses a canonical `blake3:<64 lowercase hex>` complete-content digest.
     ///
     /// Computing the digest, including streaming every byte, belongs to the acquisition layer.
-    pub(crate) fn worktree_blake3(digest: &Digest) -> Result<Self, ScopeDigestError> {
+    pub fn worktree_blake3(digest: &Digest) -> Result<Self, ScopeDigestError> {
         let Some(hexadecimal) = digest.as_str().strip_prefix("blake3:") else {
             return Err(ScopeDigestError::InvalidWorktreeDigest);
         };
@@ -203,14 +200,14 @@ impl ScopeContentIdentity {
 
 /// One validated path/mode/content-identity tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedScopeEntry {
+pub struct PreparedScopeEntry {
     path: RepoRelativePath,
     mode: ScopeMode,
     content_identity: ScopeContentIdentity,
 }
 
 impl PreparedScopeEntry {
-    pub(crate) fn new(
+    pub fn new(
         path: RepoRelativePath,
         mode: ScopeMode,
         content_identity: ScopeContentIdentity,
@@ -247,13 +244,13 @@ impl PreparedScopeEntry {
 /// instead of silently choosing one identity. With that uniqueness invariant, sorting by path is
 /// equivalent to sorting the accepted `(path, mode, content_identity)` tuples.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedScope {
+pub struct PreparedScope {
     head: ScopeHead,
     entries: Vec<PreparedScopeEntry>,
 }
 
 impl PreparedScope {
-    pub(crate) fn new(
+    pub fn new(
         head: ScopeHead,
         mut entries: Vec<PreparedScopeEntry>,
     ) -> Result<Self, ScopeDigestError> {
@@ -277,11 +274,21 @@ impl PreparedScope {
 
         Ok(Self { head, entries })
     }
+
+    #[must_use]
+    pub const fn head(&self) -> &ScopeHead {
+        &self.head
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[PreparedScopeEntry] {
+        &self.entries
+    }
 }
 
 /// Content-safe failures that prevent construction of a canonical scope input.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScopeDigestError {
+pub enum ScopeDigestError {
     #[error("scope Git object ID is invalid for its object format")]
     InvalidObjectId,
     #[error("scope worktree content digest is not canonical BLAKE3")]
@@ -300,12 +307,28 @@ pub(crate) enum ScopeDigestError {
     ObjectFormatMismatch,
 }
 
+/// Computes the canonical digest of one complete prepared scope without taking ownership.
+///
+/// A [`PreparedScope`] can be large. Callers that already proved acquisition completeness can use
+/// this borrowed form to bind the scope into multiple checks without cloning its entries.
+#[must_use]
+pub fn prepared_scope_dependency_digest<H: Hasher + ?Sized>(
+    hasher: &H,
+    scope: &PreparedScope,
+) -> Digest {
+    let mut encoder = CanonicalEncoder::new("scope");
+    encoder.text("format-version", SCOPE_DIGEST_INPUT_VERSION);
+    encoder.bytes("head", &encode_head(&scope.head));
+    encoder.sequence("entries", &scope.entries, encode_entry);
+    hasher.digest(&[SCOPE_DIGEST_DOMAIN, &encoder.finish()])
+}
+
 /// Computes the canonical dependency digest only for a complete prepared scope.
 ///
 /// `Unknown` is returned without invoking `Hasher`, making it impossible for an I/O caller to
 /// accidentally turn a failed or partial acquisition into a reusable digest.
 #[must_use]
-pub(crate) fn scope_dependency_digest<H: Hasher + ?Sized>(
+pub fn scope_dependency_digest<H: Hasher + ?Sized>(
     hasher: &H,
     scope: &DependencyValue<PreparedScope>,
 ) -> DependencyValue<Digest> {
@@ -313,11 +336,7 @@ pub(crate) fn scope_dependency_digest<H: Hasher + ?Sized>(
         return DependencyValue::Unknown;
     };
 
-    let mut encoder = CanonicalEncoder::new("scope");
-    encoder.text("format-version", SCOPE_DIGEST_INPUT_VERSION);
-    encoder.bytes("head", &encode_head(&scope.head));
-    encoder.sequence("entries", &scope.entries, encode_entry);
-    DependencyValue::Known(hasher.digest(&[SCOPE_DIGEST_DOMAIN, &encoder.finish()]))
+    DependencyValue::Known(prepared_scope_dependency_digest(hasher, scope))
 }
 
 fn encode_head(head: &ScopeHead) -> Vec<u8> {
@@ -445,14 +464,14 @@ fn append_length_prefixed(output: &mut Vec<u8>, value: &[u8]) {
 mod tests {
     use std::cell::Cell;
     use std::error::Error;
-    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use forge_schema::Digest;
 
     use super::{
         GitlinkDirtyState, PreparedScope, PreparedScopeEntry, ScopeContentIdentity,
-        ScopeDigestError, ScopeHead, ScopeMode, ScopeObjectId, scope_dependency_digest,
+        ScopeDigestError, ScopeHead, ScopeMode, ScopeObjectId, prepared_scope_dependency_digest,
+        scope_dependency_digest,
     };
     use crate::evidence::DependencyValue;
     use crate::git::GitObjectFormat;
@@ -625,6 +644,10 @@ mod tests {
 
     #[test]
     fn object_format_is_canonical_and_repository_wide() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            ScopeObjectId::new(GitObjectFormat::Sha1, &[b'A'; 40])?.lowercase_hex(),
+            &[b'a'; 40]
+        );
         let lowercase = scope(
             ScopeHead::Commit(sha1(b'a')?),
             vec![entry(
@@ -678,10 +701,21 @@ mod tests {
                 )?,
             ],
         )?;
+        let DependencyValue::Known(scope) = &prepared else {
+            unreachable!("the fixture constructs a complete prepared scope")
+        };
+        // Scope paths intentionally use the lossless native representation; pin each supported
+        // platform family so a separator or encoding change cannot masquerade as portability.
+        #[cfg(not(windows))]
+        let expected = Digest::from("fixture-fnv1a64:87f0bec6599c3a7f");
+        #[cfg(windows)]
+        let expected = Digest::from("fixture-fnv1a64:3b4c2f81ede1388b");
+        let borrowed = prepared_scope_dependency_digest(&VectorHasher, scope);
 
+        assert_eq!(borrowed, expected);
         assert_eq!(
             scope_dependency_digest(&VectorHasher, &prepared),
-            DependencyValue::Known(Digest::from("fixture-fnv1a64:87f0bec6599c3a7f"))
+            DependencyValue::Known(borrowed)
         );
         Ok(())
     }
@@ -777,6 +811,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_utf8_paths_are_lossless_and_distinct_from_lossy_display() -> Result<(), Box<dyn Error>> {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
         let native = PathBuf::from(OsString::from_vec(b"src/bad-\xff.rs".to_vec()));

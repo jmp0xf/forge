@@ -6,6 +6,7 @@
 
 pub mod branding;
 pub mod context;
+pub mod control;
 pub mod doctor;
 pub mod domain;
 pub mod error;
@@ -18,9 +19,13 @@ pub mod path;
 pub mod policy;
 pub mod ports;
 pub mod risk;
-pub(crate) mod scope;
+pub mod scope;
 pub mod wire;
 
+pub use control::{
+    OPERATION_CONTROL_PROTOCOL_VERSION, OperationControl, OperationControlError, OperationPermit,
+    UnlimitedOperationControl,
+};
 pub use domain::{
     AdapterInfo, AdapterInventory, AssetInfo, AssetInventory, Assumption, CommandResolution,
     CommandSource, CommandSpec, CommitId, Confidence, CoverageDimension, EffectivePolicy, Intent,
@@ -33,19 +38,26 @@ pub use error::{AppError, ExitCode};
 pub use forge_schema::{Diagnostic, Digest, RepoId, Severity};
 pub use git::{
     AheadBehind, BranchHead, BranchOid, BranchStatus, ChangeKind, GitError, GitErrorKind,
-    GitFileSet, GitMode, GitObjectFormat, GitObjectId, GitPathListReadError, GitRefName,
-    OrdinaryEntry, PorcelainV2ParseError, PorcelainV2ParseErrorKind, PorcelainV2ReadError,
-    PorcelainV2Status, RenameOrCopy, RenamedOrCopiedEntry, StatusEntry, SubmoduleState,
-    UnmergedEntry, XyStatus, parse_git_path_list_reader, parse_status_porcelain_v2,
-    parse_status_porcelain_v2_reader,
+    GitFileSet, GitIndexEntry, GitIndexReadError, GitIndexTag, GitMode, GitObjectFormat,
+    GitObjectId, GitPathListReadError, GitRefName, OrdinaryEntry, PorcelainV2ParseError,
+    PorcelainV2ParseErrorKind, PorcelainV2ReadError, PorcelainV2Status, RenameOrCopy,
+    RenamedOrCopiedEntry, StatusEntry, SubmoduleState, UnmergedEntry, XyStatus,
+    parse_git_index_reader, parse_git_index_reader_controlled, parse_git_path_list_reader,
+    parse_git_path_list_reader_controlled, parse_status_porcelain_v2,
+    parse_status_porcelain_v2_reader, parse_status_porcelain_v2_reader_controlled,
 };
 pub use inventory::{
     BoundedText, Inventory, InventoryEntry, InventoryError, InventoryKind, InventoryOptions,
-    InventorySkip, PathKind,
+    InventorySkip, PathKind, PathMetadata,
 };
-pub use path::{RelativePathError, RepoRelativePath};
+pub use path::{RelativePathError, RepoRelativePath, portable_relative_utf8_path};
 pub use policy::{
     EffectivePolicyContent, EvidenceRequirements, PathPattern, PolicyError, RiskLevel, RiskRule,
 };
 pub use risk::{RiskAssessment, RiskMatch, assess_risk, built_in_policy};
-pub use wire::{ProjectModelWireError, project_model_to_wire};
+pub use wire::{
+    ProjectModelWireError, assumption_to_wire, command_detail_v2_to_wire,
+    comparison_basis_v2_to_wire, coverage_dimension_name, evidence_outcome_to_wire, intent_to_wire,
+    local_evidence_state_to_wire, non_satisfying_receipt_validity_v2_to_wire,
+    process_error_kind_to_wire, project_model_to_wire, receipt_dependencies_v2_to_wire,
+};

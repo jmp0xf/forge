@@ -8,13 +8,17 @@
 #![deny(unsafe_code)]
 
 pub mod clock;
+pub mod control;
 pub mod fs;
 pub mod git;
 pub mod hash;
 pub mod interrupt;
 pub mod inventory;
 pub mod process;
+mod repository_write;
+pub mod scope;
 pub mod state;
+pub mod toolchain;
 
 /// Production runtime composition marker.
 #[derive(Debug, Default, Clone, Copy)]

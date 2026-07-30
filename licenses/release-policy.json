@@ -1,0 +1,57 @@
+{
+  "schema": "forge.license-bundle-exceptions/v1",
+  "cargo_about": {
+    "assessed_version": "0.9.1",
+    "known_selected_packages_absent_from_custom_json": [],
+    "decision": "locked-crate-archive-sha256-verification-and-separate-unpacked-source-legal-file-aggregation"
+  },
+  "spdx_expression_normalizations": {
+    "ctrlc@3.4.7": {
+      "upstream_declared": "MIT/Apache-2.0",
+      "normalized_for_sbom": "MIT OR Apache-2.0"
+    },
+    "fs2@0.4.3": {
+      "upstream_declared": "MIT/Apache-2.0",
+      "normalized_for_sbom": "MIT OR Apache-2.0"
+    },
+    "same-file@1.0.6": {
+      "upstream_declared": "Unlicense/MIT",
+      "normalized_for_sbom": "Unlicense OR MIT"
+    },
+    "walkdir@2.5.0": {
+      "upstream_declared": "Unlicense/MIT",
+      "normalized_for_sbom": "Unlicense OR MIT"
+    },
+    "winapi@0.3.9": {
+      "upstream_declared": "MIT/Apache-2.0",
+      "normalized_for_sbom": "MIT OR Apache-2.0"
+    }
+  },
+  "required_registry_legal_files": {
+    "cfg_aliases@0.2.2": [
+      "LICENSE",
+      "NOTICES.md"
+    ],
+    "linux-raw-sys@0.12.1": [
+      "COPYRIGHT",
+      "LICENSE-APACHE",
+      "LICENSE-Apache-2.0_WITH_LLVM-exception",
+      "LICENSE-MIT"
+    ],
+    "regex-syntax@0.8.11": [
+      "LICENSE-APACHE",
+      "LICENSE-MIT",
+      "src/unicode_tables/LICENSE-UNICODE"
+    ],
+    "rustix@1.1.4": [
+      "COPYRIGHT",
+      "LICENSE-APACHE",
+      "LICENSE-Apache-2.0_WITH_LLVM-exception",
+      "LICENSE-MIT"
+    ]
+  },
+  "required_workspace_legal_files": [
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ]
+}

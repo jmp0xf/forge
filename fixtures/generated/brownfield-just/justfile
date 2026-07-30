@@ -1,0 +1,2 @@
+test:
+    @printf 'brownfield just target remains authoritative\n'

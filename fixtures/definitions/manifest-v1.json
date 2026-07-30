@@ -1,0 +1,389 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "id": "brownfield-adapters",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["AGENTS.md", "CLAUDE.md", "Cargo.lock", "Cargo.toml", "src/lib.rs"]
+    },
+    {
+      "id": "brownfield-just",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "just",
+          "args": ["test"],
+          "cwd": "."
+        }
+      ],
+      "files": ["justfile"]
+    },
+    {
+      "id": "brownfield-make",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "make",
+          "args": ["--file", "Makefile", "test"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Makefile"]
+    },
+    {
+      "id": "brownfield-task",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "task",
+          "args": ["--taskfile", "Taskfile.yml", "test"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Taskfile.yml"]
+    },
+    {
+      "id": "crlf",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "seed.txt", "src/lib.rs"]
+    },
+    {
+      "id": "dirty-worktree",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "src/lib.rs"]
+    },
+    {
+      "id": "empty-repo",
+      "commands": [],
+      "files": [".keep"]
+    },
+    {
+      "id": "go-embed",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./..."],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "assets/message.txt",
+        "embed.go",
+        "embed_test.go",
+        "go.mod"
+      ]
+    },
+    {
+      "id": "go-generated",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./..."],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "generated.go",
+        "generated_test.go",
+        "go.mod"
+      ]
+    },
+    {
+      "id": "go-module",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./..."],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "go.mod",
+        "greeting.go",
+        "greeting_test.go"
+      ]
+    },
+    {
+      "id": "go-multi-module",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./..."],
+          "cwd": "alpha"
+        },
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./..."],
+          "cwd": "beta"
+        }
+      ],
+      "files": [
+        "alpha/alpha.go",
+        "alpha/alpha_test.go",
+        "alpha/go.mod",
+        "beta/beta.go",
+        "beta/beta_test.go",
+        "beta/go.mod"
+      ]
+    },
+    {
+      "id": "go-workspace",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./app/...", "./message/..."],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "app/go.mod",
+        "app/greeting.go",
+        "app/greeting_test.go",
+        "go.work",
+        "message/go.mod",
+        "message/message.go",
+        "message/message_test.go"
+      ]
+    },
+    {
+      "id": "huge-output",
+      "commands": [],
+      "files": ["README.md", "forge.toml"]
+    },
+    {
+      "id": "large-repository",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "seed.txt", "src/lib.rs"]
+    },
+    {
+      "id": "linked-worktrees",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "src/lib.rs"]
+    },
+    {
+      "id": "malicious-runner",
+      "commands": [],
+      "files": ["Cargo.toml", "Makefile", "README.md", "build.rs", "src/lib.rs"]
+    },
+    {
+      "id": "managed-block-conflict",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["AGENTS.md", "Cargo.lock", "Cargo.toml", "src/lib.rs"]
+    },
+    {
+      "id": "missing-tools",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "forge.toml", "seed.txt", "src/lib.rs"]
+    },
+    {
+      "id": "mixed-rust-go",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        },
+        {
+          "intent": "test",
+          "program": "go",
+          "args": ["test", "./..."],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "go.mod",
+        "mixed.go",
+        "mixed_test.go",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "id": "non-git",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "src/lib.rs"]
+    },
+    {
+      "id": "non-utf8-path",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "seed.txt", "src/lib.rs"]
+    },
+    {
+      "id": "rust-multi-workspace",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "alpha"
+        },
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "beta"
+        }
+      ],
+      "files": [
+        "alpha/Cargo.lock",
+        "alpha/Cargo.toml",
+        "alpha/src/lib.rs",
+        "beta/Cargo.lock",
+        "beta/Cargo.toml",
+        "beta/src/lib.rs"
+      ]
+    },
+    {
+      "id": "rust-no-lock",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "Cargo.toml",
+        "src/lib.rs",
+        "support/Cargo.toml",
+        "support/src/lib.rs"
+      ]
+    },
+    {
+      "id": "rust-package",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "id": "rust-workspace",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--workspace", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/app/Cargo.toml",
+        "crates/app/src/lib.rs",
+        "crates/message/Cargo.toml",
+        "crates/message/src/lib.rs"
+      ]
+    },
+    {
+      "id": "submodule",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "dependency-seed.txt", "src/lib.rs"]
+    },
+    {
+      "id": "symlink-escape",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": ["test", "--offline"],
+          "cwd": "."
+        }
+      ],
+      "files": ["Cargo.lock", "Cargo.toml", "src/lib.rs", "target-seed.txt"]
+    },
+    {
+      "id": "timeout-tree",
+      "commands": [],
+      "files": ["README.md", "forge.toml"]
+    }
+  ]
+}

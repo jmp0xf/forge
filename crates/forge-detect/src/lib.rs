@@ -5,24 +5,41 @@
 pub mod assets;
 pub mod config;
 pub mod go;
+pub mod inventory_cache;
 pub mod model;
 pub mod policy;
 pub mod repository;
 pub mod resolution;
 pub mod runner;
 pub mod rust;
+pub mod script;
+pub mod workflow;
 
-use forge_core::{CommandSpec, ProjectModel, ProjectUnit};
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
 
-/// Extension boundary implemented by built-in Rust and Go providers in v0.
-pub trait LanguageProvider: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn detect(&self, model: &ProjectModel) -> Vec<ProjectUnit>;
-    fn default_commands(&self, model: &ProjectModel, units: &[ProjectUnit]) -> Vec<CommandSpec>;
-}
+    pub(crate) fn repository_root() -> &'static Path {
+        #[cfg(windows)]
+        {
+            Path::new(r"C:\repo")
+        }
+        #[cfg(not(windows))]
+        {
+            Path::new("/repo")
+        }
+    }
 
-/// Returns built-in providers in a deterministic order.
-#[must_use]
-pub fn built_in_providers() -> Vec<Box<dyn LanguageProvider>> {
-    vec![Box::new(rust::RustProvider), Box::new(go::GoProvider)]
+    pub(crate) fn repository_path(path: impl AsRef<Path>) -> PathBuf {
+        repository_root().join(path)
+    }
+
+    pub(crate) fn absolute_path(path: impl AsRef<Path>) -> PathBuf {
+        #[cfg(windows)]
+        let root = Path::new(r"C:\");
+        #[cfg(not(windows))]
+        let root = Path::new("/");
+
+        root.join(path)
+    }
 }

@@ -62,11 +62,20 @@ pub fn discover_standard_assets(
         if entry.kind != InventoryKind::File {
             continue;
         }
+        RepoRelativePath::validate(&entry.path).map_err(|source| AssetDiscoveryError {
+            path: entry.path.clone(),
+            source,
+        })?;
+        let kind = standard_asset_kind(&entry.path);
+        let host = adapter_host(&entry.path);
+        if kind.is_none() && host.is_none() {
+            continue;
+        }
         let path = RepoRelativePath::new(&entry.path).map_err(|source| AssetDiscoveryError {
             path: entry.path.clone(),
             source,
         })?;
-        if let Some(kind) = standard_asset_kind(path.as_path()) {
+        if let Some(kind) = kind {
             assets.push(AssetInfo::new(
                 kind,
                 path.clone(),
@@ -78,7 +87,7 @@ pub fn discover_standard_assets(
                 Confidence::Medium,
             ));
         }
-        if let Some(host) = adapter_host(path.as_path()) {
+        if let Some(host) = host {
             adapters.push(AdapterInfo::new(
                 host,
                 path.clone(),
@@ -228,7 +237,7 @@ mod tests {
         InventoryEntry {
             path: PathBuf::from(path),
             kind: InventoryKind::File,
-            size_bytes: 1,
+            size_bytes: Some(1),
         }
     }
 
@@ -327,7 +336,7 @@ mod tests {
             entries: vec![InventoryEntry {
                 path: PathBuf::from(std::ffi::OsString::from_vec(vec![0xff])),
                 kind: InventoryKind::File,
-                size_bytes: 1,
+                size_bytes: Some(1),
             }],
             skipped: Vec::new(),
         })?;

@@ -1,0 +1,61 @@
+repository: <REPOSITORY_ID>
+mode: dry-run
+detection: complete
+planned edits: 1
+  - create: AGENTS.md (block project-index, preimage none, postimage blake3:d2643061a34420e926a16d370ef9eb0f531f6d5a5767453ef645291a8ac40630)
+    UTF-8 postimage preview (1068 bytes; control characters escaped):
+      | <!-- forge:begin block=project-index schema=1 hash=blake3:0d10ea53e82af2f8c354925f6b76feece895781a2d9d212b46b5cadb3636b505 -->\u{a}
+      | ## Authoritative paths\u{a}
+      | - `README.md`\u{a}
+      | - `forge.toml`\u{a}
+      | \u{a}
+      | ## Project-native commands\u{a}
+      | - check (required): env `CARGO_NET_OFFLINE=true` `GOPROXY=off` `GOSUMDB=off` `GOTOOLCHAIN=local` `RUSTUP_AUTO_INSTALL=0`; argv `golden-check`; cwd `.`.\u{a}
+      | \u{a}
+      | ## Optional local Receipts\u{a}
+      | - `forge evidence run check` executes the same resolved `check` command set and records a scope-bound local Receipt.\u{a}
+      | - A local Receipt is optional evidence, never CI, review, release, or approval authority.\u{a}
+      | \u{a}
+      | ## Completion evidence\u{a}
+      | - Applicable required commands above must pass; advisory commands are informative only.\u{a}
+      | - Local command success does not prove CI, review, release, signing, or authorization.\u{a}
+      | \u{a}
+      | ## Stop boundaries\u{a}
+      | - Stop rather than guessing when an applicable intent is absent, ambiguous, or unknown.\u{a}
+      | - Stop before changing CI, release, signing, ownership, migrations, or destructive/external state unless explicitly authorized.\u{a}
+      | <!-- forge:end block=project-index -->\u{a}
+assumptions: 1
+  - Configured check input patterns are validated, but v0 conservatively fingerprints the complete repository scope.
+warnings: 7
+  - warning[FGE2232]: project command `setup` is absent
+    where: project command `setup`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `setup` entry point or define `[commands.setup]` in forge.toml, then rerun forge init
+  - warning[FGE2232]: project command `format-check` is absent
+    where: project command `format-check`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `format-check` entry point or define `[commands.format-check]` in forge.toml, then rerun forge init
+  - warning[FGE2232]: project command `format` is absent
+    where: project command `format`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `format` entry point or define `[commands.format]` in forge.toml, then rerun forge init
+  - warning[FGE2232]: project command `fix` is absent
+    where: project command `fix`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `fix` entry point or define `[commands.fix]` in forge.toml, then rerun forge init
+  - warning[FGE2232]: project command `test` is absent
+    where: project command `test`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `test` entry point or define `[commands.test]` in forge.toml, then rerun forge init
+  - warning[FGE2232]: project command `verify` is absent
+    where: project command `verify`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `verify` entry point or define `[commands.verify]` in forge.toml, then rerun forge init
+  - warning[FGE2232]: project command `build` is absent
+    where: project command `build`
+    why: command resolution completed without a project-owned candidate; resolution provenance: commands.layer.existing-project.v1, commands.layer.explicit-config.v1, commands.layer.language-default.v1, config.command-surface.v1@forge.toml, 2 additional source(s)
+    next: add a project-owned `build` entry point or define `[commands.build]` in forge.toml, then rerun forge init
+skipped: 0
+rollback:
+  remove created: AGENTS.md
+  After an apply that began with a clean worktree, review the listed paths, then use `git restore -- <modified paths>` and `git clean -f -- <created paths>`. If dirty mode was allowed, preserve pre-existing edits and recover them separately instead of running these commands blindly.

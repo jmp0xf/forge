@@ -1,0 +1,5 @@
+# Keep checked-out text identical to committed bytes on every supported platform.
+* text=auto eol=lf
+
+# Fuzz seeds are opaque byte strings even when a seed happens to look like text.
+fuzz/corpus/** -text

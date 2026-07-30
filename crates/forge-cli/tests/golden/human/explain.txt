@@ -1,0 +1,71 @@
+repository: <REPOSITORY_ID>
+root: <REPOSITORY_ROOT>
+work state: clean
+repository confidence: high
+repository source: forge.repository-id/v1 — local repository identity derived from the native absolute Git common directory
+repository source: git.common-dir — common Git directory returned by git rev-parse --git-common-dir
+repository source: git.porcelain-v2-status — head, branch, upstream, and worktree entries parsed from porcelain v2
+repository source: git.repository-root — repository root returned by git rev-parse --show-toplevel
+repository source: git.worktree-dir — worktree Git directory returned by git rev-parse --git-dir
+units: 0
+commands:
+  build: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+  check: resolved (resolution high, coverage high)
+    - "golden-check" [] (cwd ., source explicit-config)
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: config.command-surface.v1 — configured command is declared directly in the selected Forge configuration
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+  fix: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+  format: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+  format-check: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+  setup: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+  test: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+  verify: absent (resolution medium, coverage unknown)
+    source: commands.layer.existing-project.v1 — existing-project command layer discovery was complete
+    source: commands.layer.explicit-config.v1 — explicit-config command layer discovery was complete
+    source: commands.layer.language-default.v1 — language-default command layer discovery was complete
+    source: config.command-surface.v1 — selected Forge configuration was parsed completely
+    source: runner.inventory.v1 — all inventoried supported runner files were scanned completely
+    source: units.provider-order.v1 — relevant built-in providers were evaluated in stable Rust then Go order
+assets: 2
+  - config.forge: forge.toml
+  - documentation.readme: README.md
+adapters: 0
+policy: blake3:050d1dded592d271e83cca099d919dabb9eeb0af1f87baa1da05139eead928b6 (confidence high)
+assumption [high]: Configured check input patterns are validated, but v0 conservatively fingerprints the complete repository scope.

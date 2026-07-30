@@ -1,0 +1,12 @@
+schema = 1
+
+[commands.check]
+program = "forge-fixture-cat"
+args = ["payload.bin"]
+cwd = "."
+inputs = ["payload.bin"]
+mutability = "read-only"
+network = "offline-requested"
+success = "exit-zero"
+coverage = ["compile"]
+enforcement = "required"

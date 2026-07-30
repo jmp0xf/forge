@@ -8,7 +8,10 @@ use std::path::Path;
 use forge_core::ports::{Hasher, RepositoryFilePort};
 use forge_core::{Digest, RepoRelativePath};
 
-use crate::managed_block::{ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block};
+use crate::managed_block::{
+    LineEnding, ManagedBlock, ManagedBlockError, ManagedBlockSyntax, MergeAction,
+    merge_managed_block_with_line_ending,
+};
 use crate::repository_file_digest;
 
 /// Maximum accepted size for an existing or resulting adapter file.
@@ -23,6 +26,9 @@ pub struct AdapterInspectionRequest<'a> {
     pub path: &'a RepoRelativePath,
     pub block_id: &'a str,
     pub desired_body: &'a str,
+    pub syntax: ManagedBlockSyntax,
+    /// Explicit fallback for a new file or an existing file with no reliable uniform style.
+    pub fallback_line_ending: LineEnding,
     /// Optional unmanaged text accepted as semantically equivalent after trailing line endings.
     pub equivalent_unmanaged: Option<&'a str>,
 }
@@ -51,6 +57,8 @@ pub enum AdapterInspectionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectedFileEdit {
     pub reason: FileEditReason,
+    /// Reviewed fallback used when the target itself has no reliable line-ending style.
+    pub fallback_line_ending: LineEnding,
     pub expected_preimage: Option<Digest>,
     pub preview_postimage: Vec<u8>,
     /// Digest of the complete resulting file, including preserved user-owned bytes.
@@ -277,19 +285,32 @@ where
         id: request.block_id,
         body: request.desired_body,
     };
-    let ordinary = merge_markdown_block(existing.as_deref(), &block, hasher, false);
+    let ordinary = merge_managed_block_with_line_ending(
+        existing.as_deref(),
+        &block,
+        request.syntax,
+        request.fallback_line_ending,
+        hasher,
+        false,
+    );
     let (reason, merged) = match ordinary {
         Ok(merged) => (
             reason_from_action(request.path, merged.action, existing.is_some())?,
             merged,
         ),
         Err(ManagedBlockError::UserEdited { .. }) => {
-            let preview = merge_markdown_block(existing.as_deref(), &block, hasher, true).map_err(
-                |source| AdapterInspectionError::ManagedBlock {
-                    path: request.path.clone(),
-                    source,
-                },
-            )?;
+            let preview = merge_managed_block_with_line_ending(
+                existing.as_deref(),
+                &block,
+                request.syntax,
+                request.fallback_line_ending,
+                hasher,
+                true,
+            )
+            .map_err(|source| AdapterInspectionError::ManagedBlock {
+                path: request.path.clone(),
+                source,
+            })?;
             if preview.action != MergeAction::Replace {
                 return Err(AdapterInspectionError::InconsistentMergeAction {
                     path: request.path.clone(),
@@ -313,6 +334,7 @@ where
         },
         Some(reason) => AdapterInspectionState::Edit(InspectedFileEdit {
             reason,
+            fallback_line_ending: request.fallback_line_ending,
             expected_preimage: existing
                 .as_deref()
                 .map(|bytes| repository_file_digest(hasher, bytes)),
@@ -387,7 +409,9 @@ mod tests {
     use forge_core::ports::{Hasher, RepositoryFilePort};
     use forge_core::{Digest, RepoRelativePath};
 
-    use crate::managed_block::{ManagedBlock, ManagedBlockError, merge_markdown_block};
+    use crate::managed_block::{
+        LineEnding, ManagedBlock, ManagedBlockError, ManagedBlockSyntax, merge_markdown_block,
+    };
     use crate::repository_file_digest;
 
     use super::{
@@ -517,6 +541,8 @@ mod tests {
                 } else {
                     "desired body"
                 },
+                syntax: ManagedBlockSyntax::Markdown,
+                fallback_line_ending: LineEnding::Lf,
                 equivalent_unmanaged: (index == 5).then_some("@AGENTS.md"),
             })
             .collect::<Vec<_>>();
@@ -578,6 +604,8 @@ mod tests {
             path: &path,
             block_id: "project-index",
             desired_body: "body",
+            syntax: ManagedBlockSyntax::Markdown,
+            fallback_line_ending: LineEnding::Lf,
             equivalent_unmanaged: None,
         };
         let oversized = MemoryFiles::from_files([(
@@ -626,6 +654,8 @@ mod tests {
             path: &path,
             block_id: "project-index",
             desired_body: "body",
+            syntax: ManagedBlockSyntax::Markdown,
+            fallback_line_ending: LineEnding::Lf,
             equivalent_unmanaged: None,
         };
 

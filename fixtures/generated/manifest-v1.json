@@ -1,0 +1,966 @@
+{
+  "schema": 1,
+  "generator_protocol": 1,
+  "source_manifest": "../definitions/manifest-v1.json",
+  "source_manifest_identity": "blake3:f3cc138f2912bbb4134b343929b2e1d5f5c8a756d2d3d2168af28ceb005fe930",
+  "fixtures": [
+    {
+      "id": "brownfield-adapters",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "AGENTS.md",
+          "bytes": 107,
+          "blake3": "blake3:4cbcfb606ff1b5d58ca26964ed6424ff82b6711244c60ac0d8e3296dd07b17ce"
+        },
+        {
+          "path": "CLAUDE.md",
+          "bytes": 90,
+          "blake3": "blake3:dd6cd97a5184fadb783cf998d6a02fbed6d3b9322154bc3ae49fdd33fd8a2c2f"
+        },
+        {
+          "path": "Cargo.lock",
+          "bytes": 171,
+          "blake3": "blake3:de4a1506c7205d49f3108fca543d405ff71d7167db125632f8ad46e2b41eaa0b"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 98,
+          "blake3": "blake3:a4e4799d37fcff6ef85886fa8a57401332a1d1679467ce7d8e8fa2d5d0657382"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 227,
+          "blake3": "blake3:e19c82d1f4a6bd5b447089fa8f370292556eb2b1dd98e9a613e8910f7a74de1a"
+        }
+      ]
+    },
+    {
+      "id": "brownfield-just",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "just",
+          "args": [
+            "test"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "justfile",
+          "bytes": 67,
+          "blake3": "blake3:f83e1bed257c25f891645b2a0891b21f278e94916612b336002f95c3e8a79641"
+        }
+      ]
+    },
+    {
+      "id": "brownfield-make",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "make",
+          "args": [
+            "--file",
+            "Makefile",
+            "test"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Makefile",
+          "bytes": 78,
+          "blake3": "blake3:bb2ccf5f2d293f35aac6bbfb74697b8055bd279a6282da54d919d2de36a0a3b9"
+        }
+      ]
+    },
+    {
+      "id": "brownfield-task",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "task",
+          "args": [
+            "--taskfile",
+            "Taskfile.yml",
+            "test"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Taskfile.yml",
+          "bytes": 99,
+          "blake3": "blake3:0819ea34033d662b24c17b54134488dbe090f585dacad47713e01dc56e08b964"
+        }
+      ]
+    },
+    {
+      "id": "crlf",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 156,
+          "blake3": "blake3:f33d85f98197ae786376ce1098f8711edc1dd7f0a45d11f03e4ff3b17d535b63"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 83,
+          "blake3": "blake3:da521d0397e823476ba2cc05392bf335747140db16c29f50e5e88edf8d56ca66"
+        },
+        {
+          "path": "seed.txt",
+          "bytes": 69,
+          "blake3": "blake3:438b994dbc013dfe80332738eb8f7a0439cb3cb2e7ba6239d92c72747835a9ee"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 197,
+          "blake3": "blake3:c6f4dbd3f7b36cd5a278cb6d5b0a23a5ad76e7f0a9217bb97abb090aeff2bdd4"
+        }
+      ]
+    },
+    {
+      "id": "dirty-worktree",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 166,
+          "blake3": "blake3:3f3c663258ee525f72ae2e062a51b6e6fb851aa9cab30d5ee09f6a3e2e8f5bb9"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 93,
+          "blake3": "blake3:e081ed02186415c27b7d9d657dd91ad88ffe1302bd9b44cc5b80b166f1b1c2fe"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 217,
+          "blake3": "blake3:a873fa5975a8772990c48b710352ee90a4f2b35eb7dc48e73818e3d9d76ed14e"
+        }
+      ]
+    },
+    {
+      "id": "empty-repo",
+      "commands": [],
+      "files": [
+        {
+          "path": ".keep",
+          "bytes": 1,
+          "blake3": "blake3:295192ea1ec8566d563b1a7587e5f0198580cdbd043842f5090a4c197c20c67a"
+        }
+      ]
+    },
+    {
+      "id": "go-embed",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./..."
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "assets/message.txt",
+          "bytes": 17,
+          "blake3": "blake3:344fc5a11bc0cc2de1aab7d7896b662b0d5482323e60dbcfc538435ec07c87ac"
+        },
+        {
+          "path": "embed.go",
+          "bytes": 128,
+          "blake3": "blake3:9c530918fc86b55fb3681a2c0a5fafd0f59521737d789539c3365feb9829537e"
+        },
+        {
+          "path": "embed_test.go",
+          "bytes": 180,
+          "blake3": "blake3:29e18acba2ca517f772c807741fd728de47a2ec0860faa911a3b6ac50d2a90c9"
+        },
+        {
+          "path": "go.mod",
+          "bytes": 52,
+          "blake3": "blake3:50f9ed08d60b9a2b3a60ccf32ec9a68555dc8b898322222c09ddd19476d7fba5"
+        }
+      ]
+    },
+    {
+      "id": "go-generated",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./..."
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "generated.go",
+          "bytes": 99,
+          "blake3": "blake3:9e3c5ccbf5cc2f725a14431beca843101145be7457db5c9e046cf4e92f048e4b"
+        },
+        {
+          "path": "generated_test.go",
+          "bytes": 141,
+          "blake3": "blake3:65e4b0c69044646594b7da71894b6b651de4044bb3bb9e843c5b3fc9d6e1c2e3"
+        },
+        {
+          "path": "go.mod",
+          "bytes": 56,
+          "blake3": "blake3:e20bd79c2e54bc19224ee24e85bd2c81de065eed69c86a38fd1baa66845132aa"
+        }
+      ]
+    },
+    {
+      "id": "go-module",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./..."
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "go.mod",
+          "bytes": 53,
+          "blake3": "blake3:dd78ea2ee0aa4a91ca18521fa833bd983511e0837c72459e4ba4cbd808c36e37"
+        },
+        {
+          "path": "greeting.go",
+          "bytes": 68,
+          "blake3": "blake3:4adf87b926ecdd07cdbd607aedc6ed6628fd7e81ed0dbbeca69964ff95cdbcdd"
+        },
+        {
+          "path": "greeting_test.go",
+          "bytes": 155,
+          "blake3": "blake3:cf0ae863183ab7cae16b8b2620f77a01fbb44f681e956e49bbbf92077668992c"
+        }
+      ]
+    },
+    {
+      "id": "go-multi-module",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./..."
+          ],
+          "cwd": "alpha"
+        },
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./..."
+          ],
+          "cwd": "beta"
+        }
+      ],
+      "files": [
+        {
+          "path": "alpha/alpha.go",
+          "bytes": 54,
+          "blake3": "blake3:2554ee727b392c901dedda7b934ea0afd221a458c98b212d6b682170f0951480"
+        },
+        {
+          "path": "alpha/alpha_test.go",
+          "bytes": 135,
+          "blake3": "blake3:6a4dec41fe5d4d0f9debce18306d3d013483ec1bc6760b4161d3e3d7cadf02bb"
+        },
+        {
+          "path": "alpha/go.mod",
+          "bytes": 65,
+          "blake3": "blake3:3fb620da6c8352f120b8112023c0a49f70c02faf8f96869eb271953e92f8ca0e"
+        },
+        {
+          "path": "beta/beta.go",
+          "bytes": 52,
+          "blake3": "blake3:34b1eec8fbd6d548a7c23d05c31e5c524e6b2bdf6f92d359b99331b0473eff54"
+        },
+        {
+          "path": "beta/beta_test.go",
+          "bytes": 133,
+          "blake3": "blake3:f43f3e52a2cb78297b374e3bff6a4d2869e71f5a25efa30b9c43c9aa5c106479"
+        },
+        {
+          "path": "beta/go.mod",
+          "bytes": 64,
+          "blake3": "blake3:d9d6a576306df48afb42540c6f5fff921a1d3cfd5564e64dbd6a772f82e75aa2"
+        }
+      ]
+    },
+    {
+      "id": "go-workspace",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./app/...",
+            "./message/..."
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "app/go.mod",
+          "bytes": 124,
+          "blake3": "blake3:a1d5390d8ea90f0e63080ff780f606133c9cf8efd301b221289b01236d5850b6"
+        },
+        {
+          "path": "app/greeting.go",
+          "bytes": 146,
+          "blake3": "blake3:9c7ed855c2cd58108b7210d6587f59ad71b009b8f5ae358d6f79cfad4120498b"
+        },
+        {
+          "path": "app/greeting_test.go",
+          "bytes": 165,
+          "blake3": "blake3:d20e42762c735bdb364fcca10679ff04daf89389bf7287301c209568136dd612"
+        },
+        {
+          "path": "go.work",
+          "bytes": 35,
+          "blake3": "blake3:893bdaea3567c772904cc98bee02bfd2181878bd39d86e1686ac1831c358f353"
+        },
+        {
+          "path": "message/go.mod",
+          "bytes": 64,
+          "blake3": "blake3:c571821a214993723900ee5c94e8c7977ec432b78acbf937140f11794be67b04"
+        },
+        {
+          "path": "message/message.go",
+          "bytes": 56,
+          "blake3": "blake3:b2e8a02a3815b1c727e7b94c6595ada920543f8cc18707db2cb24824f281d9f5"
+        },
+        {
+          "path": "message/message_test.go",
+          "bytes": 137,
+          "blake3": "blake3:a0e06b41a6f9ae2e6f516a85b022bcb61218ec70735605345af685eda0cb957c"
+        }
+      ]
+    },
+    {
+      "id": "huge-output",
+      "commands": [],
+      "files": [
+        {
+          "path": "README.md",
+          "bytes": 250,
+          "blake3": "blake3:2e9998244b13ff47aea8f55a25eee4d98e01d7303e975d9ca12bd2112a02e252"
+        },
+        {
+          "path": "forge.toml",
+          "bytes": 242,
+          "blake3": "blake3:2af3b675def2763b4a1453107b498e70515af22c015b751fdf8b68e4688b06b9"
+        }
+      ]
+    },
+    {
+      "id": "large-repository",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 168,
+          "blake3": "blake3:52f9133d8455611bf521461fd7a4226e4b5eaa04d9180226487695cd52bacc59"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 95,
+          "blake3": "blake3:525abe0df036399138a4b321d95cfa6bc408e682cce44d02af3d8fb1534dc454"
+        },
+        {
+          "path": "seed.txt",
+          "bytes": 88,
+          "blake3": "blake3:9924a6987e84a9e5520286079441bfcbe9be8a1b0281f6b3c565a9179feea503"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 221,
+          "blake3": "blake3:6c3f84048b952a24c151d331cd99778033794f98fec39aeabe014a3a145bafcd"
+        }
+      ]
+    },
+    {
+      "id": "linked-worktrees",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 168,
+          "blake3": "blake3:0f201abcd4acd70bec3afc64ccf80a5dde9972a6de8e05b67dcba0e59c31fbf3"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 95,
+          "blake3": "blake3:c03dceba2b509872278e6f30b916a63da150ed73f8abc888ed96115e591d073a"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 221,
+          "blake3": "blake3:320141bc8f64ffeda0f7d9b532b9bf6182ece14d100e73b7e776c78744e470bd"
+        }
+      ]
+    },
+    {
+      "id": "malicious-runner",
+      "commands": [],
+      "files": [
+        {
+          "path": "Cargo.toml",
+          "bytes": 234,
+          "blake3": "blake3:735ebd0fd1583e226bd1dc6ceaa517d631bd4d8657359f04a6a2c13fd735146b"
+        },
+        {
+          "path": "Makefile",
+          "bytes": 238,
+          "blake3": "blake3:08b20a4c69d41763e43245acc79a14e2a18becb58d6b49a7e5c594dfa3133e6b"
+        },
+        {
+          "path": "README.md",
+          "bytes": 184,
+          "blake3": "blake3:bbee7cf528b1b70cc3a003906ad552e6187d0b0efaa55fffc03e1cdf3ce4c7af"
+        },
+        {
+          "path": "build.rs",
+          "bytes": 275,
+          "blake3": "blake3:265e5e1918d51f3df27fcfe73c5606eeb3c4f63c41275cfced792f592ca6c659"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 57,
+          "blake3": "blake3:53c67a5e1d47d6c39845ddc23e34be437a21edb8b66b4687a6100c5040b250ea"
+        }
+      ]
+    },
+    {
+      "id": "managed-block-conflict",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "AGENTS.md",
+          "bytes": 281,
+          "blake3": "blake3:72755616b2d04482802e74b9a402491f886c0b57555c37db44ff41f54e4004ec"
+        },
+        {
+          "path": "Cargo.lock",
+          "bytes": 174,
+          "blake3": "blake3:9c8f2a939426ddcbe2435a4588cde5d2a6b9b17ec4ecb16866e993ef4226f689"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 101,
+          "blake3": "blake3:60eb0380f608dab2aad7ee728e57d2b0a99a28b17d0b8369d56b89f7ad429563"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 233,
+          "blake3": "blake3:92e46111fb65e7d6bf2057af3cd4c7adf8b49decb032916ba2fcb845e28a0108"
+        }
+      ]
+    },
+    {
+      "id": "missing-tools",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 165,
+          "blake3": "blake3:cb2a27e75e4fe344a1b4848eb239e4fa240148c418ee16b8340a1be1eef51a19"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 92,
+          "blake3": "blake3:5e53bc35d26d82e02a6ba436a03519012e0df032b963d2684ed3450d9c060f83"
+        },
+        {
+          "path": "forge.toml",
+          "bytes": 243,
+          "blake3": "blake3:eadcb4d1c90b90f77625cb5cd801112279fa1e6169be88bbbfc27ea756d0c4e6"
+        },
+        {
+          "path": "seed.txt",
+          "bytes": 59,
+          "blake3": "blake3:732c96b05b1fb3822fb080b53de9f2d4810bf4f4b93e42080da411721e4cf39e"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 334,
+          "blake3": "blake3:f4da413bc1252ed8682512d5129ba665af4e88b5cd093620dcbf204f22657cc6"
+        }
+      ]
+    },
+    {
+      "id": "mixed-rust-go",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        },
+        {
+          "intent": "test",
+          "program": "go",
+          "args": [
+            "test",
+            "./..."
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 165,
+          "blake3": "blake3:dff9468826fb6e7012b244f4bdb667887c75cdfe8c178492cc1f0eda1a640f57"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 92,
+          "blake3": "blake3:f4a44e9c49ee65fa91f7cd5ef959c8a0cb57a5ddb4f7581605d8b9d494ca32ce"
+        },
+        {
+          "path": "go.mod",
+          "bytes": 57,
+          "blake3": "blake3:0a062909a21455b4adac64835a848f86b3a584c064eca3667c162784c237df38"
+        },
+        {
+          "path": "mixed.go",
+          "bytes": 57,
+          "blake3": "blake3:fcd736fd46a841f25a3d88f4ddb7abf26accd46a2589c9848cec95b7362d51e2"
+        },
+        {
+          "path": "mixed_test.go",
+          "bytes": 150,
+          "blake3": "blake3:a910696e1b9bcc212e44459136dc26ab65688be744fbaca044029fc158abd792"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 179,
+          "blake3": "blake3:0f571a5a3c59bf355b4c2563a5e28a277bacb36ad1cc8bbdd2fb546a1baae3cc"
+        }
+      ]
+    },
+    {
+      "id": "non-git",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 159,
+          "blake3": "blake3:40d8aee9357da60095673ca4351af733447e0b2705f15c52df880807f9a2104e"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 86,
+          "blake3": "blake3:40dca7b1ac5efffdf6e75117a3f207a6b0d4fd07ff13c89e6a7e5c807235970e"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 203,
+          "blake3": "blake3:fcc3525a6072e65ca41039b05f2d9eda0ace91ba55c02e9e49d264a32c04b52e"
+        }
+      ]
+    },
+    {
+      "id": "non-utf8-path",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 165,
+          "blake3": "blake3:d218f26f452361fb1380abb9ff9be2111122c9f7bb4fedac0f02ec399e3cbe9b"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 92,
+          "blake3": "blake3:9fb8e02154905369a9ec76d1f5f7d6df633d8f834f4b3c5a2101b2bf6d7aa064"
+        },
+        {
+          "path": "seed.txt",
+          "bytes": 81,
+          "blake3": "blake3:87457476e67df72cf8d92c472431b95a94b9eb9bdb05f6d023437298c55cf6c4"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 215,
+          "blake3": "blake3:a53ffe23bac758f4c12b76a68197b982064e32aebf2187eb6ec827425d3a1b43"
+        }
+      ]
+    },
+    {
+      "id": "rust-multi-workspace",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "alpha"
+        },
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "beta"
+        }
+      ],
+      "files": [
+        {
+          "path": "alpha/Cargo.lock",
+          "bytes": 168,
+          "blake3": "blake3:1126594220a77cdb096da57b80ca91ab7e3428a88fd8ea84ab934fae9728efe2"
+        },
+        {
+          "path": "alpha/Cargo.toml",
+          "bytes": 95,
+          "blake3": "blake3:0ed2fac82dfe75a03e4cbaa593346c39351bd82a73f31b67c6609626ced26611"
+        },
+        {
+          "path": "alpha/src/lib.rs",
+          "bytes": 174,
+          "blake3": "blake3:bf03d109c15366a0ffcf48ff97fc5c74edd6cded0e78d6609dac6192a5e9fb90"
+        },
+        {
+          "path": "beta/Cargo.lock",
+          "bytes": 167,
+          "blake3": "blake3:01cbda7f36e9bfccae28c778d69db006bb9acd7ef1e29115fdda65200548bd20"
+        },
+        {
+          "path": "beta/Cargo.toml",
+          "bytes": 94,
+          "blake3": "blake3:f4163110cff3352b5472ba7b1f1f4e385270df5ac4a79dd137b5e169442bfa12"
+        },
+        {
+          "path": "beta/src/lib.rs",
+          "bytes": 171,
+          "blake3": "blake3:eaaf3f332e9ec9e2b520af95f768082d2cfd092ade883bbc15d7296a45fb1250"
+        }
+      ]
+    },
+    {
+      "id": "rust-no-lock",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.toml",
+          "bytes": 186,
+          "blake3": "blake3:fe262ae312b067796ffe6e4931cdc957f0fe0218b6483135ef20b7860276615a"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 186,
+          "blake3": "blake3:9e4db419890fe31eac0431b092834dd2379b45556c46cf59c765d1e899fc092f"
+        },
+        {
+          "path": "support/Cargo.toml",
+          "bytes": 126,
+          "blake3": "blake3:e9359bf51ddb98c90dcce2ab78e0a232abcc85543543721a09fa568629272ce4"
+        },
+        {
+          "path": "support/src/lib.rs",
+          "bytes": 33,
+          "blake3": "blake3:c9b80e76f6b0af933186a5aa387e195aede4aa3e533c49ac1ad65582e239abce"
+        }
+      ]
+    },
+    {
+      "id": "rust-package",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 164,
+          "blake3": "blake3:0b7f32bf8c39d4c63aded1f98c609a9d1f3688455d6e958fc23f3725dcc8d0ec"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 140,
+          "blake3": "blake3:9ea2f4f2a9a288e98a9f13f0c7a510c631693a68fb2b94977c949be4cd442f6c"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 231,
+          "blake3": "blake3:9aaf083cad7f9180301854ee2953c5c61276554f620e2bd5035d4df3102477a4"
+        }
+      ]
+    },
+    {
+      "id": "rust-workspace",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--workspace",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 295,
+          "blake3": "blake3:d57754a9384a961763ab6a15ebd2f57434fd1586ae781e8b463e1d2ca37881d0"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 70,
+          "blake3": "blake3:35452093659e111873fef174d7d111a89e006e1609f650ecc6ca2922f781ef71"
+        },
+        {
+          "path": "crates/app/Cargo.toml",
+          "bytes": 170,
+          "blake3": "blake3:51af38d2971dada526f72c10374279cdaf8c365f7b3b319b7ee8f2cbf562a662"
+        },
+        {
+          "path": "crates/app/src/lib.rs",
+          "bytes": 241,
+          "blake3": "blake3:80e71469f1b8024df2fd442cc7800523f905da7af7fa4f9c670fecf7d9ba43c7"
+        },
+        {
+          "path": "crates/message/Cargo.toml",
+          "bytes": 101,
+          "blake3": "blake3:602773552cd648a5452f10b1335d4cd4f23977f7cbbfe91cbb2baa61dbdf7db3"
+        },
+        {
+          "path": "crates/message/src/lib.rs",
+          "bytes": 169,
+          "blake3": "blake3:38313f41bcd1149efbe5c8933a25607799df3e1b94dff2848ff48176543e2d43"
+        }
+      ]
+    },
+    {
+      "id": "submodule",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 161,
+          "blake3": "blake3:0f061876668fd037bc0bbe8ee88442ff727de377bdce9ed247014ee7904ddb50"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 88,
+          "blake3": "blake3:11a587bf4e733e06fdb36c8be697ac45a303d0d51a4733e3ab2c3b81f8bbcacd"
+        },
+        {
+          "path": "dependency-seed.txt",
+          "bytes": 79,
+          "blake3": "blake3:325e25d03bf6c8cd85360606ba19a5a49a4ae55ed166f7c8cacceeeca1861770"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 207,
+          "blake3": "blake3:7ae8bf86e78f3a370f02917f7754feb31ab274a0661b50d71e24eafaedb3d620"
+        }
+      ]
+    },
+    {
+      "id": "symlink-escape",
+      "commands": [
+        {
+          "intent": "test",
+          "program": "cargo",
+          "args": [
+            "test",
+            "--offline"
+          ],
+          "cwd": "."
+        }
+      ],
+      "files": [
+        {
+          "path": "Cargo.lock",
+          "bytes": 166,
+          "blake3": "blake3:be323518e19d82446faa59a8dbc818c31974779b99ca5ecdd7643e98e38e1f22"
+        },
+        {
+          "path": "Cargo.toml",
+          "bytes": 93,
+          "blake3": "blake3:61ce193ed28b83c05c75281d36affd11642b43bb388342ded0a5ecd41d6f83e5"
+        },
+        {
+          "path": "src/lib.rs",
+          "bytes": 217,
+          "blake3": "blake3:43c6c03e05c64867b4b0fbfd1f728573f7b05e4cdb04737458e9012a57ab762a"
+        },
+        {
+          "path": "target-seed.txt",
+          "bytes": 86,
+          "blake3": "blake3:b5c1bd85c0c54c9ff8f772c8a46cb27100503ec8d45e810b27a7269497074dfd"
+        }
+      ]
+    },
+    {
+      "id": "timeout-tree",
+      "commands": [],
+      "files": [
+        {
+          "path": "README.md",
+          "bytes": 298,
+          "blake3": "blake3:add383d4abc9ce5aa2dd3cb101fb42edc132ebd724be83cc860c18d4d17cc309"
+        },
+        {
+          "path": "forge.toml",
+          "bytes": 264,
+          "blake3": "blake3:e4c90d33e0ba3b1d5bdb4715732e5ad30d03f6a1a196d58a824fd53dcab60cc3"
+        }
+      ]
+    }
+  ]
+}

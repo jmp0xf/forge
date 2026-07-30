@@ -11,7 +11,7 @@ pub use forge_core::{
     BoundedText, Inventory, InventoryEntry, InventoryError, InventoryKind, InventoryOptions,
     InventorySkip, PathKind,
 };
-use forge_core::{GitFileSet, RepoRelativePath};
+use forge_core::{GitFileSet, OperationControl, RepoRelativePath, UnlimitedOperationControl};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{Match, WalkBuilder};
 
@@ -31,18 +31,35 @@ pub fn build_git_inventory<G>(
 where
     G: GitPort,
 {
-    validate_root(root)?;
-    let file_set = git.file_set(root).map_err(InventoryError::Git)?;
-    build_inventory_from_git_file_set(root, &file_set, options)
+    build_git_inventory_controlled(root, git, options, &UnlimitedOperationControl)
 }
 
-pub(crate) fn build_inventory_from_git_file_set(
+/// Builds a Git-backed inventory with cooperative operation-wide checkpoints.
+pub fn build_git_inventory_controlled<G>(
+    root: &Path,
+    git: &G,
+    options: InventoryOptions,
+    control: &dyn OperationControl,
+) -> Result<Inventory, InventoryError>
+where
+    G: GitPort,
+{
+    control.checkpoint()?;
+    validate_root(root)?;
+    let file_set = git.file_set(root).map_err(InventoryError::Git)?;
+    control.checkpoint()?;
+    build_inventory_from_git_file_set_controlled(root, &file_set, options, control)
+}
+
+pub(crate) fn build_inventory_from_git_file_set_controlled(
     root: &Path,
     file_set: &GitFileSet,
     options: InventoryOptions,
+    control: &dyn OperationControl,
 ) -> Result<Inventory, InventoryError> {
     // This function is also the FileSystemPort entrypoint, so it cannot rely on the convenience
     // wrapper having validated the root first.
+    control.checkpoint()?;
     validate_root(root)?;
     let mut inventory = Inventory::default();
     let dot_ignore_matchers = load_dot_ignore_matchers(
@@ -50,15 +67,18 @@ pub(crate) fn build_inventory_from_git_file_set(
         file_set,
         options.max_text_file_bytes,
         &mut inventory.skipped,
-    );
+        control,
+    )?;
     let mut seen = BTreeSet::new();
 
     for path in &file_set.tracked {
+        control.checkpoint()?;
         if seen.insert(path.clone()) {
             inventory_path(root, path, &mut inventory);
         }
     }
     for path in &file_set.untracked {
+        control.checkpoint()?;
         if seen.contains(path) || dot_ignore_match(&dot_ignore_matchers, root, path).is_ignore() {
             continue;
         }
@@ -66,7 +86,10 @@ pub(crate) fn build_inventory_from_git_file_set(
         inventory_path(root, path, &mut inventory);
     }
 
-    inventory.finalize(options)
+    control.checkpoint()?;
+    let inventory = inventory.finalize(options)?;
+    control.checkpoint()?;
+    Ok(inventory)
 }
 
 /// Filesystem-only fallback for callers that have explicitly established a non-Git context.
@@ -77,6 +100,16 @@ pub fn build_non_git_filesystem_inventory(
     root: &Path,
     options: InventoryOptions,
 ) -> Result<Inventory, InventoryError> {
+    build_non_git_filesystem_inventory_controlled(root, options, &UnlimitedOperationControl)
+}
+
+/// Filesystem-only inventory with one checkpoint per walker entry.
+pub fn build_non_git_filesystem_inventory_controlled(
+    root: &Path,
+    options: InventoryOptions,
+    control: &dyn OperationControl,
+) -> Result<Inventory, InventoryError> {
+    control.checkpoint()?;
     validate_root(root)?;
     let mut builder = WalkBuilder::new(root);
     builder
@@ -97,6 +130,7 @@ pub fn build_non_git_filesystem_inventory(
 
     let mut inventory = Inventory::default();
     for result in builder.build() {
+        control.checkpoint()?;
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
@@ -143,11 +177,14 @@ pub fn build_non_git_filesystem_inventory(
         inventory.entries.push(InventoryEntry {
             path: relative,
             kind,
-            size_bytes: metadata.len(),
+            size_bytes: Some(metadata.len()),
         });
     }
 
-    inventory.finalize(options)
+    control.checkpoint()?;
+    let inventory = inventory.finalize(options)?;
+    control.checkpoint()?;
+    Ok(inventory)
 }
 
 fn validate_root(root: &Path) -> Result<(), InventoryError> {
@@ -193,7 +230,7 @@ fn inventory_path(root: &Path, relative: &RepoRelativePath, inventory: &mut Inve
     inventory.entries.push(InventoryEntry {
         path: relative.as_path().to_path_buf(),
         kind,
-        size_bytes: metadata.len(),
+        size_bytes: Some(metadata.len()),
     });
 }
 
@@ -208,7 +245,9 @@ fn load_dot_ignore_matchers(
     file_set: &GitFileSet,
     max_text_file_bytes: u64,
     skipped: &mut Vec<InventorySkip>,
-) -> Vec<DotIgnoreMatcher> {
+    control: &dyn OperationControl,
+) -> Result<Vec<DotIgnoreMatcher>, InventoryError> {
+    control.checkpoint()?;
     let mut ignore_paths: Vec<_> = file_set
         .tracked
         .iter()
@@ -227,11 +266,14 @@ fn load_dot_ignore_matchers(
 
     let mut matchers = Vec::new();
     for relative in ignore_paths {
+        control.checkpoint()?;
         if dot_ignore_match(&matchers, root, &relative).is_ignore() {
             continue;
         }
-        let text = match read_bounded_text(root, &relative, max_text_file_bytes) {
+        let text = match read_bounded_text_controlled(root, &relative, max_text_file_bytes, control)
+        {
             Ok(text) => text,
+            Err(InventoryError::Control(error)) => return Err(error.into()),
             Err(error) => {
                 push_dot_ignore_skip(
                     skipped,
@@ -278,6 +320,7 @@ fn load_dot_ignore_matchers(
         let mut builder = GitignoreBuilder::new(root.join(&directory));
         let mut invalid_rules = 0_usize;
         for (index, line) in contents.lines().enumerate() {
+            control.checkpoint()?;
             let line = if index == 0 {
                 line.trim_start_matches('\u{feff}')
             } else {
@@ -308,7 +351,7 @@ fn load_dot_ignore_matchers(
         }
         matchers.push(DotIgnoreMatcher { directory, matcher });
     }
-    matchers
+    Ok(matchers)
 }
 
 fn push_dot_ignore_skip(
@@ -363,7 +406,22 @@ pub fn read_bounded_text(
     relative: &RepoRelativePath,
     max_text_file_bytes: u64,
 ) -> Result<BoundedText, InventoryError> {
-    reject_symlink_components(root, relative.as_path())?;
+    read_bounded_text_controlled(
+        root,
+        relative,
+        max_text_file_bytes,
+        &UnlimitedOperationControl,
+    )
+}
+
+/// Reads bounded text while checking cancellation/deadline between fixed-size chunks.
+pub fn read_bounded_text_controlled(
+    root: &Path,
+    relative: &RepoRelativePath,
+    max_text_file_bytes: u64,
+    control: &dyn OperationControl,
+) -> Result<BoundedText, InventoryError> {
+    reject_symlink_components_controlled(root, relative.as_path(), control)?;
     let path = root.join(relative.as_path());
     let file = File::open(&path).map_err(|source| InventoryError::Io {
         path: path.clone(),
@@ -371,12 +429,21 @@ pub fn read_bounded_text(
     })?;
     let read_limit = max_text_file_bytes.saturating_add(1);
     let mut bytes = Vec::new();
-    file.take(read_limit)
-        .read_to_end(&mut bytes)
-        .map_err(|source| InventoryError::Io {
-            path: path.clone(),
-            source,
-        })?;
+    let mut reader = file.take(read_limit);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        control.checkpoint()?;
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|source| InventoryError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
     let truncated = bytes.len() as u64 > max_text_file_bytes;
     if truncated {
         let retained = match usize::try_from(max_text_file_bytes) {
@@ -393,9 +460,14 @@ pub fn read_bounded_text(
     })
 }
 
-fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), InventoryError> {
+fn reject_symlink_components_controlled(
+    root: &Path,
+    relative: &Path,
+    control: &dyn OperationControl,
+) -> Result<(), InventoryError> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
+        control.checkpoint()?;
         current.push(component);
         let metadata = fs::symlink_metadata(&current).map_err(|source| InventoryError::Io {
             path: current.clone(),
@@ -434,9 +506,7 @@ mod tests {
     use forge_core::RepoRelativePath;
     use tempfile::tempdir;
 
-    use super::{
-        InventoryKind, InventoryOptions, build_non_git_filesystem_inventory, read_bounded_text,
-    };
+    use super::{InventoryOptions, build_non_git_filesystem_inventory, read_bounded_text};
 
     #[test]
     fn inventory_respects_gitignore_and_generated_directory_boundaries()
@@ -481,6 +551,8 @@ mod tests {
     #[test]
     fn symlink_is_inventoried_but_never_followed() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
+
+        use super::InventoryKind;
 
         let directory = tempdir()?;
         let outside = tempdir()?;

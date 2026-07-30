@@ -1,20 +1,30 @@
 //! Native filesystem primitives and repository-confined writes.
 
-use std::fs::{self, File};
-use std::io::{self, Read as _, Write as _};
+use std::ffi::OsStr;
+use std::fs;
+use std::fs::File;
+use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
-use forge_core::ports::{FileSystemPort, RepositoryFilePort};
+use forge_core::ports::{
+    FileSystemPort, RepositoryApplyPort, RepositoryFilePort, RepositoryWriteError,
+    RepositoryWriteOutcome,
+};
 use forge_core::{
-    BoundedText, GitFileSet, Inventory, InventoryError, InventoryOptions, PathKind,
-    RepoRelativePath,
+    BoundedText, GitFileSet, Inventory, InventoryError, InventoryOptions, OperationControl,
+    PathKind, PathMetadata, RepoRelativePath, UnlimitedOperationControl,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::inventory::{
-    build_inventory_from_git_file_set, build_non_git_filesystem_inventory,
-    read_bounded_text as read_repository_bounded_text,
+    build_inventory_from_git_file_set_controlled, build_non_git_filesystem_inventory_controlled,
+    read_bounded_text_controlled as read_repository_bounded_text_controlled,
+};
+use crate::repository_write::{
+    BeginPrivateQuarantine, CommitMode, OpenPrivateQuarantine, RepositoryDirectoryEntry,
+    RepositoryDirectoryListing, RepositoryGcError, RootHandle,
 };
 
 /// The native implementation of [`FileSystemPort`].
@@ -41,9 +51,21 @@ impl NativeFileSystem {
         file_set: Option<&GitFileSet>,
         options: InventoryOptions,
     ) -> Result<Inventory, InventoryError> {
+        self.inventory_controlled(root, file_set, options, &UnlimitedOperationControl)
+    }
+
+    pub fn inventory_controlled(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+        control: &dyn OperationControl,
+    ) -> Result<Inventory, InventoryError> {
         match file_set {
-            Some(file_set) => build_inventory_from_git_file_set(root, file_set, options),
-            None => build_non_git_filesystem_inventory(root, options),
+            Some(file_set) => {
+                build_inventory_from_git_file_set_controlled(root, file_set, options, control)
+            }
+            None => build_non_git_filesystem_inventory_controlled(root, options, control),
         }
     }
 
@@ -53,12 +75,32 @@ impl NativeFileSystem {
         path: &RepoRelativePath,
         max_text_file_bytes: u64,
     ) -> Result<BoundedText, InventoryError> {
-        read_repository_bounded_text(root, path, max_text_file_bytes)
+        self.read_bounded_text_controlled(
+            root,
+            path,
+            max_text_file_bytes,
+            &UnlimitedOperationControl,
+        )
+    }
+
+    pub fn read_bounded_text_controlled(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+        control: &dyn OperationControl,
+    ) -> Result<BoundedText, InventoryError> {
+        read_repository_bounded_text_controlled(root, path, max_text_file_bytes, control)
     }
 
     /// Inspects one path without following the target or any symbolic-link ancestor.
     pub fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
-        path_kind(root, path)
+        self.path_metadata(root, path).map(|metadata| metadata.kind)
+    }
+
+    /// Atomically inspects one path's kind and size without following symbolic links.
+    pub fn path_metadata(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathMetadata> {
+        path_metadata(root, path)
     }
 
     /// Replaces one file through a temporary file in the target directory.
@@ -85,6 +127,16 @@ impl FileSystemPort for NativeFileSystem {
         NativeFileSystem::inventory(self, root, file_set, options)
     }
 
+    fn inventory_controlled(
+        &self,
+        root: &Path,
+        file_set: Option<&GitFileSet>,
+        options: InventoryOptions,
+        control: &dyn OperationControl,
+    ) -> Result<Inventory, InventoryError> {
+        NativeFileSystem::inventory_controlled(self, root, file_set, options, control)
+    }
+
     fn read_bounded_text(
         &self,
         root: &Path,
@@ -94,8 +146,28 @@ impl FileSystemPort for NativeFileSystem {
         NativeFileSystem::read_bounded_text(self, root, path, max_text_file_bytes)
     }
 
+    fn read_bounded_text_controlled(
+        &self,
+        root: &Path,
+        path: &RepoRelativePath,
+        max_text_file_bytes: u64,
+        control: &dyn OperationControl,
+    ) -> Result<BoundedText, InventoryError> {
+        NativeFileSystem::read_bounded_text_controlled(
+            self,
+            root,
+            path,
+            max_text_file_bytes,
+            control,
+        )
+    }
+
     fn path_kind(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathKind> {
         NativeFileSystem::path_kind(self, root, path)
+    }
+
+    fn path_metadata(&self, root: &Path, path: &RepoRelativePath) -> io::Result<PathMetadata> {
+        NativeFileSystem::path_metadata(self, root, path)
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -154,7 +226,7 @@ impl RepositoryFilePort for NativeFileSystem {
     }
 }
 
-fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
+fn path_metadata(root: &Path, relative: &RepoRelativePath) -> io::Result<PathMetadata> {
     let root_metadata = fs::symlink_metadata(root).map_err(|source| {
         FileSystemError::io("inspect repository root", root, source).into_io_error()
     })?;
@@ -181,7 +253,7 @@ fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(PathKind::Missing);
+                return Ok(PathMetadata::missing());
             }
             Err(source) => {
                 return Err(
@@ -193,7 +265,7 @@ fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
         let is_target = components.peek().is_none();
         if metadata.file_type().is_symlink() {
             if is_target {
-                return Ok(PathKind::Symlink);
+                return Ok(PathMetadata::present(PathKind::Symlink, metadata.len()));
             }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -213,11 +285,17 @@ fn path_kind(root: &Path, relative: &RepoRelativePath) -> io::Result<PathKind> {
             ));
         }
         if is_target {
-            return Ok(metadata_path_kind(&metadata));
+            return Ok(PathMetadata::present(
+                metadata_path_kind(&metadata),
+                metadata.len(),
+            ));
         }
     }
 
-    Ok(PathKind::Directory)
+    Ok(PathMetadata::present(
+        PathKind::Directory,
+        root_metadata.len(),
+    ))
 }
 
 fn metadata_path_kind(metadata: &fs::Metadata) -> PathKind {
@@ -237,7 +315,7 @@ fn metadata_path_kind(metadata: &fs::Metadata) -> PathKind {
 #[derive(Debug, Clone)]
 pub struct RepositoryWriter {
     root: PathBuf,
-    filesystem: NativeFileSystem,
+    write_root: Arc<RootHandle>,
 }
 
 impl RepositoryWriter {
@@ -261,9 +339,11 @@ impl RepositoryWriter {
         let root = fs::canonicalize(supplied_root).map_err(|source| {
             FileSystemError::io("canonicalize repository root", supplied_root, source)
         })?;
+        let write_root = RootHandle::open(&root)
+            .map_err(|source| FileSystemError::io("open repository root handle", &root, source))?;
         Ok(Self {
             root,
-            filesystem: NativeFileSystem,
+            write_root: Arc::new(write_root),
         })
     }
 
@@ -272,11 +352,19 @@ impl RepositoryWriter {
         &self.root
     }
 
+    /// Verifies that the visible root path still names the pinned directory identity.
+    pub fn validate_visible_root(&self) -> Result<(), FileSystemError> {
+        self.write_root.validate_visible_root().map_err(|source| {
+            FileSystemError::io(
+                "validate visible repository root identity",
+                &self.root,
+                source,
+            )
+        })
+    }
+
     pub fn read(&self, relative_path: impl AsRef<Path>) -> Result<Vec<u8>, FileSystemError> {
-        let target = self.checked_target(relative_path.as_ref())?;
-        self.filesystem
-            .read(&target)
-            .map_err(|source| FileSystemError::io("read repository file", &target, source))
+        self.read_required_bounded(relative_path.as_ref(), usize::MAX, "read repository file")
     }
 
     /// Reads a confined regular file while retaining at most `max_bytes`.
@@ -285,9 +373,176 @@ impl RepositoryWriter {
         relative_path: impl AsRef<Path>,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let target = self.checked_target(relative_path.as_ref())?;
-        read_file_bounded(&target, max_bytes)
-            .map_err(|source| FileSystemError::io("read bounded repository file", &target, source))
+        self.read_required_bounded(
+            relative_path.as_ref(),
+            max_bytes,
+            "read bounded repository file",
+        )
+    }
+
+    /// Reads an optional regular file through this writer's pinned root handle.
+    pub fn read_optional_bounded(
+        &self,
+        relative_path: impl AsRef<Path>,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.read_optional_bounded_normalized(
+            &normalized,
+            max_bytes,
+            "read bounded repository file through root handle",
+            &target,
+        )
+    }
+
+    pub(crate) fn validate_open_regular_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected_parent: &File,
+        object: &File,
+    ) -> Result<(), FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .validate_regular_from(&normalized, expected_parent, object)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "validate opened repository file through pinned parent",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn open_regular_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected_parent: &File,
+    ) -> Result<Option<File>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .open_regular_from(&normalized, expected_parent)
+            .map_err(|source| {
+                FileSystemError::io("open repository file through pinned parent", target, source)
+            })
+    }
+
+    pub(crate) fn open_listed_entry_from(
+        &self,
+        directory: impl AsRef<Path>,
+        expected_directory: &File,
+        entry: &RepositoryDirectoryEntry,
+    ) -> Result<File, FileSystemError> {
+        let normalized = normalize_relative_path(directory.as_ref())?;
+        let target = self.root.join(&normalized).join(entry.name());
+        self.write_root
+            .open_listed_entry_from(&normalized, expected_directory, entry)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "open listed repository entry through pinned directory",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn list_directory(
+        &self,
+        relative_path: impl AsRef<Path>,
+        max_entries: usize,
+    ) -> Result<Option<RepositoryDirectoryListing>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .list_directory(&normalized, max_entries)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "list repository directory through root handle",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn list_directory_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected: &File,
+        max_entries: usize,
+    ) -> Result<RepositoryDirectoryListing, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .list_directory_from(&normalized, expected, max_entries)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "list pinned repository directory through root handle",
+                    target,
+                    source,
+                )
+            })
+    }
+
+    pub(crate) fn begin_private_quarantine_from(
+        &self,
+        relative_path: impl AsRef<Path>,
+        expected_parent: &File,
+        quarantine_leaf: &OsStr,
+    ) -> Result<BeginPrivateQuarantine, RepositoryGcError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())
+            .map_err(|error| RepositoryGcError::not_changed(error.into_io_error()))?;
+        self.write_root
+            .begin_private_quarantine_from(&normalized, expected_parent, quarantine_leaf)
+    }
+
+    pub(crate) fn open_private_quarantine_from(
+        &self,
+        directory: impl AsRef<Path>,
+        expected_parent: &File,
+        original_leaf: &OsStr,
+        quarantine_leaf: &OsStr,
+    ) -> Result<OpenPrivateQuarantine, RepositoryGcError> {
+        let normalized = normalize_relative_path(directory.as_ref())
+            .map_err(|error| RepositoryGcError::not_changed(error.into_io_error()))?;
+        self.write_root.open_private_quarantine_from(
+            &normalized,
+            expected_parent,
+            original_leaf,
+            quarantine_leaf,
+        )
+    }
+
+    fn read_required_bounded(
+        &self,
+        relative_path: &Path,
+        max_bytes: usize,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, FileSystemError> {
+        let normalized = normalize_relative_path(relative_path)?;
+        let target = self.root.join(&normalized);
+        let bytes =
+            self.read_optional_bounded_normalized(&normalized, max_bytes, operation, &target)?;
+        bytes.ok_or_else(|| {
+            FileSystemError::io(
+                operation,
+                target,
+                io::Error::new(io::ErrorKind::NotFound, "repository file does not exist"),
+            )
+        })
+    }
+
+    fn read_optional_bounded_normalized(
+        &self,
+        normalized: &Path,
+        max_bytes: usize,
+        operation: &'static str,
+        target: &Path,
+    ) -> Result<Option<Vec<u8>>, FileSystemError> {
+        self.write_root
+            .read_bounded(normalized, max_bytes)
+            .map_err(|source| FileSystemError::io(operation, target, source))
     }
 
     pub fn exists(&self, relative_path: impl AsRef<Path>) -> Result<bool, FileSystemError> {
@@ -313,6 +568,15 @@ impl RepositoryWriter {
         self.write_atomic_with_mode(relative_path.as_ref(), bytes, NewFileMode::Default)
     }
 
+    /// Atomically creates one ordinary repository file without replacing an existing target.
+    pub fn write_atomic_new(
+        &self,
+        relative_path: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<(), FileSystemError> {
+        self.write_atomic_new_with_mode(relative_path.as_ref(), bytes, NewFileMode::Default)
+    }
+
     pub(crate) fn write_atomic_private(
         &self,
         relative_path: impl AsRef<Path>,
@@ -327,17 +591,51 @@ impl RepositoryWriter {
         relative_path: impl AsRef<Path>,
         bytes: &[u8],
     ) -> Result<(), FileSystemError> {
-        let relative_path = relative_path.as_ref();
+        self.write_atomic_private_new_with_before_commit(relative_path, bytes, || Ok(()))
+    }
+
+    /// Atomically creates one private file through the pinned repository root while exposing the
+    /// final pre-commit boundary to state-layer race tests.
+    pub(crate) fn write_atomic_private_new_with_before_commit(
+        &self,
+        relative_path: impl AsRef<Path>,
+        bytes: &[u8],
+        before_commit: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), FileSystemError> {
+        let normalized = normalize_relative_path(relative_path.as_ref())?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .write_atomic(
+                &normalized,
+                bytes,
+                NewFileMode::Private,
+                CommitMode::CreateNew,
+                before_commit,
+            )
+            .map_err(|source| {
+                FileSystemError::io("atomically create private repository file", target, source)
+            })
+    }
+
+    fn write_atomic_new_with_mode(
+        &self,
+        relative_path: &Path,
+        bytes: &[u8],
+        new_file_mode: NewFileMode,
+    ) -> Result<(), FileSystemError> {
         let normalized = normalize_relative_path(relative_path)?;
-        self.validate_target(&normalized)?;
-        self.create_parent_directories(&normalized)?;
-        let target = self.validate_target(&normalized)?;
-        write_atomic_new_impl_with_recheck(&target, bytes, NewFileMode::Private, || {
-            self.validate_target(&normalized)
-                .map(|_| ())
-                .map_err(FileSystemError::into_io_error)
-        })
-        .map_err(|source| FileSystemError::io("atomically create repository file", target, source))
+        let target = self.root.join(&normalized);
+        self.write_root
+            .write_atomic(
+                &normalized,
+                bytes,
+                new_file_mode,
+                CommitMode::CreateNew,
+                || Ok(()),
+            )
+            .map_err(|source| {
+                FileSystemError::io("atomically create repository file", target, source)
+            })
     }
 
     fn write_atomic_with_mode(
@@ -346,19 +644,68 @@ impl RepositoryWriter {
         bytes: &[u8],
         new_file_mode: NewFileMode,
     ) -> Result<(), FileSystemError> {
-        let normalized = normalize_relative_path(relative_path)?;
-        self.validate_target(&normalized)?;
-        self.create_parent_directories(&normalized)?;
+        self.write_atomic_with_mode_and_hook(relative_path, bytes, new_file_mode, || Ok(()))
+    }
 
-        // Recheck after directory creation and immediately before the write so
-        // a pre-existing path conflict cannot be hidden by the create phase.
-        let target = self.validate_target(&normalized)?;
-        write_atomic_impl_with_recheck(&target, bytes, new_file_mode, || {
-            self.validate_target(&normalized)
-                .map(|_| ())
-                .map_err(FileSystemError::into_io_error)
-        })
-        .map_err(|source| FileSystemError::io("atomically write repository file", target, source))
+    fn write_atomic_with_mode_and_hook(
+        &self,
+        relative_path: &Path,
+        bytes: &[u8],
+        new_file_mode: NewFileMode,
+        before_commit: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), FileSystemError> {
+        let normalized = normalize_relative_path(relative_path)?;
+        let target = self.root.join(&normalized);
+        self.write_root
+            .write_atomic(
+                &normalized,
+                bytes,
+                new_file_mode,
+                CommitMode::Replace,
+                before_commit,
+            )
+            .map_err(|source| {
+                FileSystemError::io("atomically write repository file", target, source)
+            })
+    }
+
+    #[cfg(test)]
+    fn write_atomic_with_before_commit(
+        &self,
+        relative_path: &Path,
+        bytes: &[u8],
+        before_commit: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), FileSystemError> {
+        self.write_atomic_with_mode_and_hook(
+            relative_path,
+            bytes,
+            NewFileMode::Default,
+            before_commit,
+        )
+    }
+
+    #[cfg(test)]
+    fn write_atomic_if_unchanged_with_hook(
+        &self,
+        relative_path: &Path,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+        max_postimage_bytes: usize,
+        hook: impl FnMut(crate::repository_write::WriteEvent) -> io::Result<()>,
+    ) -> Result<RepositoryWriteOutcome, RepositoryWriteError> {
+        let normalized = normalize_relative_path(relative_path).map_err(|error| {
+            RepositoryWriteError::new(
+                forge_core::ports::RepositoryWriteCommit::NotCommitted,
+                error.into_io_error(),
+            )
+        })?;
+        self.write_root.write_atomic_if_unchanged_with_hook(
+            &normalized,
+            expected,
+            bytes,
+            max_postimage_bytes,
+            hook,
+        )
     }
 
     fn checked_target(&self, relative_path: &Path) -> Result<PathBuf, FileSystemError> {
@@ -472,66 +819,34 @@ impl RepositoryWriter {
             }
         }
     }
-
-    fn create_parent_directories(&self, normalized: &Path) -> Result<(), FileSystemError> {
-        let Some(parent) = normalized.parent() else {
-            return Ok(());
-        };
-        let mut candidate = self.root.clone();
-        for component in parent.components() {
-            let Component::Normal(segment) = component else {
-                return Err(FileSystemError::InvalidRelativePath {
-                    path: normalized.to_path_buf(),
-                    reason: "parent path was not normalized".to_owned(),
-                });
-            };
-            candidate.push(segment);
-            match fs::create_dir(&candidate) {
-                Ok(()) => {}
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(source) => {
-                    return Err(FileSystemError::io(
-                        "create repository directory",
-                        candidate,
-                        source,
-                    ));
-                }
-            }
-
-            let metadata = fs::symlink_metadata(&candidate).map_err(|source| {
-                FileSystemError::io("verify repository directory", &candidate, source)
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(FileSystemError::SymlinkComponent { path: candidate });
-            }
-            if !metadata.is_dir() {
-                return Err(FileSystemError::AncestorNotDirectory { path: candidate });
-            }
-        }
-        Ok(())
-    }
 }
 
-fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file exceeds its bounded regular-file contract",
-        ));
+impl RepositoryApplyPort for RepositoryWriter {
+    fn read_confined_bounded(
+        &self,
+        path: &RepoRelativePath,
+        max_bytes: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        self.read_optional_bounded(path.as_path(), max_bytes)
+            .map_err(FileSystemError::into_io_error)
     }
-    let capacity = usize::try_from(metadata.len()).map_or(max_bytes, |bytes| bytes.min(max_bytes));
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take((max_bytes as u64).saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file grew beyond its read limit",
-        ));
+
+    fn write_atomic_if_unchanged(
+        &self,
+        path: &RepoRelativePath,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+        max_postimage_bytes: usize,
+    ) -> Result<RepositoryWriteOutcome, RepositoryWriteError> {
+        let normalized = normalize_relative_path(path.as_path()).map_err(|error| {
+            RepositoryWriteError::new(
+                forge_core::ports::RepositoryWriteCommit::NotCommitted,
+                error.into_io_error(),
+            )
+        })?;
+        self.write_root
+            .write_atomic_if_unchanged(&normalized, expected, bytes, max_postimage_bytes)
     }
-    Ok(bytes)
 }
 
 /// A failure to confine a filesystem operation to its intended root.
@@ -638,7 +953,13 @@ fn write_atomic_impl_with_recheck(
         )
     })?;
     let existing_permissions = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+        Ok(metadata) if metadata.is_file() => match new_file_mode {
+            NewFileMode::Default => Some(metadata.permissions()),
+            // Private replacements must be newly owner-private. Inheriting the target's mode
+            // would preserve a pre-existing disclosure boundary even though the bytes were
+            // written through a private API.
+            NewFileMode::Private => None,
+        },
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -669,42 +990,6 @@ fn write_atomic_impl_with_recheck(
     sync_parent_directory(parent)
 }
 
-fn write_atomic_new_impl_with_recheck(
-    path: &Path,
-    bytes: &[u8],
-    new_file_mode: NewFileMode,
-    recheck_before_rename: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("atomic create target has no parent: `{}`", path.display()),
-        )
-    })?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("atomic create target already exists: `{}`", path.display()),
-            ));
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => return Err(source),
-    }
-
-    let mut temporary = new_atomic_temporary_file(parent, new_file_mode)?;
-    temporary.as_file_mut().write_all(bytes)?;
-    temporary.as_file_mut().flush()?;
-    temporary.as_file().sync_all()?;
-
-    recheck_before_rename()?;
-    temporary
-        .persist_noclobber(path)
-        .map(|_| ())
-        .map_err(|error| error.error)?;
-    sync_parent_directory(parent)
-}
-
 #[cfg(unix)]
 fn new_atomic_temporary_file(parent: &Path, mode: NewFileMode) -> io::Result<NamedTempFile> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -720,7 +1005,17 @@ fn new_atomic_temporary_file(parent: &Path, mode: NewFileMode) -> io::Result<Nam
         .tempfile_in(parent)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn new_atomic_temporary_file(parent: &Path, mode: NewFileMode) -> io::Result<NamedTempFile> {
+    match mode {
+        NewFileMode::Default => NamedTempFile::new_in(parent),
+        NewFileMode::Private => tempfile::Builder::new()
+            .prefix(".forge-private-")
+            .make_in(parent, crate::state::create_private_atomic_file),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn new_atomic_temporary_file(parent: &Path, _mode: NewFileMode) -> io::Result<NamedTempFile> {
     NamedTempFile::new_in(parent)
 }
@@ -737,16 +1032,46 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error;
     use std::fs;
     use std::io;
     use std::path::Path;
 
-    use forge_core::ports::{FileSystemPort, RepositoryFilePort};
-    use forge_core::{GitFileSet, InventoryOptions, PathKind, RepoRelativePath};
+    use forge_core::ports::{
+        FileSystemPort, RepositoryFilePort, RepositoryWriteCommit, RepositoryWriteOutcome,
+    };
+    use forge_core::{GitFileSet, InventoryOptions, PathKind, PathMetadata, RepoRelativePath};
     use tempfile::tempdir;
 
     use super::{FileSystemError, NativeFileSystem, RepositoryWriter};
+    use crate::repository_write::WriteEvent;
+
+    #[cfg(windows)]
+    fn assert_no_repository_temporary_files(directory: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".forge-tmp-"),
+                "temporary file remains at {:?}",
+                entry.path()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn assert_file_missing_or_exact(path: &Path, expected: &[u8]) -> io::Result<()> {
+        match fs::read(path) {
+            Ok(bytes) => assert_eq!(bytes, expected, "partial content at {path:?}"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_filesystem_reads_and_replaces_atomically() -> Result<(), Box<dyn Error>> {
@@ -803,6 +1128,83 @@ mod tests {
             oversized,
             Err(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_writer_required_reads_preserve_not_found_diagnostics()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let writer = RepositoryWriter::new(repository.path())?;
+        let expected_path = writer.root().join("missing.txt");
+
+        for (result, expected_operation) in [
+            (writer.read("missing.txt"), "read repository file"),
+            (
+                writer.read_bounded("missing.txt", 64),
+                "read bounded repository file",
+            ),
+        ] {
+            match result {
+                Err(FileSystemError::Io {
+                    operation,
+                    path,
+                    source,
+                }) => {
+                    assert_eq!(operation, expected_operation);
+                    assert_eq!(path, expected_path);
+                    assert_eq!(source.kind(), io::ErrorKind::NotFound);
+                }
+                other => {
+                    return Err(io::Error::other(format!("unexpected result: {other:?}")).into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_writer_rejects_reads_after_visible_root_replacement() -> Result<(), Box<dyn Error>>
+    {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let saved_repository = container.path().join("saved-repository");
+        fs::create_dir(&repository)?;
+        fs::write(repository.join("target.txt"), b"reviewed")?;
+        let writer = RepositoryWriter::new(&repository)?;
+
+        fs::rename(&repository, &saved_repository)?;
+        fs::create_dir(&repository)?;
+        fs::write(repository.join("target.txt"), b"replacement")?;
+
+        for (result, expected_operation) in [
+            (writer.read("target.txt"), "read repository file"),
+            (
+                writer.read_bounded("target.txt", 8),
+                "read bounded repository file",
+            ),
+            (
+                writer
+                    .read_optional_bounded("target.txt", 8)
+                    .map(|bytes| bytes.unwrap_or_default()),
+                "read bounded repository file through root handle",
+            ),
+        ] {
+            match result {
+                Err(FileSystemError::Io {
+                    operation, source, ..
+                }) => {
+                    assert_eq!(operation, expected_operation);
+                    assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+                }
+                other => {
+                    return Err(io::Error::other(format!("unexpected result: {other:?}")).into());
+                }
+            }
+        }
+        assert_eq!(fs::read(repository.join("target.txt"))?, b"replacement");
+        assert_eq!(fs::read(saved_repository.join("target.txt"))?, b"reviewed");
         Ok(())
     }
 
@@ -925,6 +1327,22 @@ mod tests {
             )?,
             PathKind::Directory
         );
+        assert_eq!(
+            FileSystemPort::path_metadata(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("missing")?,
+            )?,
+            PathMetadata::missing()
+        );
+        assert_eq!(
+            FileSystemPort::path_metadata(
+                &filesystem,
+                repository.path(),
+                &RepoRelativePath::new("file")?,
+            )?,
+            PathMetadata::present(PathKind::File, 8)
+        );
 
         let invalid_ancestor = FileSystemPort::path_kind(
             &filesystem,
@@ -999,6 +1417,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn repository_writer_replace_preserves_existing_permissions() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repository = tempdir()?;
+        let target = repository.path().join("executable.sh");
+        fs::write(&target, b"old")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o750))?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        writer.write_atomic("executable.sh", b"new")?;
+
+        assert_eq!(fs::read(&target)?, b"new");
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o750);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_replace_does_not_inherit_permissive_permissions() -> Result<(), Box<dyn Error>>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repository = tempdir()?;
+        let target = repository.path().join("state.json");
+        fs::write(&target, b"old")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        writer.write_atomic_private("state.json", b"new")?;
+
+        assert_eq!(fs::read(&target)?, b"new");
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn new_repository_file_uses_normal_project_permissions() -> Result<(), Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1047,10 +1502,7 @@ mod tests {
 
         let result = writer.write_atomic("linked/escape.txt", b"unsafe");
 
-        assert!(matches!(
-            result,
-            Err(FileSystemError::SymlinkComponent { .. })
-        ));
+        assert!(matches!(result, Err(FileSystemError::Io { .. })));
         assert!(!outside.path().join("escape.txt").exists());
         Ok(())
     }
@@ -1063,10 +1515,376 @@ mod tests {
 
         let result = writer.write_atomic("target", b"unsafe");
 
-        assert!(matches!(
-            result,
-            Err(FileSystemError::TargetNotRegular { .. })
-        ));
+        assert!(matches!(result, Err(FileSystemError::Io { .. })));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repository_writer_rejects_ambiguous_windows_leaf_names() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        for unsafe_name in ["target.txt:stream", "trailing.", "trailing "] {
+            let result = writer.write_atomic(unsafe_name, b"unsafe");
+            assert!(matches!(result, Err(FileSystemError::Io { .. })));
+        }
+        assert!(fs::read_dir(repository.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn create_new_collision_preserves_target_and_removes_temporary_file()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let target = repository.path().join("target.txt");
+        fs::write(&target, b"owned")?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        let error = match writer.write_atomic_new("target.txt", b"intruder") {
+            Ok(()) => return Err(io::Error::other("create-new replaced an existing target").into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.io_kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target)?, b"owned");
+        let temporary_count = fs::read_dir(repository.path())?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".forge-tmp-")
+            })
+            .count();
+        assert_eq!(temporary_count, 0);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn visible_root_identity_validation_rejects_a_replacement() -> Result<(), Box<dyn Error>> {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let displaced = container.path().join("displaced");
+        fs::create_dir(&repository)?;
+        let writer = RepositoryWriter::new(&repository)?;
+        writer.validate_visible_root()?;
+
+        fs::rename(&repository, &displaced)?;
+        fs::create_dir(&repository)?;
+
+        assert!(writer.validate_visible_root().is_err());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn preflight_to_before_parent_open_swap_is_detected_without_writing_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let parent = repository.path().join("parent");
+        let saved_parent = repository.path().join("saved-parent");
+        fs::create_dir(&parent)?;
+        fs::write(parent.join("target.txt"), b"reviewed")?;
+        let writer = RepositoryWriter::new(repository.path())?;
+        assert_eq!(
+            writer.read_optional_bounded("parent/target.txt", 64)?,
+            Some(b"reviewed".to_vec())
+        );
+
+        let outcome = writer.write_atomic_if_unchanged_with_hook(
+            Path::new("parent/target.txt"),
+            Some(b"reviewed"),
+            b"forge",
+            64,
+            |event| {
+                if event == WriteEvent::BeforeParentOpen {
+                    fs::rename(&parent, &saved_parent)?;
+                    fs::create_dir(&parent)?;
+                    fs::write(parent.join("target.txt"), b"replacement")?;
+                }
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(outcome, RepositoryWriteOutcome::PreconditionMismatch);
+        assert_eq!(fs::read(parent.join("target.txt"))?, b"replacement");
+        assert_eq!(fs::read(saved_parent.join("target.txt"))?, b"reviewed");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn final_parent_swap_after_prewrite_commits_only_through_pinned_parent()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let parent = repository.path().join("parent");
+        let saved_parent = repository.path().join("saved-parent");
+        fs::create_dir(&parent)?;
+        fs::write(parent.join("target.txt"), b"reviewed")?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        let error = match writer.write_atomic_if_unchanged_with_hook(
+            Path::new("parent/target.txt"),
+            Some(b"reviewed"),
+            b"forge",
+            64,
+            |event| {
+                if event == WriteEvent::AfterPrewriteRead {
+                    fs::rename(&parent, &saved_parent)?;
+                    fs::create_dir(&parent)?;
+                    fs::write(parent.join("target.txt"), b"replacement")?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "final parent identity change was reported as verified",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
+        assert_eq!(fs::read(parent.join("target.txt"))?, b"replacement");
+        assert_eq!(fs::read(saved_parent.join("target.txt"))?, b"forge");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn leaf_change_after_prewrite_is_rechecked_and_never_overwritten() -> Result<(), Box<dyn Error>>
+    {
+        let repository = tempdir()?;
+        let target = repository.path().join("target.txt");
+        fs::write(&target, b"reviewed")?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        let outcome = writer.write_atomic_if_unchanged_with_hook(
+            Path::new("target.txt"),
+            Some(b"reviewed"),
+            b"forge",
+            64,
+            |event| {
+                if event == WriteEvent::AfterPrewriteRead {
+                    fs::write(&target, b"concurrent")?;
+                }
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(outcome, RepositoryWriteOutcome::PreconditionMismatch);
+        assert_eq!(fs::read(&target)?, b"concurrent");
+        let temporary_count = fs::read_dir(repository.path())?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".forge-tmp-")
+            })
+            .count();
+        assert_eq!(temporary_count, 0);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn intermediate_parent_swap_never_writes_replacement_tree() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        let intermediate = repository.path().join("a");
+        let saved_intermediate = repository.path().join("saved-a");
+        fs::create_dir_all(intermediate.join("b"))?;
+        fs::write(intermediate.join("b/target.txt"), b"reviewed")?;
+        let writer = RepositoryWriter::new(repository.path())?;
+        let swap_completed = Cell::new(false);
+
+        let error = match writer.write_atomic_if_unchanged_with_hook(
+            Path::new("a/b/target.txt"),
+            Some(b"reviewed"),
+            b"forge",
+            64,
+            |event| {
+                if event == WriteEvent::AfterPrewriteRead {
+                    fs::rename(&intermediate, &saved_intermediate)?;
+                    fs::create_dir_all(intermediate.join("b"))?;
+                    fs::write(intermediate.join("b/target.txt"), b"replacement")?;
+                    swap_completed.set(true);
+                }
+                Ok(())
+            },
+        ) {
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "intermediate identity change was reported as verified",
+                )
+                .into());
+            }
+            Err(error) => error,
+        };
+
+        #[cfg(unix)]
+        {
+            assert!(swap_completed.get());
+            assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
+            assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"replacement");
+            assert_eq!(fs::read(saved_intermediate.join("b/target.txt"))?, b"forge");
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(error.commit(), RepositoryWriteCommit::NotCommitted);
+            if swap_completed.get() {
+                assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"replacement");
+                assert_eq!(
+                    fs::read(saved_intermediate.join("b/target.txt"))?,
+                    b"reviewed"
+                );
+                assert_no_repository_temporary_files(&intermediate.join("b"))?;
+                assert_no_repository_temporary_files(&saved_intermediate.join("b"))?;
+            } else {
+                assert_eq!(fs::read(intermediate.join("b/target.txt"))?, b"reviewed");
+                assert!(!saved_intermediate.exists());
+                assert_no_repository_temporary_files(&intermediate.join("b"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn root_swap_after_prewrite_uses_pinned_root_and_reports_commit() -> Result<(), Box<dyn Error>>
+    {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let saved_repository = container.path().join("saved-repository");
+        fs::create_dir(&repository)?;
+        fs::write(repository.join("target.txt"), b"reviewed")?;
+        let writer = RepositoryWriter::new(&repository)?;
+
+        let error = match writer.write_atomic_if_unchanged_with_hook(
+            Path::new("target.txt"),
+            Some(b"reviewed"),
+            b"forge",
+            64,
+            |event| {
+                if event == WriteEvent::AfterPrewriteRead {
+                    fs::rename(&repository, &saved_repository)?;
+                    fs::create_dir(&repository)?;
+                    fs::write(repository.join("target.txt"), b"replacement")?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(_) => {
+                return Err(
+                    io::Error::other("root identity change was reported as verified").into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error.commit(), RepositoryWriteCommit::CommittedUnverified);
+        assert_eq!(fs::read(repository.join("target.txt"))?, b"replacement");
+        assert_eq!(fs::read(saved_repository.join("target.txt"))?, b"forge");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_writer_does_not_follow_a_swapped_ancestor() -> Result<(), Box<dyn Error>> {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let parent = repository.join("parent");
+        let saved_parent = repository.join("saved-parent");
+        fs::create_dir(&repository)?;
+        fs::create_dir(&parent)?;
+        let writer = RepositoryWriter::new(&repository)?;
+        let swap_completed = Cell::new(false);
+
+        let result = writer.write_atomic_with_before_commit(
+            Path::new("parent/target.txt"),
+            b"pinned parent",
+            || {
+                fs::rename(&parent, &saved_parent)?;
+                fs::create_dir(&parent)?;
+                swap_completed.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(&result, Err(FileSystemError::Io { .. })));
+        assert!(!parent.join("target.txt").exists());
+
+        #[cfg(unix)]
+        assert!(swap_completed.get());
+        #[cfg(unix)]
+        assert_eq!(fs::read(saved_parent.join("target.txt"))?, b"pinned parent");
+
+        #[cfg(windows)]
+        {
+            if swap_completed.get() {
+                assert!(parent.is_dir());
+                assert!(saved_parent.is_dir());
+                assert_file_missing_or_exact(&saved_parent.join("target.txt"), b"pinned parent")?;
+                assert_no_repository_temporary_files(&parent)?;
+                assert_no_repository_temporary_files(&saved_parent)?;
+            } else {
+                assert!(parent.is_dir());
+                assert!(!saved_parent.exists());
+                assert_no_repository_temporary_files(&parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn repository_writer_does_not_follow_a_swapped_root() -> Result<(), Box<dyn Error>> {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let saved_repository = container.path().join("saved-repository");
+        fs::create_dir(&repository)?;
+        let writer = RepositoryWriter::new(&repository)?;
+        let swap_completed = Cell::new(false);
+
+        let result =
+            writer.write_atomic_with_before_commit(Path::new("target.txt"), b"pinned root", || {
+                fs::rename(&repository, &saved_repository)?;
+                fs::create_dir(&repository)?;
+                swap_completed.set(true);
+                Ok(())
+            });
+
+        assert!(matches!(&result, Err(FileSystemError::Io { .. })));
+        assert!(!repository.join("target.txt").exists());
+
+        #[cfg(unix)]
+        assert!(swap_completed.get());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(saved_repository.join("target.txt"))?,
+            b"pinned root"
+        );
+
+        #[cfg(windows)]
+        {
+            if swap_completed.get() {
+                assert!(repository.is_dir());
+                assert!(saved_repository.is_dir());
+                assert_file_missing_or_exact(&saved_repository.join("target.txt"), b"pinned root")?;
+                assert_no_repository_temporary_files(&repository)?;
+                assert_no_repository_temporary_files(&saved_repository)?;
+            } else {
+                assert!(repository.is_dir());
+                assert!(!saved_repository.exists());
+                assert_no_repository_temporary_files(&repository)?;
+            }
+        }
         Ok(())
     }
 }

@@ -1,0 +1,5 @@
+[package]
+name = "fixture-non-git"
+version = "0.1.0"
+edition = "2021"
+publish = false

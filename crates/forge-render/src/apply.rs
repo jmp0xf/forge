@@ -3,14 +3,17 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::Path;
 
-use forge_core::ports::{Hasher, RepositoryFilePort};
+use forge_core::ports::{
+    Hasher, RepositoryApplyPort, RepositoryWriteCommit, RepositoryWriteOutcome,
+};
 use forge_core::{Digest, RepoRelativePath};
 
 use crate::inspection::{ADAPTER_FILE_MAX_BYTES, FileEditReason};
-use crate::managed_block::{ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block};
-use crate::plan::{ChangePlan, FileEdit, FileEditKind};
+use crate::managed_block::{
+    ManagedBlock, ManagedBlockError, MergeAction, merge_managed_block_with_line_ending,
+};
+use crate::plan::{ChangePlan, DesiredFile, FileEdit, FileEditKind};
 use crate::repository_file_digest;
 
 const SUPPORTED_PLAN_SCHEMA: u16 = 1;
@@ -50,6 +53,7 @@ pub enum ApplyErrorKind {
     ReadBeforeWrite,
     PrewriteDrift,
     Write,
+    CommittedUnverified,
     ReadAfterWrite,
     PostwriteMissing,
     PostwriteMismatch,
@@ -185,16 +189,21 @@ struct PreparedEdit {
 
 /// Applies a complete plan only after every target passes an all-files, zero-write preflight.
 ///
-/// Each file replacement is atomic through `RepositoryFilePort`; multiple targets are not one OS
-/// transaction. Any write or verification failure returns an `ApplyError` with partial progress.
+/// Each file replacement is atomic through `RepositoryApplyPort`; multiple targets are not one OS
+/// transaction. One apply-scoped port pins the repository root, and each write pins its target
+/// parent from prewrite comparison through post-write read. Any failure returns an `ApplyError`
+/// with partial progress.
+// `ApplyError` deliberately retains the typed source, target path, and recovery ledger. Its
+// Windows ABI crosses Clippy's size heuristic; boxing the public error would change the API and
+// add an allocation to every failure path.
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 pub fn apply_change_plan<F, H>(
-    repository_root: &Path,
     plan: &ChangePlan,
     filesystem: &F,
     hasher: &H,
 ) -> Result<ApplyReport, ApplyError>
 where
-    F: RepositoryFilePort + ?Sized,
+    F: RepositoryApplyPort + ?Sized,
     H: Hasher + ?Sized,
 {
     let mut edits = plan.edits.iter().collect::<Vec<_>>();
@@ -222,97 +231,59 @@ where
 
     let mut prepared = Vec::with_capacity(edits.len());
     for edit in edits {
-        prepared.push(preflight_edit(
-            repository_root,
-            edit,
-            filesystem,
-            hasher,
-            &report,
-        )?);
+        prepared.push(preflight_edit(edit, filesystem, hasher, &report)?);
     }
 
     for edit in prepared {
-        let current = filesystem
-            .read_confined_bounded(repository_root, &edit.path, ADAPTER_FILE_MAX_BYTES)
-            .map_err(|source| {
-                if source.kind() == io::ErrorKind::InvalidData {
-                    return ApplyError::io(
-                        ApplyErrorKind::ExistingFileTooLarge,
-                        edit.path.clone(),
-                        format!(
-                            "target exceeds the {ADAPTER_FILE_MAX_BYTES}-byte adapter file limit immediately before writing"
-                        ),
-                        source,
-                        report.clone(),
-                    );
-                }
-                ApplyError::io(
-                    ApplyErrorKind::ReadBeforeWrite,
+        let outcome = match filesystem.write_atomic_if_unchanged(
+            &edit.path,
+            edit.preimage.as_deref(),
+            &edit.postimage,
+            ADAPTER_FILE_MAX_BYTES,
+        ) {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                let committed = source.commit() == RepositoryWriteCommit::CommittedUnverified;
+                let kind = if committed {
+                    record_written(&mut report, &edit);
+                    ApplyErrorKind::CommittedUnverified
+                } else if source.source_error().kind() == io::ErrorKind::InvalidData {
+                    ApplyErrorKind::ExistingFileTooLarge
+                } else {
+                    ApplyErrorKind::Write
+                };
+                let detail = if committed {
+                    "the target was committed, but synchronization or handle-relative verification did not finish"
+                } else {
+                    "the confined compare-and-write operation failed before committing the target"
+                };
+                return Err(ApplyError::io(
+                    kind,
                     edit.path.clone(),
-                    "failed to recheck the target immediately before writing",
-                    source,
-                    report.clone(),
-                )
-            })?;
-        if current != edit.preimage {
+                    detail,
+                    source.into_source(),
+                    report,
+                ));
+            }
+        };
+        let RepositoryWriteOutcome::Written { observed } = outcome else {
             return Err(ApplyError::plain(
                 ApplyErrorKind::PrewriteDrift,
                 Some(edit.path.clone()),
                 "target changed after all-files preflight; the current and remaining edits were not written",
                 report,
             ));
-        }
+        };
+        record_written(&mut report, &edit);
 
-        filesystem
-            .write_atomic_confined(repository_root, &edit.path, &edit.postimage)
-            .map_err(|source| {
-                ApplyError::io(
-                    ApplyErrorKind::Write,
-                    edit.path.clone(),
-                    "confined atomic file write did not complete successfully",
-                    source,
-                    report.clone(),
-                )
-            })?;
-        report.unwritten.retain(|path| path != &edit.path);
-        report.written.push(WrittenFile {
-            path: edit.path.clone(),
-            kind: edit.kind,
-            preimage: edit.preimage_digest.clone(),
-            postimage: edit.postimage_digest.clone(),
-            verified: false,
-        });
-
-        let observed = filesystem
-            .read_confined_bounded(repository_root, &edit.path, ADAPTER_FILE_MAX_BYTES)
-            .map_err(|source| {
-                if source.kind() == io::ErrorKind::InvalidData {
-                    return ApplyError::io(
-                        ApplyErrorKind::PostimageTooLarge,
-                        edit.path.clone(),
-                        format!(
-                            "write completed but the target exceeds the {ADAPTER_FILE_MAX_BYTES}-byte adapter file limit"
-                        ),
-                        source,
-                        report.clone(),
-                    );
-                }
-                ApplyError::io(
-                    ApplyErrorKind::ReadAfterWrite,
-                    edit.path.clone(),
-                    "write completed but the target could not be reread for verification",
-                    source,
-                    report.clone(),
-                )
-            })?
-            .ok_or_else(|| {
-                ApplyError::plain(
-                    ApplyErrorKind::PostwriteMissing,
-                    Some(edit.path.clone()),
-                    "write completed but the target was missing during verification",
-                    report.clone(),
-                )
-            })?;
+        let observed = observed.ok_or_else(|| {
+            ApplyError::plain(
+                ApplyErrorKind::PostwriteMissing,
+                Some(edit.path.clone()),
+                "write committed but the target was missing during handle-relative verification",
+                report.clone(),
+            )
+        })?;
         let observed_digest = repository_file_digest(hasher, &observed);
         if observed != edit.postimage || observed_digest != edit.postimage_digest {
             return Err(ApplyError::plain(
@@ -333,6 +304,17 @@ where
     Ok(report)
 }
 
+fn record_written(report: &mut ApplyReport, edit: &PreparedEdit) {
+    report.unwritten.retain(|path| path != &edit.path);
+    report.written.push(WrittenFile {
+        path: edit.path.clone(),
+        kind: edit.kind,
+        preimage: edit.preimage_digest.clone(),
+        postimage: edit.postimage_digest.clone(),
+        verified: false,
+    });
+}
+
 fn initial_report(edits: &[&FileEdit]) -> ApplyReport {
     let mut unwritten = edits
         .iter()
@@ -345,26 +327,46 @@ fn initial_report(edits: &[&FileEdit]) -> ApplyReport {
     }
 }
 
+// Keep the same concrete error as `apply_change_plan`: it carries the preimage/recovery context
+// needed to diagnose a failed all-files preflight, and only its Windows ABI exceeds the heuristic.
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 fn preflight_edit<F, H>(
-    repository_root: &Path,
     edit: &FileEdit,
     filesystem: &F,
     hasher: &H,
     report: &ApplyReport,
 ) -> Result<PreparedEdit, ApplyError>
 where
-    F: RepositoryFilePort + ?Sized,
+    F: RepositoryApplyPort + ?Sized,
     H: Hasher + ?Sized,
 {
-    let valid_shape = match (edit.kind, edit.reason, edit.expected_preimage.is_some()) {
-        (FileEditKind::Create, FileEditReason::MissingFile, false) => true,
-        (
-            FileEditKind::ReplaceManagedBlock,
-            FileEditReason::MissingManagedBlock | FileEditReason::AssetChanged,
-            true,
-        ) => true,
-        (FileEditKind::ReplaceManagedBlock, FileEditReason::UserEdited, true) => edit.force,
-        _ => false,
+    let valid_shape = match &edit.desired {
+        DesiredFile::WholeFile(_) => matches!(
+            (
+                edit.kind,
+                edit.reason,
+                edit.expected_preimage.is_some(),
+                edit.force
+            ),
+            (
+                FileEditKind::Create,
+                FileEditReason::MissingFile,
+                false,
+                false
+            )
+        ),
+        DesiredFile::ManagedBlock(_) => {
+            match (edit.kind, edit.reason, edit.expected_preimage.is_some()) {
+                (FileEditKind::Create, FileEditReason::MissingFile, false) => true,
+                (
+                    FileEditKind::ReplaceManagedBlock,
+                    FileEditReason::MissingManagedBlock | FileEditReason::AssetChanged,
+                    true,
+                ) => true,
+                (FileEditKind::ReplaceManagedBlock, FileEditReason::UserEdited, true) => edit.force,
+                _ => false,
+            }
+        }
     };
     if !valid_shape {
         return Err(ApplyError::plain(
@@ -387,7 +389,7 @@ where
         ));
     }
     let existing = filesystem
-        .read_confined_bounded(repository_root, &edit.path, ADAPTER_FILE_MAX_BYTES)
+        .read_confined_bounded(&edit.path, ADAPTER_FILE_MAX_BYTES)
         .map_err(|source| {
             if source.kind() == io::ErrorKind::InvalidData {
                 return ApplyError::io(
@@ -426,11 +428,50 @@ where
         ));
     }
 
+    if matches!(edit.desired, DesiredFile::WholeFile(_)) {
+        let postimage_digest = repository_file_digest(hasher, &edit.preview_postimage);
+        if postimage_digest != edit.expected_postimage {
+            return Err(ApplyError::plain(
+                ApplyErrorKind::PostimageDigestMismatch,
+                Some(edit.path.clone()),
+                format!(
+                    "reviewed whole-file postimage digest {} differs from planned digest {}",
+                    postimage_digest.as_str(),
+                    edit.expected_postimage.as_str()
+                ),
+                report.clone(),
+            ));
+        }
+        return Ok(PreparedEdit {
+            kind: edit.kind,
+            path: edit.path.clone(),
+            preimage: existing,
+            preimage_digest: observed_preimage,
+            postimage: edit.preview_postimage.clone(),
+            postimage_digest,
+        });
+    }
+
+    let desired = edit.desired.managed_block().ok_or_else(|| {
+        ApplyError::plain(
+            ApplyErrorKind::InvalidEdit,
+            Some(edit.path.clone()),
+            "managed-block apply path received a whole-file edit",
+            report.clone(),
+        )
+    })?;
     let block = ManagedBlock {
-        id: edit.desired.kind.id(),
-        body: &edit.desired.body,
+        id: desired.kind.id(),
+        body: &desired.body,
     };
-    let ordinary = merge_markdown_block(existing.as_deref(), &block, hasher, false);
+    let ordinary = merge_managed_block_with_line_ending(
+        existing.as_deref(),
+        &block,
+        desired.kind.syntax(),
+        edit.fallback_line_ending,
+        hasher,
+        false,
+    );
     let (observed_reason, merged) = match ordinary {
         Ok(merged) => {
             let observed_reason = match (merged.action, existing.is_some()) {
@@ -461,9 +502,17 @@ where
                     report.clone(),
                 ));
             }
-            let merged = merge_markdown_block(existing.as_deref(), &block, hasher, true).map_err(
-                |source| ApplyError::managed_block(edit.path.clone(), source, report.clone()),
-            )?;
+            let merged = merge_managed_block_with_line_ending(
+                existing.as_deref(),
+                &block,
+                desired.kind.syntax(),
+                edit.fallback_line_ending,
+                hasher,
+                true,
+            )
+            .map_err(|source| {
+                ApplyError::managed_block(edit.path.clone(), source, report.clone())
+            })?;
             if merged.action != MergeAction::Replace {
                 return Err(ApplyError::plain(
                     ApplyErrorKind::UnexpectedMergeAction,
@@ -539,15 +588,21 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use forge_core::ports::{Hasher, RepositoryFilePort};
+    use forge_core::ports::{
+        Hasher, RepositoryApplyPort, RepositoryWriteCommit, RepositoryWriteError,
+        RepositoryWriteOutcome,
+    };
     use forge_core::{Digest, RepoId, RepoRelativePath};
 
+    use crate::ci::CiTarget;
     use crate::inspection::FileEditReason;
     use crate::managed_block::{
-        ManagedBlock, ManagedBlockError, MergeAction, merge_markdown_block,
+        LineEnding, ManagedBlock, ManagedBlockError, ManagedBlockSyntax, MergeAction,
+        merge_managed_block_with_line_ending, merge_markdown_block,
     };
     use crate::plan::{
-        ChangePlan, DesiredManagedBlock, FileEdit, FileEditKind, ManagedBlockKind, RollbackPlan,
+        ChangePlan, DesiredFile, DesiredManagedBlock, FileEdit, FileEditKind, ManagedBlockKind,
+        RollbackPlan,
     };
 
     use super::{ApplyError, ApplyErrorKind, ApplyReport, apply_change_plan};
@@ -568,6 +623,7 @@ mod tests {
         read_mutation: RefCell<Option<ReadMutation>>,
         fail_read: Option<PathBuf>,
         fail_write: Option<PathBuf>,
+        commit_then_fail: Option<PathBuf>,
         corrupt_write: Option<PathBuf>,
     }
 
@@ -641,42 +697,57 @@ mod tests {
         }
     }
 
-    impl RepositoryFilePort for ScriptedFiles {
-        fn read_confined(
-            &self,
-            _repository_root: &Path,
-            _path: &RepoRelativePath,
-        ) -> io::Result<Option<Vec<u8>>> {
-            Err(io::Error::other("apply fixture forbids unbounded reads"))
-        }
-
+    impl RepositoryApplyPort for ScriptedFiles {
         fn read_confined_bounded(
             &self,
-            _repository_root: &Path,
             path: &RepoRelativePath,
             max_bytes: usize,
         ) -> io::Result<Option<Vec<u8>>> {
             self.read_with_limit(path, max_bytes)
         }
 
-        fn write_atomic_confined(
+        fn write_atomic_if_unchanged(
             &self,
-            _repository_root: &Path,
             path: &RepoRelativePath,
+            expected: Option<&[u8]>,
             bytes: &[u8],
-        ) -> io::Result<()> {
-            let path = path.as_path();
-            self.write_attempts.borrow_mut().push(path.to_path_buf());
-            if self.fail_write.as_deref() == Some(path) {
-                return Err(io::Error::other("scripted atomic-write failure"));
+            max_postimage_bytes: usize,
+        ) -> Result<RepositoryWriteOutcome, RepositoryWriteError> {
+            let current = self
+                .read_with_limit(path, max_postimage_bytes)
+                .map_err(|source| {
+                    RepositoryWriteError::new(RepositoryWriteCommit::NotCommitted, source)
+                })?;
+            if current.as_deref() != expected {
+                return Ok(RepositoryWriteOutcome::PreconditionMismatch);
             }
-            let content = if self.corrupt_write.as_deref() == Some(path) {
+
+            let path_buf = path.as_path().to_path_buf();
+            self.write_attempts.borrow_mut().push(path_buf.clone());
+            if self.fail_write.as_deref() == Some(path_buf.as_path()) {
+                return Err(RepositoryWriteError::new(
+                    RepositoryWriteCommit::NotCommitted,
+                    io::Error::other("scripted atomic-write failure"),
+                ));
+            }
+            let content = if self.corrupt_write.as_deref() == Some(path_buf.as_path()) {
                 b"unexpected postimage".to_vec()
             } else {
                 bytes.to_vec()
             };
-            self.files.borrow_mut().insert(path.to_path_buf(), content);
-            Ok(())
+            self.files.borrow_mut().insert(path_buf.clone(), content);
+            if self.commit_then_fail.as_deref() == Some(path_buf.as_path()) {
+                return Err(RepositoryWriteError::new(
+                    RepositoryWriteCommit::CommittedUnverified,
+                    io::Error::other("scripted failure after target commit"),
+                ));
+            }
+            let observed = self
+                .read_with_limit(path, max_postimage_bytes)
+                .map_err(|source| {
+                    RepositoryWriteError::new(RepositoryWriteCommit::CommittedUnverified, source)
+                })?;
+            Ok(RepositoryWriteOutcome::Written { observed })
         }
     }
 
@@ -748,8 +819,9 @@ mod tests {
                 FileEditKind::Create
             },
             reason,
+            fallback_line_ending: LineEnding::Lf,
             path: RepoRelativePath::new(path)?,
-            desired,
+            desired: DesiredFile::ManagedBlock(desired),
             expected_preimage: existing
                 .map(|content| repository_file_digest(&FixtureHasher, content)),
             expected_postimage: repository_file_digest(&FixtureHasher, &merged.content),
@@ -764,6 +836,7 @@ mod tests {
             repository: RepoId::from("local:apply-fixture"),
             model_digest: Digest::from("fixture:model"),
             edits,
+            gaps: Vec::new(),
             assumptions: Vec::new(),
             skipped: Vec::new(),
             rollback: RollbackPlan::default(),
@@ -792,7 +865,6 @@ mod tests {
         let files = ScriptedFiles::with_files([("B.md", existing)]);
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![valid, stale]),
             &files,
             &FixtureHasher,
@@ -813,6 +885,42 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_create_writes_only_the_reviewed_missing_target() -> Result<(), Box<dyn Error>> {
+        let content = b"name: verify\non: workflow_dispatch\n".to_vec();
+        let target = FileEdit {
+            kind: FileEditKind::Create,
+            reason: FileEditReason::MissingFile,
+            fallback_line_ending: LineEnding::Lf,
+            path: RepoRelativePath::new(".github/workflows/verify.yml")?,
+            desired: DesiredFile::WholeFile(CiTarget::Github),
+            expected_preimage: None,
+            preview_postimage: content.clone(),
+            expected_postimage: repository_file_digest(&FixtureHasher, &content),
+            force: false,
+        };
+        let files = ScriptedFiles::default();
+
+        let report = apply_change_plan(&plan(vec![target.clone()]), &files, &FixtureHasher)?;
+
+        assert_eq!(
+            files.content(".github/workflows/verify.yml"),
+            Some(content.clone())
+        );
+        assert_eq!(report.written.len(), 1);
+        assert!(report.written[0].verified);
+
+        let existing = ScriptedFiles::with_files([(".github/workflows/verify.yml", content)]);
+        let error = error_from(apply_change_plan(
+            &plan(vec![target]),
+            &existing,
+            &FixtureHasher,
+        ))?;
+        assert_eq!(error.kind(), ApplyErrorKind::PreimagePresenceMismatch);
+        assert!(existing.attempts().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_target_is_rejected_before_any_read() -> Result<(), Box<dyn Error>> {
         let target = edit(
             "AGENTS.md",
@@ -824,7 +932,6 @@ mod tests {
         let files = ScriptedFiles::default();
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target.clone(), target]),
             &files,
             &FixtureHasher,
@@ -849,7 +956,6 @@ mod tests {
         let files = ScriptedFiles::default();
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
@@ -888,7 +994,6 @@ mod tests {
         let files = ScriptedFiles::with_files([("AGENTS.md", edited)]);
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
@@ -916,7 +1021,6 @@ mod tests {
         )]);
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
@@ -941,16 +1045,55 @@ mod tests {
         target.preview_postimage = b"tampered preview".to_vec();
         let files = ScriptedFiles::default();
 
-        let report = apply_change_plan(
-            Path::new("/repo"),
-            &plan(vec![target]),
-            &files,
-            &FixtureHasher,
-        )?;
+        let report = apply_change_plan(&plan(vec![target]), &files, &FixtureHasher)?;
 
         assert_eq!(files.content("AGENTS.md"), Some(recomputed));
         assert!(report.unwritten.is_empty());
         assert_eq!(report.written.len(), 1);
+        assert!(report.written[0].verified);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_recomputes_a_reviewed_crlf_create_without_using_preview_as_authority()
+    -> Result<(), Box<dyn Error>> {
+        let desired = DesiredManagedBlock {
+            kind: ManagedBlockKind::ProjectIndex,
+            body: String::from("first\nsecond"),
+        };
+        let merged = merge_managed_block_with_line_ending(
+            None,
+            &ManagedBlock {
+                id: desired.kind.id(),
+                body: &desired.body,
+            },
+            ManagedBlockSyntax::Markdown,
+            LineEnding::CrLf,
+            &FixtureHasher,
+            false,
+        )?;
+        let target = FileEdit {
+            kind: FileEditKind::Create,
+            reason: FileEditReason::MissingFile,
+            fallback_line_ending: LineEnding::CrLf,
+            path: RepoRelativePath::new("AGENTS.md")?,
+            desired: DesiredFile::ManagedBlock(desired),
+            expected_preimage: None,
+            preview_postimage: b"review projection is not write authority".to_vec(),
+            expected_postimage: repository_file_digest(&FixtureHasher, &merged.content),
+            force: false,
+        };
+        let files = ScriptedFiles::default();
+
+        let report = apply_change_plan(&plan(vec![target]), &files, &FixtureHasher)?;
+        let written = files.content("AGENTS.md").ok_or("missing written file")?;
+
+        assert_eq!(written, merged.content);
+        for (index, byte) in written.iter().enumerate() {
+            if *byte == b'\n' {
+                assert!(index > 0 && written[index - 1] == b'\r');
+            }
+        }
         assert!(report.written[0].verified);
         Ok(())
     }
@@ -975,7 +1118,6 @@ mod tests {
         };
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
@@ -999,7 +1141,6 @@ mod tests {
         };
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![c, b, a]),
             &files,
             &FixtureHasher,
@@ -1026,6 +1167,39 @@ mod tests {
     }
 
     #[test]
+    fn committed_failure_is_reported_as_unverified_written_not_unwritten()
+    -> Result<(), Box<dyn Error>> {
+        let target = edit(
+            "AGENTS.md",
+            None,
+            ManagedBlockKind::ProjectIndex,
+            "body",
+            false,
+        )?;
+        let files = ScriptedFiles {
+            commit_then_fail: Some(PathBuf::from("AGENTS.md")),
+            ..ScriptedFiles::default()
+        };
+
+        let error = error_from(apply_change_plan(
+            &plan(vec![target]),
+            &files,
+            &FixtureHasher,
+        ))?;
+
+        assert_eq!(error.kind(), ApplyErrorKind::CommittedUnverified);
+        assert_eq!(error.report().written.len(), 1);
+        assert_eq!(
+            error.report().written[0].path.as_path(),
+            Path::new("AGENTS.md")
+        );
+        assert!(!error.report().written[0].verified);
+        assert!(error.report().unwritten.is_empty());
+        assert!(files.content("AGENTS.md").is_some());
+        Ok(())
+    }
+
+    #[test]
     fn postwrite_inconsistency_is_reported_as_unverified_written_state()
     -> Result<(), Box<dyn Error>> {
         let target = edit(
@@ -1041,7 +1215,6 @@ mod tests {
         };
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
@@ -1078,13 +1251,12 @@ mod tests {
         };
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
         ))?;
 
-        assert_eq!(error.kind(), ApplyErrorKind::PostimageTooLarge);
+        assert_eq!(error.kind(), ApplyErrorKind::CommittedUnverified);
         assert_eq!(error.report().written.len(), 1);
         assert!(!error.report().written[0].verified);
         assert!(error.report().unwritten.is_empty());
@@ -1111,12 +1283,7 @@ mod tests {
         )?;
         let files = ScriptedFiles::with_files([("Z.md", existing.clone())]);
 
-        let report = apply_change_plan(
-            Path::new("/repo"),
-            &plan(vec![replace, create]),
-            &files,
-            &FixtureHasher,
-        )?;
+        let report = apply_change_plan(&plan(vec![replace, create]), &files, &FixtureHasher)?;
 
         assert!(report.unwritten.is_empty());
         assert_eq!(
@@ -1171,12 +1338,7 @@ mod tests {
         let expected = target.preview_postimage.clone();
         let files = ScriptedFiles::with_files([("AGENTS.md", edited)]);
 
-        let report = apply_change_plan(
-            Path::new("/repo"),
-            &plan(vec![target]),
-            &files,
-            &FixtureHasher,
-        )?;
+        let report = apply_change_plan(&plan(vec![target]), &files, &FixtureHasher)?;
 
         assert_eq!(files.content("AGENTS.md"), Some(expected.clone()));
         assert!(String::from_utf8(expected)?.contains("second human edit"));
@@ -1199,7 +1361,6 @@ mod tests {
         };
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,
@@ -1224,6 +1385,7 @@ mod tests {
         let target = FileEdit {
             kind: FileEditKind::ReplaceManagedBlock,
             reason: FileEditReason::AssetChanged,
+            fallback_line_ending: LineEnding::Lf,
             path: RepoRelativePath::new("AGENTS.md")?,
             desired: created.desired,
             expected_preimage: Some(repository_file_digest(&FixtureHasher, &existing)),
@@ -1234,7 +1396,6 @@ mod tests {
         let files = ScriptedFiles::with_files([("AGENTS.md", existing)]);
 
         let error = error_from(apply_change_plan(
-            Path::new("/repo"),
             &plan(vec![target]),
             &files,
             &FixtureHasher,

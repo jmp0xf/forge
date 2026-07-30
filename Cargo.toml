@@ -3,7 +3,7 @@ members = ["crates/*", "xtask"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0-rc.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Forge contributors"]
@@ -15,18 +15,23 @@ base64 = "=0.22.1"
 blake3 = "=1.8.5"
 clap = { version = "=4.6.4", features = ["derive"] }
 clap_complete = "=4.6.7"
-ctrlc = "=3.5.2"
+# 3.5.1+ adds the Apple-only dispatch2/objc2 chain whose upstream license notes unresolved
+# SDK-derived redistribution uncertainty. Keep the last pipe-based release for the v0 binary.
+ctrlc = "=3.4.7"
+find-msvc-tools = "=0.1.9"
 fs2 = "=0.4.3"
 ignore = "=0.4.25"
-nix = { version = "=0.31.3", features = ["event", "process", "signal"] }
+jsonschema = { version = "=0.48.5", default-features = false }
+nix = { version = "=0.31.3", features = ["dir", "event", "fs", "process", "resource", "signal"] }
 schemars = "=1.2.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 serde_yaml_ng = "=0.10.0"
+sha2 = "=0.10.9"
 tempfile = "=3.27.0"
 thiserror = "=2.0.18"
 toml = { version = "=1.1.3", default-features = false, features = ["std", "serde", "parse"] }
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

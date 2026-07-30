@@ -3,32 +3,42 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use forge_core::context::{
     ContextCandidate, ContextSelection, ContextSelectionError, ContextSignal,
     select_default_context_paths,
 };
+use forge_core::doctor::{DoctorCheckId, DoctorCheckStatus, DoctorSkipReason};
+use forge_core::fingerprint::validate_command_privacy;
 use forge_core::navigation::{
     AdapterObservation as NavigationAdapterObservation, AdapterObservationStatus,
     ChangeObservation, NavigationAction, NavigationBlocker, NavigationBlockerKind,
     NavigationDecision, NavigationError, NavigationInput, NavigationInputIntegrity,
-    NavigationIssue, NavigationState, ReceiptObservation, reduce_next,
+    NavigationIssue, NavigationState, reduce_next,
 };
+use forge_core::ports::RepositoryFilePort as _;
 use forge_core::{
-    AppError, Assumption, Confidence, ExitCode, Intent, InventoryKind, ProjectModel, Provenance,
-    RepoRelativePath, RiskAssessment, RiskLevel, WorkState, assess_risk,
+    AppError, CommandSpec, Confidence, ExitCode, Intent, InventoryKind, OperationControl as _,
+    ProjectModel, Provenance, RepoRelativePath, ResolvedCommandSet, RiskAssessment, RiskLevel,
+    WorkState, assess_risk, assumption_to_wire, command_detail_v2_to_wire,
+    portable_relative_utf8_path,
 };
-use forge_detect::model::{ModelDetectionCompletion, NavigationSnapshot};
+use forge_detect::model::{InventoryCacheStatus, ModelDetectionCompletion, NavigationSnapshot};
 use forge_detect::policy::PolicyBaseCompleteness;
+use forge_runtime::control::OperationBudget;
+use forge_runtime::fs::NativeFileSystem;
 use forge_schema::{
     AssumptionData, CommandData, ConfidenceData, ContextPathData, IntentData, NextActionData,
     NextData, NextStateData, RiskAssessmentData, RiskLevelData, WirePath,
 };
 
 use crate::args::Cli;
-use crate::{adapters, explain};
+use crate::{adapters, doctor, evidence_view, explain};
+
+const CONTEXT_OWNERSHIP_MAX_BYTES: usize = 1024 * 1024;
+const CONTEXT_DOCUMENT_MAX_BYTES: usize = 256 * 1024;
+const CONTEXT_DOCUMENT_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const CONTEXT_DOCUMENT_MAX_FILES: usize = 64;
 
 /// One deterministic navigation result and the envelope metadata derived with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +46,21 @@ pub(crate) struct NextOutcome {
     pub(crate) wire: NextData,
     pub(crate) exit_code: ExitCode,
     pub(crate) truncated: bool,
+    pub(crate) inventory_cache_status: InventoryCacheStatus,
 }
 
 /// Computes one next action from a single retained detection snapshot.
-pub(crate) fn execute(cli: &Cli, cancellation: Arc<AtomicBool>) -> Result<NextOutcome, AppError> {
-    let detected = explain::detect(cli, cancellation)?;
-    let adapter_observation = adapters::observe_managed(&detected.model)?;
+pub(crate) fn execute_controlled(
+    cli: &Cli,
+    control: &OperationBudget,
+) -> Result<NextOutcome, AppError> {
+    let detected = explain::detect_controlled(cli, control)?;
+    let doctor = doctor::execute_postcheck_controlled(cli, &detected, control)?;
+    control
+        .checkpoint()
+        .map_err(|error| explain::map_operation_control_error(error, "navigation analysis"))?;
+    let adapter_observation =
+        adapters::observe_managed(&detected.model, detected.navigation.config.as_ref())?;
     let changed_paths = detected.navigation.changed_paths();
     let risk = assess_risk(
         &detected.navigation.effective_policy,
@@ -56,7 +75,7 @@ pub(crate) fn execute(cli: &Cli, cancellation: Arc<AtomicBool>) -> Result<NextOu
 
     let integrity =
         navigation_integrity(detected.completion, &detected.model, &detected.navigation)?;
-    let blockers = navigation_blockers(&detected.model, &risk)?;
+    let blockers = navigation_blockers(&detected.model, &risk, &doctor)?;
     let adapters = navigation_adapter_observation(&adapter_observation)?;
     let changes = ChangeObservation::new(
         changed_paths
@@ -69,20 +88,15 @@ pub(crate) fn execute(cli: &Cli, cancellation: Arc<AtomicBool>) -> Result<NextOu
         )],
     )
     .map_err(map_navigation_error)?;
-    let receipts = ReceiptObservation::unavailable(vec![provenance(
-        "navigation.receipts-unavailable.v1",
-        None,
-        "M5 does not infer Receipt validity before the M6 evidence protocol is available",
-    )])
-    .map_err(map_navigation_error)?;
-    let check_commands = detected.model.commands.get(&Intent::Check).cloned();
+    let receipts = evidence_view::navigation_receipts_controlled(cli, &detected, &risk, control)?;
+    let state_terminal_exit_code = receipts.terminal_exit_code;
     let decision = reduce_next(NavigationInput {
         integrity,
         blockers,
         adapters,
         changes,
-        receipts,
-        check_commands,
+        receipts: receipts.observation,
+        commands: detected.model.commands.clone(),
     })
     .map_err(map_navigation_error)?;
 
@@ -94,9 +108,12 @@ pub(crate) fn execute(cli: &Cli, cancellation: Arc<AtomicBool>) -> Result<NextOu
         changed_paths.is_some(),
     )?;
     Ok(NextOutcome {
-        exit_code: completion_or(detected.completion, navigation_exit_code(decision.state())),
+        exit_code: state_terminal_exit_code.unwrap_or_else(|| {
+            completion_or(detected.completion, navigation_exit_code(decision.state()))
+        }),
         wire,
         truncated: context.truncated,
+        inventory_cache_status: detected.inventory_cache_status,
     })
 }
 
@@ -128,7 +145,7 @@ fn navigation_integrity(
         )),
         _ if navigation.policy_base_completeness == PolicyBaseCompleteness::Unknown => Some((
             false,
-            "an approved branch comparison and custom-policy base are unavailable for this committed repository",
+            "the immutable HEAD policy base could not be read and validated for this committed repository",
             "navigation.approved-base-unknown.v1",
         )),
         _ => None,
@@ -155,6 +172,7 @@ fn navigation_integrity(
 fn navigation_blockers(
     model: &ProjectModel,
     risk: &RiskAssessment,
+    doctor: &doctor::DoctorOutcome,
 ) -> Result<Vec<NavigationBlocker>, AppError> {
     let mut blockers = Vec::new();
     let git_blocker = match model.repository.work_state {
@@ -186,6 +204,76 @@ fn navigation_blockers(
                     "navigation.git-operation.v1",
                     None,
                     "repository operation markers determine the current Git work state",
+                )],
+            )
+            .map_err(map_navigation_error)?,
+        );
+    }
+
+    let environment_checks = [
+        (
+            DoctorCheckId::StateLayout,
+            "environment/state-layout",
+            "private Forge state failed its safe layout check",
+        ),
+        (
+            DoctorCheckId::ToolchainRequired,
+            "environment/toolchain",
+            "a required project tool is unavailable or failed its bounded probe",
+        ),
+        (
+            DoctorCheckId::PathSafety,
+            "environment/path-safety",
+            "repository or managed-target path safety failed",
+        ),
+    ];
+    for (check_id, blocker_id, reason) in environment_checks {
+        let check = doctor.check(check_id).ok_or_else(|| {
+            internal_error(
+                "doctor observation is missing a registered navigation check",
+                check_id.to_string(),
+            )
+        })?;
+        if check.status() == DoctorCheckStatus::Fail
+            || (check_id == DoctorCheckId::ToolchainRequired
+                && doctor.toolchain_runtime_unavailable())
+        {
+            blockers.push(
+                NavigationBlocker::new(
+                    NavigationBlockerKind::Environment,
+                    blocker_id,
+                    reason,
+                    vec![provenance(
+                        "navigation.doctor-environment.v1",
+                        None,
+                        "a typed doctor check established a local environment blocker",
+                    )],
+                )
+                .map_err(map_navigation_error)?,
+            );
+        }
+    }
+    let process = doctor
+        .check(DoctorCheckId::ProcessCapability)
+        .ok_or_else(|| {
+            internal_error(
+                "doctor observation is missing a registered navigation check",
+                DoctorCheckId::ProcessCapability.to_string(),
+            )
+        })?;
+    if process.status() == DoctorCheckStatus::Fail
+        || (process.status() == DoctorCheckStatus::Skipped
+            && process.skip_reason() == Some(DoctorSkipReason::PlatformLimitation))
+    {
+        blockers.push(
+            NavigationBlocker::new(
+                NavigationBlockerKind::Environment,
+                "environment/process-capability",
+                "this platform cannot provide the bounded process-tree capability required for project commands",
+                vec![provenance(
+                    "navigation.doctor-process-capability.v1",
+                    None,
+                    "the typed doctor capability check reported a platform limitation",
                 )],
             )
             .map_err(map_navigation_error)?,
@@ -349,33 +437,227 @@ fn context_candidates(
     }
 
     if !changed_paths.is_empty() {
-        for entry in navigation.inventory.entries.iter().filter(|entry| {
-            entry.kind == InventoryKind::File
-                && matches!(
-                    entry.path.to_str(),
-                    Some("CODEOWNERS" | ".github/CODEOWNERS" | "docs/CODEOWNERS")
-                )
-        }) {
-            let path = RepoRelativePath::new(&entry.path).map_err(|error| {
-                internal_error(
-                    "repository inventory retained an invalid ownership path",
-                    error.to_string(),
-                )
-            })?;
-            candidates.push(context_candidate(
-                ContextSignal::UncertainImpact,
-                path.clone(),
-                "ownership file exists, but v0 did not parse a matching rule for the changed paths",
-                vec![provenance(
-                    "context.codeowners-unresolved.v1",
-                    Some(WirePath::from_path(path.as_path())),
-                    "inventory proves the file exists but not that one of its rules matches",
-                )],
-                Confidence::Unknown,
-            )?);
-        }
+        candidates.extend(codeowners_context(model, changed_paths)?);
+        candidates.extend(exact_document_context(model, changed_paths)?);
     }
     Ok(candidates)
+}
+
+fn codeowners_context(
+    model: &ProjectModel,
+    changed_paths: &[RepoRelativePath],
+) -> Result<Vec<ContextCandidate>, AppError> {
+    let mut visible = model
+        .assets
+        .entries
+        .iter()
+        .filter(|asset| asset.kind == "ownership.codeowners")
+        .collect::<Vec<_>>();
+    visible.sort_by_key(|asset| codeowners_precedence(&asset.path));
+    let Some(selected) = visible.first().copied() else {
+        return Ok(Vec::new());
+    };
+    let path = selected.path.clone();
+    let source_path = Some(WirePath::from_path(path.as_path()));
+
+    if changed_paths
+        .iter()
+        .any(|changed| changed.as_path().to_str().is_none())
+    {
+        return Ok(vec![uncertain_context_candidate(
+            path,
+            "ownership impact cannot be checked losslessly for a non-UTF-8 changed path",
+            "context.codeowners-non-utf8-path.v1",
+        )?]);
+    }
+
+    if model.assets.confidence == Confidence::Unknown && codeowners_precedence(&path) != 0 {
+        return Ok(vec![context_candidate(
+            ContextSignal::UncertainImpact,
+            path,
+            "ownership precedence is uncertain because bounded asset discovery was incomplete",
+            vec![provenance(
+                "context.codeowners-precedence-unknown.v1",
+                source_path,
+                "a higher-precedence conventional CODEOWNERS path may be outside the retained inventory",
+            )],
+            Confidence::Unknown,
+        )?]);
+    }
+
+    let text = match NativeFileSystem.read_confined_bounded(
+        &model.repository.root,
+        &path,
+        CONTEXT_OWNERSHIP_MAX_BYTES,
+    ) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                return Ok(vec![uncertain_context_candidate(
+                    path,
+                    "ownership rules are not valid UTF-8",
+                    "context.codeowners-unreadable.v1",
+                )?]);
+            }
+        },
+        Ok(None) | Err(_) => {
+            return Ok(vec![uncertain_context_candidate(
+                path,
+                "ownership rules could not be completely and safely read within the v0 bound",
+                "context.codeowners-unreadable.v1",
+            )?]);
+        }
+    };
+
+    match doctor::codeowners_matches_any_path(&text, &model.repository.root, changed_paths) {
+        Ok(true) => {
+            let mut sources = selected.provenance.clone();
+            sources.push(provenance(
+                "context.codeowners-match.v1",
+                source_path,
+                "a supported CODEOWNERS rule matched at least one exact changed path",
+            ));
+            Ok(vec![context_candidate(
+                ContextSignal::CodeOwner,
+                path,
+                "CODEOWNERS rule matches an exact changed path",
+                sources,
+                selected.confidence,
+            )?])
+        }
+        Ok(false) => Ok(Vec::new()),
+        Err(_) => Ok(vec![uncertain_context_candidate(
+            path,
+            "ownership rules use invalid or unsupported CODEOWNERS syntax",
+            "context.codeowners-unresolved.v1",
+        )?]),
+    }
+}
+
+fn exact_document_context(
+    model: &ProjectModel,
+    changed_paths: &[RepoRelativePath],
+) -> Result<Vec<ContextCandidate>, AppError> {
+    let documents = model
+        .assets
+        .entries
+        .iter()
+        .filter(|asset| {
+            matches!(
+                asset.kind.as_str(),
+                "documentation.contributing"
+                    | "documentation.architecture-decision"
+                    | "documentation.runbook"
+            )
+        })
+        .collect::<Vec<_>>();
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let changed_utf8 = changed_paths
+        .iter()
+        .filter_map(|path| portable_relative_utf8_path(path.as_path()))
+        .collect::<Vec<_>>();
+    if changed_utf8.len() != changed_paths.len() {
+        return Ok(vec![uncertain_context_candidate(
+            documents[0].path.clone(),
+            "exact document impact cannot be checked for a non-UTF-8 changed path",
+            "context.document-non-utf8-path.v1",
+        )?]);
+    }
+
+    let mut candidates = Vec::new();
+    let mut remaining_bytes = CONTEXT_DOCUMENT_TOTAL_BYTES;
+    for (index, document) in documents.iter().enumerate() {
+        if index >= CONTEXT_DOCUMENT_MAX_FILES || remaining_bytes == 0 {
+            candidates.push(uncertain_context_candidate(
+                document.path.clone(),
+                "additional conventional documents were omitted by the bounded v0 scan",
+                "context.document-scan-truncated.v1",
+            )?);
+            break;
+        }
+        let read_limit = remaining_bytes.min(CONTEXT_DOCUMENT_MAX_BYTES);
+        let bytes = match NativeFileSystem.read_confined_bounded(
+            &model.repository.root,
+            &document.path,
+            read_limit,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => {
+                candidates.push(uncertain_context_candidate(
+                    document.path.clone(),
+                    "document could not be completely and safely read within the v0 bound",
+                    "context.document-unreadable.v1",
+                )?);
+                continue;
+            }
+        };
+        remaining_bytes = remaining_bytes.saturating_sub(bytes.len());
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                candidates.push(uncertain_context_candidate(
+                    document.path.clone(),
+                    "document is not valid UTF-8",
+                    "context.document-unreadable.v1",
+                )?);
+                continue;
+            }
+        };
+        let Some(matched_path) = changed_utf8
+            .iter()
+            .find(|path| text.contains(path.as_str()))
+        else {
+            continue;
+        };
+        let mut sources = document.provenance.clone();
+        sources.push(provenance(
+            "context.exact-document-match.v1",
+            Some(WirePath::from_path(document.path.as_path())),
+            "a bounded conventional document contained one exact changed repository path",
+        ));
+        candidates.push(context_candidate(
+            ContextSignal::ExactDocumentMatch,
+            document.path.clone(),
+            format!("document contains the exact changed path `{matched_path}`"),
+            sources,
+            document.confidence,
+        )?);
+    }
+    Ok(candidates)
+}
+
+fn uncertain_context_candidate(
+    path: RepoRelativePath,
+    reason: &str,
+    rule_id: &str,
+) -> Result<ContextCandidate, AppError> {
+    context_candidate(
+        ContextSignal::UncertainImpact,
+        path.clone(),
+        reason,
+        vec![provenance(
+            rule_id,
+            Some(WirePath::from_path(path.as_path())),
+            "bounded context discovery could not establish an exact relationship",
+        )],
+        Confidence::Unknown,
+    )
+}
+
+fn codeowners_precedence(path: &RepoRelativePath) -> u8 {
+    let path = path.as_path();
+    if path == Path::new(".github").join("CODEOWNERS") {
+        0
+    } else if path == Path::new("CODEOWNERS") {
+        1
+    } else if path == Path::new("docs").join("CODEOWNERS") {
+        2
+    } else {
+        3
+    }
 }
 
 fn context_candidate(
@@ -421,7 +703,12 @@ fn project_next(
     status_available: bool,
 ) -> Result<NextData, AppError> {
     let project_commands = project_decision_commands(detected, decision)?;
-    let mut assumptions = detected.wire.assumptions.clone();
+    let mut assumptions = detected
+        .model
+        .assumptions
+        .iter()
+        .map(assumption_to_wire)
+        .collect::<Vec<_>>();
     assumptions.extend(risk.uncertain_assumptions.iter().map(assumption_to_wire));
     assumptions.extend(context.assumptions.iter().map(|path| AssumptionData {
         statement: format!(
@@ -435,7 +722,7 @@ fn project_next(
     if detected.navigation.policy_base_completeness == PolicyBaseCompleteness::Unknown {
         assumptions.push(AssumptionData {
             statement: String::from(
-                "the committed repository has no accepted contract for selecting the branch and prior custom-policy base",
+                "the committed repository's immutable HEAD policy base could not be read or validated",
             ),
             provenance: vec![String::from("navigation.approved-base-unknown.v1")],
             confidence: ConfidenceData::Unknown,
@@ -458,14 +745,21 @@ fn project_next(
         required_action: action_to_wire(decision.action()),
         intent: decision.intent().map(intent_to_wire),
         project_commands,
-        // Advertising an unimplemented evidence command would make the M5 result non-actionable.
-        receipt_command: None,
+        receipt_command: (decision.action() == NavigationAction::RunIntent)
+            .then(|| {
+                decision
+                    .intent()
+                    .map(|intent| format!("forge evidence run {}", intent_name(intent)))
+            })
+            .flatten(),
         context_paths: context
             .paths
             .iter()
             .map(|path| ContextPathData {
                 path: WirePath::from_path(path.path.as_path()),
                 why: path.reason.clone(),
+                provenance: provenance_ids(&path.provenance),
+                confidence: Some(confidence_to_wire(path.confidence)),
             })
             .collect(),
         risk: RiskAssessmentData {
@@ -501,31 +795,52 @@ fn project_decision_commands(
             "the pure reducer violated its action contract",
         )
     })?;
+    project_selected_commands(
+        &detected.model.commands,
+        intent,
+        decision.project_commands(),
+    )
+}
+
+fn project_selected_commands(
+    command_sets: &BTreeMap<Intent, ResolvedCommandSet>,
+    intent: Intent,
+    selected: &[CommandSpec],
+) -> Result<Vec<CommandData>, AppError> {
     let key = intent_name(intent);
-    let available = detected.wire.commands.get(key).ok_or_else(|| {
+    let available = command_sets.get(&intent).ok_or_else(|| {
         internal_error(
             "navigation command projection is missing",
-            format!("project model wire output has no `{key}` command set"),
+            format!("project model has no `{key}` command set"),
         )
     })?;
     let by_id = available
+        .commands()
         .iter()
         .map(|command| (command.id.as_str(), command))
         .collect::<BTreeMap<_, _>>();
-    decision
-        .project_commands()
+    selected
         .iter()
         .map(|command| {
-            by_id
-                .get(command.id.as_str())
-                .cloned()
-                .cloned()
-                .ok_or_else(|| {
-                    internal_error(
-                        "navigation command projection diverged from the project model",
-                        format!("command `{}` was not retained in wire output", command.id),
-                    )
-                })
+            validate_command_privacy(command).map_err(|_| explain::command_privacy_error())?;
+            let retained = by_id.get(command.id.as_str()).copied().ok_or_else(|| {
+                internal_error(
+                    "navigation command projection diverged from the project model",
+                    format!(
+                        "command `{}` was not retained in the project model",
+                        command.id
+                    ),
+                )
+            })?;
+            if retained != command {
+                return Err(internal_error(
+                    "navigation command projection diverged from the project model",
+                    "a selected command differs from its retained project-model command",
+                ));
+            }
+            command_detail_v2_to_wire(command)
+                .map(|detail| detail.command)
+                .map_err(explain::map_projection_error)
         })
         .collect()
 }
@@ -549,14 +864,6 @@ fn risk_provenance_ids(risk: &RiskAssessment) -> Vec<String> {
             .flat_map(|assumption| assumption.provenance.iter().cloned()),
     );
     provenance_ids(&sources)
-}
-
-fn assumption_to_wire(assumption: &Assumption) -> AssumptionData {
-    AssumptionData {
-        statement: assumption.statement.clone(),
-        provenance: provenance_ids(&assumption.provenance),
-        confidence: confidence_to_wire(assumption.confidence),
-    }
 }
 
 fn canonicalize_assumptions(assumptions: &mut Vec<AssumptionData>) {
@@ -593,7 +900,10 @@ const fn state_to_wire(state: NavigationState) -> NextStateData {
         NavigationState::Blocked => NextStateData::Blocked,
         NavigationState::AdaptersDrifted => NextStateData::AdaptersDrifted,
         NavigationState::Idle => NextStateData::Idle,
+        NavigationState::ChecksFailing => NextStateData::ChecksFailing,
         NavigationState::ChangedUnverified => NextStateData::ChangedUnverified,
+        NavigationState::PartiallyVerified => NextStateData::PartiallyVerified,
+        NavigationState::LocalVerified => NextStateData::LocalVerified,
     }
 }
 
@@ -604,6 +914,7 @@ const fn action_to_wire(action: NavigationAction) -> NextActionData {
         NavigationAction::StopAndEscalate => NextActionData::StopAndEscalate,
         NavigationAction::SyncAdapters => NextActionData::SyncAdapters,
         NavigationAction::None => NextActionData::None,
+        NavigationAction::FixFailures => NextActionData::FixFailures,
         NavigationAction::RunIntent => NextActionData::RunIntent,
     }
 }
@@ -655,11 +966,13 @@ const fn risk_level_to_wire(level: RiskLevel) -> RiskLevelData {
 
 const fn navigation_exit_code(state: NavigationState) -> ExitCode {
     match state {
-        NavigationState::Idle => ExitCode::Ok,
+        NavigationState::Idle | NavigationState::LocalVerified => ExitCode::Ok,
         NavigationState::Blocked => ExitCode::EnvironmentUnmet,
         NavigationState::Unknown
         | NavigationState::AdaptersDrifted
-        | NavigationState::ChangedUnverified => ExitCode::Negative,
+        | NavigationState::ChecksFailing
+        | NavigationState::ChangedUnverified
+        | NavigationState::PartiallyVerified => ExitCode::Negative,
     }
 }
 
@@ -709,6 +1022,9 @@ pub(crate) fn render_human(outcome: &NextOutcome) -> String {
             "command: {:?} {:?} (cwd {})",
             command.program, command.args, command.cwd.display
         );
+    }
+    if let Some(command) = &data.receipt_command {
+        let _ = writeln!(output, "receipt command: {command}");
     }
     for path in &data.context_paths {
         let _ = writeln!(output, "context: {} ({})", path.path.display, path.why);
@@ -767,12 +1083,55 @@ const fn risk_level_name(level: RiskLevelData) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
 
-    use forge_core::navigation::NavigationState;
-    use forge_core::{ExitCode, RepoRelativePath};
+    use forge_core::navigation::{NavigationAction, NavigationState};
+    use forge_core::{
+        CommandSource, CommandSpec, Confidence, ExitCode, Intent, Provenance, RepoRelativePath,
+        ResolvedCommandSet, command_detail_v2_to_wire,
+    };
+    use forge_schema::{
+        IntentData, NextActionData, NextData, NextStateData, RiskAssessmentData, RiskLevelData,
+    };
 
-    use super::{named_test_for, navigation_exit_code, path_is_within};
+    use super::{
+        InventoryCacheStatus, NextOutcome, action_to_wire, codeowners_precedence, named_test_for,
+        navigation_exit_code, path_is_within, project_selected_commands, render_human,
+        state_to_wire,
+    };
+
+    fn provenance() -> Vec<Provenance> {
+        vec![Provenance {
+            rule_id: String::from("test.fixture"),
+            source_path: None,
+            source_range: None,
+            detail: String::from("test evidence"),
+        }]
+    }
+
+    fn command(id: &str, intent: Intent) -> CommandSpec {
+        CommandSpec::new(
+            id,
+            intent,
+            "cargo",
+            RepoRelativePath::root(),
+            CommandSource::ExplicitConfig,
+        )
+        .with_args(["check"])
+    }
+
+    fn resolved(
+        command: CommandSpec,
+    ) -> Result<ResolvedCommandSet, forge_core::InvalidCommandResolution> {
+        ResolvedCommandSet::resolved(
+            vec![command],
+            provenance(),
+            Confidence::High,
+            Confidence::High,
+        )
+    }
 
     #[test]
     fn named_tests_require_supported_same_directory_conventions() {
@@ -795,6 +1154,19 @@ mod tests {
     }
 
     #[test]
+    fn codeowners_precedence_uses_native_repository_components()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let github = RepoRelativePath::new(PathBuf::from(".github").join("CODEOWNERS"))?;
+        let root = RepoRelativePath::new("CODEOWNERS")?;
+        let docs = RepoRelativePath::new(PathBuf::from("docs").join("CODEOWNERS"))?;
+
+        assert_eq!(codeowners_precedence(&github), 0);
+        assert_eq!(codeowners_precedence(&root), 1);
+        assert_eq!(codeowners_precedence(&docs), 2);
+        Ok(())
+    }
+
+    #[test]
     fn root_and_nested_units_contain_paths_lexically() -> Result<(), Box<dyn std::error::Error>> {
         let path = RepoRelativePath::new("crates/core/src/lib.rs")?;
         assert!(path_is_within(&path, &RepoRelativePath::root()));
@@ -813,12 +1185,150 @@ mod tests {
     fn navigation_exit_codes_distinguish_idle_negative_and_blocked_states() {
         assert_eq!(navigation_exit_code(NavigationState::Idle), ExitCode::Ok);
         assert_eq!(
+            navigation_exit_code(NavigationState::LocalVerified),
+            ExitCode::Ok
+        );
+        assert_eq!(
             navigation_exit_code(NavigationState::ChangedUnverified),
+            ExitCode::Negative
+        );
+        assert_eq!(
+            navigation_exit_code(NavigationState::ChecksFailing),
+            ExitCode::Negative
+        );
+        assert_eq!(
+            navigation_exit_code(NavigationState::PartiallyVerified),
             ExitCode::Negative
         );
         assert_eq!(
             navigation_exit_code(NavigationState::Blocked),
             ExitCode::EnvironmentUnmet
         );
+    }
+
+    #[test]
+    fn receipt_backed_states_and_actions_use_the_existing_next_v1_variants() {
+        assert_eq!(
+            state_to_wire(NavigationState::ChecksFailing),
+            NextStateData::ChecksFailing
+        );
+        assert_eq!(
+            state_to_wire(NavigationState::PartiallyVerified),
+            NextStateData::PartiallyVerified
+        );
+        assert_eq!(
+            state_to_wire(NavigationState::LocalVerified),
+            NextStateData::LocalVerified
+        );
+        assert_eq!(
+            action_to_wire(NavigationAction::FixFailures),
+            NextActionData::FixFailures
+        );
+    }
+
+    #[test]
+    fn next_projects_only_selected_safe_commands_and_preserves_existing_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "unrelated-next-secret";
+        let mut selected = command("selected-check", Intent::Check);
+        selected
+            .env
+            .insert(OsString::from("AUTHOR"), OsString::from("Ada"));
+        selected
+            .env
+            .insert(OsString::from("BUILD_REGION"), OsString::from("us-east-1"));
+        let unrelated =
+            command("unrelated-setup", Intent::Setup).with_args(["check", "--token", secret]);
+        let command_sets = BTreeMap::from([
+            (Intent::Check, resolved(selected.clone())?),
+            (Intent::Setup, resolved(unrelated)?),
+        ]);
+
+        let projected = project_selected_commands(
+            &command_sets,
+            Intent::Check,
+            std::slice::from_ref(&selected),
+        )?;
+        let expected = command_detail_v2_to_wire(&selected)?.command;
+        assert_eq!(
+            serde_json::to_vec(&projected[0])?,
+            serde_json::to_vec(&expected)?
+        );
+        assert_eq!(projected[0].environment_names, ["AUTHOR", "BUILD_REGION"]);
+
+        let outcome = NextOutcome {
+            wire: NextData {
+                state: NextStateData::ChangedUnverified,
+                required_action: NextActionData::RunIntent,
+                intent: Some(IntentData::Check),
+                project_commands: projected,
+                receipt_command: None,
+                context_paths: Vec::new(),
+                risk: RiskAssessmentData {
+                    level: RiskLevelData::Unknown,
+                    matched: Vec::new(),
+                    provenance: Vec::new(),
+                },
+                blockers: Vec::new(),
+                reason: String::from("test decision"),
+                provenance: Vec::new(),
+                uncertain_assumptions: Vec::new(),
+            },
+            exit_code: ExitCode::Negative,
+            truncated: false,
+            inventory_cache_status: InventoryCacheStatus::Disabled,
+        };
+        let outputs = [
+            render_human(&outcome),
+            serde_json::to_string(&outcome.wire)?,
+        ];
+        assert!(outputs[1].contains("AUTHOR"));
+        assert!(outputs[1].contains("BUILD_REGION"));
+        for output in outputs {
+            assert!(
+                !output.contains(secret),
+                "unrelated command leaked: {output}"
+            );
+            assert!(
+                !output.contains("--token"),
+                "unrelated argv leaked: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn next_rejects_an_unsafe_selected_command_without_rendering_its_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret = "selected-next-secret";
+        let mut selected =
+            command("unsafe-check", Intent::Check).with_args(["check", "--token", secret]);
+        selected
+            .env
+            .insert(OsString::from("API_TOKEN"), OsString::from(secret));
+        let command_sets = BTreeMap::from([(Intent::Check, resolved(selected.clone())?)]);
+
+        let error = project_selected_commands(
+            &command_sets,
+            Intent::Check,
+            std::slice::from_ref(&selected),
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("unsafe selected command did not fail closed"))?;
+
+        assert_eq!(error.diagnostic().code.as_str(), "FGE1103");
+        for output in [
+            error.to_string(),
+            serde_json::to_string(error.diagnostic())?,
+            format!("{error:?}"),
+        ] {
+            for forbidden in [secret, "--token", "API_TOKEN"] {
+                assert!(
+                    !output.contains(forbidden),
+                    "leaked {forbidden:?}: {output}"
+                );
+            }
+        }
+        Ok(())
     }
 }

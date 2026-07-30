@@ -1,0 +1,231 @@
+{
+  "$id": "forge.release-manifest/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge release-manifest v1",
+  "description": "Standalone `forge.release-manifest/v1` document shipped with release assets.\n\nSame-major readers deliberately ignore unknown object fields and map unknown enum values to\nexplicit non-authorizing `Unknown` states. Candidate creation and release checking remain exact,\ncanonical procedures rather than relying on this compatibility reader for authorization.",
+  "type": "object",
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReleaseArtifactData"
+      },
+      "maxItems": 10,
+      "minItems": 10
+    },
+    "provenance": {
+      "$ref": "#/$defs/ReleaseProvenanceData"
+    },
+    "release": {
+      "$ref": "#/$defs/ReleaseDescriptorData"
+    },
+    "rollback": {
+      "$ref": "#/$defs/ReleaseRollbackData"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.release-manifest/v1"
+    }
+  },
+  "required": [
+    "schema",
+    "release",
+    "artifacts",
+    "provenance",
+    "rollback"
+  ],
+  "$defs": {
+    "ReleaseArtifactData": {
+      "description": "One immutable artifact described by a local release-candidate manifest.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ReleaseArtifactKindData"
+        },
+        "length": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/ReleaseSha256Data"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "target",
+        "length",
+        "sha256"
+      ]
+    },
+    "ReleaseArtifactKindData": {
+      "description": "One immutable artifact described by a local release-candidate manifest.",
+      "type": "string",
+      "enum": [
+        "binary",
+        "cyclonedx-sbom",
+        "unknown"
+      ]
+    },
+    "ReleaseAuthorityStatusData": {
+      "type": "string",
+      "enum": [
+        "unassigned-external",
+        "unknown"
+      ]
+    },
+    "ReleaseCandidateStatusData": {
+      "type": "string",
+      "enum": [
+        "local-review-candidate",
+        "unknown"
+      ]
+    },
+    "ReleaseChannelData": {
+      "type": "string",
+      "enum": [
+        "release-candidate",
+        "unknown"
+      ]
+    },
+    "ReleaseDescriptorData": {
+      "description": "Release identity and candidate-local status.",
+      "type": "object",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ReleaseChannelData"
+        },
+        "distribution": {
+          "$ref": "#/$defs/ReleaseDistributionData"
+        },
+        "status": {
+          "$ref": "#/$defs/ReleaseCandidateStatusData"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "channel",
+        "distribution",
+        "status"
+      ]
+    },
+    "ReleaseDistributionData": {
+      "type": "string",
+      "enum": [
+        "github-release",
+        "unknown"
+      ]
+    },
+    "ReleasePredicateTypeData": {
+      "type": "string",
+      "enum": [
+        "https://slsa.dev/provenance/v1",
+        "unknown"
+      ]
+    },
+    "ReleaseProvenanceData": {
+      "description": "External provenance and signing work that remains outside the candidate write set.",
+      "type": "object",
+      "properties": {
+        "authority_status": {
+          "$ref": "#/$defs/ReleaseAuthorityStatusData"
+        },
+        "predicate_type": {
+          "$ref": "#/$defs/ReleasePredicateTypeData"
+        },
+        "signing": {
+          "$ref": "#/$defs/ReleaseSigningData"
+        },
+        "status": {
+          "$ref": "#/$defs/ReleaseProvenanceStatusData"
+        },
+        "subject_set": {
+          "$ref": "#/$defs/ReleaseSubjectSetData"
+        },
+        "subjects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 12,
+          "minItems": 12
+        }
+      },
+      "required": [
+        "status",
+        "predicate_type",
+        "signing",
+        "authority_status",
+        "subject_set",
+        "subjects"
+      ]
+    },
+    "ReleaseProvenanceStatusData": {
+      "type": "string",
+      "enum": [
+        "required-external",
+        "unknown"
+      ]
+    },
+    "ReleaseRollbackData": {
+      "description": "Retention and rollback state frozen for this candidate.",
+      "type": "object",
+      "properties": {
+        "previous_release": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retain_published_releases": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ReleaseRollbackStatusData"
+        }
+      },
+      "required": [
+        "retain_published_releases",
+        "status"
+      ]
+    },
+    "ReleaseRollbackStatusData": {
+      "type": "string",
+      "enum": [
+        "first-candidate-no-n-minus-one",
+        "unknown"
+      ]
+    },
+    "ReleaseSha256Data": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ReleaseSigningData": {
+      "type": "string",
+      "enum": [
+        "sigstore-keyless-oidc",
+        "unknown"
+      ]
+    },
+    "ReleaseSubjectSetData": {
+      "type": "string",
+      "enum": [
+        "exact-finalized-local-assets",
+        "unknown"
+      ]
+    }
+  }
+}

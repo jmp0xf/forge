@@ -43,7 +43,7 @@ pub struct Cli {
     #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Override the operation timeout.
+    /// Set one total wall-clock budget for the complete command.
     #[arg(long, global = true, value_name = "DURATION")]
     pub timeout: Option<String>,
 
@@ -117,7 +117,7 @@ pub struct InitArgs {
     #[arg(long, value_enum, value_name = "RUNNER")]
     pub with_runner: Option<RunnerChoice>,
 
-    /// Generate an explicitly selected CI draft when an equivalent is absent.
+    /// Generate an explicitly selected create-only CI workflow when the target is absent.
     #[arg(long, value_enum, value_name = "PROVIDER")]
     pub with_ci: Option<CiChoice>,
 
@@ -260,6 +260,23 @@ mod tests {
         assert_eq!(cli.command, None);
         assert_eq!(cli.color, ColorChoice::Auto);
         Ok(())
+    }
+
+    #[test]
+    fn long_help_describes_timeout_as_one_total_command_budget() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("Set one total wall-clock budget for the complete command"));
+    }
+
+    #[test]
+    fn init_help_describes_create_only_ci_generation() {
+        let help = Cli::command()
+            .find_subcommand("init")
+            .map(|command| command.clone().render_long_help().to_string())
+            .unwrap_or_default();
+
+        assert!(help.contains("explicitly selected create-only CI workflow"));
     }
 
     #[test]

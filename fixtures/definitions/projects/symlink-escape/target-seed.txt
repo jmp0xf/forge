@@ -1,0 +1,1 @@
+The fixture test replaces a target path with a symlink to an external temporary file.

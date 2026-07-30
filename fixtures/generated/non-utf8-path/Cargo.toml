@@ -1,0 +1,5 @@
+[package]
+name = "fixture-non-utf8-path"
+version = "0.1.0"
+edition = "2021"
+publish = false

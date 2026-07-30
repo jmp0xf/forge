@@ -1,0 +1,11 @@
+[package]
+name = "fixture-rust-no-lock"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fixture-rust-no-lock-support = { path = "support" }

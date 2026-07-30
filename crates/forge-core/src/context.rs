@@ -384,11 +384,15 @@ fn native_path_bytes(value: &OsStr) -> usize {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
-    use std::path::{Path, PathBuf};
+    use std::ffi::OsStr;
+    use std::path::Path;
 
     use crate::{Confidence, Provenance, RepoRelativePath};
 
-    use super::{ContextCandidate, ContextSelectionError, ContextSignal, select_context_paths};
+    use super::{
+        ContextCandidate, ContextSelectionError, ContextSignal, native_path_bytes,
+        select_context_paths,
+    };
 
     fn provenance(rule: &str) -> Provenance {
         Provenance {
@@ -580,13 +584,14 @@ mod tests {
             vec![provenance("git/change")],
             Confidence::High,
         )?;
+        let exact_budget = native_path_bytes(OsStr::new("a")).saturating_add(3);
 
-        let exact = select_context_paths(vec![value.clone()], 4)?;
+        let exact = select_context_paths(vec![value.clone()], exact_budget)?;
         assert_eq!(exact.paths.len(), 1);
-        assert_eq!(exact.used_bytes, 4);
+        assert_eq!(exact.used_bytes, exact_budget);
         assert!(!exact.truncated);
 
-        let short = select_context_paths(vec![value], 3)?;
+        let short = select_context_paths(vec![value], exact_budget.saturating_sub(1))?;
         assert!(short.paths.is_empty());
         assert_eq!(short.used_bytes, 0);
         assert!(short.truncated);
@@ -613,6 +618,7 @@ mod tests {
     fn non_utf8_paths_sort_by_native_bytes() -> Result<(), Box<dyn Error>> {
         use std::ffi::OsString;
         use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::path::PathBuf;
 
         let paths = [vec![0xff], vec![0xfe]];
         let candidates = paths

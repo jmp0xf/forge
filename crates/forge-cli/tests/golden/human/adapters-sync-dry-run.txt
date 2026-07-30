@@ -1,0 +1,28 @@
+mode: sync-dry-run
+detection: complete
+changed: true
+applied: false
+  - codex AGENTS.md block=project-index drift=asset-changed: authoritative project facts render different managed content
+executable plan: true
+proposed edits: 1
+  - create AGENTS.md block=project-index reason=missing-file force-authorized=true postimage=blake3:d2643061a34420e926a16d370ef9eb0f531f6d5a5767453ef645291a8ac40630
+      | <!-- forge:begin block=project-index schema=1 hash=blake3:0d10ea53e82af2f8c354925f6b76feece895781a2d9d212b46b5cadb3636b505 -->\u{a}
+      | ## Authoritative paths\u{a}
+      | - `README.md`\u{a}
+      | - `forge.toml`\u{a}
+      | \u{a}
+      | ## Project-native commands\u{a}
+      | - check (required): env `CARGO_NET_OFFLINE=true` `GOPROXY=off` `GOSUMDB=off` `GOTOOLCHAIN=local` `RUSTUP_AUTO_INSTALL=0`; argv `golden-check`; cwd `.`.\u{a}
+      | \u{a}
+      | ## Optional local Receipts\u{a}
+      | - `forge evidence run check` executes the same resolved `check` command set and records a scope-bound local Receipt.\u{a}
+      | - A local Receipt is optional evidence, never CI, review, release, or approval authority.\u{a}
+      | \u{a}
+      | ## Completion evidence\u{a}
+      | - Applicable required commands above must pass; advisory commands are informative only.\u{a}
+      | - Local command success does not prove CI, review, release, signing, or authorization.\u{a}
+      | \u{a}
+      | ## Stop boundaries\u{a}
+      | - Stop rather than guessing when an applicable intent is absent, ambiguous, or unknown.\u{a}
+      | - Stop before changing CI, release, signing, ownership, migrations, or destructive/external state unless explicitly authorized.\u{a}
+      | <!-- forge:end block=project-index -->\u{a}

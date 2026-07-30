@@ -155,6 +155,17 @@
         "next": {
           "type": "string"
         },
+        "skip_reason": {
+          "description": "Present exactly when `status` is `skipped` in current Forge output.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DoctorSkipReasonData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "$ref": "#/$defs/CheckStatusData"
         }
@@ -197,6 +208,16 @@
         "checks",
         "tool_versions",
         "assumptions"
+      ]
+    },
+    "DoctorSkipReasonData": {
+      "description": "Typed reason why a registered doctor check was not evaluated.",
+      "type": "string",
+      "enum": [
+        "user-flag",
+        "platform-limitation",
+        "budget",
+        "unknown"
       ]
     },
     "PathEncoding": {

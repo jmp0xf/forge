@@ -7,11 +7,18 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use forge_schema::{
     AdapterData, AdapterDetailData, AdapterDriftData, AssetData, AssetDetailData, AssumptionData,
-    AssumptionDetailData, CommandData, CommandDetailData, CommandEnforcementData, CommandId,
-    CommandResolutionData, CommandSetData, CommandSourceData, ConfidenceData,
-    DerivationEvidenceData, IntentData, MutabilityData, NativeStringData, NativeStringEncodingData,
-    NetworkIntentData, ProjectModelData, ProjectUnitData, ProjectUnitDetailData, ProvenanceData,
-    SuccessPredicateData, TextRangeData, UnitDependencyDetailData, WirePath,
+    AssumptionDetailData, BaseTaskDependencyV2Data, CommandData, CommandDetailData,
+    CommandDetailV2Data, CommandEnforcementData, CommandId, CommandResolutionData, CommandSetData,
+    CommandSourceData, ComparisonBaselineV2Data, ComparisonBasisV2Data, ComparisonProtocolV2Data,
+    ConfidenceData, DependencyValidityV2Data, DerivationEvidenceData, DigestDependencyV2Data,
+    EvidenceDependencyV2Data, GitObjectFormatV2Data, GitObjectIdV2Data, GitSha1ObjectIdV2Data,
+    GitSha256ObjectIdV2Data, IntentData, InvalidGitObjectIdV2Data, InvalidReceiptValidityV2Data,
+    LocalEvidenceStateData, MutabilityData, NativeStringData, NativeStringEncodingData,
+    NetworkIntentData, NonSatisfyingReceiptValidityV2Data, OutcomeData, ProjectModelData,
+    ProjectUnitData, ProjectUnitDetailData, ProvenanceData, ReceiptApplicabilityV2Data,
+    ReceiptDependenciesV2Data, ReceiptValidityReasonV2Data, ReceiptValidityV2Data,
+    RepositoryDependencyV2Data, SuccessPredicateData, TaskAcceptanceV2Data, TextRangeData,
+    UnitDependencyDetailData, WirePath,
 };
 use thiserror::Error;
 
@@ -20,6 +27,13 @@ use crate::domain::{
     CoverageDimension, Intent, Mutability, NetworkIntent, ProjectKind, ProjectModel,
     ProjectModelError, Provenance, SuccessPredicate, WorkState,
 };
+use crate::evidence::{
+    ApplicabilityReason, BaseTaskDependency, DependencyReason, DependencyValidity, DependencyValue,
+    EvidenceDependency, EvidenceDependencyFingerprint, EvidenceOutcome, LocalEvidenceState,
+    ReceiptApplicability, ReceiptValidity,
+};
+use crate::git::GitObjectFormat;
+use crate::scope::ScopeHead;
 
 /// A domain model cannot be represented by the additive `forge.model/v1` wire contract.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -110,7 +124,7 @@ pub fn project_model_to_wire(
             &model.policy.provenance,
             model.policy.confidence,
         )),
-        assumptions: model.assumptions.iter().map(project_assumption).collect(),
+        assumptions: model.assumptions.iter().map(assumption_to_wire).collect(),
         assumption_details: Some(
             model
                 .assumptions
@@ -188,6 +202,232 @@ fn project_command_detail(
     })
 }
 
+/// Projects one authoritative command observation into the complete v2 wire representation.
+///
+/// This reuses the same lossless native-value and strict legacy-field checks as ProjectModel so a
+/// Receipt cannot silently describe a command differently from the command that was resolved.
+pub fn command_detail_v2_to_wire(
+    command: &CommandSpec,
+) -> Result<CommandDetailV2Data, ProjectModelWireError> {
+    let detail = project_command_detail(command)?;
+    Ok(CommandDetailV2Data {
+        command: detail.command,
+        native_program: detail.native_program,
+        native_args: detail.native_args,
+        native_environment_names: detail.native_environment_names,
+        source_detail: detail.source_detail,
+        enforcement: detail.enforcement,
+        success: detail.success,
+    })
+}
+
+/// Projects the complete v2 Receipt dependency set without inventing sentinels for unknown facts.
+#[must_use]
+pub fn receipt_dependencies_v2_to_wire(
+    dependencies: &EvidenceDependencyFingerprint,
+    scope_before: &DependencyValue<forge_schema::Digest>,
+) -> ReceiptDependenciesV2Data {
+    ReceiptDependenciesV2Data {
+        repository: repository_dependency_to_wire(dependencies.repository()),
+        scope_before: digest_dependency_to_wire(scope_before),
+        scope_after: digest_dependency_to_wire(dependencies.scope()),
+        command: digest_dependency_to_wire(dependencies.command()),
+        toolchain: digest_dependency_to_wire(dependencies.toolchain()),
+        environment: digest_dependency_to_wire(dependencies.environment()),
+        policy: digest_dependency_to_wire(dependencies.policy()),
+        base_task: base_task_dependency_to_wire(dependencies.base_task()),
+        forge_behavior: digest_dependency_to_wire(dependencies.forge_behavior()),
+    }
+}
+
+/// Projects the fixed v0 worktree-comparison basis from an acquired canonical scope.
+///
+/// The baseline comes from the same scope snapshot used by the Receipt, not from a branch name,
+/// upstream, merge base, or other local topology that could be mistaken for authority.
+pub fn comparison_basis_v2_to_wire(
+    head: &ScopeHead,
+    policy_base: &DependencyValue<forge_schema::Digest>,
+) -> Result<ComparisonBasisV2Data, InvalidGitObjectIdV2Data> {
+    let baseline = match head {
+        ScopeHead::Commit(object_id) => {
+            let hexadecimal = std::str::from_utf8(object_id.lowercase_hex())
+                .map_err(|_| InvalidGitObjectIdV2Data)?
+                .to_owned();
+            let commit = match object_id.object_format() {
+                GitObjectFormat::Sha1 => GitObjectIdV2Data::Sha1 {
+                    oid: GitSha1ObjectIdV2Data::new(hexadecimal)?,
+                },
+                GitObjectFormat::Sha256 => GitObjectIdV2Data::Sha256 {
+                    oid: GitSha256ObjectIdV2Data::new(hexadecimal)?,
+                },
+            };
+            ComparisonBaselineV2Data::Head { commit }
+        }
+        ScopeHead::Unborn(format) => ComparisonBaselineV2Data::Unborn {
+            object_format: match format {
+                GitObjectFormat::Sha1 => GitObjectFormatV2Data::Sha1,
+                GitObjectFormat::Sha256 => GitObjectFormatV2Data::Sha256,
+            },
+        },
+    };
+    Ok(ComparisonBasisV2Data {
+        protocol: ComparisonProtocolV2Data::WorktreeV1,
+        baseline,
+        task_acceptance: TaskAcceptanceV2Data::NotApplicable,
+        policy_base_digest: digest_dependency_to_wire(policy_base),
+    })
+}
+
+fn digest_dependency_to_wire(
+    dependency: &DependencyValue<forge_schema::Digest>,
+) -> DigestDependencyV2Data {
+    match dependency {
+        DependencyValue::Known(digest) => DigestDependencyV2Data::Known(digest.clone()),
+        DependencyValue::Unknown => DigestDependencyV2Data::Unknown,
+    }
+}
+
+fn repository_dependency_to_wire(
+    dependency: &DependencyValue<forge_schema::RepoId>,
+) -> RepositoryDependencyV2Data {
+    match dependency {
+        DependencyValue::Known(repository) => RepositoryDependencyV2Data::Known(repository.clone()),
+        DependencyValue::Unknown => RepositoryDependencyV2Data::Unknown,
+    }
+}
+
+fn base_task_dependency_to_wire(dependency: &BaseTaskDependency) -> BaseTaskDependencyV2Data {
+    match dependency {
+        BaseTaskDependency::Known(digest) => BaseTaskDependencyV2Data::Known(digest.clone()),
+        BaseTaskDependency::NotApplicable => BaseTaskDependencyV2Data::NotApplicable,
+        BaseTaskDependency::Unknown => BaseTaskDependencyV2Data::Unknown,
+    }
+}
+
+/// Projects a normalized command/Receipt outcome into its stable wire enum.
+#[must_use]
+pub const fn evidence_outcome_to_wire(outcome: EvidenceOutcome) -> OutcomeData {
+    match outcome {
+        EvidenceOutcome::Pass => OutcomeData::Pass,
+        EvidenceOutcome::ProductFailure => OutcomeData::ProductFailure,
+        EvidenceOutcome::InfrastructureFailure => OutcomeData::InfrastructureFailure,
+        EvidenceOutcome::Inconclusive => OutcomeData::Inconclusive,
+        EvidenceOutcome::TimedOut => OutcomeData::TimedOut,
+        EvidenceOutcome::Interrupted => OutcomeData::Interrupted,
+        EvidenceOutcome::Unknown => OutcomeData::Unknown,
+    }
+}
+
+/// Projects a process-boundary failure into its stable v2 Receipt spelling.
+#[must_use]
+pub const fn process_error_kind_to_wire(
+    kind: crate::ports::ProcessErrorKind,
+) -> forge_schema::ProcessErrorKindV2Data {
+    use crate::ports::ProcessErrorKind;
+    use forge_schema::ProcessErrorKindV2Data;
+
+    match kind {
+        ProcessErrorKind::InvalidRepositoryRoot => ProcessErrorKindV2Data::InvalidRepositoryRoot,
+        ProcessErrorKind::InvalidWorkingDirectory => {
+            ProcessErrorKindV2Data::InvalidWorkingDirectory
+        }
+        ProcessErrorKind::InvalidEnvironment => ProcessErrorKindV2Data::InvalidEnvironment,
+        ProcessErrorKind::UnsupportedProgram => ProcessErrorKindV2Data::UnsupportedProgram,
+        ProcessErrorKind::ExecutableUnavailable => ProcessErrorKindV2Data::ExecutableUnavailable,
+        ProcessErrorKind::PermissionDenied => ProcessErrorKindV2Data::PermissionDenied,
+        ProcessErrorKind::Spawn => ProcessErrorKindV2Data::Spawn,
+        ProcessErrorKind::ProcessTree => ProcessErrorKindV2Data::ProcessTree,
+        ProcessErrorKind::Output => ProcessErrorKindV2Data::Output,
+        ProcessErrorKind::Wait => ProcessErrorKindV2Data::Wait,
+    }
+}
+
+/// Projects a non-satisfying validity result with every typed reason retained.
+///
+/// A current, eligible pass deliberately returns [`InvalidReceiptValidityV2Data`] because it must
+/// be represented as `valid_receipts`, never smuggled into the stale branch.
+pub fn non_satisfying_receipt_validity_v2_to_wire(
+    validity: &ReceiptValidity,
+) -> Result<NonSatisfyingReceiptValidityV2Data, InvalidReceiptValidityV2Data> {
+    let mut reasons = validity
+        .dependency_reasons()
+        .iter()
+        .map(|reason| match reason {
+            DependencyReason::Changed(dependency) => {
+                ReceiptValidityReasonV2Data::DependencyChanged {
+                    dependency: evidence_dependency_to_wire(*dependency),
+                }
+            }
+            DependencyReason::Unknown(dependency) => {
+                ReceiptValidityReasonV2Data::DependencyUnknown {
+                    dependency: evidence_dependency_to_wire(*dependency),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    reasons.extend(
+        validity
+            .applicability_reasons()
+            .iter()
+            .map(|reason| match reason {
+                ApplicabilityReason::ReadOnlyScopeChangedDuringRun => {
+                    ReceiptValidityReasonV2Data::ReadOnlyScopeChangedDuringRun
+                }
+                ApplicabilityReason::ExternalSideEffectScopeChangedDuringRun => {
+                    ReceiptValidityReasonV2Data::ExternalSideEffectScopeChangedDuringRun
+                }
+                ApplicabilityReason::WorkingTreeWriteRequiresReadOnlyFollowUp => {
+                    ReceiptValidityReasonV2Data::WorkingTreeWriteRequiresReadOnlyFollowUp
+                }
+                ApplicabilityReason::MutabilityUnknown => {
+                    ReceiptValidityReasonV2Data::MutabilityUnknown
+                }
+            }),
+    );
+    if validity.outcome() != EvidenceOutcome::Pass {
+        reasons.push(ReceiptValidityReasonV2Data::OutcomeNotPassing);
+    }
+
+    NonSatisfyingReceiptValidityV2Data::new(ReceiptValidityV2Data {
+        dependency_validity: match validity.dependency_validity() {
+            DependencyValidity::Current => DependencyValidityV2Data::Current,
+            DependencyValidity::Stale => DependencyValidityV2Data::Stale,
+            DependencyValidity::Unknown => DependencyValidityV2Data::Unknown,
+        },
+        applicability: match validity.applicability() {
+            ReceiptApplicability::Eligible => ReceiptApplicabilityV2Data::Eligible,
+            ReceiptApplicability::NonProving => ReceiptApplicabilityV2Data::NonProving,
+            ReceiptApplicability::Unknown => ReceiptApplicabilityV2Data::Unknown,
+        },
+        outcome: evidence_outcome_to_wire(validity.outcome()),
+        reasons,
+    })
+}
+
+const fn evidence_dependency_to_wire(dependency: EvidenceDependency) -> EvidenceDependencyV2Data {
+    match dependency {
+        EvidenceDependency::Repository => EvidenceDependencyV2Data::Repository,
+        EvidenceDependency::Scope => EvidenceDependencyV2Data::Scope,
+        EvidenceDependency::Command => EvidenceDependencyV2Data::Command,
+        EvidenceDependency::Toolchain => EvidenceDependencyV2Data::Toolchain,
+        EvidenceDependency::Environment => EvidenceDependencyV2Data::Environment,
+        EvidenceDependency::Policy => EvidenceDependencyV2Data::Policy,
+        EvidenceDependency::BaseTask => EvidenceDependencyV2Data::BaseTask,
+        EvidenceDependency::ForgeBehavior => EvidenceDependencyV2Data::ForgeBehavior,
+    }
+}
+
+/// Projects the local-only state without adding any external authority meaning.
+#[must_use]
+pub const fn local_evidence_state_to_wire(state: LocalEvidenceState) -> LocalEvidenceStateData {
+    match state {
+        LocalEvidenceState::Insufficient => LocalEvidenceStateData::Insufficient,
+        LocalEvidenceState::Failing => LocalEvidenceStateData::Failing,
+        LocalEvidenceState::Sufficient => LocalEvidenceStateData::Sufficient,
+        LocalEvidenceState::Unknown => LocalEvidenceStateData::Unknown,
+    }
+}
+
 fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWireError> {
     let program =
         command
@@ -233,7 +473,7 @@ fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWir
 
     Ok(CommandData {
         id: command.id.clone(),
-        intent: intent(command.intent),
+        intent: intent_to_wire(command.intent),
         program: program.to_owned(),
         args,
         cwd: WirePath::from_path(command.cwd.as_path()),
@@ -243,7 +483,11 @@ fn project_command(command: &CommandSpec) -> Result<CommandData, ProjectModelWir
         network: network(command.network),
         source: command_source_name(&command.source).to_owned(),
         confidence: confidence(command.confidence),
-        coverage: command.coverage.iter().map(coverage_name).collect(),
+        coverage: command
+            .coverage
+            .iter()
+            .map(coverage_dimension_name)
+            .collect(),
     })
 }
 
@@ -324,7 +568,12 @@ fn project_adapter_detail(adapter: &crate::domain::AdapterInfo) -> AdapterDetail
     }
 }
 
-fn project_assumption(assumption: &crate::domain::Assumption) -> AssumptionData {
+/// Projects one domain assumption using the same legacy representation as the project model.
+///
+/// Consumers that project only a command-relevant slice of a model can reuse this function
+/// without first projecting every command in the model.
+#[must_use]
+pub fn assumption_to_wire(assumption: &crate::domain::Assumption) -> AssumptionData {
     AssumptionData {
         statement: assumption.statement.clone(),
         provenance: legacy_provenance(&assumption.provenance),
@@ -425,7 +674,7 @@ const fn intent_name(value: Intent) -> &'static str {
     }
 }
 
-const fn intent(value: Intent) -> IntentData {
+pub const fn intent_to_wire(value: Intent) -> IntentData {
     match value {
         Intent::Setup => IntentData::Setup,
         Intent::FormatCheck => IntentData::FormatCheck,
@@ -539,7 +788,7 @@ fn success_predicate(value: &SuccessPredicate) -> SuccessPredicateData {
     }
 }
 
-fn coverage_name(value: &CoverageDimension) -> String {
+pub fn coverage_dimension_name(value: &CoverageDimension) -> String {
     match value {
         CoverageDimension::Format => "format".to_owned(),
         CoverageDimension::Compile => "compile".to_owned(),
@@ -560,8 +809,11 @@ mod tests {
     use std::time::Duration;
 
     use forge_schema::{
-        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ConfidenceData, Digest,
-        LanguageId, NativeStringEncodingData, RepoId, UnitId, WirePath,
+        AdapterDriftData, CommandEnforcementData, CommandResolutionData, ComparisonBaselineV2Data,
+        ComparisonProtocolV2Data, ConfidenceData, DependencyValidityV2Data, Digest,
+        DigestDependencyV2Data, EvidenceDependencyV2Data, GitObjectFormatV2Data, GitObjectIdV2Data,
+        LanguageId, NativeStringEncodingData, OutcomeData, ReceiptValidityReasonV2Data, RepoId,
+        RepositoryDependencyV2Data, TaskAcceptanceV2Data, UnitId, WirePath,
     };
 
     use crate::domain::{
@@ -571,9 +823,19 @@ mod tests {
         ProjectModelError, ProjectModelInputs, ProjectUnit, Provenance, RepoFacts,
         ResolvedCommandSet, SuccessPredicate, TextRange, ToolchainInfo, UnitEdge, WorkState,
     };
+    use crate::evidence::{
+        BaseTaskDependency, DependencyValue, EvidenceDependencyFingerprint, EvidenceOutcome,
+        ExecutionDependencyFingerprint, ReceiptValidityInput, evaluate_receipt_validity,
+    };
+    use crate::git::GitObjectFormat;
     use crate::path::RepoRelativePath;
+    use crate::scope::{ScopeHead, ScopeObjectId};
 
-    use super::{ProjectModelWireError, native_string_data, project_model_to_wire};
+    use super::{
+        ProjectModelWireError, command_detail_v2_to_wire, comparison_basis_v2_to_wire,
+        native_string_data, non_satisfying_receipt_validity_v2_to_wire, project_model_to_wire,
+        receipt_dependencies_v2_to_wire,
+    };
 
     fn provenance(rule_id: impl Into<String>) -> Provenance {
         let rule_id = rule_id.into();
@@ -739,6 +1001,32 @@ mod tests {
         assert_eq!(sets["verify"].resolution, CommandResolutionData::Unknown);
         assert_eq!(sets["test"].candidates.len(), 1);
         assert_eq!(sets["verify"].candidates.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_command_projection_keeps_complete_execution_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = command("verify", Intent::Verify).with_args(["test", "--workspace"]);
+        command.env.insert("SAFE_FLAG".into(), "enabled".into());
+        command.timeout = Duration::from_secs(42);
+        command.mutability = Mutability::ReadOnly;
+        command.network = NetworkIntent::OfflineRequested;
+        command.enforcement = CommandEnforcement::Advisory;
+        command.success = SuccessPredicate::All(vec![
+            SuccessPredicate::ExitZero,
+            SuccessPredicate::ExitZeroAndStdoutEmpty,
+        ]);
+        command.coverage = BTreeSet::from([CoverageDimension::UnitTest]);
+
+        let wire = command_detail_v2_to_wire(&command)?;
+
+        assert_eq!(wire.command.id.as_str(), "verify");
+        assert_eq!(wire.command.timeout_seconds, 42);
+        assert_eq!(wire.native_args.len(), 2);
+        assert_eq!(wire.native_environment_names.len(), 1);
+        assert_eq!(wire.enforcement, CommandEnforcementData::Advisory);
+        assert_eq!(wire.command.coverage, ["unit-test"]);
         Ok(())
     }
 
@@ -1152,5 +1440,135 @@ mod tests {
                 }
             ))
         );
+    }
+
+    fn evidence_fingerprint(policy: &str) -> EvidenceDependencyFingerprint {
+        EvidenceDependencyFingerprint::new(
+            DependencyValue::Known(RepoId::from("repo:wire")),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            ExecutionDependencyFingerprint::new(
+                DependencyValue::Known(Digest::from("command:wire")),
+                DependencyValue::Known(Digest::from("toolchain:wire")),
+                DependencyValue::Known(Digest::from("environment:wire")),
+            ),
+            DependencyValue::Known(Digest::from(policy)),
+            BaseTaskDependency::NotApplicable,
+            DependencyValue::Known(Digest::from("behavior:wire")),
+        )
+    }
+
+    #[test]
+    fn receipt_dependency_projection_preserves_known_unknown_and_not_applicable() {
+        let dependencies = EvidenceDependencyFingerprint::new(
+            DependencyValue::Known(RepoId::from("repo:wire")),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            ExecutionDependencyFingerprint::new(
+                DependencyValue::Known(Digest::from("command:wire")),
+                DependencyValue::Unknown,
+                DependencyValue::Known(Digest::from("environment:wire")),
+            ),
+            DependencyValue::Known(Digest::from("policy:wire")),
+            BaseTaskDependency::NotApplicable,
+            DependencyValue::Known(Digest::from("behavior:wire")),
+        );
+
+        let wire = receipt_dependencies_v2_to_wire(&dependencies, &DependencyValue::Unknown);
+
+        assert_eq!(wire.scope_before, DigestDependencyV2Data::Unknown);
+        assert_eq!(
+            wire.repository,
+            RepositoryDependencyV2Data::Known(RepoId::from("repo:wire"))
+        );
+        assert_eq!(wire.toolchain, DigestDependencyV2Data::Unknown);
+        assert_eq!(
+            wire.policy,
+            DigestDependencyV2Data::Known(Digest::from("policy:wire"))
+        );
+        assert_eq!(
+            wire.base_task,
+            forge_schema::BaseTaskDependencyV2Data::NotApplicable
+        );
+    }
+
+    #[test]
+    fn comparison_basis_uses_the_acquired_head_without_external_topology()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let head = ScopeHead::Commit(ScopeObjectId::new(GitObjectFormat::Sha1, &[b'A'; 40])?);
+
+        let basis = comparison_basis_v2_to_wire(
+            &head,
+            &DependencyValue::Known(Digest::from("policy-base:wire")),
+        )?;
+
+        assert_eq!(basis.protocol, ComparisonProtocolV2Data::WorktreeV1);
+        assert_eq!(basis.task_acceptance, TaskAcceptanceV2Data::NotApplicable);
+        assert_eq!(
+            basis.policy_base_digest,
+            DigestDependencyV2Data::Known(Digest::from("policy-base:wire"))
+        );
+        assert!(matches!(
+            basis.baseline,
+            ComparisonBaselineV2Data::Head {
+                commit: GitObjectIdV2Data::Sha1 { ref oid }
+            } if oid.as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+
+        let unborn = comparison_basis_v2_to_wire(
+            &ScopeHead::Unborn(GitObjectFormat::Sha256),
+            &DependencyValue::Unknown,
+        )?;
+        assert_eq!(
+            unborn.baseline,
+            ComparisonBaselineV2Data::Unborn {
+                object_format: GitObjectFormatV2Data::Sha256
+            }
+        );
+        assert_eq!(unborn.policy_base_digest, DigestDependencyV2Data::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn non_satisfying_projection_retains_dependency_and_outcome_reasons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorded = evidence_fingerprint("policy:old");
+        let receipt = ReceiptValidityInput::new(
+            recorded.clone(),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            Mutability::ReadOnly,
+            EvidenceOutcome::ProductFailure,
+        );
+        let validity = evaluate_receipt_validity(&receipt, &evidence_fingerprint("policy:new"));
+
+        let wire = non_satisfying_receipt_validity_v2_to_wire(&validity)?;
+
+        assert_eq!(
+            wire.as_inner().dependency_validity,
+            DependencyValidityV2Data::Stale
+        );
+        assert_eq!(wire.as_inner().outcome, OutcomeData::ProductFailure);
+        assert_eq!(
+            wire.as_inner().reasons,
+            [
+                ReceiptValidityReasonV2Data::DependencyChanged {
+                    dependency: EvidenceDependencyV2Data::Policy,
+                },
+                ReceiptValidityReasonV2Data::OutcomeNotPassing,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_passing_receipt_cannot_be_projected_as_stale() {
+        let dependencies = evidence_fingerprint("policy:wire");
+        let receipt = ReceiptValidityInput::new(
+            dependencies.clone(),
+            DependencyValue::Known(Digest::from("scope:wire")),
+            Mutability::ReadOnly,
+            EvidenceOutcome::Pass,
+        );
+        let validity = evaluate_receipt_validity(&receipt, &dependencies);
+
+        assert!(non_satisfying_receipt_validity_v2_to_wire(&validity).is_err());
     }
 }

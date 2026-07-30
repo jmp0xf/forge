@@ -1,0 +1,14 @@
+forge.version/v1
+forge.schema-index/v1
+forge.init-plan/v1
+forge.doctor/v1
+forge.next/v1
+forge.model/v1
+forge.receipt/v1
+forge.receipt/v2
+forge.evidence/v1
+forge.evidence/v2
+forge.adapters/v1
+forge.release-manifest/v1
+forge.release-manifest/v2
+forge.diagnostic/v1

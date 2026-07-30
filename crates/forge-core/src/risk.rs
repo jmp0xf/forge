@@ -7,6 +7,7 @@ use forge_schema::WirePath;
 use crate::policy::{
     EffectivePolicyContent, EvidenceRequirements, PathPattern, PolicyError, RiskLevel, RiskRule,
 };
+use crate::portable_relative_utf8_path;
 use crate::{Assumption, Confidence, Provenance, RepoRelativePath};
 
 /// Every path match for one effective risk rule.
@@ -214,14 +215,14 @@ pub fn assess_risk(
     for rule in policy.rules() {
         let mut rule_paths = Vec::new();
         for path in &paths {
-            let Some(path_text) = path.as_path().to_str() else {
+            let Some(path_text) = portable_relative_utf8_path(path.as_path()) else {
                 unknown_paths.insert(path.clone());
                 continue;
             };
             if rule
                 .paths()
                 .iter()
-                .any(|pattern| pattern.matches(path_text))
+                .any(|pattern| pattern.matches(&path_text))
             {
                 matched_path_set.insert(path.clone());
                 rule_paths.push(path.clone());
@@ -545,6 +546,60 @@ mod tests {
                 ))
                 .all(|provenance| !provenance.detail.contains("proved"))
         );
+        let path_detail = |rule_id: &str| {
+            assessment
+                .provenance
+                .iter()
+                .find(|provenance| {
+                    provenance.rule_id == rule_id && provenance.source_path.is_some()
+                })
+                .map(|provenance| provenance.detail.as_str())
+        };
+        assert_eq!(
+            path_detail("risk/test-weakening"),
+            Some(
+                "path matches a test or lint surface; this does not establish that assertions, tests, or lint were weakened"
+            )
+        );
+        assert_eq!(
+            path_detail("risk/public-api"),
+            Some(
+                "path matches a conventional API surface; this does not establish that its public contract changed"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn docs_only_risk_remains_conditioned_on_uninspected_content() -> Result<(), Box<dyn Error>> {
+        let assessment = assess_risk(&built_in_policy()?, &paths(&["docs/guide.md"])?);
+        let assumptions = assessment
+            .uncertain_assumptions
+            .iter()
+            .filter(|assumption| {
+                assumption
+                    .provenance
+                    .iter()
+                    .any(|provenance| provenance.rule_id == "risk/docs-only/path-only-uncertainty")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(assumptions.len(), 1);
+        let assumption = assumptions[0];
+        assert_eq!(
+            assumption.statement,
+            "documentation-shaped paths are treated as low risk only under the unverified assumption that their content has no policy, command, or security semantics"
+        );
+        assert_eq!(assumption.confidence, Confidence::Unknown);
+        assert_eq!(assumption.provenance.len(), 1);
+        assert_eq!(
+            assumption.provenance[0]
+                .source_path
+                .as_ref()
+                .ok_or("docs-only assumption had no source path")?
+                .to_path_buf()?,
+            Path::new("docs/guide.md")
+        );
         Ok(())
     }
 
@@ -578,11 +633,21 @@ mod tests {
         let assessment = assess_risk(&policy, &paths(&["docs/guide.md"])?);
         assert_eq!(assessment.level, RiskLevel::Unknown);
         assert_eq!(assessment.evidence_requirements, ["check"]);
+        let unknown_risk_assumptions = assessment
+            .uncertain_assumptions
+            .iter()
+            .filter(|assumption| assumption.statement.contains("unknown risk level"))
+            .collect::<Vec<_>>();
+        assert_eq!(unknown_risk_assumptions.len(), 1);
+        assert_eq!(
+            unknown_risk_assumptions[0].statement,
+            "effective rule `risk/unknown` matched but has an unknown risk level"
+        );
         assert!(
-            assessment
-                .uncertain_assumptions
+            unknown_risk_assumptions[0]
+                .provenance
                 .iter()
-                .any(|assumption| assumption.statement.contains("unknown risk level"))
+                .all(|provenance| provenance.rule_id == "risk/unknown")
         );
         Ok(())
     }

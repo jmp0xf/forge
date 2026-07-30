@@ -2,18 +2,20 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use forge_core::ports::RepositoryFilePort as _;
-use forge_core::{AppError, Digest, ExitCode, RepoRelativePath};
+use forge_core::{
+    AppError, Digest, ExitCode, OperationControl as _, RepoRelativePath, branding::DISPLAY_NAME,
+};
+use forge_detect::config::ForgeConfig;
 use forge_detect::model::ModelDetectionCompletion;
 use forge_render::managed_block::ManagedBlockError;
 use forge_render::{
-    ADAPTER_FILE_MAX_BYTES, AdapterInspectionState, AdapterSelection, AdapterTarget, ChangePlan,
-    FileEditKind, FileEditReason, InitAdapterInspection, InitPlanOptions, ManagedBlockKind,
-    PlanError, inspect_init_targets, managed_adapter_spec_for_path, plan_init,
+    ADAPTER_FILE_MAX_BYTES, AdapterInspectionState, AdapterSelection, AdapterTarget, ApplyReport,
+    ChangePlan, FileEditKind, FileEditReason, InitAdapterInspection, InitPlanOptions,
+    ManagedBlockKind, PlanError, inspect_init_targets, managed_adapter_spec_for_path, plan_init,
 };
+use forge_runtime::control::OperationBudget;
 use forge_runtime::fs::NativeFileSystem;
 use forge_runtime::hash::Blake3Hasher;
 use forge_runtime::state::{AtomicStateStore, GitStateLayout, StateError};
@@ -35,6 +37,12 @@ enum AdaptersMode {
     SyncApply,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectionDepth {
+    StatusOnly,
+    PlanAndPreview,
+}
+
 /// A deterministic adapter result plus the internal plan used for human preview output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdaptersOutcome {
@@ -44,6 +52,7 @@ pub(crate) struct AdaptersOutcome {
     previews: Vec<AdapterPreview>,
     mode: AdaptersMode,
     completion: ModelDetectionCompletion,
+    pub(crate) apply_report: Option<ApplyReport>,
 }
 
 /// Read-only adapter facts shared by `doctor` and `next`.
@@ -53,6 +62,68 @@ pub(crate) struct AdapterObservation {
     pub(crate) managed: bool,
     pub(crate) statuses: Vec<AdapterStatusData>,
     pub(crate) changed: bool,
+}
+
+/// A private adapter manifest validated together with its confined state store.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedAdapterState {
+    exists: bool,
+    manifest: Option<AdapterManifest>,
+}
+
+impl ValidatedAdapterState {
+    pub(crate) const fn exists(&self) -> bool {
+        self.exists
+    }
+
+    fn into_manifest(self) -> Option<AdapterManifest> {
+        self.manifest
+    }
+}
+
+/// Typed failure retained for doctor so invalid state still produces a doctor report.
+#[derive(Debug)]
+pub(crate) enum AdapterStateValidationError {
+    State(StateError),
+    Manifest(AdapterManifestError),
+}
+
+impl AdapterStateValidationError {
+    pub(crate) fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::State(error) => crate::state_diagnostic::state_error_exit_code(error),
+            Self::Manifest(AdapterManifestError::Io { kind, .. }) => {
+                crate::state_diagnostic::io_error_kind_exit_code(*kind)
+            }
+            Self::Manifest(
+                AdapterManifestError::InvalidJson { .. }
+                | AdapterManifestError::MissingSchema
+                | AdapterManifestError::UnsupportedSchema { .. }
+                | AdapterManifestError::WrongRepository
+                | AdapterManifestError::DuplicateAdapter
+                | AdapterManifestError::NonCanonicalOrder
+                | AdapterManifestError::InvalidField { .. }
+                | AdapterManifestError::TooLarge,
+            ) => ExitCode::DataError,
+        }
+    }
+}
+
+impl std::fmt::Display for AdapterStateValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::State(error) => write!(formatter, "{error}"),
+            Self::Manifest(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// Read-only safety of the adapter targets selected by a normal unmanaged init.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdapterTargetSafety {
+    Safe { inspected_targets: usize },
+    Unsafe { path: RepoRelativePath },
+    Unknown { reason: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,15 +152,54 @@ struct InspectionOutcome {
 /// An unmanaged repository is not drifted merely because Forge could initialize it.
 pub(crate) fn observe_managed(
     model: &forge_core::ProjectModel,
+    config: Option<&ForgeConfig>,
 ) -> Result<AdapterObservation, AppError> {
-    let Some(manifest) = load_manifest(model)? else {
+    let state =
+        validate_retained_adapter_state(model).map_err(map_adapter_state_validation_error)?;
+    observe_managed_from_validated_state(model, config, &state)
+}
+
+/// Validates the generic private-state boundary and its bounded adapter manifest without writing.
+pub(crate) fn validate_retained_adapter_state(
+    model: &forge_core::ProjectModel,
+) -> Result<ValidatedAdapterState, AdapterStateValidationError> {
+    let layout = GitStateLayout::new(&model.repository.git_dir, &model.repository.git_common_dir);
+    let Some(store) = AtomicStateStore::open_existing_read_only(layout)
+        .map_err(AdapterStateValidationError::State)?
+    else {
+        return Ok(ValidatedAdapterState {
+            exists: false,
+            manifest: None,
+        });
+    };
+    let manifest = load_adapter_manifest(&store, &model.repository.id)
+        .map_err(AdapterStateValidationError::Manifest)?;
+    Ok(ValidatedAdapterState {
+        exists: true,
+        manifest,
+    })
+}
+
+/// Inspects managed targets from an already validated private manifest snapshot.
+pub(crate) fn observe_managed_from_validated_state(
+    model: &forge_core::ProjectModel,
+    config: Option<&ForgeConfig>,
+    state: &ValidatedAdapterState,
+) -> Result<AdapterObservation, AppError> {
+    let Some(manifest) = state.manifest.as_ref() else {
         return Ok(AdapterObservation {
             managed: false,
             statuses: Vec::new(),
             changed: false,
         });
     };
-    let inspected = inspect_adapter_state(model, Some(&manifest), &[])?;
+    let inspected = inspect_adapter_state(
+        model,
+        Some(manifest),
+        &[],
+        config,
+        InspectionDepth::StatusOnly,
+    )?;
     Ok(AdapterObservation {
         managed: true,
         statuses: inspected.statuses,
@@ -97,15 +207,54 @@ pub(crate) fn observe_managed(
     })
 }
 
-pub(crate) fn execute(
+/// Inspects the same automatically selected targets as a default init without treating a missing
+/// managed block as drift or write authorization.
+pub(crate) fn observe_default_target_safety(
+    model: &forge_core::ProjectModel,
+    config: Option<&ForgeConfig>,
+) -> AdapterTargetSafety {
+    let options = InitPlanOptions {
+        adapter_selection: init::adapter_selection_overrides(config),
+        ..InitPlanOptions::default()
+    };
+    match inspect_init_targets(model, &NativeFileSystem, &Blake3Hasher, &options) {
+        Ok(inspection) => AdapterTargetSafety::Safe {
+            inspected_targets: inspection.targets.len(),
+        },
+        Err(PlanError::Read { path, .. }) => AdapterTargetSafety::Unsafe { path },
+        Err(PlanError::AdapterFileLimit { .. } | PlanError::AttributesFileLimit { .. }) => {
+            AdapterTargetSafety::Unknown {
+                reason: "a selected adapter or attributes file exceeded its bounded read limit",
+            }
+        }
+        Err(_) => AdapterTargetSafety::Unknown {
+            reason: "the selected adapter target set could not be completely inspected",
+        },
+    }
+}
+
+pub(crate) fn execute_controlled(
     cli: &Cli,
     args: &AdaptersArgs,
-    cancellation: Arc<AtomicBool>,
+    control: &OperationBudget,
 ) -> Result<AdaptersOutcome, AppError> {
     let (mode, force_values) = request_mode(args)?;
-    let detected = explain::detect(cli, Arc::clone(&cancellation))?;
+    let detected = explain::detect_controlled(cli, control)?;
+    control
+        .checkpoint()
+        .map_err(|error| explain::map_operation_control_error(error, "adapter inspection"))?;
     let manifest = load_manifest(&detected.model)?;
-    let inspected = inspect_adapter_state(&detected.model, manifest.as_ref(), force_values)?;
+    let inspected = inspect_adapter_state(
+        &detected.model,
+        manifest.as_ref(),
+        force_values,
+        detected.navigation.config.as_ref(),
+        if mode == AdaptersMode::Check {
+            InspectionDepth::StatusOnly
+        } else {
+            InspectionDepth::PlanAndPreview
+        },
+    )?;
     let InspectionOutcome {
         options,
         plan,
@@ -132,6 +281,7 @@ pub(crate) fn execute(
             previews,
             mode,
             completion: detected.completion,
+            apply_report: None,
         });
     }
 
@@ -146,16 +296,20 @@ pub(crate) fn execute(
         adapter: options
             .adapters
             .iter()
+            .chain(&options.adopted_adapters)
             .filter_map(|adapter| {
                 (*adapter == AdapterTarget::Claude).then_some(AdapterChoice::Claude)
             })
             .collect(),
         force_block: force_values.to_vec(),
     };
-    let applied = init::execute_with_manifest_precondition(
+    control
+        .checkpoint()
+        .map_err(|error| explain::map_operation_control_error(error, "adapter synchronization"))?;
+    let applied = init::execute_with_manifest_precondition_controlled(
         cli,
         &init_args,
-        cancellation,
+        control,
         init::AdapterManifestPrecondition::Expected(manifest.clone()),
     )
     .map_err(|failure| {
@@ -181,7 +335,7 @@ pub(crate) fn execute(
         )
     })?;
     let statuses = certified_statuses(postcheck_plan, applied_manifest)?;
-    let previews = plan_previews(&applied.plan);
+    let previews = plan_previews(&applied.plan)?;
     Ok(AdaptersOutcome {
         wire: AdaptersData {
             adapters: statuses,
@@ -193,6 +347,7 @@ pub(crate) fn execute(
         previews,
         mode,
         completion: applied.completion,
+        apply_report: applied.apply_report,
     })
 }
 
@@ -200,35 +355,49 @@ fn inspect_adapter_state(
     model: &forge_core::ProjectModel,
     manifest: Option<&AdapterManifest>,
     force_values: &[String],
+    config: Option<&ForgeConfig>,
+    depth: InspectionDepth,
 ) -> Result<InspectionOutcome, AppError> {
-    let options = plan_options(manifest, force_values)?;
+    let options = plan_options(manifest, force_values, config)?;
     let filesystem = NativeFileSystem;
     let hasher = Blake3Hasher;
     let mut inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
         .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
-    let plan = match plan_init(model, &filesystem, &hasher, &options) {
-        Ok(plan) => Some(plan),
-        Err(PlanError::ManagedBlock {
-            source: ManagedBlockError::UserEdited { .. },
-            ..
-        }) => {
-            // Refresh the complete target set after the fail-closed planner observes a conflict.
-            // This avoids collapsing a multi-target check to only the first edited block.
-            inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
-                .map_err(|error| init::map_plan_error_app(error, "adapter drift inspection"))?;
-            None
+    let plan = match depth {
+        InspectionDepth::StatusOnly => None,
+        InspectionDepth::PlanAndPreview => {
+            match plan_init(model, &filesystem, &hasher, &options) {
+                Ok(plan) => Some(plan),
+                Err(PlanError::ManagedBlock {
+                    source: ManagedBlockError::UserEdited { .. },
+                    ..
+                }) => {
+                    // Refresh the complete target set after the fail-closed planner observes a
+                    // conflict. This avoids collapsing a multi-target preview to only the first
+                    // edited block.
+                    inspection = inspect_init_targets(model, &filesystem, &hasher, &options)
+                        .map_err(|error| {
+                            init::map_plan_error_app(error, "adapter drift inspection")
+                        })?;
+                    None
+                }
+                Err(error) => return Err(init::map_plan_error_app(error, "adapter drift plan")),
+            }
         }
-        Err(error) => return Err(init::map_plan_error_app(error, "adapter drift plan")),
     };
     let statuses = classify_inspection(&inspection, manifest, &model.repository.root, &filesystem)?;
-    let previews = inspection_previews(&inspection, &options);
+    let previews = if depth == InspectionDepth::PlanAndPreview {
+        inspection_previews(&inspection, &options)
+    } else {
+        Vec::new()
+    };
     let changed = statuses
         .iter()
         .any(|status| status.drift != AdapterDriftData::NoDrift);
     let user_edited = statuses
         .iter()
         .any(|status| status.drift == AdapterDriftData::UserEdited);
-    if plan.is_none() && !user_edited {
+    if depth == InspectionDepth::PlanAndPreview && plan.is_none() && !user_edited {
         return Err(inspection_changed_error());
     }
 
@@ -274,23 +443,17 @@ fn validate_sync_mode(args: &AdaptersSyncArgs) -> Result<(), AppError> {
 }
 
 fn load_manifest(model: &forge_core::ProjectModel) -> Result<Option<AdapterManifest>, AppError> {
-    let layout = GitStateLayout::new(&model.repository.git_dir, &model.repository.git_common_dir);
-    let Some(store) = AtomicStateStore::open_existing_read_only(layout)
-        .map_err(|error| map_state_error(error, "adapter manifest state"))?
-    else {
-        return Ok(None);
-    };
-    match load_adapter_manifest(&store, &model.repository.id) {
-        Ok(manifest) => Ok(manifest),
-        Err(error) => Err(map_manifest_load_error(error)),
-    }
+    validate_retained_adapter_state(model)
+        .map(ValidatedAdapterState::into_manifest)
+        .map_err(map_adapter_state_validation_error)
 }
 
 fn plan_options(
     manifest: Option<&AdapterManifest>,
     force_values: &[String],
+    config: Option<&ForgeConfig>,
 ) -> Result<InitPlanOptions, AppError> {
-    let mut adapters = BTreeSet::new();
+    let mut adopted_adapters = BTreeSet::new();
     if let Some(manifest) = manifest {
         for entry in manifest.adapters() {
             let path = manifest_entry_path(entry)?;
@@ -300,7 +463,7 @@ fn plan_options(
             if entry.block_id().as_str() == spec.block.id()
                 && matches!(spec.selection, AdapterSelection::ExplicitOrDetected)
             {
-                adapters.insert(spec.target);
+                adopted_adapters.insert(spec.target);
             }
         }
     }
@@ -332,8 +495,12 @@ fn plan_options(
         force_blocks.push(block);
     }
     Ok(InitPlanOptions {
-        adapters: adapters.into_iter().collect(),
+        adapters: Vec::new(),
+        adopted_adapters: adopted_adapters.into_iter().collect(),
+        adapter_selection: init::adapter_selection_overrides(config),
         force_blocks,
+        runner: None,
+        ci: None,
     })
 }
 
@@ -513,17 +680,32 @@ fn inspection_previews(
         .collect()
 }
 
-fn plan_previews(plan: &ChangePlan) -> Vec<AdapterPreview> {
+fn plan_previews(plan: &ChangePlan) -> Result<Vec<AdapterPreview>, AppError> {
     plan.edits
         .iter()
-        .map(|edit| AdapterPreview {
-            kind: edit.kind,
-            reason: edit.reason,
-            path: edit.path.clone(),
-            block_id: ManagedBlockId::new(edit.desired.kind.id()),
-            expected_postimage: edit.expected_postimage.clone(),
-            postimage: edit.preview_postimage.clone(),
-            force_authorized: edit.reason != FileEditReason::UserEdited || edit.force,
+        .map(|edit| {
+            let desired = edit.desired.managed_block().ok_or_else(|| {
+                AppError::internal(
+                    "FGE0228",
+                    "adapter synchronization planned a non-adapter whole-file edit",
+                    "adapters sync --apply",
+                    format!(
+                        "unexpected `{}` target at `{}`",
+                        edit.desired.id(),
+                        edit.path.as_path().display()
+                    ),
+                    format!("report this as a {DISPLAY_NAME} implementation defect"),
+                )
+            })?;
+            Ok(AdapterPreview {
+                kind: edit.kind,
+                reason: edit.reason,
+                path: edit.path.clone(),
+                block_id: ManagedBlockId::new(desired.kind.id()),
+                expected_postimage: edit.expected_postimage.clone(),
+                postimage: edit.preview_postimage.clone(),
+                force_authorized: edit.reason != FileEditReason::UserEdited || edit.force,
+            })
         })
         .collect()
 }
@@ -597,10 +779,20 @@ fn ensure_manifest_is_migratable(
     };
     let mut planned = BTreeSet::new();
     for edit in &plan.edits {
-        planned.insert((
-            edit.path.clone(),
-            ManagedBlockId::new(edit.desired.kind.id()),
-        ));
+        let desired = edit.desired.managed_block().ok_or_else(|| {
+            AppError::internal(
+                "FGE0228",
+                "adapter synchronization planned a non-adapter whole-file edit",
+                "adapter manifest migration",
+                format!(
+                    "unexpected `{}` target at `{}`",
+                    edit.desired.id(),
+                    edit.path.as_path().display()
+                ),
+                format!("report this as a {DISPLAY_NAME} implementation defect"),
+            )
+        })?;
+        planned.insert((edit.path.clone(), ManagedBlockId::new(desired.kind.id())));
     }
     for skipped in &plan.skipped {
         if let Some(satisfied) = &skipped.satisfied_managed {
@@ -735,13 +927,27 @@ fn completion_or(completion: ModelDetectionCompletion, normal: ExitCode) -> Exit
 }
 
 fn map_state_error(error: StateError, location: &str) -> AppError {
-    AppError::environment_unmet(
-        "FGE2220",
-        "Forge private adapter state is unavailable",
-        location,
-        init::sanitize_text(&error.to_string()),
-        "fix the Git private-state path or permissions, then rerun the adapter command",
+    let exit_code = crate::state_diagnostic::state_error_exit_code(&error);
+    AppError::new(
+        exit_code,
+        forge_schema::Diagnostic::new(
+            "FGE2220",
+            forge_schema::Severity::Error,
+            "Forge private adapter state is unavailable",
+            location,
+            init::sanitize_text(&error.to_string()),
+            "fix the Git private-state path or permissions, then rerun the adapter command",
+        ),
     )
+}
+
+fn map_adapter_state_validation_error(error: AdapterStateValidationError) -> AppError {
+    match error {
+        AdapterStateValidationError::State(error) => {
+            map_state_error(error, "adapter manifest state")
+        }
+        AdapterStateValidationError::Manifest(error) => map_manifest_load_error(error),
+    }
 }
 
 fn map_manifest_load_error(error: AdapterManifestError) -> AppError {
@@ -917,7 +1123,9 @@ mod tests {
             repository: repository.clone(),
             model_digest: source_digest.clone(),
             assumptions: Vec::new(),
+            gaps: Vec::new(),
             targets,
+            whole_file_targets: Vec::new(),
             reused_adapters: Vec::new(),
         };
         let manifest =

@@ -5,7 +5,7 @@ use std::fmt;
 
 use forge_core::ports::Hasher;
 use forge_core::{
-    Confidence, EffectivePolicy, EffectivePolicyContent, EvidenceRequirements, PathPattern,
+    Confidence, Digest, EffectivePolicy, EffectivePolicyContent, EvidenceRequirements, PathPattern,
     Provenance, RepoRelativePath, RiskLevel as CoreRiskLevel, RiskRule as CoreRiskRule,
     built_in_policy,
 };
@@ -15,9 +15,9 @@ use crate::config::{ForgeConfig, RiskLevel as ConfigRiskLevel};
 /// Whether the evaluator has a complete authoritative base for same-change relaxation checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyBaseCompleteness {
-    /// An unborn repository has no accepted predecessor, so the built-in policy is authoritative.
+    /// The immutable predecessor policy is known, including an explicitly absent config blob.
     Complete,
-    /// A committed predecessor may contain stricter custom policy that current files cannot prove.
+    /// The immutable predecessor policy could not be read or validated safely.
     Unknown,
 }
 
@@ -26,6 +26,8 @@ pub enum PolicyBaseCompleteness {
 pub struct PolicyResolution {
     pub effective: EffectivePolicyContent,
     pub base_completeness: PolicyBaseCompleteness,
+    /// Digest of built-in policy plus the accepted immutable HEAD policy, never the candidate.
+    pub policy_base_digest: Option<Digest>,
     pub model_policy: EffectivePolicy,
 }
 
@@ -58,21 +60,34 @@ impl fmt::Display for PolicyResolutionError {
 
 impl Error for PolicyResolutionError {}
 
-/// Applies the current configuration as a candidate over the non-weakenable built-in base.
+/// Applies the current configuration as a candidate over the accepted, non-weakenable base.
 ///
-/// `base_completeness` does not change the deterministic lower-bound content. It controls whether
-/// that content may be represented as complete: a committed repository needs an approved base
-/// snapshot that v0 does not yet define, so it remains explicitly unknown.
+/// `base_config` is read from the exact immutable baseline commit. It is first merged over the
+/// built-in minimum; the worktree `candidate_config` is then merged over that accepted result.
+/// When the base is unavailable, the known built-in lower bound remains usable for conservative
+/// navigation, but the policy dependency is explicitly incomplete.
 pub fn resolve_effective_policy(
-    config: Option<&ForgeConfig>,
+    base_config: Option<&ForgeConfig>,
+    candidate_config: Option<&ForgeConfig>,
     config_path: &RepoRelativePath,
     base_completeness: PolicyBaseCompleteness,
     hasher: &dyn Hasher,
 ) -> Result<PolicyResolution, PolicyResolutionError> {
-    let base = built_in_policy().map_err(|_| PolicyResolutionError::BuiltInInvariant)?;
-    let effective = match config {
+    let built_in = built_in_policy().map_err(|_| PolicyResolutionError::BuiltInInvariant)?;
+    let base = match base_config {
         Some(config) => {
-            let candidate = candidate_policy(config, config_path)?;
+            let accepted = configured_policy(config, config_path, PolicyLayer::AcceptedBase)?;
+            EffectivePolicyContent::merge_candidate(&built_in, &accepted)
+        }
+        None => built_in,
+    };
+    let policy_base_digest = match base_completeness {
+        PolicyBaseCompleteness::Complete => Some(base.digest(hasher)),
+        PolicyBaseCompleteness::Unknown => None,
+    };
+    let effective = match candidate_config {
+        Some(config) => {
+            let candidate = configured_policy(config, config_path, PolicyLayer::Candidate)?;
             EffectivePolicyContent::merge_candidate(&base, &candidate)
         }
         None => base,
@@ -83,7 +98,17 @@ pub fn resolve_effective_policy(
         source_range: None,
         detail: String::from("accepted built-in risk and evidence policy is the minimum base"),
     }];
-    if config.is_some() {
+    if base_config.is_some() {
+        provenance.push(Provenance {
+            rule_id: String::from("policy.accepted-head-config.v1"),
+            source_path: Some(config_path.as_path().into()),
+            source_range: None,
+            detail: String::from(
+                "accepted custom policy was read from the exact immutable baseline commit",
+            ),
+        });
+    }
+    if candidate_config.is_some() {
         provenance.push(Provenance {
             rule_id: String::from("policy.candidate-config.v1"),
             source_path: Some(config_path.as_path().into()),
@@ -101,7 +126,7 @@ pub fn resolve_effective_policy(
                 source_path: None,
                 source_range: None,
                 detail: String::from(
-                    "repository has an accepted predecessor, but v0 has no approved custom-policy base contract; prior custom rules cannot be proven absent",
+                    "the immutable predecessor policy could not be read or validated; prior custom rules cannot be proven absent",
                 ),
             });
             Confidence::Unknown
@@ -113,13 +138,21 @@ pub fn resolve_effective_policy(
     Ok(PolicyResolution {
         effective,
         base_completeness,
+        policy_base_digest,
         model_policy,
     })
 }
 
-fn candidate_policy(
+#[derive(Debug, Clone, Copy)]
+enum PolicyLayer {
+    AcceptedBase,
+    Candidate,
+}
+
+fn configured_policy(
     config: &ForgeConfig,
     config_path: &RepoRelativePath,
+    layer: PolicyLayer,
 ) -> Result<EffectivePolicyContent, PolicyResolutionError> {
     let evidence = EvidenceRequirements::new([
         (
@@ -151,12 +184,20 @@ fn candidate_policy(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let provenance = vec![Provenance {
-            rule_id: String::from("policy.candidate-risk.v1"),
+            rule_id: String::from(match layer {
+                PolicyLayer::AcceptedBase => "policy.accepted-head-risk.v1",
+                PolicyLayer::Candidate => "policy.candidate-risk.v1",
+            }),
             source_path: Some(config_path.as_path().into()),
             source_range: None,
-            detail: String::from(
-                "risk rule came from the current validated candidate configuration",
-            ),
+            detail: String::from(match layer {
+                PolicyLayer::AcceptedBase => {
+                    "risk rule came from the validated immutable baseline configuration"
+                }
+                PolicyLayer::Candidate => {
+                    "risk rule came from the current validated candidate configuration"
+                }
+            }),
         }];
         rules.push(
             CoreRiskRule::new(
@@ -210,6 +251,30 @@ mod tests {
     }
 
     #[test]
+    fn policy_resolution_errors_preserve_actionable_context() {
+        for (error, expected) in [
+            (
+                PolicyResolutionError::BuiltInInvariant,
+                "the built-in policy registry is internally invalid",
+            ),
+            (
+                PolicyResolutionError::InvalidCandidateEvidence,
+                "the validated configuration could not form typed evidence policy",
+            ),
+            (
+                PolicyResolutionError::InvalidCandidatePattern,
+                "the validated configuration contains an unsupported risk path pattern",
+            ),
+            (
+                PolicyResolutionError::InvalidCandidateRule,
+                "the validated configuration could not form a typed risk rule",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn absent_config_keeps_builtins_and_requested_base_completeness() -> Result<(), Box<dyn Error>>
     {
         for (completeness, confidence) in [
@@ -217,9 +282,13 @@ mod tests {
             (PolicyBaseCompleteness::Unknown, Confidence::Unknown),
         ] {
             let resolution =
-                resolve_effective_policy(None, &config_path()?, completeness, &PolicyHasher)?;
+                resolve_effective_policy(None, None, &config_path()?, completeness, &PolicyHasher)?;
             assert_eq!(resolution.effective.rules().len(), 9);
             assert_eq!(resolution.base_completeness, completeness);
+            assert_eq!(
+                resolution.policy_base_digest.is_some(),
+                completeness == PolicyBaseCompleteness::Complete
+            );
             assert_eq!(resolution.model_policy.confidence, confidence);
             assert!(resolution.model_policy.digest.is_some());
         }
@@ -240,6 +309,7 @@ external = []
 "#,
         )?;
         let resolution = resolve_effective_policy(
+            None,
             Some(&config),
             &config_path()?,
             PolicyBaseCompleteness::Complete,
@@ -280,6 +350,7 @@ external = ["security-review"]
 "#,
         )?;
         let resolution = resolve_effective_policy(
+            None,
             Some(&config),
             &config_path()?,
             PolicyBaseCompleteness::Complete,
@@ -303,6 +374,147 @@ external = ["security-review"]
                 .for_level(RiskLevel::Medium)
                 .is_some_and(|requirements| requirements.contains("security-scan"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_head_policy_survives_candidate_relaxation_and_deletion()
+    -> Result<(), Box<dyn Error>> {
+        let accepted = parse_forge_config(
+            r#"
+schema = 1
+[evidence.require]
+high = ["accepted-check"]
+[[risk]]
+id = "risk/accepted-custom"
+level = "critical"
+paths = ["protected/**"]
+external = ["owner-review"]
+"#,
+        )?;
+        let relaxed = parse_forge_config(
+            r#"
+schema = 1
+[evidence.require]
+high = []
+[[risk]]
+id = "risk/accepted-custom"
+level = "low"
+paths = ["protected/one-file"]
+external = []
+"#,
+        )?;
+
+        for candidate in [Some(&relaxed), None] {
+            let resolution = resolve_effective_policy(
+                Some(&accepted),
+                candidate,
+                &config_path()?,
+                PolicyBaseCompleteness::Complete,
+                &PolicyHasher,
+            )?;
+            let rule = resolution
+                .effective
+                .rule("risk/accepted-custom")
+                .ok_or("missing accepted custom rule")?;
+            assert_eq!(rule.level(), RiskLevel::Critical);
+            assert!(
+                rule.paths()
+                    .iter()
+                    .any(|pattern| pattern.as_str() == "protected/**")
+            );
+            assert!(rule.external_requirements().contains("owner-review"));
+            assert!(
+                resolution
+                    .effective
+                    .evidence_requirements()
+                    .for_level(RiskLevel::High)
+                    .is_some_and(|requirements| requirements.contains("accepted-check"))
+            );
+            assert_eq!(resolution.model_policy.confidence, Confidence::High);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn policy_base_digest_tracks_only_builtin_and_accepted_head_policy()
+    -> Result<(), Box<dyn Error>> {
+        let accepted = parse_forge_config(
+            r#"
+schema = 1
+[[risk]]
+id = "risk/accepted-a"
+level = "high"
+paths = ["accepted/**"]
+"#,
+        )?;
+        let changed_accepted = parse_forge_config(
+            r#"
+schema = 1
+[[risk]]
+id = "risk/accepted-b"
+level = "critical"
+paths = ["accepted/**"]
+"#,
+        )?;
+        let candidate_a = parse_forge_config(
+            r#"
+schema = 1
+[[risk]]
+id = "risk/candidate-a"
+level = "medium"
+paths = ["candidate/a/**"]
+"#,
+        )?;
+        let candidate_b = parse_forge_config(
+            r#"
+schema = 1
+[[risk]]
+id = "risk/candidate-b"
+level = "critical"
+paths = ["candidate/b/**"]
+"#,
+        )?;
+
+        let first = resolve_effective_policy(
+            Some(&accepted),
+            Some(&candidate_a),
+            &config_path()?,
+            PolicyBaseCompleteness::Complete,
+            &PolicyHasher,
+        )?;
+        let candidate_changed = resolve_effective_policy(
+            Some(&accepted),
+            Some(&candidate_b),
+            &config_path()?,
+            PolicyBaseCompleteness::Complete,
+            &PolicyHasher,
+        )?;
+        let head_changed = resolve_effective_policy(
+            Some(&changed_accepted),
+            Some(&candidate_a),
+            &config_path()?,
+            PolicyBaseCompleteness::Complete,
+            &PolicyHasher,
+        )?;
+        let unknown = resolve_effective_policy(
+            Some(&accepted),
+            Some(&candidate_a),
+            &config_path()?,
+            PolicyBaseCompleteness::Unknown,
+            &PolicyHasher,
+        )?;
+
+        assert_eq!(
+            first.policy_base_digest,
+            candidate_changed.policy_base_digest
+        );
+        assert_ne!(
+            first.model_policy.digest,
+            candidate_changed.model_policy.digest
+        );
+        assert_ne!(first.policy_base_digest, head_changed.policy_base_digest);
+        assert_eq!(unknown.policy_base_digest, None);
         Ok(())
     }
 
@@ -335,12 +547,14 @@ paths = ["z/**"]
 "#,
         )?;
         let first = resolve_effective_policy(
+            None,
             Some(&first),
             &config_path()?,
             PolicyBaseCompleteness::Complete,
             &PolicyHasher,
         )?;
         let second = resolve_effective_policy(
+            None,
             Some(&second),
             &config_path()?,
             PolicyBaseCompleteness::Complete,

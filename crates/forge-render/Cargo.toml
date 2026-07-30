@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 forge-core = { path = "../forge-core" }
+serde_yaml_ng.workspace = true
 
 [lints]
 workspace = true

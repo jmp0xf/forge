@@ -3,13 +3,14 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use forge_core::ports::{FileSystemPort, GitPort, Hasher};
 use forge_core::{
-    BranchHead, BranchOid, CommitId, Confidence, Diagnostic, GitError, GitErrorKind, PathKind,
-    PorcelainV2Status, Provenance, RepoFacts, RepoId, RepoRelativePath, Severity, StatusEntry,
-    UpstreamState, WorkState,
+    BranchHead, BranchOid, CommitId, Confidence, Diagnostic, GitError, GitErrorKind,
+    OperationControl, OperationControlError, PathKind, PorcelainV2Status, Provenance, RepoFacts,
+    RepoId, RepoRelativePath, Severity, StatusEntry, UnlimitedOperationControl, UpstreamState,
+    WorkState,
 };
 
 const REPOSITORY_ID_DOMAIN: &[u8] = b"forge.repository-id/v1";
@@ -30,6 +31,44 @@ pub struct RepositoryDetection {
     pub provenance: Vec<Provenance>,
     pub confidence: Confidence,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Absolute Git path observations resolved once for one repository detection.
+///
+/// Keeping these values together lets callers establish process and private-state boundaries from
+/// the same Git observations later consumed by repository detection. Construction remains behind
+/// the controlled resolvers so relative repository or Git-state paths cannot enter the detection
+/// pipeline.
+///
+/// This value deliberately does not claim operating-system directory identity or continuity. The
+/// v0 repository identity is the native common-dir *path* digest frozen by ADR-0018. Replacing a
+/// root, worktree Git directory, or common Git directory at the same path (including an ABA swap)
+/// is therefore not observable through this type. Re-resolution can still detect a persistent
+/// retarget to different paths and fail closed. Callers that need mutation confinement must pin
+/// directory capabilities at the runtime write boundary; path confirmation is neither an identity
+/// proof nor a substitute for such a capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryTopology {
+    root: PathBuf,
+    git_dir: PathBuf,
+    git_common_dir: PathBuf,
+}
+
+impl RepositoryTopology {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    #[must_use]
+    pub fn git_common_dir(&self) -> &Path {
+        &self.git_common_dir
+    }
 }
 
 impl RepositoryDetection {
@@ -95,19 +134,198 @@ where
     F: FileSystemPort + ?Sized,
     H: Hasher + ?Sized,
 {
-    let root = required_git_step("repository root", git.repository_root(start))?;
-    let git_dir = required_git_step("worktree Git directory", git.git_dir(&root))?;
-    let git_common_dir = required_git_step("common Git directory", git.git_common_dir(&root))?;
-    if !git_common_dir.is_absolute() {
+    detect_repository_controlled(start, git, filesystem, hasher, &UnlimitedOperationControl)
+}
+
+/// Detects repository facts under one caller-owned operation deadline.
+pub fn detect_repository_controlled<G, F, H>(
+    start: &Path,
+    git: &G,
+    filesystem: &F,
+    hasher: &H,
+    control: &dyn OperationControl,
+) -> Result<RepositoryDetection, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+    F: FileSystemPort + ?Sized,
+    H: Hasher + ?Sized,
+{
+    let topology = resolve_repository_topology_controlled(start, git, control)?;
+    detect_repository_from_topology_controlled(topology, git, filesystem, hasher, control)
+}
+
+/// Resolves the repository root and both Git state directories under one caller-owned deadline.
+pub fn resolve_repository_topology_controlled<G>(
+    start: &Path,
+    git: &G,
+    control: &dyn OperationControl,
+) -> Result<RepositoryTopology, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+{
+    control_step("repository root", control)?;
+    let root = require_absolute_topology_path(
+        "repository root",
+        "repository-root",
+        required_git_step("repository root", git.repository_root(start))?,
+    )?;
+    resolve_repository_topology_from_root_controlled(root, git, control)
+}
+
+/// Resolves both Git state directories for an already resolved repository root.
+///
+/// This entry point preserves callers that must establish a root-scoped process boundary before
+/// querying repository-private state, while avoiding a second `repository_root` Git invocation.
+pub fn resolve_repository_topology_from_root_controlled<G>(
+    root: PathBuf,
+    git: &G,
+    control: &dyn OperationControl,
+) -> Result<RepositoryTopology, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+{
+    let root = require_absolute_topology_path("repository root", "repository-root", root)?;
+    control_step("worktree Git directory", control)?;
+    let git_dir = require_absolute_topology_path(
+        "worktree Git directory",
+        "git-dir",
+        required_git_step("worktree Git directory", git.git_dir(&root))?,
+    )?;
+    control_step("common Git directory", control)?;
+    let git_common_dir = require_absolute_topology_path(
+        "common Git directory",
+        "git-common-dir",
+        required_git_step("common Git directory", git.git_common_dir(&root))?,
+    )?;
+    Ok(RepositoryTopology {
+        root,
+        git_dir,
+        git_common_dir,
+    })
+}
+
+/// Confirms all three retained Git paths immediately before a model is returned.
+///
+/// A persistent root, worktree Git directory, or common Git directory retarget fails closed. The
+/// comparison intentionally exposes neither expected nor observed paths in its error. Equal paths
+/// do not prove equal directory objects, and a same-path replacement or ABA remains outside this
+/// path-based v0 boundary.
+pub(crate) fn confirm_repository_topology_controlled<G>(
+    expected: &RepositoryTopology,
+    git: &G,
+    control: &dyn OperationControl,
+) -> Result<(), RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+{
+    control_step("repository root", control)?;
+    let root = require_absolute_topology_path(
+        "repository root",
+        "repository-root",
+        confirmed_git_path(
+            "repository root",
+            "repository-root",
+            git.repository_root(expected.root()),
+        )?,
+    )?;
+    if root != expected.root {
+        return Err(changed_topology_error("repository root", "repository-root"));
+    }
+
+    control_step("worktree Git directory", control)?;
+    let git_dir = require_absolute_topology_path(
+        "worktree Git directory",
+        "git-dir",
+        confirmed_git_path("worktree Git directory", "git-dir", git.git_dir(&root))?,
+    )?;
+    if git_dir != expected.git_dir {
+        return Err(changed_topology_error("worktree Git directory", "git-dir"));
+    }
+
+    control_step("common Git directory", control)?;
+    let git_common_dir = require_absolute_topology_path(
+        "common Git directory",
+        "git-common-dir",
+        confirmed_git_path(
+            "common Git directory",
+            "git-common-dir",
+            git.git_common_dir(&root),
+        )?,
+    )?;
+    if git_common_dir != expected.git_common_dir {
+        return Err(changed_topology_error(
+            "common Git directory",
+            "git-common-dir",
+        ));
+    }
+    Ok(())
+}
+
+fn changed_topology_error(step: &'static str, command: &'static str) -> RepositoryDetectionError {
+    RepositoryDetectionError {
+        step,
+        source: GitError::new(
+            GitErrorKind::InvalidData,
+            command,
+            format!("Git returned a different {step} during final path confirmation"),
+        ),
+    }
+}
+
+fn confirmed_git_path(
+    step: &'static str,
+    command: &'static str,
+    result: Result<PathBuf, GitError>,
+) -> Result<PathBuf, RepositoryDetectionError> {
+    result.map_err(|source| RepositoryDetectionError {
+        step,
+        source: GitError::new(
+            source.kind(),
+            command,
+            format!(
+                "Git path confirmation failed during {step} with {:?}",
+                source.kind()
+            ),
+        ),
+    })
+}
+
+fn require_absolute_topology_path(
+    step: &'static str,
+    command: &'static str,
+    path: PathBuf,
+) -> Result<PathBuf, RepositoryDetectionError> {
+    if !path.is_absolute() {
         return Err(RepositoryDetectionError {
-            step: "common Git directory",
+            step,
             source: GitError::new(
                 GitErrorKind::InvalidData,
-                "git-common-dir",
-                "Git returned a non-absolute common directory",
+                command,
+                format!("Git returned a non-absolute path for {step}"),
             ),
         });
     }
+    Ok(path)
+}
+
+/// Detects repository facts from Git locations already resolved by a controlled topology resolver.
+pub fn detect_repository_from_topology_controlled<G, F, H>(
+    topology: RepositoryTopology,
+    git: &G,
+    filesystem: &F,
+    hasher: &H,
+    control: &dyn OperationControl,
+) -> Result<RepositoryDetection, RepositoryDetectionError>
+where
+    G: GitPort + ?Sized,
+    F: FileSystemPort + ?Sized,
+    H: Hasher + ?Sized,
+{
+    let RepositoryTopology {
+        root,
+        git_dir,
+        git_common_dir,
+    } = topology;
     let id = derive_repository_id(&git_common_dir, hasher);
     let is_linked_worktree = git_dir != git_common_dir;
 
@@ -131,6 +349,7 @@ where
     ];
     let mut diagnostics = Vec::new();
 
+    control_step("Git status", control)?;
     let (status, status_failure_state) = match git.status(&root) {
         Ok(status) => (Some(status), None),
         Err(error) if error.kind() == GitErrorKind::CorruptRepository => {
@@ -153,6 +372,8 @@ where
             });
         }
     };
+
+    control_step("repository fact assembly", control)?;
 
     let (head, branch, upstream, work_state, status_confidence) =
         if let Some(status) = status.as_ref() {
@@ -197,6 +418,27 @@ where
         confidence: status_confidence,
         diagnostics,
     })
+}
+
+fn control_step(
+    step: &'static str,
+    control: &dyn OperationControl,
+) -> Result<(), RepositoryDetectionError> {
+    control
+        .checkpoint()
+        .map(|_| ())
+        .map_err(|error| RepositoryDetectionError {
+            step,
+            source: operation_control_git_error(step, error),
+        })
+}
+
+fn operation_control_git_error(step: &'static str, error: OperationControlError) -> GitError {
+    let kind = match error {
+        OperationControlError::TimedOut => GitErrorKind::TimedOut,
+        OperationControlError::Interrupted => GitErrorKind::Interrupted,
+    };
+    GitError::new(kind, step, error.to_string())
 }
 
 #[cfg(unix)]
@@ -423,20 +665,25 @@ fn status_diagnostic(root: &Path, state: WorkState, kind: GitErrorKind) -> Diagn
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use forge_core::ports::{FileSystemPort, GitPort, Hasher};
     use forge_core::{
         BoundedText, Digest, GitError, GitErrorKind, GitFileSet, GitObjectFormat, Inventory,
         InventoryError, InventoryOptions, PathKind, PorcelainV2Status, RepoRelativePath,
-        parse_status_porcelain_v2,
+        UnlimitedOperationControl, parse_status_porcelain_v2,
     };
 
     use super::{
-        Confidence, OperationState, WorkState, classify_work_state, derive_repository_id,
-        detect_repository,
+        Confidence, OperationState, WorkState, classify_work_state,
+        confirm_repository_topology_controlled, derive_repository_id, detect_repository,
+        detect_repository_from_topology_controlled, resolve_repository_topology_controlled,
     };
+    use crate::test_support::{absolute_path, repository_path, repository_root};
 
     #[derive(Debug)]
     struct RecordingHasher {
@@ -477,33 +724,104 @@ mod tests {
         git_dir: Result<PathBuf, GitError>,
         common_dir: Result<PathBuf, GitError>,
         status: Result<PorcelainV2Status, GitError>,
+        calls: RefCell<Vec<&'static str>>,
     }
 
     impl MockGit {
         fn with_status(status: Result<PorcelainV2Status, GitError>) -> Self {
             Self {
-                root: Ok(PathBuf::from("/repo")),
-                git_dir: Ok(PathBuf::from("/repo/.git")),
-                common_dir: Ok(PathBuf::from("/repo/.git")),
+                root: Ok(repository_root().to_path_buf()),
+                git_dir: Ok(repository_path(".git")),
+                common_dir: Ok(repository_path(".git")),
                 status,
+                calls: RefCell::new(Vec::new()),
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReplaceableTopologyPaths {
+        base: PathBuf,
+        root: PathBuf,
+        git_dir: PathBuf,
+        git_common_dir: PathBuf,
+    }
+
+    impl ReplaceableTopologyPaths {
+        fn new() -> io::Result<Self> {
+            static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+            let temporary_root = std::env::temp_dir();
+            let base = loop {
+                let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+                let candidate = temporary_root.join(format!(
+                    "forge-detect-topology-paths-{}-{sequence}",
+                    process::id()
+                ));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            let root = base.join("root");
+            let git_dir = base.join("worktree-git-dir");
+            let git_common_dir = base.join("common-git-dir");
+            let fixture = Self {
+                base,
+                root,
+                git_dir,
+                git_common_dir,
+            };
+            for path in [&fixture.root, &fixture.git_dir, &fixture.git_common_dir] {
+                fs::create_dir(path)?;
+            }
+            Ok(fixture)
+        }
+
+        fn replace_every_visible_directory(&self) -> io::Result<()> {
+            for (name, visible) in [
+                ("root", &self.root),
+                ("worktree-git-dir", &self.git_dir),
+                ("common-git-dir", &self.git_common_dir),
+            ] {
+                let displaced = self.base.join(format!("displaced-{name}"));
+                fs::rename(visible, &displaced)?;
+                fs::create_dir(visible)?;
+                if !displaced.is_dir() || !visible.is_dir() {
+                    return Err(io::Error::other(
+                        "topology replacement fixture did not retain both directory objects",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ReplaceableTopologyPaths {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.base));
         }
     }
 
     impl GitPort for MockGit {
         fn repository_root(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            self.calls.borrow_mut().push("repository-root");
             self.root.clone()
         }
 
         fn git_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            self.calls.borrow_mut().push("git-dir");
             self.git_dir.clone()
         }
 
         fn git_common_dir(&self, _start: &Path) -> Result<PathBuf, GitError> {
+            self.calls.borrow_mut().push("git-common-dir");
             self.common_dir.clone()
         }
 
         fn status(&self, _root: &Path) -> Result<PorcelainV2Status, GitError> {
+            self.calls.borrow_mut().push("status");
             self.status.clone()
         }
 
@@ -614,9 +932,9 @@ mod tests {
 
     #[test]
     fn repository_identity_is_equal_only_for_the_same_common_dir() {
-        let first = derive_repository_id(Path::new("/repo/.git"), &InputSensitiveHasher);
-        let repeated = derive_repository_id(Path::new("/repo/.git"), &InputSensitiveHasher);
-        let other = derive_repository_id(Path::new("/other/.git"), &InputSensitiveHasher);
+        let first = derive_repository_id(&repository_path(".git"), &InputSensitiveHasher);
+        let repeated = derive_repository_id(&repository_path(".git"), &InputSensitiveHasher);
+        let other = derive_repository_id(&absolute_path("other/.git"), &InputSensitiveHasher);
 
         assert_eq!(first, repeated);
         assert_ne!(first, other);
@@ -629,7 +947,7 @@ mod tests {
         let git = MockGit::with_status(Ok(status.clone()));
 
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -648,17 +966,17 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let main = MockGit::with_status(Ok(committed_status(b"")?));
         let mut linked = MockGit::with_status(Ok(committed_status(b"")?));
-        linked.root = Ok(PathBuf::from("/repo-linked"));
-        linked.git_dir = Ok(PathBuf::from("/repo/.git/worktrees/repo-linked"));
+        linked.root = Ok(absolute_path("repo-linked"));
+        linked.git_dir = Ok(repository_path(".git/worktrees/repo-linked"));
 
         let main_detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &main,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
         )?;
         let linked_detection = detect_repository(
-            Path::new("/repo-linked"),
+            &absolute_path("repo-linked"),
             &linked,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -667,6 +985,138 @@ mod tests {
         assert!(!main_detection.facts.is_linked_worktree);
         assert!(linked_detection.facts.is_linked_worktree);
         assert_eq!(main_detection.facts.id, linked_detection.facts.id);
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_linked_worktree_topology_is_reused_without_location_requeries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+        let linked_root = absolute_path("repo-linked");
+        let linked_git_dir = repository_path(".git/worktrees/repo-linked");
+        let common_dir = repository_path(".git");
+        git.root = Ok(linked_root.clone());
+        git.git_dir = Ok(linked_git_dir.clone());
+
+        let topology =
+            resolve_repository_topology_controlled(&linked_root, &git, &UnlimitedOperationControl)?;
+
+        assert_eq!(topology.root(), linked_root);
+        assert_eq!(topology.git_dir(), linked_git_dir);
+        assert_eq!(topology.git_common_dir(), common_dir);
+        assert_eq!(
+            git.calls.borrow().as_slice(),
+            ["repository-root", "git-dir", "git-common-dir"]
+        );
+        git.calls.borrow_mut().clear();
+
+        let detection = detect_repository_from_topology_controlled(
+            topology,
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+            &UnlimitedOperationControl,
+        )?;
+
+        assert_eq!(git.calls.borrow().as_slice(), ["status"]);
+        assert_eq!(detection.facts.root, linked_root);
+        assert_eq!(detection.facts.git_dir, linked_git_dir);
+        assert_eq!(detection.facts.git_common_dir, common_dir);
+        assert!(detection.facts.is_linked_worktree);
+        assert_eq!(
+            detection.facts.id,
+            derive_repository_id(&repository_path(".git"), &InputSensitiveHasher)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn path_confirmation_is_not_identity_proof_across_same_path_directory_replacements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ReplaceableTopologyPaths::new()?;
+        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+        git.root = Ok(fixture.root.clone());
+        git.git_dir = Ok(fixture.git_dir.clone());
+        git.common_dir = Ok(fixture.git_common_dir.clone());
+        let topology = resolve_repository_topology_controlled(
+            &fixture.root,
+            &git,
+            &UnlimitedOperationControl,
+        )?;
+
+        // Rename preserves each old object under a second name while create_dir installs a
+        // distinct object at the same visible path. RepositoryTopology intentionally has no OS
+        // identity/capability field, so this is a contract test for its explicit limitation, not
+        // a claim that same-principal replacement races are detected.
+        fixture.replace_every_visible_directory()?;
+        git.calls.borrow_mut().clear();
+
+        confirm_repository_topology_controlled(&topology, &git, &UnlimitedOperationControl)?;
+        assert_eq!(
+            git.calls.borrow().as_slice(),
+            ["repository-root", "git-dir", "git-common-dir"]
+        );
+        git.calls.borrow_mut().clear();
+
+        let detection = detect_repository_from_topology_controlled(
+            topology,
+            &git,
+            &MarkerFileSystem::default(),
+            &InputSensitiveHasher,
+            &UnlimitedOperationControl,
+        )?;
+
+        assert_eq!(git.calls.borrow().as_slice(), ["status"]);
+        assert_eq!(detection.facts.root, fixture.root);
+        assert_eq!(detection.facts.git_dir, fixture.git_dir);
+        assert_eq!(detection.facts.git_common_dir, fixture.git_common_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn path_confirmation_redacts_git_failure_details() -> Result<(), Box<dyn std::error::Error>> {
+        for (field, expected_step, expected_calls) in [
+            ("root", "repository root", vec!["repository-root"]),
+            (
+                "git-dir",
+                "worktree Git directory",
+                vec!["repository-root", "git-dir"],
+            ),
+            (
+                "common-dir",
+                "common Git directory",
+                vec!["repository-root", "git-dir", "git-common-dir"],
+            ),
+        ] {
+            let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+            let topology = resolve_repository_topology_controlled(
+                repository_root(),
+                &git,
+                &UnlimitedOperationControl,
+            )?;
+            let failure = GitError::new(
+                GitErrorKind::Io,
+                "fixture-path-query",
+                format!("private-{field}-path-and-detail"),
+            );
+            match field {
+                "root" => git.root = Err(failure),
+                "git-dir" => git.git_dir = Err(failure),
+                "common-dir" => git.common_dir = Err(failure),
+                _ => unreachable!(),
+            }
+            git.calls.borrow_mut().clear();
+
+            let error =
+                confirm_repository_topology_controlled(&topology, &git, &UnlimitedOperationControl)
+                    .err()
+                    .ok_or("failed Git path confirmation unexpectedly succeeded")?;
+
+            assert_eq!(error.step(), expected_step);
+            assert_eq!(error.source_error().kind(), GitErrorKind::Io);
+            assert!(!error.to_string().contains("private-"));
+            assert_eq!(git.calls.borrow().as_slice(), expected_calls);
+        }
         Ok(())
     }
 
@@ -685,7 +1135,7 @@ mod tests {
         let hasher = RecordingHasher::returning("blake3:non-utf8");
 
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &hasher,
@@ -728,24 +1178,37 @@ mod tests {
     }
 
     #[test]
-    fn repository_detection_rejects_a_relative_common_dir_before_hashing()
+    fn repository_detection_rejects_relative_topology_paths_before_hashing()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut git = MockGit::with_status(Ok(committed_status(b"")?));
-        git.common_dir = Ok(PathBuf::from(".git"));
-        let hasher = RecordingHasher::returning("blake3:must-not-be-used");
+        for (field, expected_step) in [
+            ("root", "repository root"),
+            ("git-dir", "worktree Git directory"),
+            ("common-dir", "common Git directory"),
+        ] {
+            let mut git = MockGit::with_status(Ok(committed_status(b"")?));
+            let rejected_path = format!("private-{field}-path");
+            match field {
+                "root" => git.root = Ok(PathBuf::from(&rejected_path)),
+                "git-dir" => git.git_dir = Ok(PathBuf::from(&rejected_path)),
+                "common-dir" => git.common_dir = Ok(PathBuf::from(&rejected_path)),
+                _ => unreachable!(),
+            }
+            let hasher = RecordingHasher::returning("blake3:must-not-be-used");
 
-        let error = detect_repository(
-            Path::new("/repo"),
-            &git,
-            &MarkerFileSystem::default(),
-            &hasher,
-        )
-        .err()
-        .ok_or("relative common directory unexpectedly produced facts")?;
+            let error = detect_repository(
+                repository_root(),
+                &git,
+                &MarkerFileSystem::default(),
+                &hasher,
+            )
+            .err()
+            .ok_or("relative repository topology unexpectedly produced facts")?;
 
-        assert_eq!(error.step(), "common Git directory");
-        assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
-        assert!(hasher.calls.borrow().is_empty());
+            assert_eq!(error.step(), expected_step);
+            assert_eq!(error.source_error().kind(), GitErrorKind::InvalidData);
+            assert!(!error.to_string().contains(&rejected_path));
+            assert!(hasher.calls.borrow().is_empty());
+        }
         Ok(())
     }
 
@@ -753,16 +1216,16 @@ mod tests {
     fn assembles_clean_linked_worktree_facts_with_git_provenance()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut git = MockGit::with_status(Ok(committed_status(b"")?));
-        git.git_dir = Ok(PathBuf::from("/repo/.git/worktrees/linked"));
+        git.git_dir = Ok(repository_path(".git/worktrees/linked"));
         let detection = detect_repository(
-            Path::new("/repo/subdir"),
+            &repository_path("subdir"),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
         )?;
 
         assert!(detection.facts.id.as_str().starts_with("local:"));
-        assert_eq!(detection.facts.root, Path::new("/repo"));
+        assert_eq!(detection.facts.root, repository_root());
         assert!(detection.facts.is_linked_worktree);
         assert!(detection.facts.head.is_some());
         assert_eq!(detection.facts.branch.as_deref(), Some("main"));
@@ -832,7 +1295,7 @@ mod tests {
         };
 
         let detection =
-            detect_repository(Path::new("/repo"), &git, &filesystem, &InputSensitiveHasher)?;
+            detect_repository(repository_root(), &git, &filesystem, &InputSensitiveHasher)?;
 
         assert_eq!(detection.facts.work_state, WorkState::Unknown);
         assert_eq!(detection.confidence, Confidence::Unknown);
@@ -849,7 +1312,7 @@ mod tests {
             "bounded test failure",
         )));
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &corrupt,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -863,7 +1326,7 @@ mod tests {
             "bounded test failure",
         )));
         let error = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &timeout,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -883,7 +1346,7 @@ mod tests {
         let git = MockGit::with_status(Ok(parsed_status(&input)?));
 
         let detection = detect_repository(
-            Path::new("/repo"),
+            repository_root(),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,
@@ -909,7 +1372,7 @@ mod tests {
         ));
 
         let error = detect_repository(
-            Path::new("/outside"),
+            &absolute_path("outside"),
             &git,
             &MarkerFileSystem::default(),
             &InputSensitiveHasher,

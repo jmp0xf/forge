@@ -18,15 +18,16 @@ impl RepoRelativePath {
 
     pub fn new(path: impl AsRef<Path>) -> Result<Self, RelativePathError> {
         let path = path.as_ref();
-        if contains_nul(path.as_os_str()) {
-            return Err(RelativePathError::Nul);
-        }
+        Self::validate(path)?;
 
         let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
                 Component::CurDir => {}
                 Component::Normal(value) => normalized.push(value),
+                // Keep construction defensive even though `validate` just checked the same
+                // components. A future validation refactor must not turn malformed input into a
+                // production panic.
                 Component::ParentDir => return Err(RelativePathError::ParentTraversal),
                 Component::RootDir | Component::Prefix(_) => {
                     return Err(RelativePathError::Absolute);
@@ -37,6 +38,28 @@ impl RepoRelativePath {
             normalized.push(".");
         }
         Ok(Self(normalized))
+    }
+
+    /// Validates the repository-relative lexical contract without allocating a normalized path.
+    ///
+    /// Inventory classifiers use this when most paths will not be retained as typed values.
+    pub fn validate(path: impl AsRef<Path>) -> Result<(), RelativePathError> {
+        let path = path.as_ref();
+        if contains_nul(path.as_os_str()) {
+            return Err(RelativePathError::Nul);
+        }
+
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(_) => {}
+                Component::ParentDir => return Err(RelativePathError::ParentTraversal),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(RelativePathError::Absolute);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -54,6 +77,36 @@ impl AsRef<Path> for RepoRelativePath {
     fn as_ref(&self) -> &Path {
         self.as_path()
     }
+}
+
+/// Projects one native repository-relative path into the portable UTF-8 grammar used by
+/// configuration patterns and generated text.
+///
+/// Native paths remain authoritative for filesystem access, wire round-trips, and evidence
+/// fingerprints. This projection changes only separators: each native normal component is joined
+/// with `/`, while absolute, parent-traversing, and non-UTF-8 paths fail closed. The repository
+/// root is represented as `.`.
+#[must_use]
+pub fn portable_relative_utf8_path(path: &Path) -> Option<String> {
+    let mut rendered = String::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => {
+                let component = component.to_str()?;
+                if !rendered.is_empty() {
+                    rendered.push('/');
+                }
+                rendered.push_str(component);
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(if rendered.is_empty() {
+        String::from(".")
+    } else {
+        rendered
+    })
 }
 
 /// A lexical repository-relative path violation.
@@ -88,9 +141,9 @@ fn contains_nul(value: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{RelativePathError, RepoRelativePath};
+    use super::{RelativePathError, RepoRelativePath, portable_relative_utf8_path};
 
     #[test]
     fn root_and_normal_paths_are_normalized() -> Result<(), RelativePathError> {
@@ -111,6 +164,19 @@ mod tests {
         assert_eq!(
             RepoRelativePath::new("/outside"),
             Err(RelativePathError::Absolute)
+        );
+    }
+
+    #[test]
+    fn portable_projection_joins_native_components_with_forward_slashes() {
+        let native = PathBuf::from_iter([".github", "workflows", "verify.yml"]);
+        assert_eq!(
+            portable_relative_utf8_path(&native).as_deref(),
+            Some(".github/workflows/verify.yml")
+        );
+        assert_eq!(
+            portable_relative_utf8_path(Path::new(".")).as_deref(),
+            Some(".")
         );
     }
 }

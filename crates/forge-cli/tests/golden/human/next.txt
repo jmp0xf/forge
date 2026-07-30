@@ -1,0 +1,6 @@
+state: idle
+action: none
+reason: no worktree or branch changes require navigation
+risk: unknown
+assumption: Configured check input patterns are validated, but v0 conservatively fingerprints the complete repository scope.
+assumption: risk classification is unknown because no changed paths were supplied

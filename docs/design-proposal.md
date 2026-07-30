@@ -229,7 +229,7 @@ Forge 成功不是“功能越来越多”，而是：
 | `INV-NO-SELF-WEAKENING` | 策略变更不得用修改后的宽松策略评价自己 | base/candidate policy 测试 |
 | `INV-NATIVE-PATHS` | Git 路径不得因非 UTF-8、空格或换行丢失 | Unix 原始字节 fixture；Windows wide path fixture |
 | `INV-PROCESS-TREE-TERMINATION` | 超时和取消后无遗留子孙进程 | 跨平台进程树测试 |
-| `INV-BOUNDED-OUTPUT` | 内存和终端输出有上限；完整日志外置并可引用 | huge-output fixture |
+| `INV-BOUNDED-OUTPUT` | 内存保留、spool 和终端呈现有上限；v0 Forge-managed 状态不持久化 stdout/stderr 内容 | huge-output 与隐私哨兵 fixture |
 | `INV-UNKNOWN-IS-NOT-PASS` | 证据不足必须标记 unknown/not-verified，不得冒充通过 | doctor/evidence 测试 |
 
 这些不变量比某个性能数字、文件行数或风险阈值更稳定。实现冲突时，优先保护不变量。
@@ -364,7 +364,7 @@ pub const SCHEMA_NAMESPACE: &str = "forge";
 | worktree 私有状态 | `git rev-parse --git-dir` 返回目录下的 `forge/` |
 | 可共享只读缓存 | `git rev-parse --git-common-dir` 下的 `forge/cache/` |
 | 用户级语言包或默认 | XDG/平台标准配置目录 |
-| 完整本地日志 | worktree 私有 Git 目录；CI 使用 artifact 系统 |
+| 可选 typed 日志对象 | 调用前已按 typed 策略脱敏后进入 worktree 私有 Git 目录；v0 无生产 writer |
 | 保留测试、签名与最终晋升 | 候选不可修改的外部系统 |
 
 不得生成：
@@ -564,7 +564,7 @@ forge improve   # v0 不实现
 --color auto|always|never
 -q, --quiet
 -v, --verbose                可叠加
---timeout <DURATION>
+--timeout <DURATION>          整条 Forge 命令共享的 wall-clock 总预算
 --config <PATH>
 --no-cache
 ```
@@ -581,7 +581,7 @@ forge improve   # v0 不实现
 - stderr 放进度、警告和面向人的诊断；
 - `--json` 时 stdout 不得混入日志、颜色、进度或子进程噪声；
 - 成功的只读命令尽量安静；
-- 子进程输出有界，完整日志外置并返回引用；
+- 子进程双流并发排空；内存保留、临时 spool 和终端呈现有界，并记录完整观察事实或 unavailable；
 - human 与 JSON 由同一份结构化 `Diagnostic` 渲染，语义一致。
 
 ### 8.2 JSON 信封
@@ -791,9 +791,12 @@ pub trait ProcessPort { /* argv run, timeout, cancel, kill tree */ }
 pub trait StateStore { /* load, save, lock, gc */ }
 pub trait Clock { fn now(&self) -> SystemTime; }
 pub trait Hasher { /* streaming digest */ }
+pub trait OperationControl { /* one fixed command deadline, remaining budget, cancellation */ }
 ```
 
 测试只替换这些外部端口，不 mock 风险、状态机和证据充分性等业务逻辑。
+`--timeout` 在命令入口只构造一次 `OperationControl`；后续 Git、inventory、Provider、scope、状态和
+子进程只能消费 remaining budget，不能用剩余 duration 创建新 deadline。
 
 ---
 
@@ -928,6 +931,9 @@ external = ["owner-review", "protected-ci"]
 - 配置变化使相关 ProjectModel、Receipt 和 Evidence 失效；
 - 配置本身属于高风险路径，因为它能影响评价策略。
 
+`max_log_file_bytes` 只限制可选、调用前已脱敏日志对象的读取、写入和 GC，不启用日志捕获；v0 没有
+生产日志 writer。
+
 ### 11.2 私有状态布局
 
 ```text
@@ -937,11 +943,12 @@ external = ["owner-review", "protected-ci"]
 ├── generated-v1.json
 ├── doctor-v1.json
 ├── receipts/
-│   └── <ulid>.json
+│   ├── v1/<digest>.json         # legacy read-only
+│   └── v2/<digest>.json         # current immutable
 ├── evidence/
-│   └── <evidence-id>.json
-└── logs/
-    └── <run-id>/
+│   ├── v1/<digest>.json         # legacy read-only
+│   └── v2/<digest>.json         # current immutable
+└── logs/v1/<digest>.log         # optional typed object; v0 无生产 writer
 
 <git-common-dir>/forge/cache/
 ├── inventory/
@@ -952,14 +959,16 @@ external = ["owner-review", "protected-ci"]
 
 状态要求：
 
-- 全部带 Schema；
+- Receipt、Evidence 和其他结构化状态带 Schema；日志对象以完整内容寻址，不伪装成 JSON 信封；
 - 使用独占文件锁；
 - 临时文件 + fsync + 原子 rename；
 - 读取未来 Schema 时返回 65 或 2，并给出升级/删除可再生状态的指引；
-- 损坏状态可以安全删除重建，不影响项目；
+- malformed、冲突或未知状态安全失败并保留字节；只有确认可再生且已备份时才按诊断指引恢复，不把
+  损坏状态当成不存在；
 - state 不进入 Git，不成为权威资产；
-- 日志和 Receipt 有数量、时间和总字节 GC 策略；
-- GC 不删除仍被 Evidence 引用的对象。
+- Receipt、Evidence 和可选 typed 日志对象有扫描、对象与总字节上限；current Receipt/Evidence 按数量
+  和时间保留，日志按引用闭包保留，legacy Receipt/Evidence 永不由 GC 删除；
+- GC 不删除仍被保留 Evidence 引用的 Receipt，或仍被保留 Receipt/Evidence 引用的日志。
 
 ### 11.3 缓存键
 
@@ -984,6 +993,18 @@ repository identity
 - source/confidence 为 unknown 的命令；
 - 用户要求 `--fresh` / `--no-cache`；
 - 未能获得可靠作用域摘要的结果。
+
+v0 的 shared inventory cache 采用更窄的专用键：repository identity、HEAD、inventory
+边界、effective policy、平台、Forge behavior，加上当前普通 Git index 的语义投影
+`(mode, blob object id, native relative path)`。raw index bytes 只用于在 status/index 读取前后
+检测竞态，不进入跨 linked-worktree 的共享键，因为其中含 checkout 本地 stat 数据。缓存值只含
+固定形状的资格证明（Schema、包含 behavior 的 key、平台、规则、index 语义投影、条目数和 payload digest），
+不含路径或 worktree 本地 size；命中时 inventory 与 file set 必须完全由当前 typed stage-zero index
+在同一趟校验中重建，并再次确认 raw index 未变化。旧 Schema/behavior 的缓存自然 miss。split index、
+`index.lock`、symlink/reparse、未严格排序或重复路径的 typed index、非普通 index、
+Gitlink、unmerged、sparse/skip-worktree、assume-unchanged、untracked，或 bounded Git 读取所暴露的
+状态不在明确允许的普通 stage-zero 子集内，均回退到权威 inventory。只读命令的 miss 不发布；
+只有已成功的授权状态写入才能顺带发布不可变条目。
 
 ### 11.4 并发
 
@@ -1087,6 +1108,27 @@ Taskfile.yml / Taskfile.yaml
 项目已有标准脚本
 ```
 
+v0 对“标准脚本”采用可审计的窄边界，不按相似名称猜测：只识别仓库根
+`scripts/`、`tools/`、`hack/` 的直接子项；可选扩展名为
+`sh/bash/zsh/fish/py/rb/pl/js/ps1/cmd/bat`；文件 stem 到 intent 的映射为：
+
+| intent | 精确 stem |
+|---|---|
+| setup | `setup`、`bootstrap` |
+| format-check | `format-check`、`fmt-check` |
+| format | `format`、`fmt` |
+| check | `check`、`lint` |
+| fix | `fix` |
+| test | `test` |
+| verify | `verify`、`ci` |
+| build | `build` |
+
+名称只定位 intent，不决定解释器。v0 只有在文本首行精确为
+`#!/usr/bin/env <portable-program-name>` 时才把它规范化成等价的
+`<portable-program-name> <repo-relative-script-path>` argv；缺失、截断、二进制、控制参数、
+绝对解释器或其它不可移植 shebang 只令该脚本对应的 intent 为 unknown，不污染其它 intent，
+也不执行脚本。显式配置仍可覆盖同一 intent 的 unknown。
+
 v0 不解析任意 CI shell 以反推命令；CI 仅作为“项目是否已经使用某入口”的补充证据。
 
 ### 13.2 ExistingProjectTarget 是不透明接口
@@ -1147,6 +1189,7 @@ v0 `init` **不默认生成 runner**。避免把工具偏好强加给存量仓�
 - success predicate 可确定；
 - 输出截断不影响判定；
 - 网络和副作用状态如实记录。
+- 标准工具隐式读取的外部配置已被禁用、纳入完整依赖闭包，或明确标为 unknown。
 
 否则只能形成 observation，不满足证据要求。
 
@@ -1234,7 +1277,10 @@ cargo fmt --all
 - 显式配置可以覆盖；
 - Forge 不穷举 feature 笛卡尔积；
 - rust-toolchain 变化使相关 Receipt 失效；
-- Cargo version、rustc version、target triple 和关键配置摘要进入 toolchain/environment digest。
+- Cargo version、rustc version 和 target triple 进入 toolchain digest；净化环境进入 environment
+  digest。v0 不摘要可能含秘密的 Cargo 配置内容：从命令 cwd 到文件系统根或 Cargo home 发现
+  `.cargo/config{,.toml}`、出现显式 `--config`，或无法完整检查发现链时，environment 为 typed
+  unknown，Receipt 只能作为 observation。
 
 ### 14.4 Changed 影响范围
 
@@ -1264,6 +1310,16 @@ examples/benches (是否覆盖由实际命令决定)
 cross-target (默认 not-verified)
 performance (默认 not-verified)
 ```
+
+Evidence v2 保留上述通用维度，并用现有 custom 维度声明
+`rust-format`、`rust-compile`、`rust-lint`、`rust-unit-test`、
+`rust-integration-test-local`、`rust-build`、`rust-examples-compile`、
+`rust-benches-compile`、`rust-cross-target` 和 `rust-performance`。这样 mixed repository 中
+Go 的通用 coverage 不会遮蔽 Rust 缺口。`cargo check --all-targets` 只声明通用 compile 与
+`rust-compile`；Cargo 会跳过当前 feature set 未满足 `required-features` 的 target，因此默认命令不
+声明 examples/benches compile、performance 或 cross-target coverage。无 Receipt 或部分 Receipt 时，
+Provider expectation 中尚未出现在 verified/advisory/显式 not-verified 的维度进入 not-verified；
+四分优先级为 external-required > not-verified > advisory > verified。该展示不改变本地充分性。
 
 ---
 
@@ -1966,6 +2022,9 @@ source/provenance
 
 显示字符串不是摘要输入；避免 quoting 差异造成错误碰撞。
 
+标准工具外部配置的闭合状态属于独立的 environment acquisition dependency，不并入 Command
+Digest；无法完整取得时使用 typed unknown，不能把“不知道”编码成一个可比较的命令摘要。
+
 ### 21.4 Receipt
 
 ```rust
@@ -2001,12 +2060,12 @@ raw exit code / signal
 normalized outcome
 duration
 timed_out / interrupted
-stdout/stderr digest
-有界摘要或 finding 计数
-完整日志引用（若存在）
+已观察输出：覆盖完整双流的分流 digest、总字节数、截断状态和无内容诊断摘要
+进程边界失败：分流 unavailable marker digest，无字节数和单流截断状态
+日志引用（为兼容和未来 typed producer 保留；v0 current writer 为空）
 ```
 
-默认不保存完整 stdout、环境变量值、对话或模型输出。
+v0 生产命令不保存 stdout/stderr 内容、环境变量值、对话或模型输出，`log_refs` 保持为空。
 
 ### 21.5 Receipt 有效性
 
@@ -2025,6 +2084,7 @@ TTL 只能作为额外保守限制，不能替代依赖比较。以下任一变�
 - CommandSpec；
 - 工具版本；
 - 相关环境；
+- 标准工具隐式读取的配置出现或其闭合状态变为 unknown；
 - effective policy；
 - 比较 base；
 - task acceptance（若 evidence 绑定任务）；
@@ -2139,8 +2199,10 @@ pub struct ExecSpec {
 - cwd canonicalize 且位于仓库内；
 - stdin 默认关闭，交互命令必须显式；
 - stdout/stderr 分开流式读取；
-- 内存有界，完整日志按策略落盘；
+- 双流并发排空；内存保留和临时 spool 有界，显式策略可另设总输出 hard limit；
+- v0 不把任意项目命令的 stdout/stderr 内容持久化为 Forge Receipt/Evidence；
 - 记录 wall time、raw exit、signal、timeout、cancel；
+- 子进程 timeout 取命令声明上限与 operation remaining budget 的较小值，不重置总预算；
 - 捕获 SIGINT 并终止整个进程树；
 - Unix 使用独立进程组；
 - Windows 使用 Job Object；
@@ -2221,12 +2283,14 @@ Forge 不把仓库任意文本自动当作命令或策略：
 全量聊天
 全部环境变量
 凭证
-无限 stdout/stderr
+任意原始 stdout/stderr 内容，无论完整或截断
 可由 Git 重建的源码副本
 主机名明文
 ```
 
-日志引用应使用仓库相对/状态相对路径；导出前再次脱敏。v0 不发送遥测。未来遥测必须 opt-in、单独 ADR、可检查字段、可删除历史。
+`evidence export` 只持久化并输出 canonical Evidence object；v0 不读取、脱敏或打包日志字节，current
+`log_refs` 为空。未来 typed 日志生产或导出必须先完成内容策略，再使用状态相对引用并新增 ADR。v0 不
+发送遥测。未来遥测必须 opt-in、单独 ADR、可检查字段、可删除历史。
 
 ---
 
@@ -2356,6 +2420,13 @@ branch protection
 - 已签名旧版本和独立签名策略。
 
 候选仓库内可以有公开自检，但不能把它称为最终裁判。
+
+v0 的最终 Authority Set 由独立公开仓库
+[`jmp0xf/forge-release-authority`](https://github.com/jmp0xf/forge-release-authority) 承载，并把权限分成三个
+互不混用的域：五平台 build jobs 可以执行精确候选但没有 OIDC、secret 或发布权限；finalize job 可以执行
+候选的本地组装与检查但没有 OIDC、受保护 environment 或发布写权限；protected attest job 可以取得 OIDC
+和 attestation write，但只能执行 Authority 自己的独立 verifier，不得 checkout Forge、运行 Cargo/xtask
+或执行候选二进制。候选代码因此不能进入拥有签名身份的进程。
 
 ### 23.8 N−1 兼容
 
@@ -2542,16 +2613,24 @@ cargo test --workspace
 
 ### 25.4 可分发性
 
-v0 计划：
+ADR-0041 已取代 ADR-0029，冻结首个公开 v0 候选的可分发边界：
 
-- GitHub Release 预编译二进制；
-- `cargo install --locked forge`（若名称和 crates.io 可用）；
-- checksum；
-- SBOM；
-- 发布签名；
-- 不内置自动更新；
-- Homebrew/Scoop 在首发后按需求加入；
-- Linux glibc baseline/静态链接选择由发布 spike 验证。
+- 未发布的 `0.1.0-rc.1` 终止；首个公开候选固定为 `0.1.0-rc.2`，只通过不可变 GitHub prerelease
+  分发。v0 RC 不发布到 crates.io，也不承诺 Homebrew、Scoop 或自动更新通道；
+- 本地候选包含五个冻结目标的原始二进制和五个 CycloneDX 1.6 SBOM、源码绑定的
+  `THIRD-PARTY-LICENSES.txt`、`release-manifest.json` 与 `SHA256SUMS`，共十三个最终文件；Linux 一级
+  目标使用 musl 静态链接，SBOM component 含机器可读 license expression；
+- rc.2 使用 `forge.release-manifest/v2`：`artifacts` 固定记录十一个二进制/SBOM/notice 文件，
+  `provenance.subjects` 固定记录全部十三个文件；`SHA256SUMS` 覆盖十一个 artifact 和 manifest，共十二行；
+- checked-in license gate 绑定与 SBOM 相同的五 target release closure。依赖、lock checksum、license
+  expression、已选许可证文本或 notice 漂移时必须重新生成并人工审查；`release-finalize` 只复制已绑定的
+  源码字节，不从网络、Cargo cache 或 registry 工作目录临时取材；
+- 仓库内 `xtask` 只组装和核验 `local-review-candidate`，不得签名、上传、发布或授权；
+- 最终独立复验、SLSA provenance、Sigstore 签名、审批、不可变发布和撤回权限属于
+  `jmp0xf/forge-release-authority` 的三个隔离权限域。
+
+完整目标矩阵、资产名、构建隔离、许可证闭包、失败残留、外部权威和首发回滚规则见 ADR-0041 与
+`docs/release.md`。
 
 ### 25.5 无遥测默认
 
@@ -2719,7 +2798,8 @@ GC and log references
 - local evidence 与 external authority 分离；
 - worktree 不串扰；
 - mutating command after-digest 语义正确；
-- full logs/secret 不进入默认 Evidence。
+- stdout/stderr 内容和 secret 不进入 v0 Forge-managed Receipt/Evidence 状态，current writer 的
+  `log_refs` 为空。
 
 ### M7：Hardening 与 v0 发布
 
@@ -2757,7 +2837,8 @@ N-1 public compatibility harness skeleton
 11. 实现原子 JSON/文件写入。
 12. 实现 native path / symlink 防逃逸。
 13. 实现同步 ProcessPort、超时和 kill tree。
-14. 实现有界输出、日志引用和脱敏。
+14. 实现有界输出保留、完整观察 digest/字节数和无内容诊断摘要；日志引用保留为 versioned 字段与
+    future typed producer/状态校验/GC 接口。
 15. 实现 config v1 与 unknown-field rejection。
 16. 实现 RepoFacts、AssetInventory、ProjectModel。
 17. 实现 runner 发现和 CommandSource/Confidence。
@@ -2797,6 +2878,9 @@ N-1 public compatibility harness skeleton
 
 ## 27. v0 发布验收清单
 
+本节是当前候选的发布前验收汇总，不是第 4 节 20 个不变量的第二套机器协议。只有条目在
+当前候选上具备可定位证据时才可勾选；外部 authority 未确认前不得宣称整套清单通过。
+
 ### 27.1 功能
 
 - [ ] 识别 Rust package、workspace、多个 workspace。
@@ -2817,8 +2901,11 @@ N-1 public compatibility harness skeleton
 
 - [ ] Git 路径输出使用 porcelain `-z`。
 - [ ] 外部命令全部 argv 执行。
-- [ ] 所有写入使用 preimage + 同目录原子替换。
-- [ ] 所有集合稳定排序。
+- [ ] 覆盖既有工作树文件使用 preimage + 同目录原子替换；新建工作树文件使用 expected
+  absence + 原子 create-only/no-clobber；不可变对象使用原子 create-only/no-clobber；可变
+  私有状态在独占 worktree lock 下按 versioned conflict policy 同目录原子替换。
+- [ ] 进入稳定机器合同、渲染、摘要或决策结果的无序集合先 canonical sort；有序序列保留
+  合同定义的顺序。
 - [ ] JSON stdout 无污染。
 - [ ] 退出码符合规范。
 - [ ] Receipt validity 包含 scope、command、toolchain、environment、policy。
@@ -2830,7 +2917,8 @@ N-1 public compatibility harness skeleton
 
 - [ ] symlink 逃逸测试。
 - [ ] 非 UTF-8/特殊文件名测试。
-- [ ] secret/env 脱敏测试。
+- [ ] 冻结启发式命中的凭据类 env 名与明显凭据 argv 被拒绝；Forge 管理的
+  Receipt/Evidence/log 状态不持久化环境原值，拒绝诊断不回显被拒输入。
 - [ ] 子进程树终止测试。
 - [ ] huge output 测试。
 - [ ] 恶意 README/manifest 不变成 shell 执行。
@@ -2849,7 +2937,8 @@ N-1 public compatibility harness skeleton
 - [ ] managed marker 集中。
 - [ ] 输出文案快照可审查。
 - [ ] fixtures 可独立生成/运行。
-- [ ] 没有未使用的“未来平台”死实现。
+- [ ] v0 支持矩阵只列入具有 native CI 路由的平台；矩阵外分支不得公开为受支持能力，也
+  不得预实现未被入口使用的未来行为。
 
 ### 27.5 可退出性
 
@@ -2904,9 +2993,9 @@ N-1 public compatibility harness skeleton
 |---|---:|---|
 | AGENTS 受管块上限 | 120 行 / 8 KiB | 观察删除率、上下文占用、漏指引与人工撤销 |
 | 单流内存输出 | 256 KiB | huge-output 和真实工具分布 |
-| 单日志文件 | 10 MiB | 排障需求与磁盘成本 |
-| doctor 元数据超时 | 30–60 s | p95 与超时原因 |
-| check/test 默认超时 | 5/15 min | 仓库实际耗时分布 |
+| 可选已脱敏日志对象（v0 无生产 writer） | 10 MiB | future typed producer 的排障需求与磁盘成本 |
+| doctor 元数据默认子阶段上限 | 30–60 s | p95、总预算余量与超时原因 |
+| check/test 默认子进程上限 | 5/15 min | 仓库实际耗时分布；不得重置命令总预算 |
 | Receipt GC | 最近 200 条或 14 天取宽 | Evidence 引用、磁盘占用、排障需要 |
 | context 预算 | 16 KiB 路径/摘要 | 任务完成率与默认上下文成本 |
 | 变更规模风险阈值 | 暂不硬编码或保守值 | 历史 PR 与人工风险标注 |
@@ -2921,7 +3010,7 @@ N-1 public compatibility harness skeleton
 
 ## 30. ADR 索引
 
-起始 ADR 全部位于 `docs/adr/`：
+ADR 全部位于 `docs/adr/`：
 
 | ADR | 决策 |
 |---|---|
@@ -2942,6 +3031,30 @@ N-1 public compatibility harness skeleton
 | 0015 | worktree 状态隔离，只共享内容寻址缓存 |
 | 0016 | Evidence 按依赖变化失效 |
 | 0017 | 默认不生成 runner、CI 和组织文档 |
+| 0018 | 从 Git common-dir 派生本地仓库身份 |
+| 0019 | v0 使用 HEAD 作为工作树比较基线 |
+| 0020 | 版本化完整的本地 Evidence 契约 |
+| 0021 | Evidence 状态使用不可变对象和有界保留 |
+| 0022 | 不可变证据身份对 JSON 数字做无浮点精确规范化 |
+| 0023 | JSON Schema 文档不套 Forge 结果信封 |
+| 0024 | 进程边界失败写入类型化非证明 Receipt |
+| 0025 | 每条命令使用一个操作级总预算 |
+| 0026 | 声明 Provider 命名空间覆盖与缺口 |
+| 0027 | 显式生成只创建不覆盖的 GitHub CI 工作流（已由 0037 取代） |
+| 0028 | 仓库写入固定目录句柄（通用能力保留；Windows 细节沿 0031、0033、0034 演进） |
+| 0029 | 发布可审查、可回滚的 v0 候选版本（已由 0041 取代） |
+| 0030 | 分离 release manifest 的兼容读取与候选验收 |
+| 0031 | Windows 使用原生同目录句柄重命名（已由 0033 取代） |
+| 0032 | 记录不含输出内容的命令诊断摘要 |
+| 0033 | Windows 重命名显式使用固定目标目录句柄（已由 0034 取代） |
+| 0034 | Windows 拒绝目录交换提交时安全失败 |
+| 0035 | Evidence GC 固定类目录并使用同目录隔离名（旧目录迁移部分由 0036 取代） |
+| 0036 | 未发布的旧 Evidence GC 目录残留安全失败并原样保留 |
+| 0037 | GitHub CI 固定 checkout v7 与 Node 24 运行时 |
+| 0038 | v0 不持久化任意项目命令的 stdout/stderr 内容 |
+| 0039 | 保留当前 Receipt 的 typed unknown 事实 |
+| 0040 | 项目工具外部配置未闭合时安全失败 |
+| 0041 | 通过外部权威发布许可证完整的 rc.2 |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::GitError;
+use crate::{GitError, OperationControlError};
 
 /// Default cap for repository entries retained during startup detection.
 pub const DEFAULT_MAX_INVENTORY_ENTRIES: usize = 200_000;
@@ -48,12 +48,44 @@ pub enum PathKind {
     Other,
 }
 
+/// One atomic, no-follow metadata observation for a repository path.
+///
+/// `size_bytes` is absent only when the path is missing. Keeping kind and size in one observation
+/// prevents cache validation from combining facts collected across two filesystem states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathMetadata {
+    pub kind: PathKind,
+    pub size_bytes: Option<u64>,
+}
+
+impl PathMetadata {
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            kind: PathKind::Missing,
+            size_bytes: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn present(kind: PathKind, size_bytes: u64) -> Self {
+        Self {
+            kind,
+            size_bytes: Some(size_bytes),
+        }
+    }
+}
+
 /// One stable, repository-relative inventory item.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InventoryEntry {
     pub path: PathBuf,
     pub kind: InventoryKind,
-    pub size_bytes: u64,
+    /// Live no-follow size when this entry came from the current worktree.
+    ///
+    /// Content-addressed path projections deliberately retain `None`: checkout filters can make
+    /// byte sizes differ between clean linked worktrees even when HEAD and the index are equal.
+    pub size_bytes: Option<u64>,
 }
 
 /// A skipped item or bounded degradation that remains visible to callers.
@@ -96,6 +128,8 @@ pub struct BoundedText {
 /// Inventory or bounded-read failure.
 #[derive(Debug, Error)]
 pub enum InventoryError {
+    #[error(transparent)]
+    Control(#[from] OperationControlError),
     #[error("repository root is not a directory: {0}")]
     InvalidRoot(PathBuf),
     #[error("repository inventory I/O failed at {path}: {source}")]
@@ -141,12 +175,12 @@ mod tests {
                 InventoryEntry {
                     path: PathBuf::from("z"),
                     kind: InventoryKind::File,
-                    size_bytes: 1,
+                    size_bytes: Some(1),
                 },
                 InventoryEntry {
                     path: PathBuf::from("a"),
                     kind: InventoryKind::Directory,
-                    size_bytes: 0,
+                    size_bytes: Some(0),
                 },
             ],
             skipped: vec![
@@ -173,7 +207,7 @@ mod tests {
             entries: vec![InventoryEntry {
                 path: PathBuf::from("one"),
                 kind: InventoryKind::File,
-                size_bytes: 1,
+                size_bytes: Some(1),
             }],
             skipped: Vec::new(),
         };
