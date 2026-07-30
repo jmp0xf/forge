@@ -2063,7 +2063,7 @@ mod platform {
         FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, FileIdBothDirectoryInfo,
         FileIdBothDirectoryRestartInfo, FileIdInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
+        GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
         SetFileInformationByHandle, WRITE_DAC,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -3767,24 +3767,11 @@ mod platform {
     }
 
     fn reopen_listing_root(directory: &File) -> io::Result<File> {
-        // ReOpenFile derives a new access mask from the already pinned root object; it does not
-        // resolve the visible root path again and therefore cannot cross a root-replacement race.
-        // SAFETY: the source handle is live and the returned owned handle is checked below.
-        let handle = unsafe {
-            ReOpenFile(
-                directory.as_raw_handle(),
-                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `handle` is a newly returned owned Win32 handle.
-        let reopened = unsafe { File::from_raw_handle(handle) };
-        validate_kind(&reopened, true)?;
-        Ok(reopened)
+        // A listing retains the already validated root only for identity and ACL checks. Cloning
+        // duplicates that exact pinned handle with the same granted access and cannot trigger a
+        // second open-time access check or cross a visible-root replacement race. The root handle
+        // is never enumerated, so sharing its file-object cursor is immaterial.
+        directory.try_clone()
     }
 
     fn existing_target_permissions(
@@ -4441,6 +4428,36 @@ mod tests {
             oversized,
             Err(ref error) if error.kind() == io::ErrorKind::InvalidData
         ));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_listing_retains_the_pinned_root_without_reopening_it()
+    -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        create_source(repository.path())?;
+        let root = RootHandle::open(repository.path())?;
+
+        let present = root
+            .list_directory(Path::new(DIRECTORY), 8)?
+            .ok_or_else(|| io::Error::other("present directory returned no listing"))?;
+        assert!(present.target_present());
+        assert_eq!(present.directory_chain().count(), 2);
+        for directory in present.directory_chain() {
+            assert!(directory.metadata()?.is_dir());
+        }
+
+        let missing = root
+            .list_directory(Path::new("missing"), 8)?
+            .ok_or_else(|| io::Error::other("missing directory returned no observation"))?;
+        assert!(!missing.target_present());
+        assert_eq!(missing.directory_chain().count(), 1);
+        let retained_root = missing
+            .directory_chain()
+            .next()
+            .ok_or_else(|| io::Error::other("missing listing did not retain its pinned root"))?;
+        assert!(retained_root.metadata()?.is_dir());
         Ok(())
     }
 
