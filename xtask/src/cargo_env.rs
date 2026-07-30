@@ -472,6 +472,7 @@ fn msvc_vswhere_spec(executable: OsString) -> ExecSpec {
         program: executable,
         args: [
             "-latest",
+            "-prerelease",
             "-products",
             "*",
             "-requires",
@@ -1073,6 +1074,7 @@ mod tests {
             spec.args,
             [
                 "-latest",
+                "-prerelease",
                 "-products",
                 "*",
                 "-requires",
