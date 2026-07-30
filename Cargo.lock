@@ -424,7 +424,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "base64",
  "blake3",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "base64",
  "forge-schema",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "forge-detect"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "forge-core",
  "serde",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "forge-render"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "forge-core",
  "serde_yaml_ng",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "forge-runtime"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "blake3",
  "ctrlc",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "forge-schema"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "base64",
  "schemars",
@@ -1670,7 +1670,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "blake3",
  "find-msvc-tools",

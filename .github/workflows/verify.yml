@@ -154,19 +154,19 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            asset: forge-0.1.0-rc.1-x86_64-unknown-linux-musl
+            asset: forge-0.1.0-rc.2-x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            asset: forge-0.1.0-rc.1-aarch64-unknown-linux-musl
+            asset: forge-0.1.0-rc.2-aarch64-unknown-linux-musl
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            asset: forge-0.1.0-rc.1-x86_64-apple-darwin
+            asset: forge-0.1.0-rc.2-x86_64-apple-darwin
           - runner: macos-15
             target: aarch64-apple-darwin
-            asset: forge-0.1.0-rc.1-aarch64-apple-darwin
+            asset: forge-0.1.0-rc.2-aarch64-apple-darwin
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
-            asset: forge-0.1.0-rc.1-x86_64-pc-windows-msvc.exe
+            asset: forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe
     env:
       CC_x86_64_unknown_linux_musl: musl-gcc
       CC_aarch64_unknown_linux_musl: musl-gcc
