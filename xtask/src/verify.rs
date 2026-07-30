@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
+#[cfg(any(windows, test))]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use forge_core::domain::{Mutability, NetworkIntent};
@@ -20,6 +22,12 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(44 * 60);
 const RETAINED_STREAM_BYTES: usize = 256 * 1024;
 const FAILURE_DISPLAY_BYTES: usize = 16 * 1024;
 const COMPLETE_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+// Windows cannot replace a running `xtask.exe`. Keep nested Cargo output in one reusable target
+// directory, with a second stable candidate for an xtask that was itself built in the first.
+#[cfg(any(windows, test))]
+const WINDOWS_VERIFY_TARGET_PRIMARY: &str = "target/xtask-verify-a";
+#[cfg(any(windows, test))]
+const WINDOWS_VERIFY_TARGET_SECONDARY: &str = "target/xtask-verify-b";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Enforcement {
@@ -245,7 +253,7 @@ pub(crate) fn run(repository: &Path) -> Result<VerifyReport, VerifyError> {
 }
 
 fn step_spec(
-    _repository: &Path,
+    repository: &Path,
     step: &VerifyStep,
     timeout: Duration,
 ) -> Result<ExecSpec, VerifyError> {
@@ -255,11 +263,25 @@ fn step_spec(
             step.cwd
         ))
     })?;
+    #[cfg(windows)]
+    let env = {
+        let mut env = cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host);
+        env.overrides.insert(
+            OsString::from("CARGO_TARGET_DIR"),
+            windows_verify_target_dir(repository)?.into_os_string(),
+        );
+        env
+    };
+    #[cfg(not(windows))]
+    let env = {
+        let _ = repository;
+        cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host)
+    };
     Ok(ExecSpec {
         program: OsString::from("cargo"),
         args: step.args.iter().map(OsString::from).collect(),
         cwd,
-        env: cargo_environment(CargoNetworkMode::Inherit, CargoCompilationTarget::Host),
+        env,
         timeout,
         stdin: StdinPolicy::Closed,
         stdout: OutputPolicy::CaptureBounded {
@@ -273,6 +295,39 @@ fn step_spec(
         network: NetworkIntent::Inherit,
         concurrency_key: Some(String::from("xtask-verify")),
     })
+}
+
+#[cfg(windows)]
+fn windows_verify_target_dir(repository: &Path) -> Result<PathBuf, VerifyError> {
+    let repository = repository.canonicalize().map_err(|error| {
+        VerifyError::environment(format!(
+            "failed to resolve the repository before selecting a nested Cargo target directory: {error}"
+        ))
+    })?;
+    let current_executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| {
+            VerifyError::environment(format!(
+                "failed to resolve the running xtask executable before selecting a nested Cargo target directory: {error}"
+            ))
+        })?;
+    Ok(select_windows_verify_target_dir(
+        &repository,
+        &current_executable,
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn select_windows_verify_target_dir(repository: &Path, current_executable: &Path) -> PathBuf {
+    debug_assert!(repository.is_absolute());
+    debug_assert!(current_executable.is_absolute());
+
+    let primary = repository.join(WINDOWS_VERIFY_TARGET_PRIMARY);
+    if current_executable.starts_with(&primary) {
+        repository.join(WINDOWS_VERIFY_TARGET_SECONDARY)
+    } else {
+        primary
+    }
 }
 
 fn observation_passed(observation: &ProcessObservation) -> bool {
@@ -377,7 +432,8 @@ mod tests {
 
     use super::{
         COMPLETE_OUTPUT_BYTES, Enforcement, FAILURE_DISPLAY_BYTES, OPERATION_TIMEOUT,
-        RETAINED_STREAM_BYTES, VERIFY_STEPS, step_spec,
+        RETAINED_STREAM_BYTES, VERIFY_STEPS, WINDOWS_VERIFY_TARGET_PRIMARY,
+        WINDOWS_VERIFY_TARGET_SECONDARY, select_windows_verify_target_dir, step_spec,
     };
 
     #[test]
@@ -461,9 +517,12 @@ mod tests {
     #[test]
     fn every_step_uses_argv_closed_stdin_and_a_bounded_process_contract()
     -> Result<(), Box<dyn std::error::Error>> {
-        let repository = Path::new("/repository");
+        #[cfg(windows)]
+        let repository = std::env::current_dir()?.canonicalize()?;
+        #[cfg(not(windows))]
+        let repository = Path::new("/repository").to_path_buf();
         for step in VERIFY_STEPS {
-            let spec = step_spec(repository, step, Duration::from_secs(7))?;
+            let spec = step_spec(&repository, step, Duration::from_secs(7))?;
             assert_eq!(spec.program, OsStr::new("cargo"));
             assert_eq!(spec.stdin, StdinPolicy::Closed);
             assert_eq!(spec.mutability, Mutability::ExternalSideEffect);
@@ -476,12 +535,28 @@ mod tests {
                 }
             );
             assert_eq!(spec.stderr, spec.stdout);
+            #[cfg(not(windows))]
             assert!(
                 !spec
                     .env
                     .overrides
                     .contains_key(OsStr::new("CARGO_TARGET_DIR"))
             );
+            #[cfg(windows)]
+            {
+                let target_dir = spec
+                    .env
+                    .overrides
+                    .get(OsStr::new("CARGO_TARGET_DIR"))
+                    .ok_or("Windows verify step must isolate its nested Cargo target")?;
+                let target_dir = Path::new(target_dir);
+                assert!(target_dir.is_absolute());
+                assert!(target_dir.starts_with(&repository));
+                assert!(
+                    target_dir.ends_with(WINDOWS_VERIFY_TARGET_PRIMARY)
+                        || target_dir.ends_with(WINDOWS_VERIFY_TARGET_SECONDARY)
+                );
+            }
             assert_eq!(
                 spec.env
                     .overrides
@@ -491,5 +566,32 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn windows_target_selection_is_stable_and_avoids_the_running_candidate() {
+        #[cfg(windows)]
+        let repository = Path::new(r"C:\repository");
+        #[cfg(not(windows))]
+        let repository = Path::new("/repository");
+        #[cfg(windows)]
+        let outside_executable = Path::new(r"C:\outside\target\debug\xtask.exe");
+        #[cfg(not(windows))]
+        let outside_executable = Path::new("/outside/target/debug/xtask");
+        let primary = repository.join(WINDOWS_VERIFY_TARGET_PRIMARY);
+        let secondary = repository.join(WINDOWS_VERIFY_TARGET_SECONDARY);
+
+        assert_eq!(
+            select_windows_verify_target_dir(repository, outside_executable),
+            primary
+        );
+        assert_eq!(
+            select_windows_verify_target_dir(repository, &primary.join("debug/xtask.exe")),
+            secondary
+        );
+        assert_eq!(
+            select_windows_verify_target_dir(repository, &secondary.join("debug/xtask.exe")),
+            primary
+        );
     }
 }
