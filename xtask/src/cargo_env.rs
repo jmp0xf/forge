@@ -48,6 +48,8 @@ const MSVC_VSWHERE_OUTPUT_HARD_LIMIT: u64 =
 #[cfg(any(all(windows, target_env = "msvc"), test))]
 const MSVC_EXPLICIT_INSTALL_ROOT_ENV: &str = "XTASK_MSVC_INSTALL_ROOT";
 #[cfg(all(windows, target_env = "msvc"))]
+const MSVC_EXTERNAL_PATH_UNIT_LIMIT: usize = 260;
+#[cfg(all(windows, target_env = "msvc"))]
 const MSVC_VSWHERE_RELATIVE_PATH: &str = r"Microsoft Visual Studio\Installer\vswhere.exe";
 #[cfg(all(windows, target_env = "msvc"))]
 const MSVC_VSWHERE_PROGRAM_FILES_KEYS: &[&str] = &["ProgramFiles(x86)", "ProgramFiles"];
@@ -325,7 +327,72 @@ fn canonical_installation_root(path: &Path) -> Result<PathBuf, CargoEnvironmentE
             "Visual Studio discovery returned an installation root that was not a directory",
         )));
     }
-    Ok(root)
+    // Windows canonicalization uses an extended-length (`\\?\`) spelling. Keep it for identity
+    // validation, but do not feed it into `find-msvc-tools`: the derived PATH/LIB/INCLUDE values
+    // are consumed by external MSVC programs. Only simplify a local disk spelling whose root is
+    // short enough for legacy Win32 consumers and re-canonicalizes to the exact same object. The
+    // concrete tool and environment paths derived from this root are checked after discovery.
+    let external_root = msvc_external_path_from_canonical(&root)?;
+    let confirmed = std::fs::canonicalize(&external_root).map_err(|error| {
+        CargoEnvironmentError(format!(
+            "failed to confirm the external Visual Studio installation spelling ({:?})",
+            error.kind()
+        ))
+    })?;
+    if confirmed != root {
+        return Err(CargoEnvironmentError(String::from(
+            "the external Visual Studio installation spelling changed canonical identity",
+        )));
+    }
+    Ok(external_root)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn msvc_external_path_from_canonical(canonical: &Path) -> Result<PathBuf, CargoEnvironmentError> {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::path::{Component, Prefix};
+
+    let prefix = match canonical.components().next() {
+        Some(Component::Prefix(prefix)) => prefix.kind(),
+        _ => {
+            return Err(CargoEnvironmentError(String::from(
+                "Visual Studio discovery did not resolve to a local disk path",
+            )));
+        }
+    };
+    let external = match prefix {
+        Prefix::Disk(_) => canonical.to_path_buf(),
+        Prefix::VerbatimDisk(_) => {
+            let units = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+            let native = units.get(4..).ok_or_else(|| {
+                CargoEnvironmentError(String::from(
+                    "the canonical Visual Studio path had an invalid verbatim disk prefix",
+                ))
+            })?;
+            PathBuf::from(OsString::from_wide(native))
+        }
+        Prefix::UNC(_, _)
+        | Prefix::VerbatimUNC(_, _)
+        | Prefix::Verbatim(_)
+        | Prefix::DeviceNS(_) => {
+            return Err(CargoEnvironmentError(String::from(
+                "Visual Studio discovery did not resolve to a supported local disk namespace",
+            )));
+        }
+    };
+    if !external.is_absolute()
+        || !matches!(
+            external.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+        )
+        || external.as_os_str().to_str().is_none()
+        || external.as_os_str().encode_wide().count() >= MSVC_EXTERNAL_PATH_UNIT_LIMIT
+    {
+        return Err(CargoEnvironmentError(String::from(
+            "the Visual Studio installation path cannot be represented safely for MSVC tools",
+        )));
+    }
+    Ok(external)
 }
 
 #[cfg(all(windows, target_env = "msvc"))]
@@ -381,6 +448,7 @@ fn is_msvc_probe_input_key(key: &str) -> bool {
 #[cfg(all(windows, target_env = "msvc"))]
 struct MsvcProbeEnvironment {
     values: BTreeMap<&'static str, OsString>,
+    installation_root: Option<PathBuf>,
 }
 
 #[cfg(all(windows, target_env = "msvc"))]
@@ -390,8 +458,10 @@ impl MsvcProbeEnvironment {
             .map(PathBuf::from)
             .map(|path| canonical_installation_root(&path))
             .transpose()?;
+        let values = capture_msvc_probe_values(env::var_os, installation_root.as_deref());
         Ok(Self {
-            values: capture_msvc_probe_values(env::var_os, installation_root.as_deref()),
+            values,
+            installation_root,
         })
     }
 }
@@ -678,12 +748,23 @@ pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironment
     let environment = match materialize_msvc_tool_environment(
         &probe_environment.values,
         tool.env().into_iter().cloned(),
-    ) {
+    )
+    .and_then(|environment| {
+        if let Some(installation_root) = probe_environment.installation_root.as_deref() {
+            validate_msvc_installation_tool_delta(
+                installation_root,
+                tool.path(),
+                &probe_environment.values,
+                tool.env(),
+            )?;
+        }
+        Ok(environment)
+    }) {
         Ok(environment) => environment,
         Err(error) => {
             write_msvc_probe_output(MSVC_PROBE_NOT_FOUND_MAGIC)?;
             return Err(CargoEnvironmentError(format!(
-                "MSVC toolchain environment was incomplete: {error}"
+                "MSVC toolchain projection was invalid: {error}"
             )));
         }
     };
@@ -694,6 +775,118 @@ pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironment
         CargoEnvironmentError(format!("failed to encode MSVC probe output: {error}"))
     })?;
     write_msvc_probe_output(&frame)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn validate_msvc_installation_tool_delta<'a, I>(
+    installation_root: &Path,
+    tool_path: &Path,
+    captured: &BTreeMap<&'static str, OsString>,
+    tool_environment: I,
+) -> Result<(), MsvcProbeProtocolError>
+where
+    I: IntoIterator<Item = &'a (OsString, OsString)>,
+{
+    if !tool_path.starts_with(installation_root) {
+        return Err(MsvcProbeProtocolError::new(
+            "MSVC tool path was outside the discovered Visual Studio installation",
+        ));
+    }
+    validate_msvc_external_path(tool_path)
+        .map_err(|reason| MsvcProbeProtocolError::new(format!("MSVC tool path {reason}")))?;
+    let mut validated_keys = BTreeMap::new();
+    for (raw_key, value) in tool_environment {
+        let Some(key) = canonical_msvc_tool_environment_key(raw_key) else {
+            continue;
+        };
+        if validated_keys.insert(key, ()).is_some() {
+            return Err(MsvcProbeProtocolError::new(format!(
+                "MSVC tool environment repeats the {} value",
+                key.name()
+            )));
+        }
+        let inherited = captured
+            .get(key.name())
+            .map(|value| value.as_os_str())
+            .unwrap_or_default();
+        let inherited_paths = env::split_paths(inherited).collect::<Vec<_>>();
+        let projected_paths = env::split_paths(value).collect::<Vec<_>>();
+        // `find-msvc-tools` 0.1.9 prepends discovered paths to this exact inherited tail. Split
+        // the pinned dependency's projection at that boundary so pre-existing project or builder
+        // paths remain compatible and only paths derived from the simplified VS root are bounded.
+        let Some(derived_paths) = projected_paths.strip_suffix(inherited_paths.as_slice()) else {
+            return Err(MsvcProbeProtocolError::new(format!(
+                "MSVC {} projection did not preserve the inherited path tail",
+                key.name()
+            )));
+        };
+        if derived_paths.is_empty() {
+            return Err(MsvcProbeProtocolError::new(format!(
+                "MSVC {} projection contained no derived path entries",
+                key.name()
+            )));
+        }
+        let mut installation_path_count = 0_usize;
+        for (ordinal, path) in derived_paths.iter().enumerate() {
+            if !path.starts_with(installation_root) {
+                continue;
+            }
+            installation_path_count += 1;
+            validate_msvc_external_path(path).map_err(|reason| {
+                MsvcProbeProtocolError::new(format!(
+                    "MSVC Visual Studio {} path entry {} {reason}",
+                    key.name(),
+                    ordinal + 1
+                ))
+            })?;
+        }
+        if installation_path_count == 0 {
+            return Err(MsvcProbeProtocolError::new(format!(
+                "MSVC {} projection contained no Visual Studio installation path",
+                key.name()
+            )));
+        }
+    }
+    for key in MsvcEnvironmentKey::ALL {
+        if !validated_keys.contains_key(&key) {
+            return Err(MsvcProbeProtocolError::new(format!(
+                "MSVC tool environment omitted the derived {} projection",
+                key.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn validate_msvc_external_path(path: &Path) -> Result<(), &'static str> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::{Component, Prefix};
+
+    if !path.is_absolute()
+        || !matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+        )
+    {
+        return Err("was not an ordinary drive-absolute path");
+    }
+    // The pinned finder joins inherited VCToolsVersion text below the installation root. A parent
+    // component would satisfy lexical `starts_with` while resolving outside that trusted prefix.
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("contained a parent traversal");
+    }
+    let units = path.as_os_str().encode_wide();
+    if units.clone().any(|unit| unit == 0) {
+        return Err("contained a NUL code unit");
+    }
+    if units.count() >= MSVC_EXTERNAL_PATH_UNIT_LIMIT {
+        return Err("exceeded the legacy Windows path limit");
+    }
+    Ok(())
 }
 
 #[cfg(all(windows, target_env = "msvc"))]
@@ -1047,6 +1240,12 @@ mod tests {
     use forge_core::ports::{EnvPolicy, OutputPolicy, ProcessObservation, StdinPolicy};
     use forge_runtime::process::empty_process_output_digests;
 
+    #[cfg(all(windows, target_env = "msvc"))]
+    use super::{
+        canonical_installation_root, msvc_external_path_from_canonical,
+        validate_msvc_installation_tool_delta,
+    };
+
     use super::{
         MSVC_EXPLICIT_INSTALL_ROOT_ENV, MSVC_PROBE_HEADER_BYTES, MSVC_PROBE_MAGIC,
         MSVC_PROBE_MAX_DIAGNOSTIC_BYTES, MSVC_PROBE_MAX_FRAME_BYTES, MSVC_PROBE_MAX_VALUE_UNITS,
@@ -1079,6 +1278,35 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, target_env = "msvc"))]
+    fn msvc_tool_delta(
+        captured: &BTreeMap<&'static str, OsString>,
+        derived: &Path,
+    ) -> Result<Vec<(OsString, OsString)>, std::env::JoinPathsError> {
+        msvc_tool_delta_with_paths(captured, &[derived.to_path_buf()])
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    fn msvc_tool_delta_with_paths(
+        captured: &BTreeMap<&'static str, OsString>,
+        derived: &[PathBuf],
+    ) -> Result<Vec<(OsString, OsString)>, std::env::JoinPathsError> {
+        MsvcEnvironmentKey::ALL
+            .into_iter()
+            .map(|key| {
+                let inherited = captured
+                    .get(key.name())
+                    .map(|value| value.as_os_str())
+                    .unwrap_or_default();
+                let paths = derived
+                    .iter()
+                    .cloned()
+                    .chain(std::env::split_paths(inherited));
+                Ok((OsString::from(key.name()), std::env::join_paths(paths)?))
+            })
+            .collect()
+    }
+
     #[test]
     fn build_environment_allows_toolchain_controls_but_not_registry_tokens() {
         assert!(is_cargo_build_environment_key(OsStr::new(
@@ -1106,6 +1334,213 @@ mod tests {
         assert!(supported_msvc_target("x86_64-pc-windows-msvc"));
         assert!(!supported_msvc_target("aarch64-pc-windows-msvc"));
         assert!(!supported_msvc_target("x86_64-pc-windows-gnu"));
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_installation_root_uses_a_short_external_disk_spelling_without_changing_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::path::{Component, Prefix};
+
+        let temporary = tempfile::tempdir()?;
+        let canonical = std::fs::canonicalize(temporary.path())?;
+        let external = canonical_installation_root(temporary.path())?;
+
+        assert!(matches!(
+            external.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+        ));
+        assert_eq!(std::fs::canonicalize(&external)?, canonical);
+        Ok(())
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_external_spelling_simplifies_only_safe_verbatim_disk_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = Path::new(r"\\?\C:\Program Files\Microsoft Visual Studio\路径");
+        assert_eq!(
+            msvc_external_path_from_canonical(canonical)?,
+            PathBuf::from(r"C:\Program Files\Microsoft Visual Studio\路径")
+        );
+        assert_eq!(
+            msvc_external_path_from_canonical(Path::new(r"C:\Visual Studio"))?,
+            PathBuf::from(r"C:\Visual Studio")
+        );
+
+        for unsupported in [
+            PathBuf::from(r"\\server\share\Visual Studio"),
+            PathBuf::from(r"\\?\UNC\server\share\Visual Studio"),
+            PathBuf::from(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Visual Studio"),
+            PathBuf::from(r"\\.\C:\Visual Studio"),
+            PathBuf::from(r"relative\Visual Studio"),
+            PathBuf::from(format!(r"\\?\C:\{}", "x".repeat(260))),
+        ] {
+            assert!(
+                msvc_external_path_from_canonical(&unsupported).is_err(),
+                "unsupported MSVC path was accepted: {}",
+                unsupported.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_external_delta_limits_only_derived_paths_and_preserves_the_inherited_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        fn installation_descendant_with_units(units: usize) -> PathBuf {
+            assert!(units >= 6);
+            PathBuf::from(format!(r"C:\VS\{}", "x".repeat(units - 6)))
+        }
+
+        let installation_root = Path::new(r"C:\VS");
+        let short_tool = Path::new(r"C:\VS\VC\bin\link.exe");
+        let path_259 = installation_descendant_with_units(259);
+        let path_260 = installation_descendant_with_units(260);
+        assert_eq!(path_259.as_os_str().encode_wide().count(), 259);
+        assert_eq!(path_260.as_os_str().encode_wide().count(), 260);
+
+        let inherited_overlong = installation_descendant_with_units(260);
+        let captured = BTreeMap::from([
+            (
+                "PATH",
+                std::env::join_paths([
+                    Path::new(r"relative\project-tools"),
+                    Path::new(r"\\server\share\bin"),
+                ])?,
+            ),
+            (
+                "LIB",
+                std::env::join_paths([Path::new(r"\\?\C:\builder\lib")])?,
+            ),
+            ("INCLUDE", std::env::join_paths([&inherited_overlong])?),
+        ]);
+
+        validate_msvc_installation_tool_delta(
+            installation_root,
+            short_tool,
+            &captured,
+            &msvc_tool_delta(&captured, &path_259)?,
+        )?;
+        validate_msvc_installation_tool_delta(
+            installation_root,
+            short_tool,
+            &captured,
+            &msvc_tool_delta_with_paths(
+                &captured,
+                &[path_259.clone(), PathBuf::from(r"\\sdk-server\sdk\bin")],
+            )?,
+        )?;
+        assert!(
+            validate_msvc_installation_tool_delta(
+                installation_root,
+                short_tool,
+                &captured,
+                &msvc_tool_delta(&captured, &path_260)?,
+            )
+            .is_err()
+        );
+
+        let non_bmp_259 = PathBuf::from(format!(r"C:\VS\{}x", "😀".repeat(126)));
+        let non_bmp_260 = PathBuf::from(format!(r"C:\VS\{}", "😀".repeat(127)));
+        assert_eq!(non_bmp_259.as_os_str().encode_wide().count(), 259);
+        assert_eq!(non_bmp_260.as_os_str().encode_wide().count(), 260);
+        let empty_capture = BTreeMap::new();
+        validate_msvc_installation_tool_delta(
+            installation_root,
+            short_tool,
+            &empty_capture,
+            &msvc_tool_delta(&empty_capture, &non_bmp_259)?,
+        )?;
+        assert!(
+            validate_msvc_installation_tool_delta(
+                installation_root,
+                short_tool,
+                &empty_capture,
+                &msvc_tool_delta(&empty_capture, &non_bmp_260)?,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_installation_delta_rejects_missing_or_incomplete_paths_without_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let installation_root = Path::new(r"C:\VS");
+        let tool = Path::new(r"C:\VS\VC\bin\link.exe");
+        let captured = BTreeMap::new();
+        let mut nul_path_units = Path::new(r"C:\VS\private-segment")
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        nul_path_units.push(0);
+        let nul_path = PathBuf::from(OsString::from_wide(&nul_path_units));
+        for unsafe_path in [
+            PathBuf::from(r"C:\VS\..\private-segment"),
+            PathBuf::from(r"relative\private-segment"),
+            PathBuf::from(r"C:private-segment"),
+            PathBuf::from(r"\private-segment"),
+            PathBuf::from(r"\\server\share\private-segment"),
+            PathBuf::from(r"\\?\C:\private-segment"),
+            PathBuf::from(r"\\.\C:\private-segment"),
+            nul_path,
+        ] {
+            let error = validate_msvc_installation_tool_delta(
+                installation_root,
+                tool,
+                &captured,
+                &msvc_tool_delta(&captured, &unsafe_path)?,
+            )
+            .err()
+            .ok_or_else(|| std::io::Error::other("unsafe MSVC path was accepted"))?
+            .to_string();
+            assert!(!error.contains("private-segment"));
+            assert!(error.contains("PATH"));
+        }
+        let tool_error = validate_msvc_installation_tool_delta(
+            installation_root,
+            Path::new(r"relative\private-tool.exe"),
+            &captured,
+            &msvc_tool_delta(&captured, Path::new(r"C:\VS\safe"))?,
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("unsafe MSVC tool path was accepted"))?
+        .to_string();
+        assert!(!tool_error.contains("private-tool"));
+
+        let mut incomplete = msvc_tool_delta(&captured, Path::new(r"C:\VS\safe"))?;
+        incomplete.pop();
+        let incomplete_error =
+            validate_msvc_installation_tool_delta(installation_root, tool, &captured, &incomplete)
+                .err()
+                .ok_or_else(|| std::io::Error::other("incomplete MSVC delta was accepted"))?
+                .to_string();
+        assert!(incomplete_error.contains("omitted the derived INCLUDE projection"));
+
+        let captured_with_path = BTreeMap::from([(
+            "PATH",
+            std::env::join_paths([Path::new(r"relative\project-tools")])?,
+        )]);
+        let mut changed_tail = msvc_tool_delta(&captured_with_path, Path::new(r"C:\VS\safe"))?;
+        changed_tail[0].1 = std::env::join_paths([Path::new(r"C:\VS\safe")])?;
+        let tail_error = validate_msvc_installation_tool_delta(
+            installation_root,
+            tool,
+            &captured_with_path,
+            &changed_tail,
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("changed inherited MSVC tail was accepted"))?
+        .to_string();
+        assert!(tail_error.contains("PATH projection did not preserve the inherited path tail"));
+        Ok(())
     }
 
     #[test]
