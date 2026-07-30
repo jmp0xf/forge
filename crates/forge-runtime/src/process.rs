@@ -1224,6 +1224,10 @@ where
                 "command environment contains a restricted pager, prompt, or trace setting",
             ));
         }
+        // Windows environment names are case-insensitive even though `BTreeMap<OsString, _>` is
+        // not. Remove the inherited spelling before applying the explicit value so an ambient
+        // `Path` cannot survive alongside, and later override, an explicit `PATH`.
+        environment.retain(|candidate, _| !environment_policy_key_eq(candidate, key));
         environment.insert(key.clone(), value.clone());
     }
     Ok(environment)
@@ -3184,6 +3188,27 @@ mod tests {
             .overrides
             .insert(OsString::from("git_terminal_prompt"), OsString::from("1"));
         assert!(sanitized_environment([], &policy).is_err());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_environment_replaces_an_inherited_key_with_different_case()
+    -> Result<(), Box<dyn Error>> {
+        let inherited = [(OsString::from("Path"), OsString::from("ambient-path"))];
+        let policy = EnvPolicy::minimal_with_overrides(BTreeMap::from([(
+            OsString::from("PATH"),
+            OsString::from("explicit-path"),
+        )]));
+
+        let environment = sanitized_environment(inherited, &policy)?;
+        let matching: Vec<_> = environment
+            .iter()
+            .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].0, OsStr::new("PATH"));
+        assert_eq!(matching[0].1, OsStr::new("explicit-path"));
         Ok(())
     }
 
