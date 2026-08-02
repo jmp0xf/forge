@@ -180,6 +180,64 @@ pub(crate) fn prepared_cargo_environment(
     Ok(policy)
 }
 
+/// Returns the exact MSVC PATH/LIB/INCLUDE overrides prepared for one Windows release build.
+///
+/// The values are borrowed from the same policy that the caller will move into the Cargo process;
+/// this function never probes again or falls back to ambient environment values.
+pub(crate) fn windows_msvc_build_inputs(
+    policy: &EnvPolicy,
+    compilation_target: CargoCompilationTarget<'_>,
+) -> Result<Option<[OsString; 3]>, CargoEnvironmentError> {
+    #[cfg(all(windows, target_env = "msvc"))]
+    {
+        if windows_msvc_target(compilation_target).is_none() {
+            return Ok(None);
+        }
+        projected_windows_msvc_build_inputs(policy).map(Some)
+    }
+    #[cfg(not(all(windows, target_env = "msvc")))]
+    {
+        let _ = (policy, compilation_target);
+        Ok(None)
+    }
+}
+
+#[cfg(any(all(windows, target_env = "msvc"), test))]
+fn projected_windows_msvc_build_inputs(
+    policy: &EnvPolicy,
+) -> Result<[OsString; 3], CargoEnvironmentError> {
+    let mut projected = Vec::with_capacity(MsvcEnvironmentKey::COUNT);
+    for expected in MsvcEnvironmentKey::ALL {
+        let mut matches = policy.overrides.iter().filter_map(|(key, value)| {
+            (canonical_msvc_tool_environment_key(key) == Some(expected)).then_some(value)
+        });
+        let value = matches.next().ok_or_else(|| {
+            CargoEnvironmentError(format!(
+                "prepared MSVC build environment is missing {}",
+                expected.name()
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(CargoEnvironmentError(format!(
+                "prepared MSVC build environment repeats {}",
+                expected.name()
+            )));
+        }
+        if value.is_empty() {
+            return Err(CargoEnvironmentError(format!(
+                "prepared MSVC build environment contains an empty {}",
+                expected.name()
+            )));
+        }
+        projected.push(value.clone());
+    }
+    projected.try_into().map_err(|_| {
+        CargoEnvironmentError(String::from(
+            "prepared MSVC build environment did not contain exactly three values",
+        ))
+    })
+}
+
 #[cfg(all(windows, target_env = "msvc"))]
 fn extend_windows_msvc_environment(
     runner: &SynchronousProcessRunner,
@@ -1301,7 +1359,8 @@ mod tests {
         is_cargo_build_environment_key, is_msvc_probe_input_key, materialize_msvc_tool_environment,
         msvc_probe_environment_for, msvc_probe_executable, msvc_probe_spec, msvc_vswhere_spec,
         observation_reports_toolchain_not_found, parse_vswhere_installation_path,
-        require_probe_success, require_vswhere_success, supported_msvc_target,
+        projected_windows_msvc_build_inputs, require_probe_success, require_vswhere_success,
+        supported_msvc_target, windows_msvc_build_inputs,
     };
 
     fn observation(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> ProcessObservation {
@@ -1372,6 +1431,117 @@ mod tests {
             "CARGO_TARGET_PRIVATE_TOKEN"
         )));
         assert!(is_cargo_build_environment_key(OsStr::new("LIB")));
+    }
+
+    #[test]
+    fn projected_msvc_build_inputs_are_complete_ordered_and_content_free_on_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy = EnvPolicy::minimal();
+        policy.overrides.extend([
+            (
+                OsString::from("INCLUDE"),
+                OsString::from("include-sentinel"),
+            ),
+            (OsString::from("PATH"), OsString::from("path-sentinel")),
+            (OsString::from("LIB"), OsString::from("lib-sentinel")),
+            (
+                OsString::from("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"),
+                OsString::from("linker.exe"),
+            ),
+        ]);
+
+        assert_eq!(
+            projected_windows_msvc_build_inputs(&policy)?,
+            [
+                OsString::from("path-sentinel"),
+                OsString::from("lib-sentinel"),
+                OsString::from("include-sentinel"),
+            ]
+        );
+
+        policy.overrides.remove(OsStr::new("INCLUDE"));
+        let Err(error) = projected_windows_msvc_build_inputs(&policy) else {
+            return Err("missing INCLUDE was accepted".into());
+        };
+        let error = error.to_string();
+        assert!(error.contains("missing INCLUDE"));
+        assert!(!error.contains("sentinel"));
+
+        policy
+            .overrides
+            .insert(OsString::from("INCLUDE"), OsString::new());
+        let Err(error) = projected_windows_msvc_build_inputs(&policy) else {
+            return Err("empty INCLUDE was accepted".into());
+        };
+        let error = error.to_string();
+        assert!(error.contains("empty INCLUDE"));
+        assert!(!error.contains("sentinel"));
+
+        policy.overrides.insert(
+            OsString::from("INCLUDE"),
+            OsString::from("include-sentinel"),
+        );
+        policy
+            .overrides
+            .insert(OsString::from("Path"), OsString::from("duplicate-sentinel"));
+        let Err(error) = projected_windows_msvc_build_inputs(&policy) else {
+            return Err("case-insensitive duplicate PATH was accepted".into());
+        };
+        let error = error.to_string();
+        assert!(error.contains("repeats PATH"));
+        assert!(!error.contains("sentinel"));
+        Ok(())
+    }
+
+    #[cfg(not(all(windows, target_env = "msvc")))]
+    #[test]
+    fn non_windows_build_input_projection_never_uses_ambient_or_policy_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy = EnvPolicy::minimal();
+        for name in ["PATH", "LIB", "INCLUDE"] {
+            policy
+                .overrides
+                .insert(OsString::from(name), OsString::from("must-not-be-observed"));
+        }
+        assert_eq!(
+            windows_msvc_build_inputs(
+                &policy,
+                super::CargoCompilationTarget::Target("x86_64-pc-windows-msvc")
+            )?,
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn windows_build_input_projection_activates_only_for_the_msvc_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy = EnvPolicy::minimal();
+        for (name, value) in [
+            ("PATH", "prepared-path"),
+            ("LIB", "prepared-lib"),
+            ("INCLUDE", "prepared-include"),
+        ] {
+            policy
+                .overrides
+                .insert(OsString::from(name), OsString::from(value));
+        }
+        assert!(
+            windows_msvc_build_inputs(
+                &policy,
+                super::CargoCompilationTarget::Target("x86_64-pc-windows-msvc")
+            )?
+            .is_some()
+        );
+        assert_eq!(
+            windows_msvc_build_inputs(
+                &policy,
+                super::CargoCompilationTarget::Target("x86_64-unknown-linux-musl")
+            )?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
