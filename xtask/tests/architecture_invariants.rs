@@ -1553,6 +1553,62 @@ fn primary_verification_workflow_keeps_authority_read_only_and_dependencies_immu
 }
 
 #[test]
+fn primary_verification_exercises_private_windows_build_input_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = repository_root()?;
+    let workflow = fs::read_to_string(root.join(".github/workflows/verify.yml"))?;
+    let windows_step = workflow
+        .split("      - name: Build and execute Windows release candidate\n")
+        .nth(1)
+        .and_then(|suffix| suffix.split("\n  adapters:\n").next())
+        .ok_or("Windows native release step is missing")?;
+
+    assert_eq!(
+        workflow.matches("--build-input-observation-dir").count(),
+        1,
+        "only the native Windows release path should enable the opt-in raw diagnostic"
+    );
+    for required in [
+        "$env:RUNNER_TEMP",
+        "forge-dist",
+        "forge-private-build-input",
+        "--output-dir $dist",
+        "--build-input-observation-dir $privateObservationDirectory",
+        "forge.release-build-input-observation/v1",
+        "diagnostic-only-not-release-evidence",
+        "cargo_command.arguments",
+        "windows-wide",
+        "windows_msvc_environment.status",
+        "Get-CanonicalUtf16Bytes",
+        "$ActualAssetNames.Count -ne 2",
+        "finally {",
+        "Remove-Item -LiteralPath $privateObservationDirectory -Recurse -Force",
+    ] {
+        assert!(
+            windows_step.contains(required),
+            "Windows native release step lost private observation guard `{required}`"
+        );
+    }
+    for forbidden in [
+        "actions/upload-artifact",
+        "release-finalize",
+        "release-check",
+        "gh release",
+        "Get-Content",
+        "ConvertTo-Json",
+        "Write-Host",
+        "Write-Output",
+        "Tee-Object",
+    ] {
+        assert!(
+            !windows_step.contains(forbidden),
+            "raw diagnostic path must not gain release or upload authority through `{forbidden}`"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn candidate_workflow_authority_parser_rejects_yaml_spelling_bypasses() {
     let valid = r#"name: verify
 on:

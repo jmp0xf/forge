@@ -585,8 +585,12 @@ impl RepositoryWriter {
         self.write_atomic_with_mode(relative_path.as_ref(), bytes, NewFileMode::Private)
     }
 
-    /// Atomically creates one private file without replacing an existing identity.
-    pub(crate) fn write_atomic_private_new(
+    /// Atomically creates one owner-private file without replacing an existing target.
+    ///
+    /// This is appropriate for bounded diagnostic handoffs that may contain local paths or other
+    /// private machine state. The caller remains responsible for keeping the surrounding directory
+    /// out of public artifact and logging paths.
+    pub fn write_atomic_private_new(
         &self,
         relative_path: impl AsRef<Path>,
         bytes: &[u8],

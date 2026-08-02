@@ -22,15 +22,22 @@ use forge_runtime::fs::RepositoryWriter;
 use forge_runtime::git::{GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
 use forge_runtime::process::SynchronousProcessRunner;
 use forge_schema::{
-    ReleaseArtifactKindV2Data, ReleaseArtifactV2Data, ReleaseAuthorityStatusData,
-    ReleaseCandidateStatusData, ReleaseChannelData, ReleaseDescriptorData, ReleaseDistributionData,
-    ReleaseManifestV2Data, ReleasePredicateTypeData, ReleaseProvenanceStatusData,
-    ReleaseProvenanceV2Data, ReleaseRollbackData, ReleaseRollbackStatusData, ReleaseSha256Data,
-    ReleaseSigningData, ReleaseSubjectSetData, SchemaKind,
+    GitObjectIdV2Data, GitSha1ObjectIdV2Data, GitSha256ObjectIdV2Data, ReleaseArtifactKindV2Data,
+    ReleaseArtifactV2Data, ReleaseAuthorityStatusData, ReleaseBuildInputCargoCommandData,
+    ReleaseBuildInputNativeStringData, ReleaseBuildInputObservationData,
+    ReleaseBuildInputObservationPhaseData, ReleaseBuildInputObservationPurposeData,
+    ReleaseBuildInputTargetData, ReleaseBuildInputValueData,
+    ReleaseBuildInputWindowsMsvcEnvironmentData, ReleaseCandidateStatusData, ReleaseChannelData,
+    ReleaseDescriptorData, ReleaseDistributionData, ReleaseManifestV2Data,
+    ReleasePredicateTypeData, ReleaseProvenanceStatusData, ReleaseProvenanceV2Data,
+    ReleaseRollbackData, ReleaseRollbackStatusData, ReleaseSha256Data, ReleaseSigningData,
+    ReleaseSubjectSetData, SchemaKind,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cargo_env::{CargoCompilationTarget, CargoNetworkMode, prepared_cargo_environment};
+use crate::cargo_env::{
+    CargoCompilationTarget, CargoNetworkMode, prepared_cargo_environment, windows_msvc_build_inputs,
+};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -66,6 +73,8 @@ const MAX_GIT_INDEX_ENTRIES: usize = 200_000;
 const MAX_HASH_OBJECT_ARGUMENT_UNITS: usize = 16 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BUILD_INPUT_OBSERVATION_BYTES: usize = 512 * 1024;
+const BUILD_INPUT_OBSERVATION_PREFIX: &str = "release-build-input-observation-";
 const FINALIZED_ASSET_COUNT: u16 = 13;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const CARGO_METADATA_TIMEOUT: Duration = Duration::from_secs(300);
@@ -83,7 +92,7 @@ const REJECTED_RELEASE_GIT_ENV: &[&str] = &[
     "GIT_EXEC_PATH",
 ];
 
-pub(crate) const BUILD_HELP: &str = "usage: xtask release-build --target <TRIPLE> --output-dir <DIR>\n\nBuilds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. Run the compiled xtask directly when a nested `cargo run` is unsuitable.";
+pub(crate) const BUILD_HELP: &str = "usage: xtask release-build --target <TRIPLE> --output-dir <DIR> [--build-input-observation-dir <DIR>]\n\nBuilds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. The optional observation is a private, diagnostic-only pre-build record that can contain local toolchain paths; it is not a release asset or evidence and must not be uploaded raw. Run the compiled xtask directly when a nested `cargo run` is unsuitable.";
 pub(crate) const FINALIZE_HELP: &str = "usage: xtask release-finalize --output-dir <DIR>\n\nRequires all five target binaries and SBOMs, then copies the source-bound license notices and writes release-manifest.json and SHA256SUMS without overwriting different bytes.";
 pub(crate) const CHECK_HELP: &str = "usage: xtask release-check --output-dir <DIR>\n\nRecomputes the complete local asset set, binary formats, SBOMs, manifest, and SHA-256 checksums. Success is local consistency evidence, not provenance, signature, approval, upload, or publication.";
 pub(crate) const LICENSE_CHECK_HELP: &str = "usage: xtask release-license-check\n\nRecomputes the reviewed five-target scoped Cargo tree graph, legal-file inventory, policy, and deterministic THIRD-PARTY-LICENSES.txt fixed point. Fetched .crate archive bytes must match Cargo.lock SHA-256; legal text is separately read and hashed from current unpacked sources, without claiming the archive check proves those unpacked bytes. Each native release-build must independently prove compiler-artifact parity before staging.";
@@ -205,21 +214,43 @@ pub(crate) enum ReleaseCommandOutput {
 struct BuildRequest {
     target: &'static ReleaseTarget,
     output_directory: PathBuf,
+    build_input_observation_directory: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct BuildInputObservationOutput {
+    writer: RepositoryWriter,
+    file_name: String,
+}
+
+#[derive(Debug)]
+struct PreparedCargoInvocation {
+    program: OsString,
+    arguments: Vec<OsString>,
+    working_directory: PathBuf,
+    environment: EnvPolicy,
 }
 
 pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, ReleaseError> {
     if is_help(arguments) {
         return Ok(ReleaseCommandOutput::Help(BUILD_HELP));
     }
-    let options = parse_options(arguments, &["--target", "--output-dir"])?;
-    let request = BuildRequest {
-        target: parse_target(required_option(&options, "--target")?)?,
-        output_directory: PathBuf::from(required_option(&options, "--output-dir")?),
-    };
+    let request = parse_build_request(arguments)?;
     let repository = repository_root()?;
     let output = open_command_output_directory(&repository, &request.output_directory)?;
+    let build_input_observation = request
+        .build_input_observation_directory
+        .as_deref()
+        .map(|directory| {
+            open_build_input_observation_output(&repository, &output, request.target, directory)
+        })
+        .transpose()?;
     let targets = std::slice::from_ref(request.target);
-    let source = ReleaseSource::prepare(&repository, targets, &[output.root()])?;
+    let mut output_roots = vec![output.root()];
+    if let Some(observation) = &build_input_observation {
+        output_roots.push(observation.writer.root());
+    }
+    let source = ReleaseSource::prepare(&repository, targets, &output_roots)?;
     let build_directory = tempdir().map_err(|error| {
         ReleaseError::environment(format!(
             "failed to create a fresh temporary Cargo target directory: {error}"
@@ -230,7 +261,13 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
             "failed to pin the fresh Cargo target directory before building: {error}"
         ))
     })?;
-    let built_packages = cargo_build(source.repository(), request.target, build_directory.path())?;
+    let built_packages = cargo_build(
+        source.repository(),
+        request.target,
+        build_directory.path(),
+        build_input_observation.as_ref(),
+        &source.snapshot().source_commit,
+    )?;
     source.require_unchanged(targets, "Cargo release build")?;
     let metadata: CargoMetadata =
         serde_json::from_slice(source.snapshot().metadata(request.target)?).map_err(|error| {
@@ -258,6 +295,20 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
         binary_asset_name(request.target),
         output.root().display()
     )))
+}
+
+fn parse_build_request(arguments: &[String]) -> Result<BuildRequest, ReleaseError> {
+    let options = parse_options(
+        arguments,
+        &["--target", "--output-dir", "--build-input-observation-dir"],
+    )?;
+    Ok(BuildRequest {
+        target: parse_target(required_option(&options, "--target")?)?,
+        output_directory: PathBuf::from(required_option(&options, "--output-dir")?),
+        build_input_observation_directory: options
+            .get("--build-input-observation-dir")
+            .map(PathBuf::from),
+    })
 }
 
 pub(crate) fn run_finalize(arguments: &[String]) -> Result<ReleaseCommandOutput, ReleaseError> {
@@ -1849,6 +1900,8 @@ fn cargo_build(
     repository: &Path,
     target: &ReleaseTarget,
     target_directory: &Path,
+    build_input_observation: Option<&BuildInputObservationOutput>,
+    source_commit: &str,
 ) -> Result<BTreeSet<String>, ReleaseError> {
     require_no_external_cargo_configuration(repository)?;
     let mut arguments = [
@@ -1876,9 +1929,24 @@ fn cargo_build(
         CargoCompilationTarget::Target(target.triple),
         &label,
     )?;
+    let invocation = PreparedCargoInvocation {
+        program: cargo_program(),
+        arguments,
+        working_directory: repository.to_path_buf(),
+        environment,
+    };
+    if let Some(output) = build_input_observation {
+        write_build_input_observation(output, source_commit, target, &invocation)?;
+    }
+    let PreparedCargoInvocation {
+        program,
+        arguments,
+        working_directory,
+        environment,
+    } = invocation;
     let observation = run_bounded_process(
-        repository,
-        cargo_program(),
+        &working_directory,
+        program,
         arguments,
         environment,
         CARGO_BUILD_TIMEOUT,
@@ -1893,6 +1961,218 @@ fn cargo_build(
     later_configuration_boundary?;
     let stdout = require_process_success(observation, &label)?;
     parse_cargo_build_artifacts(&stdout, target.triple)
+}
+
+fn write_build_input_observation(
+    output: &BuildInputObservationOutput,
+    source_commit: &str,
+    target: &ReleaseTarget,
+    invocation: &PreparedCargoInvocation,
+) -> Result<(), ReleaseError> {
+    let document = build_input_observation(source_commit, target, invocation)?;
+    let bytes = to_pretty_json(&document, "release-build input observation")?;
+    if bytes.len() > MAX_BUILD_INPUT_OBSERVATION_BYTES {
+        return Err(ReleaseError::environment(format!(
+            "release-build input observation exceeds the {MAX_BUILD_INPUT_OBSERVATION_BYTES}-byte limit"
+        )));
+    }
+    validate_visible_root(&output.writer, "build input observation output")?;
+    output
+        .writer
+        .write_atomic_private_new(&output.file_name, &bytes)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to create the private build input observation: {error}"
+            ))
+        })?;
+    let readback = output
+        .writer
+        .read_bounded(&output.file_name, MAX_BUILD_INPUT_OBSERVATION_BYTES)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read back the private build input observation: {error}"
+            ))
+        })?;
+    if readback != bytes {
+        return Err(ReleaseError::environment(
+            "private build input observation changed during exact readback",
+        ));
+    }
+    validate_visible_root(&output.writer, "build input observation output")
+}
+
+fn build_input_observation(
+    source_commit: &str,
+    target: &ReleaseTarget,
+    invocation: &PreparedCargoInvocation,
+) -> Result<ReleaseBuildInputObservationData, ReleaseError> {
+    let windows_msvc_environment = windows_msvc_build_inputs(
+        &invocation.environment,
+        CargoCompilationTarget::Target(target.triple),
+    )
+    .map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to project bounded MSVC build inputs for diagnostic observation: {error}"
+        ))
+    })?
+    .map(|[path, lib, include]| {
+        Ok(ReleaseBuildInputWindowsMsvcEnvironmentData::Observed {
+            path: encode_windows_msvc_input(&path)?,
+            lib: encode_windows_msvc_input(&lib)?,
+            include: encode_windows_msvc_input(&include)?,
+        })
+    })
+    .transpose()?
+    .unwrap_or(ReleaseBuildInputWindowsMsvcEnvironmentData::NotApplicable);
+
+    if invocation.arguments.is_empty() || invocation.arguments.len() > 32 {
+        return Err(ReleaseError::internal(
+            "prepared Cargo argument count is outside the observation contract",
+        ));
+    }
+    let cargo_command = ReleaseBuildInputCargoCommandData {
+        program: encode_release_build_native_string(&invocation.program)?,
+        arguments: invocation
+            .arguments
+            .iter()
+            .map(|argument| encode_release_build_native_string(argument))
+            .collect::<Result<Vec<_>, _>>()?,
+        working_directory: encode_release_build_native_string(
+            invocation.working_directory.as_os_str(),
+        )?,
+    };
+
+    Ok(ReleaseBuildInputObservationData {
+        schema: SchemaKind::ReleaseBuildInputObservation.id(),
+        purpose: ReleaseBuildInputObservationPurposeData::DiagnosticOnlyNotReleaseEvidence,
+        phase:
+            ReleaseBuildInputObservationPhaseData::AfterEnvironmentPreparationBeforeCargoReleaseBuild,
+        source_commit: release_build_source_commit(source_commit)?,
+        target: release_build_input_target(target)?,
+        cargo_command,
+        windows_msvc_environment,
+    })
+}
+
+fn encode_release_build_native_string(
+    value: &OsStr,
+) -> Result<ReleaseBuildInputNativeStringData, ReleaseError> {
+    encode_release_build_native_string_for_host(value)
+}
+
+#[cfg(unix)]
+fn encode_release_build_native_string_for_host(
+    value: &OsStr,
+) -> Result<ReleaseBuildInputNativeStringData, ReleaseError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use forge_schema::ReleaseBuildInputRawBytesBase64Data;
+
+    let raw_base64 = ReleaseBuildInputRawBytesBase64Data::new(STANDARD.encode(value.as_bytes()))
+        .map_err(|_| {
+            ReleaseError::environment(
+                "prepared Cargo invocation contains an empty, NUL, or oversized Unix-native value",
+            )
+        })?;
+    Ok(ReleaseBuildInputNativeStringData::UnixBytes { raw_base64 })
+}
+
+#[cfg(windows)]
+fn encode_release_build_native_string_for_host(
+    value: &OsStr,
+) -> Result<ReleaseBuildInputNativeStringData, ReleaseError> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use forge_schema::ReleaseBuildInputRawBase64Data;
+
+    let bytes = value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let raw_base64 = ReleaseBuildInputRawBase64Data::new(STANDARD.encode(bytes)).map_err(|_| {
+        ReleaseError::environment(
+            "prepared Cargo invocation contains an empty, NUL, or oversized Windows-native value",
+        )
+    })?;
+    Ok(ReleaseBuildInputNativeStringData::WindowsWide { raw_base64 })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_release_build_native_string_for_host(
+    _value: &OsStr,
+) -> Result<ReleaseBuildInputNativeStringData, ReleaseError> {
+    Err(ReleaseError::environment(
+        "prepared Cargo invocation uses a native value on an unsupported host",
+    ))
+}
+
+fn release_build_source_commit(value: &str) -> Result<GitObjectIdV2Data, ReleaseError> {
+    match value.len() {
+        40 => GitSha1ObjectIdV2Data::new(value).map(|oid| GitObjectIdV2Data::Sha1 { oid }),
+        64 => GitSha256ObjectIdV2Data::new(value).map(|oid| GitObjectIdV2Data::Sha256 { oid }),
+        _ => Err(forge_schema::InvalidGitObjectIdV2Data),
+    }
+    .map_err(|_| ReleaseError::internal("release source commit lost its validated object identity"))
+}
+
+fn release_build_input_target(
+    target: &ReleaseTarget,
+) -> Result<ReleaseBuildInputTargetData, ReleaseError> {
+    match target.triple {
+        "x86_64-unknown-linux-musl" => Ok(ReleaseBuildInputTargetData::X8664UnknownLinuxMusl),
+        "aarch64-unknown-linux-musl" => Ok(ReleaseBuildInputTargetData::Aarch64UnknownLinuxMusl),
+        "x86_64-apple-darwin" => Ok(ReleaseBuildInputTargetData::X8664AppleDarwin),
+        "aarch64-apple-darwin" => Ok(ReleaseBuildInputTargetData::Aarch64AppleDarwin),
+        "x86_64-pc-windows-msvc" => Ok(ReleaseBuildInputTargetData::X8664PcWindowsMsvc),
+        _ => Err(ReleaseError::internal(
+            "accepted release target has no input-observation wire identity",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn encode_windows_msvc_input(value: &OsStr) -> Result<ReleaseBuildInputValueData, ReleaseError> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    encode_windows_utf16_input(value.encode_wide())
+}
+
+#[cfg(not(windows))]
+fn encode_windows_msvc_input(_value: &OsStr) -> Result<ReleaseBuildInputValueData, ReleaseError> {
+    Err(ReleaseError::internal(
+        "non-Windows build unexpectedly produced MSVC input values",
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn encode_windows_utf16_input(
+    units: impl IntoIterator<Item = u16>,
+) -> Result<ReleaseBuildInputValueData, ReleaseError> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use forge_schema::{ReleaseBuildInputRawBase64Data, ReleaseBuildInputValueEncodingData};
+
+    let units = units.into_iter().collect::<Vec<_>>();
+    if units.is_empty() || units.len() > 32_766 || units.contains(&0) {
+        return Err(ReleaseError::environment(
+            "prepared MSVC build input is empty, contains NUL, or exceeds the Windows value limit",
+        ));
+    }
+    let bytes = units
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let raw_base64 = ReleaseBuildInputRawBase64Data::new(STANDARD.encode(bytes)).map_err(|_| {
+        ReleaseError::internal("failed to encode a validated MSVC build input losslessly")
+    })?;
+    Ok(ReleaseBuildInputValueData {
+        encoding: ReleaseBuildInputValueEncodingData::WindowsUtf16leBase64,
+        raw_base64,
+    })
 }
 
 fn parse_cargo_build_artifacts(
@@ -2380,11 +2660,20 @@ fn absolute_clean_path(path: &Path) -> Result<PathBuf, ReleaseError> {
     Ok(absolute)
 }
 
+#[cfg(test)]
 fn open_output_directory(repository: &Path, path: &Path) -> Result<RepositoryWriter, ReleaseError> {
+    open_labeled_output_directory(repository, path, "release output")
+}
+
+fn open_labeled_output_directory(
+    repository: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<RepositoryWriter, ReleaseError> {
     let absolute = absolute_clean_path(path)?;
     let output = RepositoryWriter::new(&absolute).map_err(|error| {
         ReleaseError::environment(format!(
-            "failed to pin the existing release output directory {}: {error}",
+            "failed to pin the existing {label} directory {}: {error}",
             absolute.display()
         ))
     })?;
@@ -2396,11 +2685,11 @@ fn open_output_directory(repository: &Path, path: &Path) -> Result<RepositoryWri
     })?;
     if output.root() == repository || output.root().starts_with(&repository) {
         return Err(ReleaseError::environment(format!(
-            "release output must be outside the source repository: {}",
+            "{label} must be outside the source repository: {}",
             output.root().display()
         )));
     }
-    validate_visible_root(&output, "release output")?;
+    validate_visible_root(&output, label)?;
     Ok(output)
 }
 
@@ -2408,17 +2697,93 @@ fn open_command_output_directory(
     repository: &Path,
     path: &Path,
 ) -> Result<RepositoryWriter, ReleaseError> {
-    let output = open_output_directory(repository, path)?;
-    for (private_directory, label) in git_private_directories(repository)? {
+    open_labeled_command_output_directory(repository, path, "release output")
+}
+
+fn open_labeled_command_output_directory(
+    repository: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<RepositoryWriter, ReleaseError> {
+    let output = open_labeled_output_directory(repository, path, label)?;
+    for (private_directory, private_label) in git_private_directories(repository)? {
         if output.root() == private_directory || output.root().starts_with(&private_directory) {
             return Err(ReleaseError::environment(format!(
-                "release output must be outside the {label}: {}",
+                "{label} must be outside the {private_label}: {}",
                 output.root().display()
             )));
         }
     }
-    validate_visible_root(&output, "release output")?;
+    validate_visible_root(&output, label)?;
     Ok(output)
+}
+
+fn open_build_input_observation_output(
+    repository: &Path,
+    release_output: &RepositoryWriter,
+    target: &ReleaseTarget,
+    path: &Path,
+) -> Result<BuildInputObservationOutput, ReleaseError> {
+    let writer =
+        open_labeled_command_output_directory(repository, path, "build input observation output")?;
+    require_disjoint_output_roots(release_output.root(), writer.root())?;
+    require_observation_does_not_contain_source(repository, writer.root())?;
+    let file_name = format!("{BUILD_INPUT_OBSERVATION_PREFIX}{}.json", target.triple);
+    match writer.read_optional_bounded(&file_name, MAX_BUILD_INPUT_OBSERVATION_BYTES) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(ReleaseError::environment(format!(
+                "build input observation already exists; use a fresh destination for `{file_name}`"
+            )));
+        }
+        Err(error) => {
+            return Err(ReleaseError::environment(format!(
+                "failed to inspect the build input observation destination: {error}"
+            )));
+        }
+    }
+    validate_visible_root(&writer, "build input observation output")?;
+    Ok(BuildInputObservationOutput { writer, file_name })
+}
+
+fn require_observation_does_not_contain_source(
+    repository: &Path,
+    observation_output: &Path,
+) -> Result<(), ReleaseError> {
+    let repository = fs::canonicalize(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to resolve the source repository boundary {}: {error}",
+            repository.display()
+        ))
+    })?;
+    if repository.starts_with(observation_output) {
+        return Err(ReleaseError::environment(
+            "build input observation output must not contain the source repository",
+        ));
+    }
+    for (private_directory, _) in git_private_directories(&repository)? {
+        if private_directory.starts_with(observation_output) {
+            return Err(ReleaseError::environment(
+                "build input observation output must not contain a Git private directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_disjoint_output_roots(
+    release_output: &Path,
+    observation_output: &Path,
+) -> Result<(), ReleaseError> {
+    if release_output == observation_output
+        || release_output.starts_with(observation_output)
+        || observation_output.starts_with(release_output)
+    {
+        return Err(ReleaseError::environment(
+            "release output and build input observation output must be disjoint directories",
+        ));
+    }
+    Ok(())
 }
 
 fn git_private_directories(
@@ -5228,21 +5593,27 @@ fn to_pretty_json<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>, Relea
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::Write as _;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::Duration;
 
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use forge_core::ports::EnvPolicy;
     use forge_core::{Mutability, NetworkIntent};
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        CHECKSUMS_FILE, LICENSE_NOTICES_FILE, MANIFEST_FILE, RELEASE_TARGETS, ReleaseError,
-        ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, binary_asset_name, check, finalize,
-        render_sbom, sha256_hex, stage_built, validate_binary_format,
+        BUILD_INPUT_OBSERVATION_PREFIX, BuildInputObservationOutput, CHECKSUMS_FILE,
+        LICENSE_NOTICES_FILE, MANIFEST_FILE, PreparedCargoInvocation, RELEASE_TARGETS,
+        ReleaseError, ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, binary_asset_name,
+        build_input_observation, check, encode_windows_utf16_input, finalize,
+        finalized_asset_names, known_stage_names, parse_build_request, render_sbom,
+        require_disjoint_output_roots, sha256_hex, stage_built, validate_binary_format,
+        write_build_input_observation,
     };
 
     const METADATA: &str = r#"{
@@ -5279,6 +5650,277 @@ mod tests {
         "{\"reason\":\"compiler-artifact\",\"package_id\":\"path+file:///repo/crates/forge-cli#0.1.0-rc.2\"}\n",
         "{\"reason\":\"build-finished\",\"success\":true}\n",
     );
+
+    fn prepared_test_cargo_invocation(environment: EnvPolicy) -> PreparedCargoInvocation {
+        PreparedCargoInvocation {
+            program: OsString::from("cargo-program-sentinel"),
+            arguments: vec![
+                OsString::from("build-argument-sentinel"),
+                OsString::from("--locked"),
+            ],
+            working_directory: PathBuf::from("/working-directory-sentinel"),
+            environment,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_native_string_equals(
+        actual: &forge_schema::ReleaseBuildInputNativeStringData,
+        expected: &OsStr,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let forge_schema::ReleaseBuildInputNativeStringData::UnixBytes { raw_base64 } = actual
+        else {
+            return Err("Unix invocation value did not use Unix-native encoding".into());
+        };
+        assert_eq!(STANDARD.decode(raw_base64.as_str())?, expected.as_bytes());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn assert_native_string_equals(
+        actual: &forge_schema::ReleaseBuildInputNativeStringData,
+        expected: &OsStr,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let forge_schema::ReleaseBuildInputNativeStringData::WindowsWide { raw_base64 } = actual
+        else {
+            return Err("Windows invocation value did not use Windows-native encoding".into());
+        };
+        let expected = expected
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(STANDARD.decode(raw_base64.as_str())?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_request_keeps_observation_explicit_and_optional() -> Result<(), ReleaseError> {
+        let default = parse_build_request(&[
+            String::from("--target"),
+            String::from("x86_64-unknown-linux-musl"),
+            String::from("--output-dir"),
+            String::from("/candidate"),
+        ])?;
+        assert_eq!(default.target, &RELEASE_TARGETS[0]);
+        assert_eq!(default.output_directory, PathBuf::from("/candidate"));
+        assert_eq!(default.build_input_observation_directory, None);
+
+        let observed = parse_build_request(&[
+            String::from("--build-input-observation-dir"),
+            String::from("/private-observation"),
+            String::from("--output-dir"),
+            String::from("/candidate"),
+            String::from("--target"),
+            String::from("x86_64-pc-windows-msvc"),
+        ])?;
+        assert_eq!(observed.target, &RELEASE_TARGETS[4]);
+        assert_eq!(
+            observed.build_input_observation_directory,
+            Some(PathBuf::from("/private-observation"))
+        );
+
+        let duplicate = parse_build_request(&[
+            String::from("--target"),
+            String::from("x86_64-unknown-linux-musl"),
+            String::from("--output-dir"),
+            String::from("/candidate"),
+            String::from("--build-input-observation-dir"),
+            String::from("/first"),
+            String::from("--build-input-observation-dir"),
+            String::from("/second"),
+        ]);
+        let Err(duplicate) = duplicate else {
+            return Err(ReleaseError::internal(
+                "duplicate observation destinations were accepted",
+            ));
+        };
+        assert_eq!(duplicate.kind(), ReleaseErrorKind::Usage);
+        Ok(())
+    }
+
+    #[test]
+    fn observation_binds_the_exact_prepared_invocation_before_consumption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut environment = EnvPolicy::minimal();
+        environment
+            .overrides
+            .insert(OsString::from("BOUND_INPUT"), OsString::from("exact-value"));
+        let invocation = prepared_test_cargo_invocation(environment);
+        let document = build_input_observation(&"a".repeat(40), &RELEASE_TARGETS[0], &invocation)?;
+        assert_native_string_equals(
+            &document.cargo_command.program,
+            OsStr::new("cargo-program-sentinel"),
+        )?;
+        assert_eq!(document.cargo_command.arguments.len(), 2);
+        assert_native_string_equals(
+            &document.cargo_command.arguments[0],
+            OsStr::new("build-argument-sentinel"),
+        )?;
+        assert_native_string_equals(
+            &document.cargo_command.working_directory,
+            OsStr::new("/working-directory-sentinel"),
+        )?;
+
+        let PreparedCargoInvocation {
+            program,
+            arguments,
+            working_directory,
+            environment,
+        } = invocation;
+        assert_eq!(program, OsString::from("cargo-program-sentinel"));
+        assert_eq!(arguments[0], OsString::from("build-argument-sentinel"));
+        assert_eq!(
+            working_directory,
+            PathBuf::from("/working-directory-sentinel")
+        );
+        assert_eq!(
+            environment.overrides.get(OsStr::new("BOUND_INPUT")),
+            Some(&OsString::from("exact-value"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_input_encoding_preserves_every_utf16_code_unit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = encode_windows_utf16_input([0x0041, 0xd800, 0x0042])?;
+        assert_eq!(
+            STANDARD.decode(value.raw_base64.as_str())?,
+            [0x41, 0x00, 0x00, 0xd8, 0x42, 0x00]
+        );
+        for invalid in [Vec::new(), vec![0], vec![1; 32_767]] {
+            assert!(encode_windows_utf16_input(invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(windows, target_env = "msvc")))]
+    #[test]
+    fn non_windows_observation_never_guesses_msvc_values() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut environment = EnvPolicy::minimal();
+        for name in ["PATH", "LIB", "INCLUDE"] {
+            environment.overrides.insert(
+                OsString::from(name),
+                OsString::from("private-path-sentinel"),
+            );
+        }
+        let invocation = prepared_test_cargo_invocation(environment);
+        let document = build_input_observation(&"a".repeat(40), &RELEASE_TARGETS[4], &invocation)?;
+        let rendered = serde_json::to_string(&document)?;
+        assert!(rendered.contains("\"status\":\"not-applicable\""));
+        assert!(rendered.contains("diagnostic-only-not-release-evidence"));
+        assert!(!rendered.contains("private-path-sentinel"));
+        Ok(())
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn windows_observation_reads_the_prepared_policy_losslessly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut environment = EnvPolicy::minimal();
+        for (name, value) in [
+            ("PATH", "prepared-path"),
+            ("LIB", "prepared-lib"),
+            ("INCLUDE", "prepared-include"),
+        ] {
+            environment
+                .overrides
+                .insert(OsString::from(name), OsString::from(value));
+        }
+        let invocation = prepared_test_cargo_invocation(environment);
+        let document = build_input_observation(&"a".repeat(40), &RELEASE_TARGETS[4], &invocation)?;
+        let forge_schema::ReleaseBuildInputWindowsMsvcEnvironmentData::Observed {
+            path,
+            lib,
+            include,
+        } = document.windows_msvc_environment
+        else {
+            return Err("Windows MSVC observation omitted the prepared values".into());
+        };
+        for (actual, expected) in [
+            (path, "prepared-path"),
+            (lib, "prepared-lib"),
+            (include, "prepared-include"),
+        ] {
+            let expected = expected
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(STANDARD.decode(actual.raw_base64.as_str())?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_input_observation_is_private_create_only_and_outside_release_assets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let observation_directory = temporary.path().join("observation");
+        fs::create_dir(&observation_directory)?;
+        let writer = forge_runtime::fs::RepositoryWriter::new(&observation_directory)?;
+        let file_name = format!(
+            "{BUILD_INPUT_OBSERVATION_PREFIX}{}.json",
+            RELEASE_TARGETS[0].triple
+        );
+        let output = BuildInputObservationOutput {
+            writer,
+            file_name: file_name.clone(),
+        };
+        let invocation = prepared_test_cargo_invocation(EnvPolicy::minimal());
+        write_build_input_observation(&output, &"a".repeat(40), &RELEASE_TARGETS[0], &invocation)?;
+        let first = output.writer.read_bounded(&file_name, 512 * 1024)?;
+        assert!(
+            write_build_input_observation(
+                &output,
+                &"b".repeat(40),
+                &RELEASE_TARGETS[0],
+                &invocation,
+            )
+            .is_err()
+        );
+        assert_eq!(output.writer.read_bounded(&file_name, 512 * 1024)?, first);
+        assert!(
+            known_stage_names()
+                .iter()
+                .all(|name| !name.starts_with(BUILD_INPUT_OBSERVATION_PREFIX))
+        );
+        assert!(
+            finalized_asset_names()
+                .iter()
+                .all(|name| !name.starts_with(BUILD_INPUT_OBSERVATION_PREFIX))
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                fs::metadata(observation_directory.join(file_name))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_and_observation_roots_must_be_disjoint() {
+        let root = PathBuf::from("/tmp/forge-release-root-test");
+        assert!(require_disjoint_output_roots(&root, &root).is_err());
+        assert!(require_disjoint_output_roots(&root, &root.join("observation")).is_err());
+        assert!(require_disjoint_output_roots(&root.join("candidate"), &root).is_err());
+        assert!(
+            require_disjoint_output_roots(&root.join("candidate"), &root.join("observation"))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn release_cargo_preparation_preserves_linker_authority_and_offline_policy()

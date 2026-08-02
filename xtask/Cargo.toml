@@ -9,6 +9,7 @@ publish.workspace = true
 default-run = "xtask"
 
 [dependencies]
+base64.workspace = true
 blake3.workspace = true
 forge-core = { path = "../crates/forge-core" }
 forge-schema = { path = "../crates/forge-schema" }

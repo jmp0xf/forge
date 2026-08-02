@@ -4,6 +4,8 @@ This runbook assembles reviewable local assets for `0.1.0-rc.2`. It does not gra
 perform a tag, upload, signature, attestation, or GitHub Release mutation. `0.1.0-rc.1` was never tagged or published
 and is not a distributable predecessor. The current contract and its trust boundary are in
 [ADR-0041](adr/0041-publish-license-complete-rc2-through-external-authority.md), which supersedes ADR-0029.
+The optional private build-input diagnostic and its non-authority boundary are fixed by
+[ADR-0043](adr/0043-record-private-release-build-input-diagnostics.md).
 
 The Forge candidate repository must not contain a release or signing workflow. The physically separate Authority Set
 is the independent public
@@ -91,6 +93,37 @@ target/debug/xtask release-build --target x86_64-unknown-linux-musl --output-dir
 ```text
 .\target\debug\xtask.exe release-build --target x86_64-pc-windows-msvc --output-dir C:\forge-0.1.0-rc.2-dist
 ```
+
+When diagnosing the exact pre-Cargo boundary, opt in to a separate private handoff directory:
+
+```text
+New-Item -ItemType Directory C:\forge-private-build-input
+.\target\debug\xtask.exe release-build --target x86_64-pc-windows-msvc --output-dir C:\forge-0.1.0-rc.2-dist --build-input-observation-dir C:\forge-private-build-input
+```
+
+The observation directory must already exist, be disjoint from the release output, and neither contain nor sit inside
+the source repository or its Git private directories. Forge creates exactly the target-bound fixed name
+`release-build-input-observation-<TRIPLE>.json` with owner-private, create-only semantics before Cargo starts. A
+pre-existing fixed name fails without replacement. Use a fresh dedicated directory even though unrelated entries are
+not release assets.
+
+The raw v1 document records the source commit, target, exact native Cargo program/ordered arguments/working directory,
+and, on a native Windows MSVC build, the prepared `PATH`, `LIB`, and `INCLUDE` from the same invocation. Those values
+can disclose local toolchain and SDK paths. The document is candidate-controlled diagnostic input only: it is not one
+of the thirteen release files, a Receipt, Evidence, provenance, signature, approval, or publication authority. Never
+print or upload it, and never place it under the release output.
+
+For ordinary candidate handoff, transfer only the fixed binary/SBOM pair; an Authority-owned path may separately carry
+only an allowlisted path-free summary. After a non-echoing local check, remove the raw file namespace in a
+`finally`/equivalent cleanup path. A Cargo failure after observation can leave the file for private diagnosis;
+interruption on a disposable hosted runner is contained by VM destruction, while a persistent self-hosted runner
+requires a trusted post-job cleanup.
+
+An Authority-owned sanitizer may read the raw file on the same runner, emit an allowlisted path-free summary, and remove
+the raw file for canary diagnosis and policy development. Sanitization reduces disclosure; it does not make a
+candidate-controlled report independent. Formal qualification must use a fresh run whose Authority-owned observation,
+enforcement, and builder record independently bind the real inputs. Candidate CI, raw observation, or its sanitized
+summary cannot by itself replace any independent Authority gate below.
 
 Repeat on appropriate trusted runners for all five targets, transferring only the fixed named binary/SBOM pairs between
 jobs. `release-build` has no arbitrary external-binary staging mode. It runs the locked, offline release build in a new
