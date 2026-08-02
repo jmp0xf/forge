@@ -214,10 +214,146 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           $dist = Join-Path $env:RUNNER_TEMP "forge-dist"
+          $privateObservationDirectory = Join-Path $env:RUNNER_TEMP "forge-private-build-input"
+          if ((Test-Path -LiteralPath $dist) -or (Test-Path -LiteralPath $privateObservationDirectory)) {
+            throw "release candidate output roots must be fresh"
+          }
           New-Item -ItemType Directory -Path $dist | Out-Null
-          .\target\debug\xtask.exe release-build --target "${{ matrix.target }}" --output-dir $dist
-          & (Join-Path $dist "${{ matrix.asset }}") version
+          New-Item -ItemType Directory -Path $privateObservationDirectory | Out-Null
+
+          function Get-CanonicalUtf16Bytes {
+            param([object]$Encoded, [string]$Label)
+            if (($Encoded -isnot [string]) -or [string]::IsNullOrEmpty($Encoded)) {
+              throw "$Label is not a non-empty Base64 string"
+            }
+            try {
+              [byte[]]$Bytes = [Convert]::FromBase64String($Encoded)
+            } catch {
+              throw "$Label is not valid Base64"
+            }
+            if (($Bytes.Length -eq 0) -or ($Bytes.Length -gt 65532) -or (($Bytes.Length % 2) -ne 0)) {
+              throw "$Label has an invalid decoded length"
+            }
+            if ([Convert]::ToBase64String($Bytes) -cne $Encoded) {
+              throw "$Label is not canonical Base64"
+            }
+            for ($Index = 0; $Index -lt $Bytes.Length; $Index += 2) {
+              if (($Bytes[$Index] -eq 0) -and ($Bytes[$Index + 1] -eq 0)) {
+                throw "$Label contains a NUL code unit"
+              }
+            }
+            return ,$Bytes
+          }
+
+          try {
+            & .\target\debug\xtask.exe release-build `
+              --target "${{ matrix.target }}" `
+              --output-dir $dist `
+              --build-input-observation-dir $privateObservationDirectory
+            $BuildExitCode = $LASTEXITCODE
+
+            $ObservationName = "release-build-input-observation-${{ matrix.target }}.json"
+            $ObservationPath = Join-Path $privateObservationDirectory $ObservationName
+            if (-not (Test-Path -LiteralPath $ObservationPath -PathType Leaf)) {
+              if ($BuildExitCode -ne 0) {
+                throw "release-build failed before observation creation with exit code $BuildExitCode"
+              }
+              throw "release-build did not create its private observation"
+            }
+            $ObservationEntries = @(Get-ChildItem -LiteralPath $privateObservationDirectory -Force)
+            if (($ObservationEntries.Count -ne 1) -or ($ObservationEntries[0].Name -cne $ObservationName)) {
+              throw "private observation directory does not contain exactly the fixed file"
+            }
+            $ObservationFile = Get-Item -LiteralPath $ObservationPath -Force
+            if ($ObservationFile.PSIsContainer -or
+                (($ObservationFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                ($ObservationFile.Length -le 0) -or ($ObservationFile.Length -gt 524288)) {
+              throw "private observation is not one bounded non-reparse regular file"
+            }
+
+            try {
+              [byte[]]$ObservationBytes = [IO.File]::ReadAllBytes($ObservationPath)
+              $StrictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+              $Observation = $StrictUtf8.GetString($ObservationBytes) | ConvertFrom-Json -Depth 16
+            } catch {
+              throw "private observation is not strict UTF-8 JSON"
+            }
+            if ($Observation.schema -cne "forge.release-build-input-observation/v1" -or
+                $Observation.purpose -cne "diagnostic-only-not-release-evidence" -or
+                $Observation.phase -cne "after-environment-preparation-before-cargo-release-build" -or
+                $Observation.target -cne "x86_64-pc-windows-msvc") {
+              throw "private observation has an unexpected contract identity"
+            }
+
+            $SourceObjectFormat = ((& git rev-parse --show-object-format) -join "").Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to read the source object format"
+            }
+            $SourceOid = ((& git rev-parse HEAD) -join "").Trim()
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to read the source commit"
+            }
+            if (($Observation.source_commit.object_format -cne $SourceObjectFormat) -or
+                ($Observation.source_commit.oid -cne $SourceOid)) {
+              throw "private observation is not bound to the checked-out source commit"
+            }
+
+            $ObservedArguments = @($Observation.cargo_command.arguments)
+            if ($ObservedArguments.Count -ne 13) {
+              throw "private observation has an unexpected Cargo argument count"
+            }
+            $NativeValues = @($Observation.cargo_command.program)
+            $NativeValues += $ObservedArguments
+            $NativeValues += @($Observation.cargo_command.working_directory)
+            if ($NativeValues.Count -ne 15) {
+              throw "private observation omitted a Cargo invocation value"
+            }
+            foreach ($Value in $NativeValues) {
+              if ($Value.encoding -cne "windows-wide") {
+                throw "Cargo invocation value does not use Windows-native encoding"
+              }
+              $null = Get-CanonicalUtf16Bytes $Value.raw_base64 "Cargo invocation value"
+            }
+
+            if ($Observation.windows_msvc_environment.status -cne "observed") {
+              throw "private observation omitted the prepared MSVC environment"
+            }
+            foreach ($Name in @("path", "lib", "include")) {
+              $Value = $Observation.windows_msvc_environment.$Name
+              if ($Value.encoding -cne "windows-utf16le-base64") {
+                throw "prepared MSVC $Name uses an unexpected encoding"
+              }
+              $null = Get-CanonicalUtf16Bytes $Value.raw_base64 "prepared MSVC $Name"
+            }
+            if ($BuildExitCode -ne 0) {
+              throw "release-build failed after observation creation with exit code $BuildExitCode"
+            }
+
+            $DistEntries = @(Get-ChildItem -LiteralPath $dist -Force)
+            $ExpectedAssetNames = @("${{ matrix.asset }}", "${{ matrix.asset }}.cdx.json") | Sort-Object
+            $ActualAssetNames = @($DistEntries | ForEach-Object {
+              if ($_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                throw "release output contains a non-regular entry"
+              }
+              $_.Name
+            }) | Sort-Object
+            if (($ActualAssetNames.Count -ne 2) -or
+                (($ActualAssetNames -join "`n") -cne ($ExpectedAssetNames -join "`n"))) {
+              throw "release output does not contain exactly the binary and SBOM"
+            }
+
+            & (Join-Path $dist "${{ matrix.asset }}") version
+            if ($LASTEXITCODE -ne 0) {
+              throw "release candidate execution failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            if (Test-Path -LiteralPath $privateObservationDirectory) {
+              Remove-Item -LiteralPath $privateObservationDirectory -Recurse -Force
+            }
+          }
 
   adapters:
     name: Host adapter contract
