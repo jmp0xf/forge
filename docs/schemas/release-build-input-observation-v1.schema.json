@@ -1,0 +1,294 @@
+{
+  "$id": "forge.release-build-input-observation/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge release-build-input-observation v1",
+  "description": "Standalone `forge.release-build-input-observation/v1` diagnostic document.\n\nThis opt-in record is produced immediately before the Cargo release build consumes the same\nprepared environment policy. Candidate-controlled self-observation is not independent proof;\nan external authority must sanitize it and bind any accepted conclusions independently.",
+  "type": "object",
+  "properties": {
+    "cargo_command": {
+      "$ref": "#/$defs/ReleaseBuildInputCargoCommandData"
+    },
+    "phase": {
+      "$ref": "#/$defs/ReleaseBuildInputObservationPhaseData"
+    },
+    "purpose": {
+      "$ref": "#/$defs/ReleaseBuildInputObservationPurposeData"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.release-build-input-observation/v1"
+    },
+    "source_commit": {
+      "$ref": "#/$defs/GitObjectIdV2Data"
+    },
+    "target": {
+      "$ref": "#/$defs/ReleaseBuildInputTargetData"
+    },
+    "windows_msvc_environment": {
+      "$ref": "#/$defs/ReleaseBuildInputWindowsMsvcEnvironmentData"
+    }
+  },
+  "required": [
+    "schema",
+    "purpose",
+    "phase",
+    "source_commit",
+    "target",
+    "cargo_command",
+    "windows_msvc_environment"
+  ],
+  "$defs": {
+    "GitObjectIdV2Data": {
+      "description": "A validated object ID paired with its Git object format.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha1"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha1ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha256"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha256ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "object_format"
+          ]
+        }
+      ]
+    },
+    "GitSha1ObjectIdV2Data": {
+      "description": "A validated full SHA-1 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "GitSha256ObjectIdV2Data": {
+      "description": "A validated full SHA-256 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ReleaseBuildInputCargoCommandData": {
+      "description": "The exact Cargo program, ordered arguments, and working directory consumed after observation.\n\nThis deliberately does not claim to represent a complete process specification or environment.",
+      "type": "object",
+      "properties": {
+        "arguments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReleaseBuildInputNativeStringData"
+          },
+          "maxItems": 32,
+          "minItems": 1
+        },
+        "program": {
+          "$ref": "#/$defs/ReleaseBuildInputNativeStringData"
+        },
+        "working_directory": {
+          "$ref": "#/$defs/ReleaseBuildInputNativeStringData"
+        }
+      },
+      "required": [
+        "program",
+        "arguments",
+        "working_directory"
+      ]
+    },
+    "ReleaseBuildInputNativeStringData": {
+      "description": "One lossless, bounded platform-native value used by the exact Cargo invocation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "encoding": {
+              "type": "string",
+              "const": "unix-bytes"
+            },
+            "raw_base64": {
+              "$ref": "#/$defs/ReleaseBuildInputRawBytesBase64Data"
+            }
+          },
+          "required": [
+            "encoding",
+            "raw_base64"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "encoding": {
+              "type": "string",
+              "const": "windows-wide"
+            },
+            "raw_base64": {
+              "$ref": "#/$defs/ReleaseBuildInputRawBase64Data"
+            }
+          },
+          "required": [
+            "encoding",
+            "raw_base64"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "encoding": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "encoding"
+          ]
+        }
+      ]
+    },
+    "ReleaseBuildInputObservationPhaseData": {
+      "description": "The exact release-build boundary at which the diagnostic values were captured.",
+      "type": "string",
+      "enum": [
+        "after-environment-preparation-before-cargo-release-build",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildInputObservationPurposeData": {
+      "description": "Why an opt-in release-build input observation exists.\n\nThe record is emitted by candidate-controlled code and can contain private local paths. It is\ndiagnostic input to an external sanitizer, never release evidence or publication authority.",
+      "type": "string",
+      "enum": [
+        "diagnostic-only-not-release-evidence",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildInputRawBase64Data": {
+      "description": "Canonical padded Base64 for one bounded Windows-native UTF-16LE value.",
+      "type": "string",
+      "maxLength": 87376,
+      "minLength": 4,
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+    },
+    "ReleaseBuildInputRawBytesBase64Data": {
+      "description": "Canonical padded Base64 for one bounded Unix-native string.",
+      "type": "string",
+      "maxLength": 87376,
+      "minLength": 4,
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+    },
+    "ReleaseBuildInputTargetData": {
+      "description": "One accepted native release target associated with an input observation.",
+      "type": "string",
+      "enum": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildInputValueData": {
+      "description": "One losslessly encoded Windows environment value.\n\n`raw_base64` is canonical padded Base64 over the little-endian bytes of the exact UTF-16 code\nunits. It can disclose local paths and must remain in the private diagnostic handoff.",
+      "type": "object",
+      "properties": {
+        "encoding": {
+          "$ref": "#/$defs/ReleaseBuildInputValueEncodingData"
+        },
+        "raw_base64": {
+          "$ref": "#/$defs/ReleaseBuildInputRawBase64Data"
+        }
+      },
+      "required": [
+        "encoding",
+        "raw_base64"
+      ]
+    },
+    "ReleaseBuildInputValueEncodingData": {
+      "description": "Lossless representation used for one private Windows environment value.",
+      "type": "string",
+      "enum": [
+        "windows-utf16le-base64",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildInputWindowsMsvcEnvironmentData": {
+      "description": "MSVC-specific environment inputs observed after Forge's bounded toolchain projection.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "include": {
+              "$ref": "#/$defs/ReleaseBuildInputValueData"
+            },
+            "lib": {
+              "$ref": "#/$defs/ReleaseBuildInputValueData"
+            },
+            "path": {
+              "$ref": "#/$defs/ReleaseBuildInputValueData"
+            },
+            "status": {
+              "type": "string",
+              "const": "observed"
+            }
+          },
+          "required": [
+            "status",
+            "path",
+            "lib",
+            "include"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "not-applicable"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        }
+      ]
+    }
+  }
+}

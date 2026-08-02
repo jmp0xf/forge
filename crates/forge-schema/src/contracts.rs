@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,6 +54,7 @@ pub enum SchemaKind {
     EvidenceV1,
     Evidence,
     Adapters,
+    ReleaseBuildInputObservation,
     ReleaseManifestV1,
     ReleaseManifest,
     Diagnostic,
@@ -72,6 +75,7 @@ impl SchemaKind {
         Self::EvidenceV1,
         Self::Evidence,
         Self::Adapters,
+        Self::ReleaseBuildInputObservation,
         Self::ReleaseManifestV1,
         Self::ReleaseManifest,
         Self::Diagnostic,
@@ -95,6 +99,7 @@ impl SchemaKind {
             Self::ReceiptV1 | Self::Receipt => "receipt",
             Self::EvidenceV1 | Self::Evidence => "evidence",
             Self::Adapters => "adapters",
+            Self::ReleaseBuildInputObservation => "release-build-input-observation",
             Self::ReleaseManifestV1 | Self::ReleaseManifest => "release-manifest",
             Self::Diagnostic => "diagnostic",
             Self::Unknown => "unknown",
@@ -115,6 +120,7 @@ impl SchemaKind {
             | Self::ReceiptV1
             | Self::EvidenceV1
             | Self::Adapters
+            | Self::ReleaseBuildInputObservation
             | Self::ReleaseManifestV1
             | Self::Diagnostic
             | Self::Unknown => 1,
@@ -161,6 +167,9 @@ impl FromStr for SchemaKind {
             ("evidence", Some(1)) => Self::EvidenceV1,
             ("evidence", None | Some(2)) => Self::Evidence,
             ("adapters", None | Some(1)) => Self::Adapters,
+            ("release-build-input-observation", None | Some(1)) => {
+                Self::ReleaseBuildInputObservation
+            }
             ("release-manifest" | "release", Some(1)) => Self::ReleaseManifestV1,
             ("release-manifest" | "release", None | Some(2)) => Self::ReleaseManifest,
             ("diagnostic", None | Some(1)) => Self::Diagnostic,
@@ -1526,6 +1535,238 @@ pub struct AdaptersData {
     pub applied: bool,
 }
 
+/// Why an opt-in release-build input observation exists.
+///
+/// The record is emitted by candidate-controlled code and can contain private local paths. It is
+/// diagnostic input to an external sanitizer, never release evidence or publication authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildInputObservationPurposeData {
+    DiagnosticOnlyNotReleaseEvidence,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The exact release-build boundary at which the diagnostic values were captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildInputObservationPhaseData {
+    AfterEnvironmentPreparationBeforeCargoReleaseBuild,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One accepted native release target associated with an input observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildInputTargetData {
+    #[serde(rename = "x86_64-unknown-linux-musl")]
+    X8664UnknownLinuxMusl,
+    #[serde(rename = "aarch64-unknown-linux-musl")]
+    Aarch64UnknownLinuxMusl,
+    #[serde(rename = "x86_64-apple-darwin")]
+    X8664AppleDarwin,
+    #[serde(rename = "aarch64-apple-darwin")]
+    Aarch64AppleDarwin,
+    #[serde(rename = "x86_64-pc-windows-msvc")]
+    X8664PcWindowsMsvc,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lossless representation used for one private Windows environment value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildInputValueEncodingData {
+    WindowsUtf16leBase64,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A malformed or unbounded native-byte Base64 value supplied to the observation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "release-build native bytes must be bounded canonical Base64 over non-empty NUL-free bytes"
+)]
+pub struct InvalidReleaseBuildInputRawBytesBase64Data;
+
+/// Canonical padded Base64 for one bounded Unix-native string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildInputRawBytesBase64Data(
+    #[schemars(
+        length(min = 4, max = 87376),
+        regex(pattern = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
+    )]
+    String,
+);
+
+impl ReleaseBuildInputRawBytesBase64Data {
+    pub fn new(
+        value: impl Into<String>,
+    ) -> Result<Self, InvalidReleaseBuildInputRawBytesBase64Data> {
+        let value = value.into();
+        if !bounded_release_build_input_base64_shape(&value) {
+            return Err(InvalidReleaseBuildInputRawBytesBase64Data);
+        }
+        let bytes = STANDARD
+            .decode(&value)
+            .map_err(|_| InvalidReleaseBuildInputRawBytesBase64Data)?;
+        if bytes.is_empty()
+            || bytes.len() > 65_532
+            || bytes.contains(&0)
+            || STANDARD.encode(&bytes) != value
+        {
+            return Err(InvalidReleaseBuildInputRawBytesBase64Data);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildInputRawBytesBase64Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A malformed or unbounded UTF-16LE Base64 value supplied to the observation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "release-build input value must be bounded canonical Base64 over non-empty NUL-free UTF-16LE code units"
+)]
+pub struct InvalidReleaseBuildInputRawBase64Data;
+
+/// Canonical padded Base64 for one bounded Windows-native UTF-16LE value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildInputRawBase64Data(
+    #[schemars(
+        length(min = 4, max = 87376),
+        regex(pattern = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
+    )]
+    String,
+);
+
+impl ReleaseBuildInputRawBase64Data {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidReleaseBuildInputRawBase64Data> {
+        let value = value.into();
+        if !bounded_release_build_input_base64_shape(&value) {
+            return Err(InvalidReleaseBuildInputRawBase64Data);
+        }
+        let bytes = STANDARD
+            .decode(&value)
+            .map_err(|_| InvalidReleaseBuildInputRawBase64Data)?;
+        if bytes.is_empty()
+            || bytes.len() > 65_532
+            || bytes.len() % 2 != 0
+            || bytes.chunks_exact(2).any(|unit| unit == [0_u8, 0_u8])
+            || STANDARD.encode(&bytes) != value
+        {
+            return Err(InvalidReleaseBuildInputRawBase64Data);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn bounded_release_build_input_base64_shape(value: &str) -> bool {
+    (4..=87_376).contains(&value.len()) && value.len() % 4 == 0 && value.is_ascii()
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildInputRawBase64Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One losslessly encoded Windows environment value.
+///
+/// `raw_base64` is canonical padded Base64 over the little-endian bytes of the exact UTF-16 code
+/// units. It can disclose local paths and must remain in the private diagnostic handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildInputValueData {
+    pub encoding: ReleaseBuildInputValueEncodingData,
+    pub raw_base64: ReleaseBuildInputRawBase64Data,
+}
+
+/// One lossless, bounded platform-native value used by the exact Cargo invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "encoding", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildInputNativeStringData {
+    UnixBytes {
+        raw_base64: ReleaseBuildInputRawBytesBase64Data,
+    },
+    WindowsWide {
+        raw_base64: ReleaseBuildInputRawBase64Data,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// The exact Cargo program, ordered arguments, and working directory consumed after observation.
+///
+/// This deliberately does not claim to represent a complete process specification or environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildInputCargoCommandData {
+    pub program: ReleaseBuildInputNativeStringData,
+    #[schemars(length(min = 1, max = 32))]
+    pub arguments: Vec<ReleaseBuildInputNativeStringData>,
+    pub working_directory: ReleaseBuildInputNativeStringData,
+}
+
+/// MSVC-specific environment inputs observed after Forge's bounded toolchain projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildInputWindowsMsvcEnvironmentData {
+    Observed {
+        path: ReleaseBuildInputValueData,
+        lib: ReleaseBuildInputValueData,
+        include: ReleaseBuildInputValueData,
+    },
+    NotApplicable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Standalone `forge.release-build-input-observation/v1` diagnostic document.
+///
+/// This opt-in record is produced immediately before the Cargo release build consumes the same
+/// prepared environment policy. Candidate-controlled self-observation is not independent proof;
+/// an external authority must sanitize it and bind any accepted conclusions independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildInputObservationData {
+    pub schema: String,
+    pub purpose: ReleaseBuildInputObservationPurposeData,
+    pub phase: ReleaseBuildInputObservationPhaseData,
+    pub source_commit: GitObjectIdV2Data,
+    pub target: ReleaseBuildInputTargetData,
+    pub cargo_command: ReleaseBuildInputCargoCommandData,
+    pub windows_msvc_environment: ReleaseBuildInputWindowsMsvcEnvironmentData,
+}
+
 /// One immutable artifact described by a local release-candidate manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -1777,6 +2018,9 @@ pub fn schema_for_kind(kind: SchemaKind) -> SchemaDocument {
         SchemaKind::EvidenceV1 => schema_for!(Envelope<EvidenceData>),
         SchemaKind::Evidence => schema_for!(Envelope<EvidenceV2Data>),
         SchemaKind::Adapters => schema_for!(Envelope<AdaptersData>),
+        SchemaKind::ReleaseBuildInputObservation => {
+            schema_for!(ReleaseBuildInputObservationData)
+        }
         SchemaKind::ReleaseManifestV1 => schema_for!(ReleaseManifestData),
         SchemaKind::ReleaseManifest => schema_for!(ReleaseManifestV2Data),
         SchemaKind::Diagnostic | SchemaKind::Unknown => {
@@ -1836,12 +2080,17 @@ mod tests {
         GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
         ProcessErrorKindV2Data, ProjectModelData, ProjectUnitDetailData,
         ReceiptValidityReasonV2Data, ReleaseArtifactKindData, ReleaseArtifactKindV2Data,
-        ReleaseAuthorityStatusData, ReleaseCandidateStatusData, ReleaseChannelData,
-        ReleaseDistributionData, ReleaseManifestData, ReleaseManifestV2Data,
-        ReleasePredicateTypeData, ReleaseProvenanceStatusData, ReleaseRollbackStatusData,
-        ReleaseSha256Data, ReleaseSigningData, ReleaseSubjectSetData, SchemaIndexData, SchemaKind,
-        SchemaVersion, StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData,
-        schema_json,
+        ReleaseAuthorityStatusData, ReleaseBuildInputCargoCommandData,
+        ReleaseBuildInputNativeStringData, ReleaseBuildInputObservationData,
+        ReleaseBuildInputObservationPhaseData, ReleaseBuildInputObservationPurposeData,
+        ReleaseBuildInputRawBase64Data, ReleaseBuildInputRawBytesBase64Data,
+        ReleaseBuildInputTargetData, ReleaseBuildInputValueData,
+        ReleaseBuildInputValueEncodingData, ReleaseBuildInputWindowsMsvcEnvironmentData,
+        ReleaseCandidateStatusData, ReleaseChannelData, ReleaseDistributionData,
+        ReleaseManifestData, ReleaseManifestV2Data, ReleasePredicateTypeData,
+        ReleaseProvenanceStatusData, ReleaseRollbackStatusData, ReleaseSha256Data,
+        ReleaseSigningData, ReleaseSubjectSetData, SchemaIndexData, SchemaKind, SchemaVersion,
+        StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData, schema_json,
     };
     use crate::Digest;
 
@@ -1862,6 +2111,7 @@ mod tests {
         assert!(ids.contains(&String::from("forge.receipt/v2")));
         assert!(ids.contains(&String::from("forge.evidence/v1")));
         assert!(ids.contains(&String::from("forge.evidence/v2")));
+        assert!(ids.contains(&String::from("forge.release-build-input-observation/v1")));
         assert!(ids.contains(&String::from("forge.release-manifest/v1")));
         assert!(ids.contains(&String::from("forge.release-manifest/v2")));
     }
@@ -1900,6 +2150,10 @@ mod tests {
             SchemaKind::ReleaseManifest
         );
         assert_eq!(
+            SchemaKind::from_str("forge.release-build-input-observation/v1")?,
+            SchemaKind::ReleaseBuildInputObservation
+        );
+        assert_eq!(
             SchemaKind::from_str("release")?,
             SchemaKind::ReleaseManifest
         );
@@ -1914,6 +2168,82 @@ mod tests {
         assert_eq!(
             SchemaVersion::for_kind(SchemaKind::ReleaseManifest),
             SchemaVersion::new("release-manifest", 2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_input_observation_has_standalone_versioned_branches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = ReleaseBuildInputValueData {
+            encoding: ReleaseBuildInputValueEncodingData::WindowsUtf16leBase64,
+            raw_base64: ReleaseBuildInputRawBase64Data::new("QQA=")?,
+        };
+        let native = ReleaseBuildInputNativeStringData::UnixBytes {
+            raw_base64: ReleaseBuildInputRawBytesBase64Data::new("Y2FyZ28=")?,
+        };
+        let observed = ReleaseBuildInputObservationData {
+            schema: SchemaKind::ReleaseBuildInputObservation.id(),
+            purpose: ReleaseBuildInputObservationPurposeData::DiagnosticOnlyNotReleaseEvidence,
+            phase: ReleaseBuildInputObservationPhaseData::AfterEnvironmentPreparationBeforeCargoReleaseBuild,
+            source_commit: GitObjectIdV2Data::Sha1 {
+                oid: GitSha1ObjectIdV2Data::new("a".repeat(40))?,
+            },
+            target: ReleaseBuildInputTargetData::X8664PcWindowsMsvc,
+            cargo_command: ReleaseBuildInputCargoCommandData {
+                program: native.clone(),
+                arguments: vec![native.clone()],
+                working_directory: native,
+            },
+            windows_msvc_environment: ReleaseBuildInputWindowsMsvcEnvironmentData::Observed {
+                path: value.clone(),
+                lib: value.clone(),
+                include: value,
+            },
+        };
+        let rendered = serde_json::to_value(&observed)?;
+        assert_eq!(
+            rendered["schema"],
+            "forge.release-build-input-observation/v1"
+        );
+        assert_eq!(rendered["windows_msvc_environment"]["status"], "observed");
+        assert_eq!(
+            serde_json::from_value::<ReleaseBuildInputObservationData>(rendered)?,
+            observed
+        );
+
+        let not_applicable = ReleaseBuildInputWindowsMsvcEnvironmentData::NotApplicable;
+        assert_eq!(
+            serde_json::to_value(not_applicable)?,
+            serde_json::json!({"status": "not-applicable"})
+        );
+        for invalid in ["", "AAA=", "QQ==", "QWE"] {
+            assert!(ReleaseBuildInputRawBase64Data::new(invalid).is_err());
+            assert!(
+                serde_json::from_value::<ReleaseBuildInputRawBase64Data>(serde_json::json!(
+                    invalid
+                ))
+                .is_err()
+            );
+        }
+        let oversized = "A".repeat(87_380);
+        assert!(ReleaseBuildInputRawBase64Data::new(&oversized).is_err());
+        assert!(ReleaseBuildInputRawBytesBase64Data::new(&oversized).is_err());
+
+        let schema: Value =
+            serde_json::from_str(&schema_json(SchemaKind::ReleaseBuildInputObservation)?)?;
+        assert_eq!(schema["$id"], "forge.release-build-input-observation/v1");
+        assert_eq!(
+            schema["properties"]["schema"]["const"],
+            "forge.release-build-input-observation/v1"
+        );
+        assert_eq!(
+            schema["$defs"]["ReleaseBuildInputRawBase64Data"]["maxLength"],
+            87_376
+        );
+        assert_eq!(
+            schema["$defs"]["ReleaseBuildInputCargoCommandData"]["properties"]["arguments"]["maxItems"],
+            32
         );
         Ok(())
     }
