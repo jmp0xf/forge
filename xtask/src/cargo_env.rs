@@ -845,9 +845,9 @@ pub(crate) fn run_msvc_probe_helper(target: &str) -> Result<(), CargoEnvironment
                 )));
             }
         };
-    // `Tool::env` is a delta to the environment supplied to `find_tool_with_env`, not a complete
-    // snapshot. Some valid discovery branches therefore return an empty delta. Materialize the
-    // three variables required by downstream MSVC tools before crossing the helper boundary.
+    // `Tool::env` is branch-dependent: each key it contains is a complete projected value, while
+    // some valid discovery branches return no keys. Materialize exactly the three variables
+    // required by downstream MSVC tools without appending the captured tail a second time.
     let environment = match materialize_msvc_tool_environment(
         &probe_environment.values,
         tool.env().into_iter().cloned(),
@@ -908,12 +908,17 @@ where
                 key.name()
             )));
         }
-        let inherited = captured
+        let inherited_paths = captured
             .get(key.name())
-            .map(|value| value.as_os_str())
+            .map(|value| env::split_paths(value).collect::<Vec<_>>())
             .unwrap_or_default();
-        let inherited_paths = env::split_paths(inherited).collect::<Vec<_>>();
-        let projected_paths = env::split_paths(value).collect::<Vec<_>>();
+        let projected_value = strip_missing_msvc_inherited_tail(
+            key,
+            value.clone(),
+            captured.contains_key(key.name()),
+        )?;
+        validate_msvc_path_entries(key, &projected_value)?;
+        let projected_paths = env::split_paths(&projected_value).collect::<Vec<_>>();
         // `find-msvc-tools` 0.1.9 prepends discovered paths to this exact inherited tail. Split
         // the pinned dependency's projection at that boundary so pre-existing project or builder
         // paths remain compatible and only paths derived from the simplified VS root are bounded.
@@ -1769,6 +1774,38 @@ mod tests {
             assert!(!error.contains("private-segment"));
             assert!(error.contains("PATH"));
         }
+
+        let private_derived_path = Path::new(r"C:\VS\private-segment");
+        let captured_empty_path = BTreeMap::from([("PATH", OsString::new())]);
+        let explicit_empty_error = validate_msvc_installation_tool_delta(
+            installation_root,
+            tool,
+            &captured_empty_path,
+            &msvc_tool_delta(&captured_empty_path, private_derived_path)?,
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("explicit empty MSVC tail was accepted"))?
+        .to_string();
+        assert!(explicit_empty_error.contains("empty path entry"));
+        assert!(explicit_empty_error.contains("PATH"));
+        assert!(!explicit_empty_error.contains("private-segment"));
+
+        let mut additional_empty_tail = msvc_tool_delta(&captured, private_derived_path)?;
+        additional_empty_tail[0].1 =
+            std::env::join_paths([private_derived_path, Path::new(""), Path::new("")])?;
+        let additional_empty_error = validate_msvc_installation_tool_delta(
+            installation_root,
+            tool,
+            &captured,
+            &additional_empty_tail,
+        )
+        .err()
+        .ok_or_else(|| std::io::Error::other("additional empty MSVC tail was accepted"))?
+        .to_string();
+        assert!(additional_empty_error.contains("empty path entry"));
+        assert!(additional_empty_error.contains("PATH"));
+        assert!(!additional_empty_error.contains("private-segment"));
+
         let tool_error = validate_msvc_installation_tool_delta(
             installation_root,
             Path::new(r"relative\private-tool.exe"),
@@ -2161,22 +2198,39 @@ mod tests {
     }
 
     #[test]
-    fn msvc_tool_environment_removes_the_dependency_tail_for_an_absent_inherited_value()
+    fn msvc_tool_environment_preserves_a_captured_tail_and_removes_absent_dependency_tails()
     -> Result<(), Box<dyn std::error::Error>> {
         let derived = Path::new("derived-toolchain-path");
+        let inherited = Path::new("inherited-toolchain-path");
+        let captured = BTreeMap::from([("PATH", std::env::join_paths([inherited])?)]);
         let projection_with_synthetic_tail = std::env::join_paths([derived, Path::new("")])?;
+        let projection_with_inherited_tail = std::env::join_paths([derived, inherited])?;
         let tool_environment = MsvcEnvironmentKey::ALL.map(|key| {
-            (
-                OsString::from(key.name()),
-                projection_with_synthetic_tail.clone(),
-            )
+            let value = if key == MsvcEnvironmentKey::Path {
+                projection_with_inherited_tail.clone()
+            } else {
+                projection_with_synthetic_tail.clone()
+            };
+            (OsString::from(key.name()), value)
         });
 
-        let materialized = materialize_msvc_tool_environment(&BTreeMap::new(), tool_environment)?;
+        let materialized = materialize_msvc_tool_environment(&captured, tool_environment)?;
 
-        for value in materialized.values() {
+        assert_eq!(
+            std::env::split_paths(
+                materialized
+                    .get(&MsvcEnvironmentKey::Path)
+                    .ok_or_else(|| { std::io::Error::other("PATH was not materialized") })?
+            )
+            .collect::<Vec<_>>(),
+            [derived.to_path_buf(), inherited.to_path_buf()]
+        );
+        for key in [MsvcEnvironmentKey::Lib, MsvcEnvironmentKey::Include] {
             assert_eq!(
-                std::env::split_paths(value).collect::<Vec<_>>(),
+                std::env::split_paths(materialized.get(&key).ok_or_else(|| {
+                    std::io::Error::other(format!("{} was not materialized", key.name()))
+                })?)
+                .collect::<Vec<_>>(),
                 [derived.to_path_buf()]
             );
         }
