@@ -9,6 +9,12 @@ use tempfile::tempdir;
 
 const EXIT_ENV_UNMET: i32 = 2;
 const EXIT_USAGE: i32 = 64;
+const RELEASE_BUILD_HELP: &str = concat!(
+    "usage: xtask release-build --target <TRIPLE> --output-dir <DIR> [--build-input-observation-dir <DIR>]\n\n",
+    "Builds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. The optional observation is a private, diagnostic-only pre-build record that can contain local toolchain paths; it is not a release asset or evidence and must not be uploaded raw. Run the compiled xtask directly when a nested `cargo run` is unsuitable.\n",
+);
+const RELEASE_BUILD_USAGE_ERROR: &[u8] =
+    b"error: release command options must be explicit `--name value` pairs\n";
 
 #[test]
 fn release_subcommands_publish_help_on_stdout() -> std::io::Result<()> {
@@ -23,11 +29,9 @@ fn release_subcommands_publish_help_on_stdout() -> std::io::Result<()> {
         );
     }
     let build_help = run(["release-build", "--help"])?;
-    assert!(
-        String::from_utf8_lossy(&build_help.stdout)
-            .contains("[--build-input-observation-dir <DIR>]")
-    );
-    assert!(String::from_utf8_lossy(&build_help.stdout).contains("must not be uploaded raw"));
+    assert_eq!(build_help.status.code(), Some(0));
+    assert_eq!(build_help.stdout, RELEASE_BUILD_HELP.as_bytes());
+    assert!(build_help.stderr.is_empty());
     Ok(())
 }
 
@@ -37,11 +41,15 @@ fn release_subcommands_report_usage_on_stderr() -> std::io::Result<()> {
         let output = run([command])?;
         assert_eq!(output.status.code(), Some(EXIT_USAGE), "{command}");
         assert!(output.stdout.is_empty(), "{command}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .starts_with("error: release command options must be explicit"),
-            "{command}"
-        );
+        if command == "release-build" {
+            assert_eq!(output.stderr, RELEASE_BUILD_USAGE_ERROR, "{command}");
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .starts_with("error: release command options must be explicit"),
+                "{command}"
+            );
+        }
     }
     Ok(())
 }

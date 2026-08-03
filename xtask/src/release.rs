@@ -231,6 +231,39 @@ struct PreparedCargoInvocation {
     environment: EnvPolicy,
 }
 
+// This argv belongs only to the convenient local one-command path. A qualification plan must not
+// carry it; the external release authority constructs and executes its own Cargo invocation from
+// policy.
+fn local_release_build_arguments(target: &ReleaseTarget, target_directory: &Path) -> Vec<OsString> {
+    let mut arguments = [
+        "build",
+        "--release",
+        "--locked",
+        "--offline",
+        "-p",
+        "forge-cli",
+        "--bin",
+        "forge",
+        "--message-format=json-render-diagnostics",
+        "--target",
+        target.triple,
+        "--target-dir",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    arguments.push(target_directory.as_os_str().to_owned());
+    arguments
+}
+
+fn release_build_completed_message(target: &ReleaseTarget, output_directory: &Path) -> String {
+    format!(
+        "built and staged {} with its CycloneDX SBOM in {}; local candidate only, not signed or published",
+        binary_asset_name(target),
+        output_directory.display()
+    )
+}
+
 pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, ReleaseError> {
     if is_help(arguments) {
         return Ok(ReleaseCommandOutput::Help(BUILD_HELP));
@@ -290,11 +323,9 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     validate_binary_format(request.target, &binary)?;
     stage_built(&output, request.target, &binary, source.snapshot())?;
     source.require_unchanged(targets, "release asset staging")?;
-    Ok(ReleaseCommandOutput::Completed(format!(
-        "built and staged {} with its CycloneDX SBOM in {}; local candidate only, not signed or published",
-        binary_asset_name(request.target),
-        output.root().display()
-    )))
+    Ok(ReleaseCommandOutput::Completed(
+        release_build_completed_message(request.target, output.root()),
+    ))
 }
 
 fn parse_build_request(arguments: &[String]) -> Result<BuildRequest, ReleaseError> {
@@ -1904,24 +1935,7 @@ fn cargo_build(
     source_commit: &str,
 ) -> Result<BTreeSet<String>, ReleaseError> {
     require_no_external_cargo_configuration(repository)?;
-    let mut arguments = [
-        "build",
-        "--release",
-        "--locked",
-        "--offline",
-        "-p",
-        "forge-cli",
-        "--bin",
-        "forge",
-        "--message-format=json-render-diagnostics",
-        "--target",
-        target.triple,
-        "--target-dir",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect::<Vec<_>>();
-    arguments.push(target_directory.as_os_str().to_owned());
+    let arguments = local_release_build_arguments(target, target_directory);
     let label = format!("Cargo release build for {}", target.triple);
     let environment = prepared_release_cargo_environment(
         repository,
@@ -5596,7 +5610,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::Write as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
 
@@ -5611,9 +5625,10 @@ mod tests {
         LICENSE_NOTICES_FILE, MANIFEST_FILE, PreparedCargoInvocation, RELEASE_TARGETS,
         ReleaseError, ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, binary_asset_name,
         build_input_observation, check, encode_windows_utf16_input, finalize,
-        finalized_asset_names, known_stage_names, parse_build_request, render_sbom,
-        require_disjoint_output_roots, sha256_hex, stage_built, validate_binary_format,
-        write_build_input_observation,
+        finalized_asset_names, known_stage_names, local_release_build_arguments,
+        parse_build_request, release_build_completed_message, render_sbom,
+        require_disjoint_output_roots, sbom_asset_name, sha256_hex, stage_built,
+        validate_binary_format, write_build_input_observation,
     };
 
     const METADATA: &str = r#"{
@@ -6639,6 +6654,34 @@ mod tests {
     }
 
     #[test]
+    fn local_release_build_invocation_and_completion_text_are_frozen() {
+        let target = &RELEASE_TARGETS[0];
+        assert_eq!(
+            local_release_build_arguments(target, Path::new("fresh-target")),
+            [
+                "build",
+                "--release",
+                "--locked",
+                "--offline",
+                "-p",
+                "forge-cli",
+                "--bin",
+                "forge",
+                "--message-format=json-render-diagnostics",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "--target-dir",
+                "fresh-target",
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            release_build_completed_message(target, Path::new("dist")),
+            "built and staged forge-0.1.0-rc.2-x86_64-unknown-linux-musl with its CycloneDX SBOM in dist; local candidate only, not signed or published"
+        );
+    }
+
+    #[test]
     fn scoped_cargo_tree_parser_is_strict_and_reconstructs_edges() -> Result<(), ReleaseError> {
         let metadata: super::CargoMetadata = serde_json::from_str(METADATA)
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
@@ -6749,6 +6792,12 @@ mod tests {
             &binary,
         )?;
         assert_eq!(first, second);
+        assert_eq!(
+            first.as_slice(),
+            include_bytes!(
+                "../tests/golden/release-build/forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json"
+            )
+        );
         let text = String::from_utf8(first)
             .map_err(|error| ReleaseError::internal(format!("test SBOM was not UTF-8: {error}")))?;
         assert!(text.contains("\"specVersion\": \"1.6\""));
@@ -7318,14 +7367,56 @@ mod tests {
         let snapshot = snapshot();
 
         stage_built(&output_writer, target, &binary, &snapshot)?;
+        let binary_name = binary_asset_name(target);
+        let sbom_name = sbom_asset_name(target);
+        let mut names = fs::read_dir(&output)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name())
+                    .map_err(|error| ReleaseError::internal(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        assert_eq!(
+            names,
+            [OsString::from(&binary_name), OsString::from(&sbom_name)]
+        );
+        let first_binary = fs::read(output.join(&binary_name))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let first_sbom = fs::read(output.join(&sbom_name))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert_eq!(first_binary, binary);
+        assert_eq!(
+            first_sbom.as_slice(),
+            include_bytes!(
+                "../tests/golden/release-build/forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json"
+            )
+        );
+
         stage_built(&output_writer, target, &binary, &snapshot)?;
+        assert_eq!(
+            fs::read(output.join(&binary_name))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first_binary
+        );
+        assert_eq!(
+            fs::read(output.join(&sbom_name))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first_sbom
+        );
         let mut different = binary.clone();
         different.push(1);
         assert!(stage_built(&output_writer, target, &different, &snapshot).is_err());
         assert_eq!(
-            fs::read(output.join(binary_asset_name(target)))
+            fs::read(output.join(&binary_name))
                 .map_err(|error| ReleaseError::internal(error.to_string()))?,
             binary
+        );
+        assert_eq!(
+            fs::read(output.join(&sbom_name))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first_sbom
         );
         Ok(())
     }
