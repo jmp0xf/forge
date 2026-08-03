@@ -2428,6 +2428,15 @@ v0 的最终 Authority Set 由独立公开仓库
 和 attestation write，但只能执行 Authority 自己的独立 verifier，不得 checkout Forge、运行 Cargo/xtask
 或执行候选二进制。候选代码因此不能进入拥有签名身份的进程。
 
+build job 没有高权限，并不自动使候选对自身构建输入的报告成为独立证明。正式 qualification 必须遵循
+ADR-0044 的 plan/execute/apply 边界：candidate plan 只表达固定语义请求；Authority 从自己的 policy 与
+runner probe 构造完整调用，并以不同 OS principal/namespace 下贯穿三阶段的可信 driver 控制真实 Cargo、
+全部候选 descendants、写域和网络；candidate apply 只能在受限写域组装由该执行结果摘要绑定的 binary，
+每个 target handoff 还要由对应 driver 封口，最终十三文件再由 Authority 独立复验。候选侧 raw/sanitized
+observation 只用于诊断，不能进入 builder record 或 provenance。仅有父进程关系或环境过滤不构成此隔离。
+实现、两次独立完整 fresh canary 及其 artifact audit 完成前，下游 qualification、attestation 与发布入口
+保持不可达。
+
 ### 23.8 N−1 兼容
 
 `xtask diff-plans` 对公开 fixtures 比较：
@@ -2628,9 +2637,11 @@ ADR-0041 已取代 ADR-0029，冻结首个公开 v0 候选的可分发边界：
 - 仓库内 `xtask` 只组装和核验 `local-review-candidate`，不得签名、上传、发布或授权；
 - 最终独立复验、SLSA provenance、Sigstore 签名、审批、不可变发布和撤回权限属于
   `jmp0xf/forge-release-authority` 的三个隔离权限域。
+- 正式 native build 还必须由 Authority 按 ADR-0044 直接执行真实 Cargo 并先绑定 binary；候选的 build-input
+  observation 即使已脱敏，也不能替代这条执行因果链。
 
 完整目标矩阵、资产名、构建隔离、许可证闭包、失败残留、外部权威和首发回滚规则见 ADR-0041 与
-`docs/release.md`。
+ADR-0044，以及 `docs/release.md`。
 
 ### 25.5 无遥测默认
 
@@ -3055,6 +3066,9 @@ ADR 全部位于 `docs/adr/`：
 | 0039 | 保留当前 Receipt 的 typed unknown 事实 |
 | 0040 | 项目工具外部配置未闭合时安全失败 |
 | 0041 | 通过外部权威发布许可证完整的 rc.2 |
+| 0042 | 使用标准 in-toto subject 描述符 |
+| 0043 | 记录私密的发布构建输入诊断 |
+| 0044 | 由外部 Authority 执行发布 Cargo |
 
 实现变更必须引用相应 ADR；新 ADR 不删除旧记录，而是通过 Supersedes/Superseded by 建立历史。
 
