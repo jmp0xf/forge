@@ -1,0 +1,249 @@
+{
+  "$id": "forge.release-build-apply-descriptor/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge release-build-apply-descriptor v1",
+  "description": "Standalone `forge.release-build-apply-descriptor/v1` candidate input.\n\nThe external Authority creates and independently validates this path-free projection from the\nCargo execution it owns. Authority-private profile, policy, nonce, run, probe, and success\nstate never enter this candidate-visible document. Deserialization is only a tolerant\nsame-major compatibility reader; strict apply acceptance must separately reject unknown\nbranches, wrong identity, semantic graph violations, and non-canonical bytes.",
+  "type": "object",
+  "properties": {
+    "binary": {
+      "$ref": "#/$defs/ReleaseBuildBoundBinaryData"
+    },
+    "plan_sha256": {
+      "$ref": "#/$defs/ReleaseSha256Data"
+    },
+    "purpose": {
+      "$ref": "#/$defs/ReleaseBuildApplyDescriptorPurposeData"
+    },
+    "sbom_graph": {
+      "$ref": "#/$defs/ReleaseBuildSbomGraphData"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.release-build-apply-descriptor/v1"
+    }
+  },
+  "required": [
+    "schema",
+    "purpose",
+    "plan_sha256",
+    "binary",
+    "sbom_graph"
+  ],
+  "$defs": {
+    "ReleaseBuildApplyDescriptorPurposeData": {
+      "description": "Why an Authority supplies a descriptor to candidate-controlled apply code.",
+      "type": "string",
+      "enum": [
+        "candidate-apply-input-not-authority-evidence",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildBinaryLengthData": {
+      "description": "One runtime-validated release binary length.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 268435456,
+      "minimum": 1
+    },
+    "ReleaseBuildBoundBinaryData": {
+      "description": "The binary captured by the Authority-owned execute stage and bound into apply input.",
+      "type": "object",
+      "properties": {
+        "length": {
+          "$ref": "#/$defs/ReleaseBuildBinaryLengthData"
+        },
+        "sha256": {
+          "$ref": "#/$defs/ReleaseSha256Data"
+        }
+      },
+      "required": [
+        "length",
+        "sha256"
+      ]
+    },
+    "ReleaseBuildDependencyKeysData": {
+      "description": "One runtime-bounded dependency-key list.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReleaseBuildPackageKeyData"
+      },
+      "maxItems": 512
+    },
+    "ReleaseBuildPackageKeyData": {
+      "description": "One bounded, path-free package key used to join graph nodes and edges.\n\nCurrent strict acceptance recomputes the key from source kind, name, and version. The public\nreader only enforces a bounded safe wire shape so future same-major readers can remain tolerant.",
+      "type": "string",
+      "maxLength": 384,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.+@-]{0,383}$"
+    },
+    "ReleaseBuildPackageNameData": {
+      "description": "One bounded Cargo package name used by the release protocol.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "ReleaseBuildPackageSourceData": {
+      "description": "The closed source classes representable by the v1 SBOM projection.",
+      "oneOf": [
+        {
+          "description": "A package in the bound Forge workspace; it carries no registry archive checksum.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "A crates.io package whose v1 SBOM source is fixed to Cargo's canonical crates.io index ID.\n\nThe renderer maps this branch to\n`registry+https://github.com/rust-lang/crates.io-index`; other registries and Git sources\nrequire a future contract instead of injecting an arbitrary URL.",
+          "type": "object",
+          "properties": {
+            "crate_archive_sha256": {
+              "$ref": "#/$defs/ReleaseSha256Data"
+            },
+            "kind": {
+              "type": "string",
+              "const": "crates-io"
+            }
+          },
+          "required": [
+            "kind",
+            "crate_archive_sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ReleaseBuildPackageVersionData": {
+      "description": "One bounded Cargo package version used by the release protocol.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[0-9][0-9A-Za-z.+-]{0,127}$"
+    },
+    "ReleaseBuildSbomDependenciesData": {
+      "description": "One runtime-bounded target-specific adjacency list.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReleaseBuildSbomDependencyData"
+      },
+      "maxItems": 512,
+      "minItems": 1
+    },
+    "ReleaseBuildSbomDependencyData": {
+      "description": "One adjacency-list row in the target-specific SBOM projection.",
+      "type": "object",
+      "properties": {
+        "depends_on": {
+          "$ref": "#/$defs/ReleaseBuildDependencyKeysData"
+        },
+        "package": {
+          "$ref": "#/$defs/ReleaseBuildPackageKeyData"
+        }
+      },
+      "required": [
+        "package",
+        "depends_on"
+      ]
+    },
+    "ReleaseBuildSbomGraphData": {
+      "description": "The minimal target-specific package graph needed to render the existing CycloneDX SBOM bytes.",
+      "type": "object",
+      "properties": {
+        "dependencies": {
+          "$ref": "#/$defs/ReleaseBuildSbomDependenciesData"
+        },
+        "packages": {
+          "$ref": "#/$defs/ReleaseBuildSbomPackagesData"
+        },
+        "root": {
+          "$ref": "#/$defs/ReleaseBuildPackageKeyData"
+        }
+      },
+      "required": [
+        "root",
+        "packages",
+        "dependencies"
+      ]
+    },
+    "ReleaseBuildSbomLicenseExpressionData": {
+      "description": "One reviewed, already normalized SPDX expression used in the target SBOM projection.\n\nThe current apply gate rejects `Unknown`. Keeping a compatibility state lets a same-major\nreader diagnose a future expression without accepting arbitrary candidate-visible text or\nturning this field into a path/URL disclosure channel.",
+      "type": "string",
+      "enum": [
+        "(MIT OR Apache-2.0) AND Unicode-3.0",
+        "Apache-2.0",
+        "Apache-2.0 OR BSL-1.0",
+        "Apache-2.0 OR MIT",
+        "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+        "BSD-2-Clause",
+        "BSD-2-Clause OR Apache-2.0 OR MIT",
+        "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
+        "CC0-1.0 OR MIT-0 OR Apache-2.0",
+        "MIT",
+        "MIT OR Apache-2.0",
+        "MIT-0",
+        "Unicode-3.0",
+        "Unlicense OR MIT",
+        "Zlib",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildSbomPackageData": {
+      "description": "One path-free package in the target-specific SBOM projection.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/ReleaseBuildPackageKeyData"
+        },
+        "name": {
+          "$ref": "#/$defs/ReleaseBuildPackageNameData"
+        },
+        "sbom_license_expression": {
+          "$ref": "#/$defs/ReleaseBuildSbomLicenseExpressionData"
+        },
+        "source": {
+          "$ref": "#/$defs/ReleaseBuildPackageSourceData"
+        },
+        "version": {
+          "$ref": "#/$defs/ReleaseBuildPackageVersionData"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "version",
+        "sbom_license_expression",
+        "source"
+      ]
+    },
+    "ReleaseBuildSbomPackagesData": {
+      "description": "One runtime-bounded target-specific package list.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReleaseBuildSbomPackageData"
+      },
+      "maxItems": 512,
+      "minItems": 1
+    },
+    "ReleaseSha256Data": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

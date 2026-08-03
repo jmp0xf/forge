@@ -1,0 +1,226 @@
+{
+  "$id": "forge.release-build-plan/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Forge release-build-plan v1",
+  "description": "Standalone `forge.release-build-plan/v1` candidate request.\n\nDeserialization is a tolerant same-major compatibility reader, not current acceptance. The\nstrict release gate must separately enforce exact schema identity, current enum branches,\nsemantic invariants, and canonical bytes before this request can influence an Authority\nexecution.",
+  "type": "object",
+  "properties": {
+    "binary": {
+      "$ref": "#/$defs/ReleaseBuildBinaryData"
+    },
+    "cargo_lock_sha256": {
+      "$ref": "#/$defs/ReleaseSha256Data"
+    },
+    "dependency_resolution": {
+      "$ref": "#/$defs/ReleaseBuildDependencyResolutionData"
+    },
+    "network": {
+      "$ref": "#/$defs/ReleaseBuildNetworkData"
+    },
+    "outputs": {
+      "$ref": "#/$defs/ReleaseBuildPlanOutputsData"
+    },
+    "package": {
+      "$ref": "#/$defs/ReleaseBuildPlanPackageData"
+    },
+    "profile": {
+      "$ref": "#/$defs/ReleaseBuildProfileData"
+    },
+    "purpose": {
+      "$ref": "#/$defs/ReleaseBuildPlanPurposeData"
+    },
+    "schema": {
+      "type": "string",
+      "const": "forge.release-build-plan/v1"
+    },
+    "source_commit": {
+      "$ref": "#/$defs/GitObjectIdV2Data"
+    },
+    "target": {
+      "$ref": "#/$defs/ReleaseBuildTargetData"
+    }
+  },
+  "required": [
+    "schema",
+    "purpose",
+    "source_commit",
+    "cargo_lock_sha256",
+    "target",
+    "package",
+    "binary",
+    "profile",
+    "dependency_resolution",
+    "network",
+    "outputs"
+  ],
+  "$defs": {
+    "GitObjectIdV2Data": {
+      "description": "A validated object ID paired with its Git object format.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha1"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha1ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "sha256"
+            },
+            "oid": {
+              "$ref": "#/$defs/GitSha256ObjectIdV2Data"
+            }
+          },
+          "required": [
+            "object_format",
+            "oid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_format": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "object_format"
+          ]
+        }
+      ]
+    },
+    "GitSha1ObjectIdV2Data": {
+      "description": "A validated full SHA-1 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "GitSha256ObjectIdV2Data": {
+      "description": "A validated full SHA-256 Git object ID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ReleaseBuildBinaryData": {
+      "description": "The fixed binary requested by a release build plan.",
+      "type": "string",
+      "enum": [
+        "forge",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildDependencyResolutionData": {
+      "description": "The fixed dependency-resolution mode requested by a release build plan.",
+      "type": "string",
+      "enum": [
+        "locked",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildNetworkData": {
+      "description": "The fixed network mode requested by a release build plan.",
+      "type": "string",
+      "enum": [
+        "offline",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildOutputNameData": {
+      "description": "One bounded release output basename.",
+      "type": "string",
+      "maxLength": 255,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$"
+    },
+    "ReleaseBuildPackageNameData": {
+      "description": "One bounded Cargo package name used by the release protocol.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "ReleaseBuildPackageVersionData": {
+      "description": "One bounded Cargo package version used by the release protocol.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[0-9][0-9A-Za-z.+-]{0,127}$"
+    },
+    "ReleaseBuildPlanOutputsData": {
+      "description": "Target-derived, reviewable output basenames requested by a release build plan.",
+      "type": "object",
+      "properties": {
+        "binary": {
+          "$ref": "#/$defs/ReleaseBuildOutputNameData"
+        },
+        "sbom": {
+          "$ref": "#/$defs/ReleaseBuildOutputNameData"
+        }
+      },
+      "required": [
+        "binary",
+        "sbom"
+      ]
+    },
+    "ReleaseBuildPlanPackageData": {
+      "description": "The fixed package requested by a release build plan.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/ReleaseBuildPackageNameData"
+        },
+        "version": {
+          "$ref": "#/$defs/ReleaseBuildPackageVersionData"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "ReleaseBuildPlanPurposeData": {
+      "description": "Why a candidate emits a release build plan.\n\nThe plan is an untrusted semantic request to an external authority. It is never an executable\ncommand, builder record, qualification result, approval, or release evidence.",
+      "type": "string",
+      "enum": [
+        "authority-execution-request-not-release-evidence",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildProfileData": {
+      "description": "The fixed Cargo profile requested by a release build plan.",
+      "type": "string",
+      "enum": [
+        "release",
+        "unknown"
+      ]
+    },
+    "ReleaseBuildTargetData": {
+      "description": "One target accepted by the release plan/apply protocol.\n\nThis is intentionally separate from the diagnostic observation contract so additions cannot\nsilently change the already published observation-v1 schema.",
+      "type": "string",
+      "enum": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "unknown"
+      ]
+    },
+    "ReleaseSha256Data": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

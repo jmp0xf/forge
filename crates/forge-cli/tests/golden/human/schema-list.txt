@@ -10,6 +10,8 @@ forge.evidence/v1
 forge.evidence/v2
 forge.adapters/v1
 forge.release-build-input-observation/v1
+forge.release-build-plan/v1
+forge.release-build-apply-descriptor/v1
 forge.release-manifest/v1
 forge.release-manifest/v2
 forge.diagnostic/v1
