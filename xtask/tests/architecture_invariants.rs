@@ -444,20 +444,23 @@ fn constructs_product_subprocess(source: &str) -> bool {
 }
 
 #[test]
-fn release_build_apply_is_nominally_filesystem_only_and_dispatched_explicitly() {
+fn release_build_apply_is_nominally_filesystem_only_and_dispatched_explicitly() -> Result<(), String>
+{
     let source = include_str!("../src/release_apply.rs");
     let product_source = source_without_test_items(source);
     let release_source = include_str!("../src/release.rs");
     let apply_domain = [
-        rust_item_source(release_source, "mod strict_release_protocol {")
-            .expect("strict release protocol module must remain a distinct item"),
-        rust_item_source(release_source, "fn render_release_build_apply_sbom(")
-            .expect("release-build apply SBOM renderer must remain a distinct item"),
+        rust_item_source(release_source, "mod strict_release_protocol {").ok_or_else(|| {
+            String::from("strict release protocol module must remain a distinct item")
+        })?,
+        rust_item_source(release_source, "fn render_release_build_apply_sbom(").ok_or_else(
+            || String::from("release-build apply SBOM renderer must remain a distinct item"),
+        )?,
         rust_item_source(
             release_source,
             "pub(crate) fn assemble_release_build_apply(",
         )
-        .expect("release-build apply assembly must remain a distinct item"),
+        .ok_or_else(|| String::from("release-build apply assembly must remain a distinct item"))?,
     ]
     .join("\n");
 
@@ -529,6 +532,7 @@ fn release_build_apply_is_nominally_filesystem_only_and_dispatched_explicitly() 
             "xtask main lost release-build apply dispatch `{required}`"
         );
     }
+    Ok(())
 }
 
 fn rust_item_source<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
