@@ -2456,6 +2456,11 @@ impl ReleaseSha256Data {
             Err(InvalidReleaseSha256Data)
         }
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl<'de> Deserialize<'de> for ReleaseSha256Data {
@@ -3130,6 +3135,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let canonical = "a".repeat(64);
         let digest = ReleaseSha256Data::new(canonical.clone())?;
+        assert_eq!(digest.as_str(), canonical);
         assert_eq!(serde_json::to_value(digest)?, serde_json::json!(canonical));
 
         for invalid in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
