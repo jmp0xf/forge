@@ -2953,7 +2953,12 @@ mod tests {
         // Establish the ordering through an independent kernel observation instead of assuming a
         // fixed sleep was long enough on a loaded runner. WNOWAIT leaves the exited child unreaped,
         // so it still owns its PID/PGID when attach reaches EVFILT_PROC registration.
-        wait_until_child_is_exited_but_unreaped(child.id(), Duration::from_secs(2))?;
+        if let Err(error) =
+            wait_until_child_is_exited_but_unreaped(child.id(), Duration::from_secs(2))
+        {
+            super::reap_direct_child(&mut child);
+            return Err(error.into());
+        }
         let mut tree = match prepared_tree.attach(&child) {
             Ok(tree) => tree,
             Err(error) => {
