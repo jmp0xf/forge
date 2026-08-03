@@ -5,7 +5,10 @@ perform a tag, upload, signature, attestation, or GitHub Release mutation. `0.1.
 and is not a distributable predecessor. The current contract and its trust boundary are in
 [ADR-0041](adr/0041-publish-license-complete-rc2-through-external-authority.md), which supersedes ADR-0029.
 The optional private build-input diagnostic and its non-authority boundary are fixed by
-[ADR-0043](adr/0043-record-private-release-build-input-diagnostics.md).
+[ADR-0043](adr/0043-record-private-release-build-input-diagnostics.md). Formal qualification must additionally use the
+Authority-executed plan/execute/apply boundary in
+[ADR-0044](adr/0044-let-the-external-authority-execute-release-cargo.md); the current single-command candidate path is
+not that boundary.
 
 The Forge candidate repository must not contain a release or signing workflow. The physically separate Authority Set
 is the independent public
@@ -34,8 +37,8 @@ The exact staged asset names are:
 | `x86_64-pc-windows-msvc` | `forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe` | `forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json` |
 
 The Linux artifacts must be static 64-bit ELF files without a `PT_INTERP` loader. The local structural check establishes
-only that an ELF is static-compatible; the protected builder, external provenance, and native E2E must establish that
-the named musl target really produced it. The macOS artifacts must be thin 64-bit `MH_EXECUTE` Mach-O files with a
+only that an ELF is static-compatible; the Authority driver/builder, external provenance, and native E2E must establish
+that the named musl target really produced it. The macOS artifacts must be thin 64-bit `MH_EXECUTE` Mach-O files with a
 nonempty file-backed executable segment and a file-backed `LC_MAIN`. The Windows artifact must be an executable,
 non-DLL x86-64 PE32+ image whose entry point is file-backed by an executable section. Confirm the `LC_MAIN` assumption
 with a real Rust output on each native macOS runner. These structural checks do not replace native-platform E2E.
@@ -125,6 +128,15 @@ candidate-controlled report independent. Formal qualification must use a fresh r
 enforcement, and builder record independently bind the real inputs. Candidate CI, raw observation, or its sanitized
 summary cannot by itself replace any independent Authority gate below.
 
+The formal path therefore remains disabled until ADR-0044 is implemented. Its candidate plan may request only the
+fixed release semantics; an Authority-owned driver in a separate OS-protected write domain must validate that request,
+choose and execute the actual Cargo/toolchain/cwd/environment in a fresh restricted namespace, terminate all candidate
+descendants, and bind the resulting binary before any candidate apply step. The same driver must retain control until
+the apply output is sealed, matched to the captured binary digest, and handed to the independent thirteen-file
+verifier. Sharing one principal, wrapping this existing `release-build` command, or promoting its diagnostic summary
+does not satisfy that boundary. The commands in this section remain the local-review workflow and intentionally
+preserve their current behavior.
+
 Repeat on appropriate trusted runners for all five targets, transferring only the fixed named binary/SBOM pairs between
 jobs. `release-build` has no arbitrary external-binary staging mode. It runs the locked, offline release build in a new
 temporary Cargo target directory for that invocation; it does not reuse `target/forge-release-build` or another prior
@@ -134,8 +146,8 @@ The nested Cargo process is offline and receives only the minimal toolchain envi
 wrapper, linker, SDK, and target controls needed by common Unix, macOS, and MSVC setups. Secret-like environment names
 and registry tokens are not forwarded. External Cargo configuration is rejected, but the selected Cargo executable,
 toolchain, wrappers, linkers, SDK, dependency cache, build scripts, and allowed environment values remain builder
-inputs. These controls do not make the local build reproducible or authoritative. The protected builder must freeze
-and attest them separately.
+inputs. These controls do not make the local build reproducible or authoritative. The Authority driver/builder must
+freeze and attest them separately.
 
 The output directory must already exist, resolve outside the source repository and its actual worktree-specific and
 shared Git directories, and be a real directory rather than a symlink. An output below any of those boundaries is
@@ -274,13 +286,22 @@ as authority.
 
 The Authority workflow isolates three permission domains:
 
-1. Five native build jobs may checkout and execute the exact Forge candidate. They receive no OIDC token, protected
-   environment, secret, or release permission.
-2. The finalize job may execute the candidate `release-finalize` and `release-check` commands. It likewise receives no
-   OIDC token, protected environment, or GitHub Release write permission.
+1. Five native build jobs run an Authority controller for the exact Forge candidate. Candidate plan code, the Cargo
+   tree (including build scripts), and candidate apply code execute only inside the ADR-0044 restricted subdomain;
+   Authority policy/state/records, CI command files, sealed handoff and network boundary remain outside their write
+   set. The jobs receive no OIDC token, protected environment, secret, or release permission.
+2. The finalize job gives the five sealed handoffs to candidate `release-finalize` and `release-check` only through an
+   ADR-0044 restricted, read-only input domain with a fresh output namespace; Authority records remain outside the
+   candidate write set, and the output is sealed after all descendants exit. The job likewise receives no OIDC token,
+   protected environment, or GitHub Release write permission.
 3. The protected attest job may receive OIDC and attestation-write permission, but it checks out and executes only the
    Authority repository and its independent verifier. It must not checkout Forge, run Cargo/xtask, or execute any
    candidate binary.
+
+The five target records form one cohort only when they share the exact qualification run, source commit, Authority
+commit and policy digest, and each binds its own plan, complete correlated build profile, binary and SBOM. Cross-run or
+fieldwise profile composition is rejected. Any candidate failure, containment uncertainty, cleanup failure or digest
+mismatch produces no success record and cannot reach finalize.
 
 The protected identity is the immutable Authority repository identity recorded in ADR-0041, with issuer
 `https://token.actions.githubusercontent.com` and environment `forge-release`. Before any public release, that
@@ -298,8 +319,8 @@ Authority Set must provide and preserve evidence for all of the following:
 4. The named release approver, security approver, rollback owner, private-vulnerability triage owner, and withdrawal
    permissions were confirmed on the protected platform boundary. The current single owner assignment is
    accountability, not evidence of independent second-person review.
-5. The protected builder froze and recorded the compiler, wrappers, linker, dependency cache and relevant environment;
-   local source/lock/binary binding alone does not prove those inputs.
+5. The Authority driver/builder froze and recorded the compiler, wrappers, linker, dependency cache and relevant
+   environment; local source/lock/binary binding alone does not prove those inputs.
 6. Owner/legal explicitly confirmed the right to distribute original contributions under the project license, reviewed
    the exact dependency/license ledger and notices, and confirmed that the thirteen-file distribution needs no other
    license artifact. Candidate text, chat, or a PR description is not that confirmation. If compliance requires a
