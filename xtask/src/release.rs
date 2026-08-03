@@ -74,7 +74,11 @@ const MAX_REGISTRY_CRATE_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REGISTRY_CACHE_ENTRIES: usize = 1_000_000;
 const MANIFEST_FILE: &str = "release-manifest.json";
 const CHECKSUMS_FILE: &str = "SHA256SUMS";
-const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_BOUND_BINARY_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_PLAN_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_APPLY_SBOM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BINARY_BYTES: u64 = MAX_RELEASE_BUILD_BOUND_BINARY_BYTES as u64;
 const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SOURCE_TREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 32 * 1024 * 1024;
@@ -85,7 +89,7 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUILD_INPUT_OBSERVATION_BYTES: usize = 512 * 1024;
 const BUILD_INPUT_OBSERVATION_PREFIX: &str = "release-build-input-observation-";
-const RELEASE_BUILD_PLAN_FILE: &str = "release-build-plan.json";
+pub(crate) const RELEASE_BUILD_PLAN_FILE: &str = "release-build-plan.json";
 const RELEASE_PACKAGE_NAME: &str = "forge-cli";
 const RELEASE_BINARY_NAME: &str = "forge";
 const CRATES_IO_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -183,28 +187,28 @@ impl ReleaseError {
         self.kind
     }
 
-    fn negative(message: impl Into<String>) -> Self {
+    pub(crate) fn negative(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Negative,
             message: message.into(),
         }
     }
 
-    fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Usage,
             message: message.into(),
         }
     }
 
-    fn environment(message: impl Into<String>) -> Self {
+    pub(crate) fn environment(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Environment,
             message: message.into(),
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Internal,
             message: message.into(),
@@ -476,11 +480,11 @@ pub(crate) fn run_license_generate(
     )))
 }
 
-fn is_help(arguments: &[String]) -> bool {
+pub(crate) fn is_help(arguments: &[String]) -> bool {
     matches!(arguments, [argument] if argument == "--help" || argument == "help")
 }
 
-fn parse_options(
+pub(crate) fn parse_options(
     arguments: &[String],
     allowed: &[&str],
 ) -> Result<BTreeMap<String, String>, ReleaseError> {
@@ -513,7 +517,7 @@ fn parse_options(
     Ok(options)
 }
 
-fn required_option<'a>(
+pub(crate) fn required_option<'a>(
     options: &'a BTreeMap<String, String>,
     name: &str,
 ) -> Result<&'a str, ReleaseError> {
@@ -541,10 +545,6 @@ fn parse_target(triple: &str) -> Result<&'static ReleaseTarget, ReleaseError> {
 
 mod strict_release_protocol {
     use super::*;
-
-    // These bounds are shared by the parser and the no-follow file seam that lands next.
-    pub(super) const MAX_RELEASE_BUILD_PLAN_BYTES: usize = 16 * 1024;
-    pub(super) const MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 
     #[derive(Debug)]
     pub(super) struct AcceptedReleaseBuildPlan {
@@ -914,7 +914,6 @@ mod strict_release_protocol {
         Ok(())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "awaits the apply command"))]
     pub(super) fn accept_release_build_apply_descriptor(
         plan: &AcceptedReleaseBuildPlan,
         bytes: &[u8],
@@ -946,7 +945,6 @@ mod strict_release_protocol {
         Ok(AcceptedReleaseBuildApplyDescriptor { document })
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "awaits the apply command"))]
     pub(super) fn accept_release_build_apply<'a>(
         plan: &'a AcceptedReleaseBuildPlan,
         descriptor: &'a AcceptedReleaseBuildApplyDescriptor,
@@ -1044,7 +1042,7 @@ fn write_release_build_plan(
         output,
         RELEASE_BUILD_PLAN_FILE,
         &bytes,
-        strict_release_protocol::MAX_RELEASE_BUILD_PLAN_BYTES,
+        MAX_RELEASE_BUILD_PLAN_BYTES,
         LABEL,
     )?;
     require_exact_output_namespace(
@@ -3290,7 +3288,7 @@ fn validate_staged_assets(
     Ok(())
 }
 
-fn absolute_clean_path(path: &Path) -> Result<PathBuf, ReleaseError> {
+pub(crate) fn absolute_clean_path(path: &Path) -> Result<PathBuf, ReleaseError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -4997,7 +4995,6 @@ fn accepted_release_build_source_commit(plan: &ReleaseBuildPlanData) -> Result<&
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "awaits the apply output seam"))]
 fn render_release_build_apply_sbom(
     apply: &strict_release_protocol::AcceptedReleaseBuildApply<'_>,
 ) -> Result<Vec<u8>, ReleaseError> {
@@ -5008,6 +5005,68 @@ fn render_release_build_apply_sbom(
         accepted_release_build_source_commit(apply.plan())?,
         apply.binary(),
     )
+}
+
+/// Fully accepted, path-free candidate output for one release-build apply invocation.
+#[derive(Debug)]
+pub(crate) struct ReleaseBuildApplyAssembly {
+    pub(crate) target: &'static str,
+    pub(crate) binary_name: String,
+    pub(crate) sbom_name: String,
+    pub(crate) binary: Vec<u8>,
+    pub(crate) sbom: Vec<u8>,
+}
+
+impl ReleaseBuildApplyAssembly {
+    #[must_use]
+    pub(crate) fn target(&self) -> &'static str {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) fn binary_name(&self) -> &str {
+        &self.binary_name
+    }
+
+    #[must_use]
+    pub(crate) fn sbom_name(&self) -> &str {
+        &self.sbom_name
+    }
+
+    #[must_use]
+    pub(crate) fn binary(&self) -> &[u8] {
+        &self.binary
+    }
+
+    #[must_use]
+    pub(crate) fn sbom(&self) -> &[u8] {
+        &self.sbom
+    }
+}
+
+pub(crate) fn assemble_release_build_apply(
+    plan_bytes: &[u8],
+    descriptor_bytes: &[u8],
+    binary: Vec<u8>,
+) -> Result<ReleaseBuildApplyAssembly, ReleaseError> {
+    let plan = strict_release_protocol::accept_release_build_plan(plan_bytes)?;
+    let descriptor =
+        strict_release_protocol::accept_release_build_apply_descriptor(&plan, descriptor_bytes)?;
+    let apply = strict_release_protocol::accept_release_build_apply(&plan, &descriptor, &binary)?;
+    let sbom = render_release_build_apply_sbom(&apply)?;
+    if sbom.len() > MAX_RELEASE_BUILD_APPLY_SBOM_BYTES {
+        return Err(ReleaseError::internal(format!(
+            "accepted release-build SBOM exceeds its {}-byte output limit",
+            MAX_RELEASE_BUILD_APPLY_SBOM_BYTES
+        )));
+    }
+    Ok(ReleaseBuildApplyAssembly {
+        target: apply.target().triple,
+        binary_name: apply.plan().outputs.binary.as_str().to_owned(),
+        sbom_name: apply.plan().outputs.sbom.as_str().to_owned(),
+        binary,
+        sbom,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6596,22 +6655,23 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::strict_release_protocol::{
-        AcceptedReleaseBuildPlan, MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES,
-        MAX_RELEASE_BUILD_PLAN_BYTES, accept_release_build_apply,
+        AcceptedReleaseBuildPlan, accept_release_build_apply,
         accept_release_build_apply_descriptor, accept_release_build_plan, accepted_plan_target,
     };
     use super::{
         BUILD_INPUT_OBSERVATION_PREFIX, BuildInputObservationOutput, CHECKSUMS_FILE,
-        CRATES_IO_SOURCE_ID, LICENSE_NOTICES_FILE, MANIFEST_FILE, PLAN_HELP,
+        CRATES_IO_SOURCE_ID, LICENSE_NOTICES_FILE, MANIFEST_FILE,
+        MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES, MAX_RELEASE_BUILD_PLAN_BYTES, PLAN_HELP,
         PreparedCargoInvocation, RELEASE_BUILD_PLAN_FILE, RELEASE_TARGETS, ReleaseError,
         ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, accepted_release_build_license,
-        binary_asset_name, build_input_observation, check, encode_windows_utf16_input, finalize,
-        finalized_asset_names, known_stage_names, local_release_build_arguments,
-        parse_build_request, parse_plan_request, release_build_completed_message,
-        release_build_license_data, release_build_plan_completed_message,
-        render_release_build_apply_sbom, render_release_build_plan, render_sbom,
-        require_disjoint_output_roots, sbom_asset_name, sha256_hex, stage_built, to_pretty_json,
-        validate_binary_format, write_build_input_observation, write_release_build_plan,
+        assemble_release_build_apply, binary_asset_name, build_input_observation, check,
+        encode_windows_utf16_input, finalize, finalized_asset_names, known_stage_names,
+        local_release_build_arguments, parse_build_request, parse_plan_request,
+        release_build_completed_message, release_build_license_data,
+        release_build_plan_completed_message, render_release_build_apply_sbom,
+        render_release_build_plan, render_sbom, require_disjoint_output_roots, sbom_asset_name,
+        sha256_hex, stage_built, to_pretty_json, validate_binary_format,
+        write_build_input_observation, write_release_build_plan,
     };
 
     const METADATA: &str = r#"{
@@ -7349,6 +7409,35 @@ mod tests {
             error.to_string(),
             "release-build apply inputs do not share one accepted plan binding"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_apply_assembly_is_exact_for_every_supported_target() -> TestResult {
+        for target in &RELEASE_TARGETS {
+            let plan_bytes = protocol_bytes(&protocol_plan(target.plan_target)?)?;
+            let accepted_plan = accept_release_build_plan(&plan_bytes)?;
+            let binary = fake_binary(target.triple);
+            let mut descriptor_document = protocol_descriptor(&accepted_plan)?;
+            descriptor_document.binary.length =
+                ReleaseBuildBinaryLengthData::new(binary.len() as u64)?;
+            descriptor_document.binary.sha256 = ReleaseSha256Data::new(sha256_hex(&binary))?;
+            let descriptor_bytes = protocol_bytes(&descriptor_document)?;
+
+            let accepted_descriptor =
+                accept_release_build_apply_descriptor(&accepted_plan, &descriptor_bytes)?;
+            let accepted =
+                accept_release_build_apply(&accepted_plan, &accepted_descriptor, &binary)?;
+            let expected_sbom = render_release_build_apply_sbom(&accepted)?;
+            let assembly =
+                assemble_release_build_apply(&plan_bytes, &descriptor_bytes, binary.clone())?;
+
+            assert_eq!(assembly.target(), target.triple);
+            assert_eq!(assembly.binary_name(), binary_asset_name(target));
+            assert_eq!(assembly.sbom_name(), sbom_asset_name(target));
+            assert_eq!(assembly.binary(), binary);
+            assert_eq!(assembly.sbom(), expected_sbom);
+        }
         Ok(())
     }
 

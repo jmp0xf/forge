@@ -14,6 +14,7 @@ mod cargo_env;
 mod compat;
 mod fixtures;
 mod release;
+mod release_apply;
 mod verify;
 
 const EXIT_OK: u8 = 0;
@@ -47,6 +48,9 @@ fn main() -> ExitCode {
         }
         [command, rest @ ..] if command == "release-build-plan" => {
             run_release_command(release::run_plan(rest))
+        }
+        [command, rest @ ..] if command == "release-build-apply" => {
+            run_release_command(release_apply::run(rest))
         }
         [command, rest @ ..] if command == "release-finalize" => {
             run_release_command(release::run_finalize(rest))
@@ -427,6 +431,7 @@ fn print_help() {
          diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate\n\
          release-build     build and stage one accepted release target\n\
          release-build-plan write one create-only candidate request without running Cargo\n\
+         release-build-apply assemble one strictly bound candidate without child processes\n\
          release-finalize  require all targets and write manifest/checksums\n\
          release-check     verify the complete local release asset set\n\
          release-license-check verify the checked-in dependency-license fixed point\n\
