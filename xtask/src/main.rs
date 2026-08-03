@@ -475,10 +475,8 @@ mod tests {
         let unexpected = temporary.path().join("stale-v1.schema.json");
         fs::write(&unexpected, b"{}\n")?;
 
-        let SchemaCheckError::Drift(drifted) = check_schemas_in(temporary.path())
-            .expect_err("an unregistered schema file must be reported as drift")
-        else {
-            return Err("unexpected schema-check error kind".into());
+        let Err(SchemaCheckError::Drift(drifted)) = check_schemas_in(temporary.path()) else {
+            return Err("an unregistered schema file was not reported as drift".into());
         };
         assert_eq!(drifted, [format!("{} (unexpected)", unexpected.display())]);
         Ok(())
