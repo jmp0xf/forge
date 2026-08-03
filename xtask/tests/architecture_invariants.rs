@@ -443,6 +443,101 @@ fn constructs_product_subprocess(source: &str) -> bool {
         || product_source.contains("Command::new(")
 }
 
+#[test]
+fn release_build_apply_is_nominally_filesystem_only_and_dispatched_explicitly() {
+    let source = include_str!("../src/release_apply.rs");
+    let product_source = source_without_test_items(source);
+    let release_source = include_str!("../src/release.rs");
+    let apply_domain = [
+        rust_item_source(release_source, "mod strict_release_protocol {")
+            .expect("strict release protocol module must remain a distinct item"),
+        rust_item_source(release_source, "fn render_release_build_apply_sbom(")
+            .expect("release-build apply SBOM renderer must remain a distinct item"),
+        rust_item_source(
+            release_source,
+            "pub(crate) fn assemble_release_build_apply(",
+        )
+        .expect("release-build apply assembly must remain a distinct item"),
+    ]
+    .join("\n");
+
+    // This is a cheap candidate-repository regression guard, not proof of the Authority's
+    // zero-child OS sandbox, read-only input, exclusive output, or process-tree containment.
+    for forbidden in [
+        "repository_root",
+        "open_labeled_command_output_directory",
+        "std::process",
+        "GitCli",
+        "WorktreeGuard",
+        "ReleaseSource",
+        "cargo_program",
+        "cargo_build",
+        "run_build(",
+        "run_bounded_process",
+        "ProcessPort",
+        "SynchronousProcessRunner",
+        "capture_cargo_metadata",
+        "capture_cargo_trees",
+        "stage_built",
+        "write_once_or_same",
+        "tempdir",
+    ] {
+        assert!(
+            !product_source.contains(forbidden),
+            "release-build apply production code gained forbidden capability `{forbidden}`"
+        );
+        assert!(
+            !apply_domain.contains(forbidden),
+            "release-build apply domain gained forbidden capability `{forbidden}`"
+        );
+    }
+
+    for required in [
+        "RepositoryWriter",
+        "write_atomic_new",
+        "assemble_release_build_apply",
+        "release::RELEASE_BUILD_PLAN_FILE",
+        "release-build-apply-descriptor.json",
+        "release-build-bound-binary",
+    ] {
+        assert!(
+            product_source.contains(required),
+            "release-build apply lost fixed filesystem contract `{required}`"
+        );
+    }
+
+    for required in [
+        "accept_release_build_plan(plan_bytes)",
+        "accept_release_build_apply_descriptor(&plan, descriptor_bytes)",
+        "accept_release_build_apply(&plan, &descriptor, &binary)",
+        "render_release_build_apply_sbom(&apply)",
+    ] {
+        assert!(
+            apply_domain.contains(required),
+            "release-build apply domain lost strict assembly step `{required}`"
+        );
+    }
+
+    let main = include_str!("../src/main.rs");
+    for required in [
+        "mod release_apply;",
+        "command == \"release-build-apply\"",
+        "run_release_command(release_apply::run(rest))",
+    ] {
+        assert!(
+            main.contains(required),
+            "xtask main lost release-build apply dispatch `{required}`"
+        );
+    }
+}
+
+fn rust_item_source<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    let start = source.find(signature)?;
+    let opening_brace = source[start..].find('{')? + start;
+    let end = matching_rust_block_end(source, opening_brace)?;
+    source.get(start..end)
+}
+
 fn source_without_test_items(source: &str) -> String {
     const TEST_ITEM_ATTRIBUTE: &str = "#[cfg(test)]";
 
