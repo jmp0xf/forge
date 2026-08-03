@@ -1,0 +1,111 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:cargo/forge@0.1.0-rc.2",
+      "name": "forge",
+      "version": "0.1.0-rc.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d25526acd83bcc63a7d69f00f34d8a34680d9c7c5d1fe904498a4cf58cbb1db8"
+        }
+      ],
+      "properties": [
+        {
+          "name": "forge:target-triple",
+          "value": "x86_64-unknown-linux-musl"
+        },
+        {
+          "name": "forge:cargo-lock-sha256",
+          "value": "99f013b3a84fe43c2600103848b73688393760a208e8ffb17d1c5d5f17fca0ba"
+        },
+        {
+          "name": "forge:source-commit",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "name": "forge:binary-sha256",
+          "value": "d25526acd83bcc63a7d69f00f34d8a34680d9c7c5d1fe904498a4cf58cbb1db8"
+        },
+        {
+          "name": "forge:binary-length",
+          "value": "120"
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "urn:forge:cargo:blake3:64cb58a7c7140fcccb9d4e1b634cd87c96b79e59d89b705be52f014a947528b3",
+      "name": "build-helper",
+      "version": "1.2.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "properties": [
+        {
+          "name": "forge:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "urn:forge:cargo:blake3:7f7d73fdaf9504d3480df0f766dc32d010ae74cd3e395e0ea87da6c5c87041f9",
+      "name": "serde",
+      "version": "1.0.229",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c"
+        }
+      ],
+      "properties": [
+        {
+          "name": "forge:cargo-source",
+          "value": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:cargo/forge@0.1.0-rc.2",
+      "dependsOn": [
+        "urn:forge:cargo:blake3:64cb58a7c7140fcccb9d4e1b634cd87c96b79e59d89b705be52f014a947528b3",
+        "urn:forge:cargo:blake3:7f7d73fdaf9504d3480df0f766dc32d010ae74cd3e395e0ea87da6c5c87041f9"
+      ]
+    },
+    {
+      "ref": "urn:forge:cargo:blake3:64cb58a7c7140fcccb9d4e1b634cd87c96b79e59d89b705be52f014a947528b3",
+      "dependsOn": []
+    },
+    {
+      "ref": "urn:forge:cargo:blake3:7f7d73fdaf9504d3480df0f766dc32d010ae74cd3e395e0ea87da6c5c87041f9",
+      "dependsOn": []
+    }
+  ]
+}

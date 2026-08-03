@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ mod cargo_env;
 mod compat;
 mod fixtures;
 mod release;
+mod release_apply;
 mod verify;
 
 const EXIT_OK: u8 = 0;
@@ -43,6 +45,12 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "diff-plans" => run_diff_plans(rest),
         [command, rest @ ..] if command == "release-build" => {
             run_release_command(release::run_build(rest))
+        }
+        [command, rest @ ..] if command == "release-build-plan" => {
+            run_release_command(release::run_plan(rest))
+        }
+        [command, rest @ ..] if command == "release-build-apply" => {
+            run_release_command(release_apply::run(rest))
         }
         [command, rest @ ..] if command == "release-finalize" => {
             run_release_command(release::run_finalize(rest))
@@ -316,7 +324,41 @@ enum SchemaCheckError {
 
 fn check_schemas() -> Result<usize, SchemaCheckError> {
     let directory = schema_directory().map_err(SchemaCheckError::Internal)?;
+    check_schemas_in(&directory)
+}
+
+fn check_schemas_in(directory: &Path) -> Result<usize, SchemaCheckError> {
     let mut drifted = Vec::new();
+    let expected_names = SchemaKind::all()
+        .iter()
+        .map(|kind| kind.file_name())
+        .collect::<BTreeSet<_>>();
+    match fs::read_dir(directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    SchemaCheckError::Environment(format!(
+                        "failed to enumerate {}: {error}",
+                        directory.display()
+                    ))
+                })?;
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    continue;
+                };
+                if file_name.ends_with(".schema.json") && !expected_names.contains(file_name) {
+                    drifted.push(format!("{} (unexpected)", entry.path().display()));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SchemaCheckError::Environment(format!(
+                "failed to enumerate {}: {error}",
+                directory.display()
+            )));
+        }
+    }
     for kind in SchemaKind::all() {
         let expected = schema_json(*kind).map_err(|error| {
             SchemaCheckError::Internal(format!("failed to render {}: {error}", kind.id()))
@@ -336,6 +378,7 @@ fn check_schemas() -> Result<usize, SchemaCheckError> {
             }
         }
     }
+    drifted.sort();
 
     if drifted.is_empty() {
         Ok(SchemaKind::all().len())
@@ -387,6 +430,8 @@ fn print_help() {
          generate-fixtures build deterministic fixture repositories\n\
          diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate\n\
          release-build     build and stage one accepted release target\n\
+         release-build-plan write one create-only candidate request without running Cargo\n\
+         release-build-apply assemble one strictly bound candidate without child processes\n\
          release-finalize  require all targets and write manifest/checksums\n\
          release-check     verify the complete local release asset set\n\
          release-license-check verify the checked-in dependency-license fixed point\n\
@@ -408,9 +453,13 @@ fn print_diff_plans_help() {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::process::ExitCode;
 
-    use super::{EXIT_OK, run_check_schemas, schema_directory};
+    use forge_schema::{SchemaKind, schema_json};
+    use tempfile::tempdir;
+
+    use super::{EXIT_OK, SchemaCheckError, check_schemas_in, run_check_schemas, schema_directory};
 
     #[test]
     fn checked_in_schemas_match_generated_contracts_in_default_test_gate() {
@@ -421,6 +470,24 @@ mod tests {
     fn schema_directory_is_repository_relative_to_xtask() -> Result<(), String> {
         let directory = schema_directory()?;
         assert!(directory.ends_with("docs/schemas"));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_check_rejects_an_unregistered_checked_in_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        for kind in SchemaKind::all() {
+            fs::write(temporary.path().join(kind.file_name()), schema_json(*kind)?)?;
+        }
+        fs::write(temporary.path().join("README.md"), b"not a schema\n")?;
+        let unexpected = temporary.path().join("stale-v1.schema.json");
+        fs::write(&unexpected, b"{}\n")?;
+
+        let Err(SchemaCheckError::Drift(drifted)) = check_schemas_in(temporary.path()) else {
+            return Err("an unregistered schema file was not reported as drift".into());
+        };
+        assert_eq!(drifted, [format!("{} (unexpected)", unexpected.display())]);
         Ok(())
     }
 }

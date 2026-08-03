@@ -55,6 +55,8 @@ pub enum SchemaKind {
     Evidence,
     Adapters,
     ReleaseBuildInputObservation,
+    ReleaseBuildPlan,
+    ReleaseBuildApplyDescriptor,
     ReleaseManifestV1,
     ReleaseManifest,
     Diagnostic,
@@ -76,6 +78,8 @@ impl SchemaKind {
         Self::Evidence,
         Self::Adapters,
         Self::ReleaseBuildInputObservation,
+        Self::ReleaseBuildPlan,
+        Self::ReleaseBuildApplyDescriptor,
         Self::ReleaseManifestV1,
         Self::ReleaseManifest,
         Self::Diagnostic,
@@ -100,6 +104,8 @@ impl SchemaKind {
             Self::EvidenceV1 | Self::Evidence => "evidence",
             Self::Adapters => "adapters",
             Self::ReleaseBuildInputObservation => "release-build-input-observation",
+            Self::ReleaseBuildPlan => "release-build-plan",
+            Self::ReleaseBuildApplyDescriptor => "release-build-apply-descriptor",
             Self::ReleaseManifestV1 | Self::ReleaseManifest => "release-manifest",
             Self::Diagnostic => "diagnostic",
             Self::Unknown => "unknown",
@@ -121,6 +127,8 @@ impl SchemaKind {
             | Self::EvidenceV1
             | Self::Adapters
             | Self::ReleaseBuildInputObservation
+            | Self::ReleaseBuildPlan
+            | Self::ReleaseBuildApplyDescriptor
             | Self::ReleaseManifestV1
             | Self::Diagnostic
             | Self::Unknown => 1,
@@ -170,6 +178,8 @@ impl FromStr for SchemaKind {
             ("release-build-input-observation", None | Some(1)) => {
                 Self::ReleaseBuildInputObservation
             }
+            ("release-build-plan", None | Some(1)) => Self::ReleaseBuildPlan,
+            ("release-build-apply-descriptor", None | Some(1)) => Self::ReleaseBuildApplyDescriptor,
             ("release-manifest" | "release", Some(1)) => Self::ReleaseManifestV1,
             ("release-manifest" | "release", None | Some(2)) => Self::ReleaseManifest,
             ("diagnostic", None | Some(1)) => Self::Diagnostic,
@@ -1767,6 +1777,651 @@ pub struct ReleaseBuildInputObservationData {
     pub windows_msvc_environment: ReleaseBuildInputWindowsMsvcEnvironmentData,
 }
 
+/// Why a candidate emits a release build plan.
+///
+/// The plan is an untrusted semantic request to an external authority. It is never an executable
+/// command, builder record, qualification result, approval, or release evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildPlanPurposeData {
+    AuthorityExecutionRequestNotReleaseEvidence,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One target accepted by the release plan/apply protocol.
+///
+/// This is intentionally separate from the diagnostic observation contract so additions cannot
+/// silently change the already published observation-v1 schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildTargetData {
+    #[serde(rename = "x86_64-unknown-linux-musl")]
+    X8664UnknownLinuxMusl,
+    #[serde(rename = "aarch64-unknown-linux-musl")]
+    Aarch64UnknownLinuxMusl,
+    #[serde(rename = "x86_64-apple-darwin")]
+    X8664AppleDarwin,
+    #[serde(rename = "aarch64-apple-darwin")]
+    Aarch64AppleDarwin,
+    #[serde(rename = "x86_64-pc-windows-msvc")]
+    X8664PcWindowsMsvc,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release package name must be 1..=128 ASCII alphanumeric, hyphen, or underscore bytes")]
+pub struct InvalidReleaseBuildPackageNameData;
+
+/// One bounded Cargo package name used by the release protocol.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildPackageNameData(
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+    )]
+    String,
+);
+
+impl ReleaseBuildPackageNameData {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidReleaseBuildPackageNameData> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        let valid_first = bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        if valid_first
+            && value.len() <= 128
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidReleaseBuildPackageNameData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildPackageNameData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release package version must be 1..=128 bounded SemVer-shaped ASCII bytes")]
+pub struct InvalidReleaseBuildPackageVersionData;
+
+/// One bounded Cargo package version used by the release protocol.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildPackageVersionData(
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[0-9][0-9A-Za-z.+-]{0,127}$")
+    )]
+    String,
+);
+
+impl ReleaseBuildPackageVersionData {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidReleaseBuildPackageVersionData> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        let valid_first = bytes.next().is_some_and(|byte| byte.is_ascii_digit());
+        if valid_first
+            && value.len() <= 128
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidReleaseBuildPackageVersionData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildPackageVersionData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release package key must be 1..=384 path-free protocol-safe ASCII bytes")]
+pub struct InvalidReleaseBuildPackageKeyData;
+
+/// One bounded, path-free package key used to join graph nodes and edges.
+///
+/// Current strict acceptance recomputes the key from source kind, name, and version. The public
+/// reader only enforces a bounded safe wire shape so future same-major readers can remain tolerant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildPackageKeyData(
+    #[schemars(
+        length(min = 1, max = 384),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9:_.+@-]{0,383}$")
+    )]
+    String,
+);
+
+impl ReleaseBuildPackageKeyData {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidReleaseBuildPackageKeyData> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        let valid_first = bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        if valid_first
+            && value.len() <= 384
+            && bytes.all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b':' | b'_' | b'.' | b'+' | b'@' | b'-')
+            })
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidReleaseBuildPackageKeyData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildPackageKeyData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One reviewed, already normalized SPDX expression used in the target SBOM projection.
+///
+/// The current apply gate rejects `Unknown`. Keeping a compatibility state lets a same-major
+/// reader diagnose a future expression without accepting arbitrary candidate-visible text or
+/// turning this field into a path/URL disclosure channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildSbomLicenseExpressionData {
+    #[serde(rename = "(MIT OR Apache-2.0) AND Unicode-3.0")]
+    MitOrApache20AndUnicode30,
+    #[serde(rename = "Apache-2.0")]
+    Apache20,
+    #[serde(rename = "Apache-2.0 OR BSL-1.0")]
+    Apache20OrBsl10,
+    #[serde(rename = "Apache-2.0 OR MIT")]
+    Apache20OrMit,
+    #[serde(rename = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT")]
+    Apache20WithLlvmExceptionOrApache20OrMit,
+    #[serde(rename = "BSD-2-Clause")]
+    Bsd2Clause,
+    #[serde(rename = "BSD-2-Clause OR Apache-2.0 OR MIT")]
+    Bsd2ClauseOrApache20OrMit,
+    #[serde(rename = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception")]
+    Cc010OrApache20OrApache20WithLlvmException,
+    #[serde(rename = "CC0-1.0 OR MIT-0 OR Apache-2.0")]
+    Cc010OrMit0OrApache20,
+    #[serde(rename = "MIT")]
+    Mit,
+    #[serde(rename = "MIT OR Apache-2.0")]
+    MitOrApache20,
+    #[serde(rename = "MIT-0")]
+    Mit0,
+    #[serde(rename = "Unicode-3.0")]
+    Unicode30,
+    #[serde(rename = "Unlicense OR MIT")]
+    UnlicenseOrMit,
+    #[serde(rename = "Zlib")]
+    Zlib,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release output name must be a 1..=255 byte path-free ASCII basename")]
+pub struct InvalidReleaseBuildOutputNameData;
+
+/// One bounded release output basename.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildOutputNameData(
+    #[schemars(
+        length(min = 1, max = 255),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+    )]
+    String,
+);
+
+impl ReleaseBuildOutputNameData {
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidReleaseBuildOutputNameData> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        let valid_first = bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        if valid_first
+            && value.len() <= 255
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidReleaseBuildOutputNameData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildOutputNameData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The fixed package requested by a release build plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildPlanPackageData {
+    pub name: ReleaseBuildPackageNameData,
+    pub version: ReleaseBuildPackageVersionData,
+}
+
+/// The fixed binary requested by a release build plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildBinaryData {
+    Forge,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The fixed Cargo profile requested by a release build plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildProfileData {
+    Release,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The fixed dependency-resolution mode requested by a release build plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildDependencyResolutionData {
+    Locked,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The fixed network mode requested by a release build plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildNetworkData {
+    Offline,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Target-derived, reviewable output basenames requested by a release build plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildPlanOutputsData {
+    pub binary: ReleaseBuildOutputNameData,
+    pub sbom: ReleaseBuildOutputNameData,
+}
+
+/// Standalone `forge.release-build-plan/v1` candidate request.
+///
+/// Deserialization is a tolerant same-major compatibility reader, not current acceptance. The
+/// strict release gate must separately enforce exact schema identity, current enum branches,
+/// semantic invariants, and canonical bytes before this request can influence an Authority
+/// execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildPlanData {
+    pub schema: String,
+    pub purpose: ReleaseBuildPlanPurposeData,
+    pub source_commit: GitObjectIdV2Data,
+    pub cargo_lock_sha256: ReleaseSha256Data,
+    pub target: ReleaseBuildTargetData,
+    pub package: ReleaseBuildPlanPackageData,
+    pub binary: ReleaseBuildBinaryData,
+    pub profile: ReleaseBuildProfileData,
+    pub dependency_resolution: ReleaseBuildDependencyResolutionData,
+    pub network: ReleaseBuildNetworkData,
+    pub outputs: ReleaseBuildPlanOutputsData,
+}
+
+/// Why an Authority supplies a descriptor to candidate-controlled apply code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildApplyDescriptorPurposeData {
+    CandidateApplyInputNotAuthorityEvidence,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release bound binary length must be within 1..=268435456 bytes")]
+pub struct InvalidReleaseBuildBinaryLengthData;
+
+/// One runtime-validated release binary length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildBinaryLengthData(#[schemars(range(min = 1, max = 268_435_456))] u64);
+
+impl ReleaseBuildBinaryLengthData {
+    pub fn new(value: u64) -> Result<Self, InvalidReleaseBuildBinaryLengthData> {
+        if (1..=268_435_456).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidReleaseBuildBinaryLengthData)
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildBinaryLengthData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The binary captured by the Authority-owned execute stage and bound into apply input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildBoundBinaryData {
+    pub length: ReleaseBuildBinaryLengthData,
+    pub sha256: ReleaseSha256Data,
+}
+
+/// The closed source classes representable by the v1 SBOM projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ReleaseBuildPackageSourceData {
+    /// A package in the bound Forge workspace; it carries no registry archive checksum.
+    Workspace,
+    /// A crates.io package whose v1 SBOM source is fixed to Cargo's canonical crates.io index ID.
+    ///
+    /// The renderer maps this branch to
+    /// `registry+https://github.com/rust-lang/crates.io-index`; other registries and Git sources
+    /// require a future contract instead of injecting an arbitrary URL.
+    CratesIo {
+        crate_archive_sha256: ReleaseSha256Data,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// One path-free package in the target-specific SBOM projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildSbomPackageData {
+    pub key: ReleaseBuildPackageKeyData,
+    pub name: ReleaseBuildPackageNameData,
+    pub version: ReleaseBuildPackageVersionData,
+    pub sbom_license_expression: ReleaseBuildSbomLicenseExpressionData,
+    pub source: ReleaseBuildPackageSourceData,
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MIN: usize, const MAX: usize>(
+    deserializer: D,
+    expectation: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MIN: usize, const MAX: usize> {
+        expectation: &'static str,
+        marker: std::marker::PhantomData<fn() -> T>,
+    }
+
+    impl<'de, T, const MIN: usize, const MAX: usize> serde::de::Visitor<'de>
+        for BoundedVecVisitor<T, MIN, MAX>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.expectation)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            if let Some(length) = sequence.size_hint() {
+                if length > MAX {
+                    return Err(serde::de::Error::invalid_length(length, &self));
+                }
+            }
+
+            let capacity = sequence.size_hint().unwrap_or(0).min(MAX);
+            let mut values = Vec::with_capacity(capacity);
+            while values.len() < MAX {
+                match sequence.next_element()? {
+                    Some(value) => values.push(value),
+                    None if values.len() < MIN => {
+                        return Err(serde::de::Error::invalid_length(values.len(), &self));
+                    }
+                    None => return Ok(values),
+                }
+            }
+
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MIN, MAX> {
+        expectation,
+        marker: std::marker::PhantomData,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release SBOM dependency list must contain at most 512 package keys")]
+pub struct InvalidReleaseBuildDependencyKeysData;
+
+/// One runtime-bounded dependency-key list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildDependencyKeysData(
+    #[schemars(length(max = 512))] Vec<ReleaseBuildPackageKeyData>,
+);
+
+impl ReleaseBuildDependencyKeysData {
+    pub fn new(
+        values: Vec<ReleaseBuildPackageKeyData>,
+    ) -> Result<Self, InvalidReleaseBuildDependencyKeysData> {
+        if values.len() <= 512 {
+            Ok(Self(values))
+        } else {
+            Err(InvalidReleaseBuildDependencyKeysData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[ReleaseBuildPackageKeyData] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildDependencyKeysData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = deserialize_bounded_vec::<D, ReleaseBuildPackageKeyData, 0, 512>(
+            deserializer,
+            "at most 512 release SBOM dependency keys",
+        )?;
+        Self::new(values).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One adjacency-list row in the target-specific SBOM projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildSbomDependencyData {
+    pub package: ReleaseBuildPackageKeyData,
+    pub depends_on: ReleaseBuildDependencyKeysData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release SBOM package list must contain 1..=512 packages")]
+pub struct InvalidReleaseBuildSbomPackagesData;
+
+/// One runtime-bounded target-specific package list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildSbomPackagesData(
+    #[schemars(length(min = 1, max = 512))] Vec<ReleaseBuildSbomPackageData>,
+);
+
+impl ReleaseBuildSbomPackagesData {
+    pub fn new(
+        values: Vec<ReleaseBuildSbomPackageData>,
+    ) -> Result<Self, InvalidReleaseBuildSbomPackagesData> {
+        if (1..=512).contains(&values.len()) {
+            Ok(Self(values))
+        } else {
+            Err(InvalidReleaseBuildSbomPackagesData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[ReleaseBuildSbomPackageData] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildSbomPackagesData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = deserialize_bounded_vec::<D, ReleaseBuildSbomPackageData, 1, 512>(
+            deserializer,
+            "between 1 and 512 release SBOM packages",
+        )?;
+        Self::new(values).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("release SBOM adjacency list must contain 1..=512 rows")]
+pub struct InvalidReleaseBuildSbomDependenciesData;
+
+/// One runtime-bounded target-specific adjacency list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ReleaseBuildSbomDependenciesData(
+    #[schemars(length(min = 1, max = 512))] Vec<ReleaseBuildSbomDependencyData>,
+);
+
+impl ReleaseBuildSbomDependenciesData {
+    pub fn new(
+        values: Vec<ReleaseBuildSbomDependencyData>,
+    ) -> Result<Self, InvalidReleaseBuildSbomDependenciesData> {
+        if (1..=512).contains(&values.len()) {
+            Ok(Self(values))
+        } else {
+            Err(InvalidReleaseBuildSbomDependenciesData)
+        }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[ReleaseBuildSbomDependencyData] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseBuildSbomDependenciesData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = deserialize_bounded_vec::<D, ReleaseBuildSbomDependencyData, 1, 512>(
+            deserializer,
+            "between 1 and 512 release SBOM dependency rows",
+        )?;
+        Self::new(values).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The minimal target-specific package graph needed to render the existing CycloneDX SBOM bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildSbomGraphData {
+    pub root: ReleaseBuildPackageKeyData,
+    pub packages: ReleaseBuildSbomPackagesData,
+    pub dependencies: ReleaseBuildSbomDependenciesData,
+}
+
+/// Standalone `forge.release-build-apply-descriptor/v1` candidate input.
+///
+/// The external Authority creates and independently validates this path-free projection from the
+/// Cargo execution it owns. Authority-private profile, policy, nonce, run, probe, and success
+/// state never enter this candidate-visible document. Deserialization is only a tolerant
+/// same-major compatibility reader; strict apply acceptance must separately reject unknown
+/// branches, wrong identity, semantic graph violations, and non-canonical bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseBuildApplyDescriptorData {
+    pub schema: String,
+    pub purpose: ReleaseBuildApplyDescriptorPurposeData,
+    pub plan_sha256: ReleaseSha256Data,
+    pub binary: ReleaseBuildBoundBinaryData,
+    pub sbom_graph: ReleaseBuildSbomGraphData,
+}
+
 /// One immutable artifact described by a local release-candidate manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -1800,6 +2455,11 @@ impl ReleaseSha256Data {
         } else {
             Err(InvalidReleaseSha256Data)
         }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -2021,6 +2681,10 @@ pub fn schema_for_kind(kind: SchemaKind) -> SchemaDocument {
         SchemaKind::ReleaseBuildInputObservation => {
             schema_for!(ReleaseBuildInputObservationData)
         }
+        SchemaKind::ReleaseBuildPlan => schema_for!(ReleaseBuildPlanData),
+        SchemaKind::ReleaseBuildApplyDescriptor => {
+            schema_for!(ReleaseBuildApplyDescriptorData)
+        }
         SchemaKind::ReleaseManifestV1 => schema_for!(ReleaseManifestData),
         SchemaKind::ReleaseManifest => schema_for!(ReleaseManifestV2Data),
         SchemaKind::Diagnostic | SchemaKind::Unknown => {
@@ -2080,17 +2744,27 @@ mod tests {
         GitSha256ObjectIdV2Data, JsonErrorStatusV2Data, NativeStringEncodingData,
         ProcessErrorKindV2Data, ProjectModelData, ProjectUnitDetailData,
         ReceiptValidityReasonV2Data, ReleaseArtifactKindData, ReleaseArtifactKindV2Data,
-        ReleaseAuthorityStatusData, ReleaseBuildInputCargoCommandData,
+        ReleaseAuthorityStatusData, ReleaseBuildApplyDescriptorData,
+        ReleaseBuildApplyDescriptorPurposeData, ReleaseBuildBinaryData,
+        ReleaseBuildBinaryLengthData, ReleaseBuildBoundBinaryData, ReleaseBuildDependencyKeysData,
+        ReleaseBuildDependencyResolutionData, ReleaseBuildInputCargoCommandData,
         ReleaseBuildInputNativeStringData, ReleaseBuildInputObservationData,
         ReleaseBuildInputObservationPhaseData, ReleaseBuildInputObservationPurposeData,
         ReleaseBuildInputRawBase64Data, ReleaseBuildInputRawBytesBase64Data,
         ReleaseBuildInputTargetData, ReleaseBuildInputValueData,
         ReleaseBuildInputValueEncodingData, ReleaseBuildInputWindowsMsvcEnvironmentData,
-        ReleaseCandidateStatusData, ReleaseChannelData, ReleaseDistributionData,
-        ReleaseManifestData, ReleaseManifestV2Data, ReleasePredicateTypeData,
-        ReleaseProvenanceStatusData, ReleaseRollbackStatusData, ReleaseSha256Data,
-        ReleaseSigningData, ReleaseSubjectSetData, SchemaIndexData, SchemaKind, SchemaVersion,
-        StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData, schema_json,
+        ReleaseBuildNetworkData, ReleaseBuildOutputNameData, ReleaseBuildPackageKeyData,
+        ReleaseBuildPackageNameData, ReleaseBuildPackageSourceData, ReleaseBuildPackageVersionData,
+        ReleaseBuildPlanData, ReleaseBuildPlanOutputsData, ReleaseBuildPlanPackageData,
+        ReleaseBuildPlanPurposeData, ReleaseBuildProfileData, ReleaseBuildSbomDependenciesData,
+        ReleaseBuildSbomDependencyData, ReleaseBuildSbomGraphData,
+        ReleaseBuildSbomLicenseExpressionData, ReleaseBuildSbomPackageData,
+        ReleaseBuildSbomPackagesData, ReleaseBuildTargetData, ReleaseCandidateStatusData,
+        ReleaseChannelData, ReleaseDistributionData, ReleaseManifestData, ReleaseManifestV2Data,
+        ReleasePredicateTypeData, ReleaseProvenanceStatusData, ReleaseRollbackStatusData,
+        ReleaseSha256Data, ReleaseSigningData, ReleaseSubjectSetData, SchemaIndexData, SchemaKind,
+        SchemaVersion, StaleReceiptV2Data, SuccessPredicateData, TaskAcceptanceV2Data, VersionData,
+        schema_json,
     };
     use crate::Digest;
 
@@ -2112,6 +2786,8 @@ mod tests {
         assert!(ids.contains(&String::from("forge.evidence/v1")));
         assert!(ids.contains(&String::from("forge.evidence/v2")));
         assert!(ids.contains(&String::from("forge.release-build-input-observation/v1")));
+        assert!(ids.contains(&String::from("forge.release-build-plan/v1")));
+        assert!(ids.contains(&String::from("forge.release-build-apply-descriptor/v1")));
         assert!(ids.contains(&String::from("forge.release-manifest/v1")));
         assert!(ids.contains(&String::from("forge.release-manifest/v2")));
     }
@@ -2154,6 +2830,14 @@ mod tests {
             SchemaKind::ReleaseBuildInputObservation
         );
         assert_eq!(
+            SchemaKind::from_str("forge.release-build-plan/v1")?,
+            SchemaKind::ReleaseBuildPlan
+        );
+        assert_eq!(
+            SchemaKind::from_str("release-build-apply-descriptor")?,
+            SchemaKind::ReleaseBuildApplyDescriptor
+        );
+        assert_eq!(
             SchemaKind::from_str("release")?,
             SchemaKind::ReleaseManifest
         );
@@ -2161,6 +2845,7 @@ mod tests {
         assert!(SchemaKind::from_str("forge.receipt/v02").is_err());
         assert!(SchemaKind::from_str("forge.model/v2").is_err());
         assert!(SchemaKind::from_str("forge.release-manifest/v3").is_err());
+        assert!(SchemaKind::from_str("forge.release-build-plan/v2").is_err());
         assert_eq!(
             SchemaVersion::for_kind(SchemaKind::Receipt),
             SchemaVersion::new("receipt", 2)
@@ -2249,10 +2934,208 @@ mod tests {
     }
 
     #[test]
+    fn release_build_plan_and_apply_descriptor_are_bounded_standalone_contracts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root_key = ReleaseBuildPackageKeyData::new("workspace:forge-cli@0.1.0-rc.2")?;
+        let dependency_key = ReleaseBuildPackageKeyData::new("crates-io:serde@1.0.229")?;
+        let plan = ReleaseBuildPlanData {
+            schema: SchemaKind::ReleaseBuildPlan.id(),
+            purpose: ReleaseBuildPlanPurposeData::AuthorityExecutionRequestNotReleaseEvidence,
+            source_commit: GitObjectIdV2Data::Sha1 {
+                oid: GitSha1ObjectIdV2Data::new("a".repeat(40))?,
+            },
+            cargo_lock_sha256: ReleaseSha256Data::new("b".repeat(64))?,
+            target: ReleaseBuildTargetData::X8664UnknownLinuxMusl,
+            package: ReleaseBuildPlanPackageData {
+                name: ReleaseBuildPackageNameData::new("forge-cli")?,
+                version: ReleaseBuildPackageVersionData::new("0.1.0-rc.2")?,
+            },
+            binary: ReleaseBuildBinaryData::Forge,
+            profile: ReleaseBuildProfileData::Release,
+            dependency_resolution: ReleaseBuildDependencyResolutionData::Locked,
+            network: ReleaseBuildNetworkData::Offline,
+            outputs: ReleaseBuildPlanOutputsData {
+                binary: ReleaseBuildOutputNameData::new(
+                    "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+                )?,
+                sbom: ReleaseBuildOutputNameData::new(
+                    "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json",
+                )?,
+            },
+        };
+        let plan_value = serde_json::to_value(&plan)?;
+        assert_eq!(
+            plan_value["purpose"],
+            "authority-execution-request-not-release-evidence"
+        );
+        assert_eq!(plan_value["target"], "x86_64-unknown-linux-musl");
+        assert_eq!(
+            serde_json::from_value::<ReleaseBuildPlanData>(plan_value.clone())?,
+            plan
+        );
+
+        let descriptor = ReleaseBuildApplyDescriptorData {
+            schema: SchemaKind::ReleaseBuildApplyDescriptor.id(),
+            purpose:
+                ReleaseBuildApplyDescriptorPurposeData::CandidateApplyInputNotAuthorityEvidence,
+            plan_sha256: ReleaseSha256Data::new("c".repeat(64))?,
+            binary: ReleaseBuildBoundBinaryData {
+                length: ReleaseBuildBinaryLengthData::new(120)?,
+                sha256: ReleaseSha256Data::new("d".repeat(64))?,
+            },
+            sbom_graph: ReleaseBuildSbomGraphData {
+                root: root_key.clone(),
+                packages: ReleaseBuildSbomPackagesData::new(vec![
+                    ReleaseBuildSbomPackageData {
+                        key: root_key.clone(),
+                        name: ReleaseBuildPackageNameData::new("forge-cli")?,
+                        version: ReleaseBuildPackageVersionData::new("0.1.0-rc.2")?,
+                        sbom_license_expression:
+                            ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+                        source: ReleaseBuildPackageSourceData::Workspace,
+                    },
+                    ReleaseBuildSbomPackageData {
+                        key: dependency_key.clone(),
+                        name: ReleaseBuildPackageNameData::new("serde")?,
+                        version: ReleaseBuildPackageVersionData::new("1.0.229")?,
+                        sbom_license_expression:
+                            ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+                        source: ReleaseBuildPackageSourceData::CratesIo {
+                            crate_archive_sha256: ReleaseSha256Data::new("e".repeat(64))?,
+                        },
+                    },
+                ])?,
+                dependencies: ReleaseBuildSbomDependenciesData::new(vec![
+                    ReleaseBuildSbomDependencyData {
+                        package: root_key,
+                        depends_on: ReleaseBuildDependencyKeysData::new(vec![
+                            dependency_key.clone(),
+                        ])?,
+                    },
+                    ReleaseBuildSbomDependencyData {
+                        package: dependency_key,
+                        depends_on: ReleaseBuildDependencyKeysData::new(Vec::new())?,
+                    },
+                ])?,
+            },
+        };
+        let descriptor_value = serde_json::to_value(&descriptor)?;
+        assert_eq!(
+            descriptor_value["purpose"],
+            "candidate-apply-input-not-authority-evidence"
+        );
+        assert_eq!(
+            descriptor_value["sbom_graph"]["packages"][1]["source"]["kind"],
+            "crates-io"
+        );
+        assert_eq!(
+            serde_json::from_value::<ReleaseBuildApplyDescriptorData>(descriptor_value.clone())?,
+            descriptor
+        );
+
+        let private_license = serde_json::from_value::<ReleaseBuildSbomLicenseExpressionData>(
+            serde_json::json!("/home/private"),
+        )?;
+        assert!(matches!(
+            private_license,
+            ReleaseBuildSbomLicenseExpressionData::Unknown
+        ));
+        assert_eq!(
+            serde_json::to_value(private_license)?,
+            serde_json::json!("unknown")
+        );
+
+        let mut zero_length = descriptor_value.clone();
+        zero_length["binary"]["length"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<ReleaseBuildApplyDescriptorData>(zero_length).is_err());
+
+        let mut empty_packages = descriptor_value.clone();
+        empty_packages["sbom_graph"]["packages"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ReleaseBuildApplyDescriptorData>(empty_packages).is_err());
+
+        let mut empty_dependencies = descriptor_value.clone();
+        empty_dependencies["sbom_graph"]["dependencies"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<ReleaseBuildApplyDescriptorData>(empty_dependencies).is_err()
+        );
+
+        let mut oversized_depends_on = descriptor_value.clone();
+        oversized_depends_on["sbom_graph"]["dependencies"][0]["depends_on"] =
+            serde_json::json!(vec!["crates-io:serde@1.0.229"; 513]);
+        assert!(
+            serde_json::from_value::<ReleaseBuildApplyDescriptorData>(oversized_depends_on)
+                .is_err()
+        );
+
+        let mut future_plan = plan_value.clone();
+        future_plan["future_optional_field"] = serde_json::json!(true);
+        assert_eq!(
+            serde_json::from_value::<ReleaseBuildPlanData>(future_plan)?,
+            plan
+        );
+        let mut future_binary = plan_value;
+        future_binary["binary"] = serde_json::json!("future-binary");
+        assert!(matches!(
+            serde_json::from_value::<ReleaseBuildPlanData>(future_binary)?.binary,
+            ReleaseBuildBinaryData::Unknown
+        ));
+
+        let mut future_descriptor = descriptor_value;
+        future_descriptor["future_optional_field"] = serde_json::json!(true);
+        future_descriptor["sbom_graph"]["packages"][1]["source"] =
+            serde_json::json!({"kind": "future-source"});
+        let future_descriptor =
+            serde_json::from_value::<ReleaseBuildApplyDescriptorData>(future_descriptor)?;
+        assert!(matches!(
+            &future_descriptor.sbom_graph.packages.as_slice()[1].source,
+            ReleaseBuildPackageSourceData::Unknown
+        ));
+
+        for invalid in ["", "../forge", "forge/name", &"a".repeat(129)] {
+            assert!(ReleaseBuildPackageNameData::new(invalid).is_err());
+        }
+        assert!(ReleaseBuildPackageVersionData::new("version").is_err());
+        assert!(ReleaseBuildPackageKeyData::new("workspace/forge@1.0.0").is_err());
+        assert!(ReleaseBuildOutputNameData::new("../forge").is_err());
+
+        let plan_schema: Value = serde_json::from_str(&schema_json(SchemaKind::ReleaseBuildPlan)?)?;
+        assert_eq!(plan_schema["$id"], "forge.release-build-plan/v1");
+        assert_eq!(
+            plan_schema["properties"]["schema"]["const"],
+            "forge.release-build-plan/v1"
+        );
+        assert_eq!(
+            plan_schema["$defs"]["ReleaseBuildOutputNameData"]["maxLength"],
+            255
+        );
+
+        let descriptor_schema: Value =
+            serde_json::from_str(&schema_json(SchemaKind::ReleaseBuildApplyDescriptor)?)?;
+        assert_eq!(
+            descriptor_schema["$id"],
+            "forge.release-build-apply-descriptor/v1"
+        );
+        assert_eq!(
+            descriptor_schema["$defs"]["ReleaseBuildSbomPackagesData"]["maxItems"],
+            512
+        );
+        assert_eq!(
+            descriptor_schema["$defs"]["ReleaseBuildBinaryLengthData"]["maximum"],
+            268_435_456
+        );
+        assert_eq!(
+            descriptor_schema["$defs"]["ReleaseBuildDependencyKeysData"]["maxItems"],
+            512
+        );
+        Ok(())
+    }
+
+    #[test]
     fn release_sha256_accepts_only_canonical_lowercase_hex()
     -> Result<(), Box<dyn std::error::Error>> {
         let canonical = "a".repeat(64);
         let digest = ReleaseSha256Data::new(canonical.clone())?;
+        assert_eq!(digest.as_str(), canonical);
         assert_eq!(serde_json::to_value(digest)?, serde_json::json!(canonical));
 
         for invalid in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {

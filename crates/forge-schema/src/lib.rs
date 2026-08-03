@@ -4,6 +4,7 @@
 
 mod contracts;
 mod diagnostic;
+pub mod exact_json;
 mod ids;
 mod path;
 

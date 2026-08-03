@@ -12,27 +12,37 @@ use std::path::{Component as PathComponent, Path, PathBuf};
 use std::time::Duration;
 
 use forge_core::ports::{
-    EnvPolicy, ExecSpec, OutputPolicy, ProcessObservation, ProcessPort, StdinPolicy,
+    EnvPolicy, ExecSpec, GitPort, OutputPolicy, ProcessObservation, ProcessPort, StdinPolicy,
 };
 use forge_core::{
-    GitIndexEntry, GitIndexTag, GitObjectFormat, Mutability, NetworkIntent, RepoRelativePath,
-    parse_git_index_reader,
+    BranchOid, GitIndexEntry, GitIndexTag, GitObjectFormat, Mutability, NetworkIntent,
+    RepoRelativePath, parse_git_index_reader,
 };
 use forge_runtime::fs::RepositoryWriter;
 use forge_runtime::git::{GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
 use forge_runtime::process::SynchronousProcessRunner;
+use forge_schema::exact_json::{ExactJsonError, parse_exact_json};
 use forge_schema::{
     GitObjectIdV2Data, GitSha1ObjectIdV2Data, GitSha256ObjectIdV2Data, ReleaseArtifactKindV2Data,
-    ReleaseArtifactV2Data, ReleaseAuthorityStatusData, ReleaseBuildInputCargoCommandData,
+    ReleaseArtifactV2Data, ReleaseAuthorityStatusData, ReleaseBuildApplyDescriptorData,
+    ReleaseBuildApplyDescriptorPurposeData, ReleaseBuildBinaryData, ReleaseBuildDependencyKeysData,
+    ReleaseBuildDependencyResolutionData, ReleaseBuildInputCargoCommandData,
     ReleaseBuildInputNativeStringData, ReleaseBuildInputObservationData,
     ReleaseBuildInputObservationPhaseData, ReleaseBuildInputObservationPurposeData,
     ReleaseBuildInputTargetData, ReleaseBuildInputValueData,
-    ReleaseBuildInputWindowsMsvcEnvironmentData, ReleaseCandidateStatusData, ReleaseChannelData,
-    ReleaseDescriptorData, ReleaseDistributionData, ReleaseManifestV2Data,
+    ReleaseBuildInputWindowsMsvcEnvironmentData, ReleaseBuildNetworkData,
+    ReleaseBuildOutputNameData, ReleaseBuildPackageKeyData, ReleaseBuildPackageNameData,
+    ReleaseBuildPackageSourceData, ReleaseBuildPackageVersionData, ReleaseBuildPlanData,
+    ReleaseBuildPlanOutputsData, ReleaseBuildPlanPackageData, ReleaseBuildPlanPurposeData,
+    ReleaseBuildProfileData, ReleaseBuildSbomDependenciesData, ReleaseBuildSbomDependencyData,
+    ReleaseBuildSbomGraphData, ReleaseBuildSbomLicenseExpressionData, ReleaseBuildSbomPackageData,
+    ReleaseBuildSbomPackagesData, ReleaseBuildTargetData, ReleaseCandidateStatusData,
+    ReleaseChannelData, ReleaseDescriptorData, ReleaseDistributionData, ReleaseManifestV2Data,
     ReleasePredicateTypeData, ReleaseProvenanceStatusData, ReleaseProvenanceV2Data,
     ReleaseRollbackData, ReleaseRollbackStatusData, ReleaseSha256Data, ReleaseSigningData,
     ReleaseSubjectSetData, SchemaKind,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::cargo_env::{
@@ -64,7 +74,11 @@ const MAX_REGISTRY_CRATE_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REGISTRY_CACHE_ENTRIES: usize = 1_000_000;
 const MANIFEST_FILE: &str = "release-manifest.json";
 const CHECKSUMS_FILE: &str = "SHA256SUMS";
-const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_BOUND_BINARY_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_PLAN_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_RELEASE_BUILD_APPLY_SBOM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BINARY_BYTES: u64 = MAX_RELEASE_BUILD_BOUND_BINARY_BYTES as u64;
 const MAX_SOURCE_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SOURCE_TREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 32 * 1024 * 1024;
@@ -75,6 +89,11 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUILD_INPUT_OBSERVATION_BYTES: usize = 512 * 1024;
 const BUILD_INPUT_OBSERVATION_PREFIX: &str = "release-build-input-observation-";
+pub(crate) const RELEASE_BUILD_PLAN_FILE: &str = "release-build-plan.json";
+const RELEASE_PACKAGE_NAME: &str = "forge-cli";
+const RELEASE_BINARY_NAME: &str = "forge";
+const CRATES_IO_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const MAX_RELEASE_BUILD_GRAPH_EDGES: usize = 4096;
 const FINALIZED_ASSET_COUNT: u16 = 13;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const CARGO_METADATA_TIMEOUT: Duration = Duration::from_secs(300);
@@ -93,6 +112,7 @@ const REJECTED_RELEASE_GIT_ENV: &[&str] = &[
 ];
 
 pub(crate) const BUILD_HELP: &str = "usage: xtask release-build --target <TRIPLE> --output-dir <DIR> [--build-input-observation-dir <DIR>]\n\nBuilds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. The optional observation is a private, diagnostic-only pre-build record that can contain local toolchain paths; it is not a release asset or evidence and must not be uploaded raw. Run the compiled xtask directly when a nested `cargo run` is unsuitable.";
+pub(crate) const PLAN_HELP: &str = "usage: xtask release-build-plan --target <TRIPLE> --output-dir <DIR>\n\nWrites exactly release-build-plan.json into an existing fresh empty directory outside the source repository. The canonical document binds the clean Git commit, Cargo.lock digest, target, and fixed release semantics without requesting Cargo or creating a binary, SBOM, or Cargo target directory. It is an untrusted candidate request, never builder evidence, qualification, approval, or release authority. This command does not establish a process sandbox or trust the Git found on PATH: formal qualification must invoke an already-built xtask directly while the external Authority pins the real Git executable and enforces its child-process allowlist; do not enter this phase through cargo run.";
 pub(crate) const FINALIZE_HELP: &str = "usage: xtask release-finalize --output-dir <DIR>\n\nRequires all five target binaries and SBOMs, then copies the source-bound license notices and writes release-manifest.json and SHA256SUMS without overwriting different bytes.";
 pub(crate) const CHECK_HELP: &str = "usage: xtask release-check --output-dir <DIR>\n\nRecomputes the complete local asset set, binary formats, SBOMs, manifest, and SHA-256 checksums. Success is local consistency evidence, not provenance, signature, approval, upload, or publication.";
 pub(crate) const LICENSE_CHECK_HELP: &str = "usage: xtask release-license-check\n\nRecomputes the reviewed five-target scoped Cargo tree graph, legal-file inventory, policy, and deterministic THIRD-PARTY-LICENSES.txt fixed point. Fetched .crate archive bytes must match Cargo.lock SHA-256; legal text is separately read and hashed from current unpacked sources, without claiming the archive check proves those unpacked bytes. Each native release-build must independently prove compiler-artifact parity before staging.";
@@ -112,33 +132,39 @@ struct ReleaseTarget {
     triple: &'static str,
     executable_name: &'static str,
     format: BinaryFormat,
+    plan_target: ReleaseBuildTargetData,
 }
 
 const RELEASE_TARGETS: [ReleaseTarget; 5] = [
     ReleaseTarget {
         triple: "x86_64-unknown-linux-musl",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::ElfX86_64Static,
+        plan_target: ReleaseBuildTargetData::X8664UnknownLinuxMusl,
     },
     ReleaseTarget {
         triple: "aarch64-unknown-linux-musl",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::ElfAarch64Static,
+        plan_target: ReleaseBuildTargetData::Aarch64UnknownLinuxMusl,
     },
     ReleaseTarget {
         triple: "x86_64-apple-darwin",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::MachOX86_64,
+        plan_target: ReleaseBuildTargetData::X8664AppleDarwin,
     },
     ReleaseTarget {
         triple: "aarch64-apple-darwin",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::MachOAarch64,
+        plan_target: ReleaseBuildTargetData::Aarch64AppleDarwin,
     },
     ReleaseTarget {
         triple: "x86_64-pc-windows-msvc",
         executable_name: "forge.exe",
         format: BinaryFormat::PeX86_64,
+        plan_target: ReleaseBuildTargetData::X8664PcWindowsMsvc,
     },
 ];
 
@@ -161,28 +187,28 @@ impl ReleaseError {
         self.kind
     }
 
-    fn negative(message: impl Into<String>) -> Self {
+    pub(crate) fn negative(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Negative,
             message: message.into(),
         }
     }
 
-    fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Usage,
             message: message.into(),
         }
     }
 
-    fn environment(message: impl Into<String>) -> Self {
+    pub(crate) fn environment(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Environment,
             message: message.into(),
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: ReleaseErrorKind::Internal,
             message: message.into(),
@@ -218,6 +244,12 @@ struct BuildRequest {
 }
 
 #[derive(Debug)]
+struct PlanRequest {
+    target: &'static ReleaseTarget,
+    output_directory: PathBuf,
+}
+
+#[derive(Debug)]
 struct BuildInputObservationOutput {
     writer: RepositoryWriter,
     file_name: String,
@@ -229,6 +261,39 @@ struct PreparedCargoInvocation {
     arguments: Vec<OsString>,
     working_directory: PathBuf,
     environment: EnvPolicy,
+}
+
+// This argv belongs only to the convenient local one-command path. A qualification plan must not
+// carry it; the external release authority constructs and executes its own Cargo invocation from
+// policy.
+fn local_release_build_arguments(target: &ReleaseTarget, target_directory: &Path) -> Vec<OsString> {
+    let mut arguments = [
+        "build",
+        "--release",
+        "--locked",
+        "--offline",
+        "-p",
+        RELEASE_PACKAGE_NAME,
+        "--bin",
+        RELEASE_BINARY_NAME,
+        "--message-format=json-render-diagnostics",
+        "--target",
+        target.triple,
+        "--target-dir",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    arguments.push(target_directory.as_os_str().to_owned());
+    arguments
+}
+
+fn release_build_completed_message(target: &ReleaseTarget, output_directory: &Path) -> String {
+    format!(
+        "built and staged {} with its CycloneDX SBOM in {}; local candidate only, not signed or published",
+        binary_asset_name(target),
+        output_directory.display()
+    )
 }
 
 pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, ReleaseError> {
@@ -290,11 +355,9 @@ pub(crate) fn run_build(arguments: &[String]) -> Result<ReleaseCommandOutput, Re
     validate_binary_format(request.target, &binary)?;
     stage_built(&output, request.target, &binary, source.snapshot())?;
     source.require_unchanged(targets, "release asset staging")?;
-    Ok(ReleaseCommandOutput::Completed(format!(
-        "built and staged {} with its CycloneDX SBOM in {}; local candidate only, not signed or published",
-        binary_asset_name(request.target),
-        output.root().display()
-    )))
+    Ok(ReleaseCommandOutput::Completed(
+        release_build_completed_message(request.target, output.root()),
+    ))
 }
 
 fn parse_build_request(arguments: &[String]) -> Result<BuildRequest, ReleaseError> {
@@ -308,6 +371,38 @@ fn parse_build_request(arguments: &[String]) -> Result<BuildRequest, ReleaseErro
         build_input_observation_directory: options
             .get("--build-input-observation-dir")
             .map(PathBuf::from),
+    })
+}
+
+pub(crate) fn run_plan(arguments: &[String]) -> Result<ReleaseCommandOutput, ReleaseError> {
+    if is_help(arguments) {
+        return Ok(ReleaseCommandOutput::Help(PLAN_HELP));
+    }
+    let request = parse_plan_request(arguments)?;
+    let repository = repository_root()?;
+    let output = open_labeled_command_output_directory(
+        &repository,
+        &request.output_directory,
+        "release-build plan output",
+    )?;
+    write_release_build_plan(&repository, request.target, &output)?;
+    Ok(ReleaseCommandOutput::Completed(
+        release_build_plan_completed_message(request.target),
+    ))
+}
+
+fn release_build_plan_completed_message(target: &ReleaseTarget) -> String {
+    format!(
+        "wrote canonical {RELEASE_BUILD_PLAN_FILE} for {}; candidate request only, not builder evidence, qualification, approval, or release authority",
+        target.triple
+    )
+}
+
+fn parse_plan_request(arguments: &[String]) -> Result<PlanRequest, ReleaseError> {
+    let options = parse_options(arguments, &["--target", "--output-dir"])?;
+    Ok(PlanRequest {
+        target: parse_target(required_option(&options, "--target")?)?,
+        output_directory: PathBuf::from(required_option(&options, "--output-dir")?),
     })
 }
 
@@ -385,11 +480,11 @@ pub(crate) fn run_license_generate(
     )))
 }
 
-fn is_help(arguments: &[String]) -> bool {
+pub(crate) fn is_help(arguments: &[String]) -> bool {
     matches!(arguments, [argument] if argument == "--help" || argument == "help")
 }
 
-fn parse_options(
+pub(crate) fn parse_options(
     arguments: &[String],
     allowed: &[&str],
 ) -> Result<BTreeMap<String, String>, ReleaseError> {
@@ -422,7 +517,7 @@ fn parse_options(
     Ok(options)
 }
 
-fn required_option<'a>(
+pub(crate) fn required_option<'a>(
     options: &'a BTreeMap<String, String>,
     name: &str,
 ) -> Result<&'a str, ReleaseError> {
@@ -446,6 +541,519 @@ fn parse_target(triple: &str) -> Result<&'static ReleaseTarget, ReleaseError> {
                     .join(", ")
             ))
         })
+}
+
+mod strict_release_protocol {
+    use super::*;
+
+    #[derive(Debug)]
+    pub(super) struct AcceptedReleaseBuildPlan {
+        document: ReleaseBuildPlanData,
+        target: &'static ReleaseTarget,
+        sha256: ReleaseSha256Data,
+    }
+
+    impl AcceptedReleaseBuildPlan {
+        pub(super) fn document(&self) -> &ReleaseBuildPlanData {
+            &self.document
+        }
+
+        pub(super) fn target(&self) -> &'static ReleaseTarget {
+            self.target
+        }
+
+        pub(super) fn sha256(&self) -> &ReleaseSha256Data {
+            &self.sha256
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct AcceptedReleaseBuildApplyDescriptor {
+        document: ReleaseBuildApplyDescriptorData,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct AcceptedReleaseBuildApply<'a> {
+        plan: &'a AcceptedReleaseBuildPlan,
+        descriptor: &'a AcceptedReleaseBuildApplyDescriptor,
+        binary: &'a [u8],
+    }
+
+    impl<'a> AcceptedReleaseBuildApply<'a> {
+        pub(super) fn plan(&self) -> &ReleaseBuildPlanData {
+            &self.plan.document
+        }
+
+        pub(super) fn target(&self) -> &'static ReleaseTarget {
+            self.plan.target
+        }
+
+        pub(super) fn descriptor(&self) -> &ReleaseBuildApplyDescriptorData {
+            &self.descriptor.document
+        }
+
+        pub(super) fn binary(&self) -> &'a [u8] {
+            self.binary
+        }
+    }
+
+    fn parse_canonical_release_protocol_json<T>(
+        bytes: &[u8],
+        maximum: usize,
+        label: &'static str,
+    ) -> Result<T, ReleaseError>
+    where
+        T: DeserializeOwned + PartialEq + Serialize,
+    {
+        let parsed = parse_exact_json(bytes, maximum).map_err(|error| match error {
+            ExactJsonError::TooLarge => {
+                ReleaseError::negative(format!("{label} exceeds its {maximum}-byte limit"))
+            }
+            ExactJsonError::Malformed => {
+                ReleaseError::negative(format!("{label} is not bounded exact JSON"))
+            }
+        })?;
+        let document: T = parsed
+            .deserialize_consistent()
+            .map_err(|_| ReleaseError::negative(format!("{label} has an invalid typed shape")))?;
+        let canonical = to_pretty_json(&document, label)?;
+        if canonical != bytes {
+            return Err(ReleaseError::negative(format!(
+                "{label} is not canonical pretty JSON with one LF terminator"
+            )));
+        }
+        Ok(document)
+    }
+
+    pub(super) fn accepted_plan_target(
+        target: ReleaseBuildTargetData,
+    ) -> Result<&'static ReleaseTarget, ReleaseError> {
+        RELEASE_TARGETS
+            .iter()
+            .find(|known| known.plan_target == target)
+            .ok_or_else(|| ReleaseError::negative("release-build plan has an unsupported target"))
+    }
+
+    pub(super) fn accept_release_build_plan(
+        bytes: &[u8],
+    ) -> Result<AcceptedReleaseBuildPlan, ReleaseError> {
+        let document: ReleaseBuildPlanData = parse_canonical_release_protocol_json(
+            bytes,
+            MAX_RELEASE_BUILD_PLAN_BYTES,
+            "release-build plan",
+        )?;
+        if document.schema != "forge.release-build-plan/v1" {
+            return Err(ReleaseError::negative(
+                "release-build plan has an unsupported schema",
+            ));
+        }
+        if !matches!(
+            document.purpose,
+            ReleaseBuildPlanPurposeData::AuthorityExecutionRequestNotReleaseEvidence
+        ) {
+            return Err(ReleaseError::negative(
+                "release-build plan has an unsupported purpose",
+            ));
+        }
+        if matches!(document.source_commit, GitObjectIdV2Data::Unknown) {
+            return Err(ReleaseError::negative(
+                "release-build plan has an unsupported source object format",
+            ));
+        }
+        let target = accepted_plan_target(document.target)?;
+        if document.package.name.as_str() != RELEASE_PACKAGE_NAME
+            || document.package.version.as_str() != RELEASE_VERSION
+        {
+            return Err(ReleaseError::negative(
+                "release-build plan requests an unsupported package identity",
+            ));
+        }
+        if !matches!(document.binary, ReleaseBuildBinaryData::Forge)
+            || !matches!(document.profile, ReleaseBuildProfileData::Release)
+            || !matches!(
+                document.dependency_resolution,
+                ReleaseBuildDependencyResolutionData::Locked
+            )
+            || !matches!(document.network, ReleaseBuildNetworkData::Offline)
+        {
+            return Err(ReleaseError::negative(
+                "release-build plan requests unsupported build semantics",
+            ));
+        }
+        if document.outputs.binary.as_str() != binary_asset_name(target)
+            || document.outputs.sbom.as_str() != sbom_asset_name(target)
+        {
+            return Err(ReleaseError::negative(
+                "release-build plan output names do not match its target",
+            ));
+        }
+        let sha256 = ReleaseSha256Data::new(sha256_hex(bytes)).map_err(|_| {
+            ReleaseError::internal("canonical release-build plan SHA-256 was malformed")
+        })?;
+        Ok(AcceptedReleaseBuildPlan {
+            document,
+            target,
+            sha256,
+        })
+    }
+
+    fn expected_release_build_package_key(
+        package: &ReleaseBuildSbomPackageData,
+    ) -> Result<String, ReleaseError> {
+        if matches!(
+            package.sbom_license_expression,
+            ReleaseBuildSbomLicenseExpressionData::Unknown
+        ) {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor has an unsupported license expression",
+            ));
+        }
+        let source = match &package.source {
+            ReleaseBuildPackageSourceData::Workspace => "workspace",
+            ReleaseBuildPackageSourceData::CratesIo { .. } => "crates-io",
+            _ => {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor has an unsupported package source",
+                ));
+            }
+        };
+        Ok(format!(
+            "{source}:{}@{}",
+            package.name.as_str(),
+            package.version.as_str()
+        ))
+    }
+
+    fn validate_release_build_graph(
+        plan: &AcceptedReleaseBuildPlan,
+        graph: &ReleaseBuildSbomGraphData,
+    ) -> Result<(), ReleaseError> {
+        let packages = graph.packages.as_slice();
+        let mut packages_by_key = BTreeMap::new();
+        let mut identities = BTreeSet::new();
+        let mut previous_key = None;
+        for package in packages {
+            let key = package.key.as_str();
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor packages are not strictly key-sorted",
+                ));
+            }
+            previous_key = Some(key);
+            if expected_release_build_package_key(package)? != key {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor contains a non-canonical package key",
+                ));
+            }
+            if !identities.insert((package.name.as_str(), package.version.as_str())) {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor repeats a package name and version",
+                ));
+            }
+            if packages_by_key.insert(key, package).is_some() {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor repeats a package key",
+                ));
+            }
+        }
+
+        let expected_root_key = format!(
+            "workspace:{RELEASE_PACKAGE_NAME}@{}",
+            plan.document().package.version.as_str()
+        );
+        if graph.root.as_str() != expected_root_key {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor has an unsupported root key",
+            ));
+        }
+        let root = packages_by_key.get(graph.root.as_str()).ok_or_else(|| {
+            ReleaseError::negative("release-build apply descriptor root package is absent")
+        })?;
+        if root.name.as_str() != RELEASE_PACKAGE_NAME
+            || root.version.as_str() != plan.document().package.version.as_str()
+            || !matches!(&root.source, ReleaseBuildPackageSourceData::Workspace)
+            || !matches!(
+                root.sbom_license_expression,
+                ReleaseBuildSbomLicenseExpressionData::MitOrApache20
+            )
+        {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor root package semantics are unsupported",
+            ));
+        }
+
+        let rows = graph.dependencies.as_slice();
+        if rows.len() != packages.len() {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor must contain one dependency row per package",
+            ));
+        }
+        let mut edges = BTreeMap::new();
+        let mut previous_row = None;
+        let mut edge_count = 0_usize;
+        for row in rows {
+            let package = row.package.as_str();
+            if previous_row.is_some_and(|previous| previous >= package) {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor dependency rows are not strictly key-sorted",
+                ));
+            }
+            previous_row = Some(package);
+            if !packages_by_key.contains_key(package) {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor has a dependency row for an unknown package",
+                ));
+            }
+            let mut depends_on = Vec::new();
+            let mut previous_dependency = None;
+            for dependency in row.depends_on.as_slice() {
+                let dependency = dependency.as_str();
+                if previous_dependency.is_some_and(|previous| previous >= dependency) {
+                    return Err(ReleaseError::negative(
+                        "release-build apply descriptor dependency targets are not strictly key-sorted",
+                    ));
+                }
+                previous_dependency = Some(dependency);
+                if dependency == package {
+                    return Err(ReleaseError::negative(
+                        "release-build apply descriptor contains a self dependency",
+                    ));
+                }
+                if !packages_by_key.contains_key(dependency) {
+                    return Err(ReleaseError::negative(
+                        "release-build apply descriptor contains a dangling dependency",
+                    ));
+                }
+                edge_count = edge_count
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_RELEASE_BUILD_GRAPH_EDGES)
+                    .ok_or_else(|| {
+                        ReleaseError::negative(
+                            "release-build apply descriptor exceeds the graph edge limit",
+                        )
+                    })?;
+                depends_on.push(dependency);
+            }
+            if edges.insert(package, depends_on).is_some() {
+                return Err(ReleaseError::negative(
+                    "release-build apply descriptor repeats a dependency row",
+                ));
+            }
+        }
+        if edges.len() != packages_by_key.len() {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor dependency rows do not close over packages",
+            ));
+        }
+
+        let mut indegrees: BTreeMap<&str, usize> = packages_by_key
+            .keys()
+            .map(|package| (*package, 0_usize))
+            .collect();
+        for dependencies in edges.values() {
+            for dependency in dependencies {
+                let indegree = indegrees.get_mut(dependency).ok_or_else(|| {
+                    ReleaseError::internal("validated release-build graph lost an edge target")
+                })?;
+                *indegree = indegree.checked_add(1).ok_or_else(|| {
+                    ReleaseError::internal("validated release-build graph indegree overflowed")
+                })?;
+            }
+        }
+        if indegrees.get(graph.root.as_str()) != Some(&0) {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor root has an incoming dependency",
+            ));
+        }
+
+        let mut reachable = BTreeSet::new();
+        let mut pending = vec![graph.root.as_str()];
+        while let Some(package) = pending.pop() {
+            if !reachable.insert(package) {
+                continue;
+            }
+            let dependencies = edges.get(package).ok_or_else(|| {
+                ReleaseError::internal("validated release-build graph lost a dependency row")
+            })?;
+            pending.extend(dependencies.iter().copied());
+        }
+        if reachable.len() != packages_by_key.len() {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor contains an unreachable package",
+            ));
+        }
+
+        let mut ready: Vec<_> = indegrees
+            .iter()
+            .filter_map(|(package, indegree)| (*indegree == 0).then_some(*package))
+            .collect();
+        let mut visited = 0_usize;
+        while let Some(package) = ready.pop() {
+            visited = visited.checked_add(1).ok_or_else(|| {
+                ReleaseError::internal("validated release-build graph node count overflowed")
+            })?;
+            for dependency in edges.get(package).ok_or_else(|| {
+                ReleaseError::internal("validated release-build graph lost a dependency row")
+            })? {
+                let indegree = indegrees.get_mut(dependency).ok_or_else(|| {
+                    ReleaseError::internal("validated release-build graph lost an edge target")
+                })?;
+                *indegree = indegree.checked_sub(1).ok_or_else(|| {
+                    ReleaseError::internal("validated release-build graph indegree underflowed")
+                })?;
+                if *indegree == 0 {
+                    ready.push(dependency);
+                }
+            }
+        }
+        if visited != packages_by_key.len() {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor package graph contains a cycle",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn accept_release_build_apply_descriptor(
+        plan: &AcceptedReleaseBuildPlan,
+        bytes: &[u8],
+    ) -> Result<AcceptedReleaseBuildApplyDescriptor, ReleaseError> {
+        let document: ReleaseBuildApplyDescriptorData = parse_canonical_release_protocol_json(
+            bytes,
+            MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES,
+            "release-build apply descriptor",
+        )?;
+        if document.schema != "forge.release-build-apply-descriptor/v1" {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor has an unsupported schema",
+            ));
+        }
+        if !matches!(
+            document.purpose,
+            ReleaseBuildApplyDescriptorPurposeData::CandidateApplyInputNotAuthorityEvidence
+        ) {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor has an unsupported purpose",
+            ));
+        }
+        if &document.plan_sha256 != plan.sha256() {
+            return Err(ReleaseError::negative(
+                "release-build apply descriptor does not bind the accepted plan",
+            ));
+        }
+        validate_release_build_graph(plan, &document.sbom_graph)?;
+        Ok(AcceptedReleaseBuildApplyDescriptor { document })
+    }
+
+    pub(super) fn accept_release_build_apply<'a>(
+        plan: &'a AcceptedReleaseBuildPlan,
+        descriptor: &'a AcceptedReleaseBuildApplyDescriptor,
+        bytes: &'a [u8],
+    ) -> Result<AcceptedReleaseBuildApply<'a>, ReleaseError> {
+        if &descriptor.document.plan_sha256 != plan.sha256() {
+            return Err(ReleaseError::negative(
+                "release-build apply inputs do not share one accepted plan binding",
+            ));
+        }
+        if u64::try_from(bytes.len()).ok() != Some(descriptor.document.binary.length.get()) {
+            return Err(ReleaseError::negative(
+                "release-build bound binary length does not match its descriptor",
+            ));
+        }
+        let sha256 = ReleaseSha256Data::new(sha256_hex(bytes)).map_err(|_| {
+            ReleaseError::internal("release-build bound binary SHA-256 was malformed")
+        })?;
+        if descriptor.document.binary.sha256 != sha256 {
+            return Err(ReleaseError::negative(
+                "release-build bound binary SHA-256 does not match its descriptor",
+            ));
+        }
+        validate_binary_format(plan.target(), bytes).map_err(|_| {
+            ReleaseError::negative(
+                "release-build bound binary format does not match the accepted target",
+            )
+        })?;
+        Ok(AcceptedReleaseBuildApply {
+            plan,
+            descriptor,
+            binary: bytes,
+        })
+    }
+}
+
+fn render_release_build_plan(
+    target: &ReleaseTarget,
+    source_commit: &str,
+    cargo_lock: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let document = ReleaseBuildPlanData {
+        schema: SchemaKind::ReleaseBuildPlan.id(),
+        purpose: ReleaseBuildPlanPurposeData::AuthorityExecutionRequestNotReleaseEvidence,
+        source_commit: release_build_source_commit(source_commit)?,
+        cargo_lock_sha256: ReleaseSha256Data::new(sha256_hex(cargo_lock)).map_err(|_| {
+            ReleaseError::internal("release-build plan Cargo.lock SHA-256 was malformed")
+        })?,
+        target: target.plan_target,
+        package: ReleaseBuildPlanPackageData {
+            name: ReleaseBuildPackageNameData::new(RELEASE_PACKAGE_NAME).map_err(|_| {
+                ReleaseError::internal("release-build package name constant was malformed")
+            })?,
+            version: ReleaseBuildPackageVersionData::new(RELEASE_VERSION).map_err(|_| {
+                ReleaseError::internal("release-build package version constant was malformed")
+            })?,
+        },
+        binary: ReleaseBuildBinaryData::Forge,
+        profile: ReleaseBuildProfileData::Release,
+        dependency_resolution: ReleaseBuildDependencyResolutionData::Locked,
+        network: ReleaseBuildNetworkData::Offline,
+        outputs: ReleaseBuildPlanOutputsData {
+            binary: ReleaseBuildOutputNameData::new(binary_asset_name(target)).map_err(|_| {
+                ReleaseError::internal("release-build binary output name was malformed")
+            })?,
+            sbom: ReleaseBuildOutputNameData::new(sbom_asset_name(target)).map_err(|_| {
+                ReleaseError::internal("release-build SBOM output name was malformed")
+            })?,
+        },
+    };
+    let bytes = to_pretty_json(&document, "release-build plan")?;
+    strict_release_protocol::accept_release_build_plan(&bytes).map_err(|error| {
+        ReleaseError::internal(format!(
+            "generated release-build plan failed its strict self-check: {error}"
+        ))
+    })?;
+    Ok(bytes)
+}
+
+fn write_release_build_plan(
+    repository: &Path,
+    target: &ReleaseTarget,
+    output: &RepositoryWriter,
+) -> Result<(), ReleaseError> {
+    const LABEL: &str = "release-build plan output";
+    require_fresh_output_namespace(output, LABEL)?;
+    let source = WorktreeGuard::capture(repository)?;
+    let bytes = render_release_build_plan(target, &source.source_commit, &source.cargo_lock)?;
+    source.require_same(
+        &WorktreeGuard::capture(repository)?,
+        "release-build plan generation",
+    )?;
+    require_fresh_output_namespace(output, LABEL)?;
+    write_fresh_protocol_file(
+        output,
+        RELEASE_BUILD_PLAN_FILE,
+        &bytes,
+        MAX_RELEASE_BUILD_PLAN_BYTES,
+        LABEL,
+    )?;
+    require_exact_output_namespace(
+        output,
+        &BTreeSet::from([RELEASE_BUILD_PLAN_FILE.to_owned()]),
+        LABEL,
+    )?;
+    source.require_same(
+        &WorktreeGuard::capture(repository)?,
+        "release-build plan output creation",
+    )
 }
 
 fn repository_root() -> Result<PathBuf, ReleaseError> {
@@ -477,18 +1085,21 @@ impl WorktreeGuard {
         let index = git_index_snapshot(repository, &source_commit)?;
         let status = git_status(repository)?;
         require_clean_status(&status)?;
-        let cargo_lock = read_bounded(
-            &repository.join("Cargo.lock"),
-            MAX_METADATA_BYTES as u64,
-            "Cargo.lock",
-        )?;
+        let committed_cargo_lock = read_committed_cargo_lock(repository, &source_commit)?;
+        let cargo_lock = read_pinned_cargo_lock(repository)?;
+        if cargo_lock != committed_cargo_lock {
+            return Err(ReleaseError::environment(
+                "pinned Cargo.lock bytes do not match the reported source commit",
+            ));
+        }
 
         require_expected_git_worktree(repository)?;
-        let later_lock = read_bounded(
-            &repository.join("Cargo.lock"),
-            MAX_METADATA_BYTES as u64,
-            "Cargo.lock",
-        )?;
+        let later_lock = read_pinned_cargo_lock(repository)?;
+        if later_lock != committed_cargo_lock {
+            return Err(ReleaseError::environment(
+                "pinned Cargo.lock bytes changed away from the reported source commit",
+            ));
+        }
         let later_status = git_status(repository)?;
         require_clean_status(&later_status)?;
         let later_commit = git_head(repository)?;
@@ -1652,14 +2263,70 @@ fn require_safe_local_git_config(repository: &Path) -> Result<(), ReleaseError> 
 }
 
 fn git_raw_index_snapshot(repository: &Path) -> Result<Vec<u8>, ReleaseError> {
-    GitCli::new()
-        .with_timeout(GIT_TIMEOUT)
+    release_git_cli()
         .index_snapshot_bytes(repository, MAX_METADATA_BYTES)
         .map_err(|error| {
             ReleaseError::environment(format!(
                 "failed to capture the bounded raw Git index without links, locks, or split-index omissions: {error}"
             ))
         })
+}
+
+fn release_git_cli() -> GitCli {
+    GitCli::new()
+        .with_timeout(GIT_TIMEOUT)
+        .with_isolated_global_config(empty_git_config_path())
+}
+
+fn read_pinned_cargo_lock(repository: &Path) -> Result<Vec<u8>, ReleaseError> {
+    RepositoryWriter::new(repository)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to pin the source repository for Cargo.lock: {error}"
+            ))
+        })?
+        .read_bounded("Cargo.lock", MAX_METADATA_BYTES)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read Cargo.lock through the pinned source root: {error}"
+            ))
+        })
+}
+
+fn read_committed_cargo_lock(
+    repository: &Path,
+    source_commit: &str,
+) -> Result<Vec<u8>, ReleaseError> {
+    let git = release_git_cli();
+    let status = git.status(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to bind Cargo.lock to typed Git status: {error}"
+        ))
+    })?;
+    let Some(BranchOid::Commit(commit)) = status.branch.oid.as_ref() else {
+        return Err(ReleaseError::environment(
+            "typed Git status omitted the source commit needed to bind Cargo.lock",
+        ));
+    };
+    if commit.as_bytes() != source_commit.as_bytes() {
+        return Err(ReleaseError::environment(
+            "typed Git status and the release source commit disagree",
+        ));
+    }
+    let cargo_lock_path = RepoRelativePath::new("Cargo.lock")
+        .map_err(|_| ReleaseError::internal("Cargo.lock path constant was invalid"))?;
+    git.read_commit_file_bounded(
+        repository,
+        commit,
+        &cargo_lock_path,
+        MAX_METADATA_BYTES as u64,
+    )
+    .map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to read Cargo.lock from the reported source commit: {error}"
+        ))
+    })?
+    .ok_or_else(|| ReleaseError::environment("reported source commit does not contain Cargo.lock"))
 }
 
 fn git_index_snapshot(repository: &Path, source_commit: &str) -> Result<Vec<u8>, ReleaseError> {
@@ -1904,24 +2571,7 @@ fn cargo_build(
     source_commit: &str,
 ) -> Result<BTreeSet<String>, ReleaseError> {
     require_no_external_cargo_configuration(repository)?;
-    let mut arguments = [
-        "build",
-        "--release",
-        "--locked",
-        "--offline",
-        "-p",
-        "forge-cli",
-        "--bin",
-        "forge",
-        "--message-format=json-render-diagnostics",
-        "--target",
-        target.triple,
-        "--target-dir",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect::<Vec<_>>();
-    arguments.push(target_directory.as_os_str().to_owned());
+    let arguments = local_release_build_arguments(target, target_directory);
     let label = format!("Cargo release build for {}", target.triple);
     let environment = prepared_release_cargo_environment(
         repository,
@@ -2638,7 +3288,7 @@ fn validate_staged_assets(
     Ok(())
 }
 
-fn absolute_clean_path(path: &Path) -> Result<PathBuf, ReleaseError> {
+pub(crate) fn absolute_clean_path(path: &Path) -> Result<PathBuf, ReleaseError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -3075,48 +3725,112 @@ fn visible_output_asset_names(
     output: &RepositoryWriter,
     max_entries: usize,
 ) -> Result<BTreeSet<String>, ReleaseError> {
-    validate_visible_root(output, "release output")?;
-    let entries = fs::read_dir(output.root()).map_err(|error| {
-        ReleaseError::environment(format!(
-            "failed to enumerate pinned release output {}: {error}",
-            output.root().display()
-        ))
-    })?;
+    visible_output_entry_names(output, max_entries, "release output")
+}
+
+fn visible_output_entry_names(
+    output: &RepositoryWriter,
+    max_entries: usize,
+    label: &str,
+) -> Result<BTreeSet<String>, ReleaseError> {
+    validate_visible_root(output, label)?;
+    let entries = output
+        .list_root_regular_file_names(max_entries)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to enumerate pinned {label} {}: {error}",
+                output.root().display()
+            ))
+        })?;
     let mut names = BTreeSet::new();
     for entry in entries {
-        let entry = entry.map_err(|error| {
-            ReleaseError::environment(format!(
-                "failed to enumerate a release output entry: {error}"
-            ))
-        })?;
-        if names.len() == max_entries {
-            return Err(ReleaseError::environment(format!(
-                "release output contains more than {max_entries} allowed entries"
-            )));
-        }
-        let file_type = entry.file_type().map_err(|error| {
-            ReleaseError::environment(format!(
-                "failed to inspect release output entry {}: {error}",
-                entry.path().display()
-            ))
-        })?;
-        if !file_type.is_file() || file_type.is_symlink() {
-            return Err(ReleaseError::environment(format!(
-                "release output entry is not a real regular file: {}",
-                entry.path().display()
-            )));
-        }
-        let name = entry.file_name().into_string().map_err(|_| {
-            ReleaseError::environment("release output contains a non-UTF-8 entry name")
+        let name = entry.into_string().map_err(|_| {
+            ReleaseError::environment(format!("{label} contains a non-UTF-8 entry name"))
         })?;
         if !names.insert(name.clone()) {
             return Err(ReleaseError::environment(format!(
-                "release output enumerated duplicate entry `{name}`"
+                "{label} enumerated duplicate entry `{name}`"
             )));
         }
     }
-    validate_visible_root(output, "release output")?;
+    validate_visible_root(output, label)?;
     Ok(names)
+}
+
+fn require_fresh_output_namespace(
+    output: &RepositoryWriter,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    if visible_output_entry_names(output, 1, label)?.is_empty() {
+        Ok(())
+    } else {
+        Err(ReleaseError::environment(format!(
+            "{label} must be a fresh empty directory"
+        )))
+    }
+}
+
+fn require_exact_output_namespace(
+    output: &RepositoryWriter,
+    expected: &BTreeSet<String>,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    let actual = visible_output_entry_names(output, expected.len(), label)?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+        let unexpected = actual.difference(expected).cloned().collect::<Vec<_>>();
+        Err(ReleaseError::environment(format!(
+            "{label} does not contain its exact file set; missing=[{}], unexpected=[{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        )))
+    }
+}
+
+fn write_fresh_protocol_file(
+    output: &RepositoryWriter,
+    name: &str,
+    bytes: &[u8],
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    if bytes.len() > max_bytes {
+        return Err(ReleaseError::internal(format!(
+            "{label} document exceeds its {max_bytes}-byte limit"
+        )));
+    }
+    validate_visible_root(output, label)?;
+    match output.write_atomic_new(name, bytes) {
+        Ok(()) => {}
+        Err(error) if error.io_kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ReleaseError::environment(format!(
+                "{label} already contains `{name}`; use a fresh directory"
+            )));
+        }
+        Err(error) => {
+            return Err(ReleaseError::environment(format!(
+                "failed to atomically create {label} file `{name}`: {error}"
+            )));
+        }
+    }
+    validate_visible_root(output, label)?;
+    let actual = output
+        .read_optional_bounded(name, max_bytes)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to verify pinned {label} file `{name}`: {error}"
+            ))
+        })?;
+    validate_visible_root(output, label)?;
+    if actual.as_deref() == Some(bytes) {
+        Ok(())
+    } else {
+        Err(ReleaseError::environment(format!(
+            "newly created {label} file does not match its canonical bytes: `{name}`"
+        )))
+    }
 }
 
 fn binary_asset_name(target: &ReleaseTarget) -> String {
@@ -3125,7 +3839,10 @@ fn binary_asset_name(target: &ReleaseTarget) -> String {
     } else {
         ""
     };
-    format!("forge-{RELEASE_VERSION}-{}{suffix}", target.triple)
+    format!(
+        "{RELEASE_BINARY_NAME}-{RELEASE_VERSION}-{}{suffix}",
+        target.triple
+    )
 }
 
 fn sbom_asset_name(target: &ReleaseTarget) -> String {
@@ -3602,7 +4319,7 @@ struct BomComponent {
 
 #[derive(Debug, Serialize)]
 struct BomLicenseChoice {
-    expression: String,
+    expression: ReleaseBuildSbomLicenseExpressionData,
 }
 
 #[derive(Debug, Serialize)]
@@ -3861,22 +4578,18 @@ fn parse_scoped_cargo_tree_graph(
     })
 }
 
-fn render_sbom(
+fn cargo_release_sbom_projection(
     target: &ReleaseTarget,
     metadata_bytes: &[u8],
     tree_bytes: &[u8],
     cargo_lock: &[u8],
-    source_commit: &str,
-    binary: &[u8],
-) -> Result<Vec<u8>, ReleaseError> {
+) -> Result<ReleaseBuildSbomGraphData, ReleaseError> {
     let metadata: CargoMetadata = serde_json::from_slice(metadata_bytes).map_err(|error| {
         ReleaseError::environment(format!(
             "Cargo metadata for {} is not valid JSON: {error}",
             target.triple
         ))
     })?;
-    let lock = parse_cargo_lock(cargo_lock)?;
-    let lock_packages = cargo_lock_packages(&lock)?;
     let packages: BTreeMap<_, _> = metadata
         .packages
         .iter()
@@ -3888,33 +4601,6 @@ fn render_sbom(
         .copied()
         .ok_or_else(|| ReleaseError::internal("selected Cargo root disappeared"))?;
     let selected = &selection.package_ids;
-
-    let root_ref = format!("pkg:cargo/forge@{RELEASE_VERSION}");
-    let mut references = BTreeMap::new();
-    for id in selected {
-        let package = packages.get(id.as_str()).ok_or_else(|| {
-            ReleaseError::environment(format!("Cargo metadata has no package for `{id}`"))
-        })?;
-        let reference = if package.id == root.id {
-            root_ref.clone()
-        } else {
-            format!(
-                "urn:forge:cargo:blake3:{}",
-                blake3::hash(
-                    format!(
-                        "{}\0{}\0{}",
-                        package.name,
-                        package.version,
-                        package.source.as_deref().unwrap_or("workspace")
-                    )
-                    .as_bytes()
-                )
-                .to_hex()
-            )
-        };
-        references.insert(id.clone(), reference);
-    }
-
     let mut component_ids: Vec<_> = selected
         .iter()
         .filter(|id| id.as_str() != root.id)
@@ -3926,63 +4612,280 @@ fn render_sbom(
         left.map(|package| (&package.name, &package.version, &package.source))
             .cmp(&right.map(|package| (&package.name, &package.version, &package.source)))
     });
-    let mut components = Vec::with_capacity(component_ids.len());
+    component_ids.push(root.id.clone());
+
     for id in &component_ids {
+        let package = packages.get(id.as_str()).ok_or_else(|| {
+            ReleaseError::internal("selected Cargo package disappeared during source preflight")
+        })?;
+        match package.source.as_deref() {
+            None | Some(CRATES_IO_SOURCE_ID) => {}
+            Some(_) => {
+                return Err(ReleaseError::negative(
+                    "release SBOM projection supports only workspace and crates.io packages",
+                ));
+            }
+        }
+    }
+    let lock = parse_cargo_lock(cargo_lock)?;
+    let lock_packages = cargo_lock_packages(&lock)?;
+
+    let mut keys_by_id = BTreeMap::new();
+    let mut projected_packages = Vec::with_capacity(component_ids.len());
+    for id in component_ids {
         let package = packages.get(id.as_str()).ok_or_else(|| {
             ReleaseError::internal(format!("selected Cargo package disappeared: `{id}`"))
         })?;
-        let lock_checksum = release_package_lock_checksum(package, &lock_packages)?;
-        let hashes = match lock_checksum {
-            Some(checksum) => vec![BomHash {
-                alg: "SHA-256",
-                content: checksum,
-            }],
-            None => Vec::new(),
+        let lock_checksum = if package.id == root.id {
+            None
+        } else {
+            release_package_lock_checksum(package, &lock_packages)?
         };
-        let properties = package
-            .source
-            .as_ref()
-            .map(|source| {
+        let (key_prefix, source) = match package.source.as_deref() {
+            None => ("workspace", ReleaseBuildPackageSourceData::Workspace),
+            Some(CRATES_IO_SOURCE_ID) => {
+                let checksum = lock_checksum.ok_or_else(|| {
+                    ReleaseError::internal(
+                        "validated crates.io release package lost its lock checksum",
+                    )
+                })?;
+                let crate_archive_sha256 = ReleaseSha256Data::new(checksum).map_err(|_| {
+                    ReleaseError::internal(
+                        "validated crates.io release package checksum became malformed",
+                    )
+                })?;
+                (
+                    "crates-io",
+                    ReleaseBuildPackageSourceData::CratesIo {
+                        crate_archive_sha256,
+                    },
+                )
+            }
+            Some(_) => {
+                return Err(ReleaseError::internal(
+                    "validated Cargo package escaped its closed source projection",
+                ));
+            }
+        };
+        let key = ReleaseBuildPackageKeyData::new(format!(
+            "{key_prefix}:{}@{}",
+            package.name, package.version
+        ))
+        .map_err(|_| {
+            ReleaseError::negative(
+                "selected Cargo package identity is outside the release SBOM protocol",
+            )
+        })?;
+        let projected = ReleaseBuildSbomPackageData {
+            key: key.clone(),
+            name: ReleaseBuildPackageNameData::new(package.name.clone()).map_err(|_| {
+                ReleaseError::negative(
+                    "selected Cargo package name is outside the release SBOM protocol",
+                )
+            })?,
+            version: ReleaseBuildPackageVersionData::new(package.version.clone()).map_err(
+                |_| {
+                    ReleaseError::negative(
+                        "selected Cargo package version is outside the release SBOM protocol",
+                    )
+                },
+            )?,
+            sbom_license_expression: release_build_license_data(&package_license_expression(
+                package,
+            )?)?,
+            source,
+        };
+        if keys_by_id.insert(id, key).is_some() {
+            return Err(ReleaseError::internal(
+                "scoped Cargo tree projection repeated a package ID",
+            ));
+        }
+        projected_packages.push(projected);
+    }
+    projected_packages.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let root_key = keys_by_id
+        .get(&selection.root_id)
+        .cloned()
+        .ok_or_else(|| ReleaseError::internal("release SBOM projection lost its root key"))?;
+    let mut projected_dependencies = Vec::with_capacity(selection.edges.len());
+    let mut edge_count = 0_usize;
+    for (id, dependencies) in selection.edges {
+        let package = keys_by_id.get(&id).cloned().ok_or_else(|| {
+            ReleaseError::internal("release SBOM projection lost a dependency-row package")
+        })?;
+        let mut depends_on = Vec::with_capacity(dependencies.len());
+        for dependency in dependencies {
+            edge_count = edge_count
+                .checked_add(1)
+                .filter(|count| *count <= MAX_RELEASE_BUILD_GRAPH_EDGES)
+                .ok_or_else(|| {
+                    ReleaseError::negative(
+                        "local release SBOM projection exceeds the graph edge limit",
+                    )
+                })?;
+            depends_on.push(keys_by_id.get(&dependency).cloned().ok_or_else(|| {
+                ReleaseError::internal("release SBOM projection lost a dependency target")
+            })?);
+        }
+        depends_on.sort();
+        projected_dependencies.push(ReleaseBuildSbomDependencyData {
+            package,
+            depends_on: ReleaseBuildDependencyKeysData::new(depends_on).map_err(|_| {
+                ReleaseError::negative(
+                    "local release SBOM projection exceeds the per-package dependency limit",
+                )
+            })?,
+        });
+    }
+    projected_dependencies.sort_by(|left, right| left.package.cmp(&right.package));
+
+    Ok(ReleaseBuildSbomGraphData {
+        root: root_key,
+        packages: ReleaseBuildSbomPackagesData::new(projected_packages).map_err(|_| {
+            ReleaseError::negative("local release SBOM projection exceeds the package limit")
+        })?,
+        dependencies: ReleaseBuildSbomDependenciesData::new(projected_dependencies).map_err(
+            |_| {
+                ReleaseError::negative(
+                    "local release SBOM projection exceeds the dependency-row limit",
+                )
+            },
+        )?,
+    })
+}
+
+fn release_build_source_identity(
+    source: &ReleaseBuildPackageSourceData,
+) -> Result<Option<&'static str>, ReleaseError> {
+    match source {
+        ReleaseBuildPackageSourceData::Workspace => Ok(None),
+        ReleaseBuildPackageSourceData::CratesIo { .. } => Ok(Some(CRATES_IO_SOURCE_ID)),
+        _ => Err(ReleaseError::internal(
+            "release SBOM renderer received an unaccepted package source",
+        )),
+    }
+}
+
+fn release_sbom_reference(package: &ReleaseBuildSbomPackageData) -> Result<String, ReleaseError> {
+    Ok(format!(
+        "urn:forge:cargo:blake3:{}",
+        blake3::hash(
+            format!(
+                "{}\0{}\0{}",
+                package.name.as_str(),
+                package.version.as_str(),
+                release_build_source_identity(&package.source)?.unwrap_or("workspace")
+            )
+            .as_bytes()
+        )
+        .to_hex()
+    ))
+}
+
+fn render_release_sbom_projection(
+    target: &ReleaseTarget,
+    projection: &ReleaseBuildSbomGraphData,
+    cargo_lock_sha256: &str,
+    source_commit: &str,
+    binary: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let packages: BTreeMap<_, _> = projection
+        .packages
+        .as_slice()
+        .iter()
+        .map(|package| (package.key.as_str(), package))
+        .collect();
+    let root = packages
+        .get(projection.root.as_str())
+        .copied()
+        .ok_or_else(|| ReleaseError::internal("release SBOM projection omitted its root"))?;
+    let root_ref = format!("pkg:cargo/forge@{RELEASE_VERSION}");
+    let mut references = BTreeMap::new();
+    for (key, package) in &packages {
+        let reference = if *key == projection.root.as_str() {
+            root_ref.clone()
+        } else {
+            release_sbom_reference(package)?
+        };
+        references.insert(*key, reference);
+    }
+
+    let mut component_keys = packages
+        .iter()
+        .filter(|(key, _)| **key != projection.root.as_str())
+        .map(|(key, package)| {
+            Ok((
+                *key,
+                package.name.as_str(),
+                package.version.as_str(),
+                release_build_source_identity(&package.source)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ReleaseError>>()?;
+    component_keys
+        .sort_by(|left, right| (left.1, left.2, left.3).cmp(&(right.1, right.2, right.3)));
+    let mut components = Vec::with_capacity(component_keys.len());
+    for (key, _, _, _) in component_keys {
+        let package = packages
+            .get(key)
+            .copied()
+            .ok_or_else(|| ReleaseError::internal("release SBOM component disappeared"))?;
+        let (hashes, properties) = match &package.source {
+            ReleaseBuildPackageSourceData::Workspace => (Vec::new(), Vec::new()),
+            ReleaseBuildPackageSourceData::CratesIo {
+                crate_archive_sha256,
+            } => (
+                vec![BomHash {
+                    alg: "SHA-256",
+                    content: crate_archive_sha256.as_str().to_owned(),
+                }],
                 vec![BomProperty {
                     name: "forge:cargo-source",
-                    value: source.clone(),
-                }]
-            })
-            .unwrap_or_default();
+                    value: CRATES_IO_SOURCE_ID.to_owned(),
+                }],
+            ),
+            _ => {
+                return Err(ReleaseError::internal(
+                    "release SBOM renderer received an unaccepted package source",
+                ));
+            }
+        };
         components.push(BomComponent {
             component_type: "library",
-            bom_ref: references.get(id).cloned().ok_or_else(|| {
-                ReleaseError::internal(format!("selected Cargo package has no reference: `{id}`"))
-            })?,
-            name: package.name.clone(),
-            version: package.version.clone(),
+            bom_ref: references
+                .get(key)
+                .cloned()
+                .ok_or_else(|| ReleaseError::internal("release SBOM component has no reference"))?,
+            name: package.name.as_str().to_owned(),
+            version: package.version.as_str().to_owned(),
             licenses: vec![BomLicenseChoice {
-                expression: package_license_expression(package)?,
+                expression: accepted_release_build_license(package.sbom_license_expression)?,
             }],
             hashes,
             properties,
         });
     }
 
-    let mut dependencies = Vec::with_capacity(selected.len());
-    for id in selected {
-        let mut depends_on: Vec<_> = selection
-            .edges
-            .get(id)
-            .ok_or_else(|| ReleaseError::internal("selected scoped Cargo tree node disappeared"))?
+    let mut dependencies = Vec::with_capacity(projection.dependencies.as_slice().len());
+    for row in projection.dependencies.as_slice() {
+        let mut depends_on: Vec<_> = row
+            .depends_on
+            .as_slice()
             .iter()
             .map(|dependency| {
-                references.get(dependency).cloned().ok_or_else(|| {
-                    ReleaseError::internal("scoped Cargo tree edge target has no SBOM reference")
+                references.get(dependency.as_str()).cloned().ok_or_else(|| {
+                    ReleaseError::internal("release SBOM dependency target has no reference")
                 })
             })
             .collect::<Result<Vec<_>, ReleaseError>>()?;
         depends_on.sort();
         depends_on.dedup();
         dependencies.push(BomDependency {
-            reference: references.get(id).cloned().ok_or_else(|| {
-                ReleaseError::internal(format!("selected Cargo node has no reference: `{id}`"))
-            })?,
+            reference: references
+                .get(row.package.as_str())
+                .cloned()
+                .ok_or_else(|| ReleaseError::internal("release SBOM row has no reference"))?,
             depends_on,
         });
     }
@@ -4000,7 +4903,7 @@ fn render_sbom(
                 name: "forge".to_owned(),
                 version: RELEASE_VERSION.to_owned(),
                 licenses: vec![BomLicenseChoice {
-                    expression: package_license_expression(root)?,
+                    expression: accepted_release_build_license(root.sbom_license_expression)?,
                 }],
                 hashes: vec![BomHash {
                     alg: "SHA-256",
@@ -4013,7 +4916,7 @@ fn render_sbom(
                     },
                     BomProperty {
                         name: "forge:cargo-lock-sha256",
-                        value: sha256_hex(cargo_lock),
+                        value: cargo_lock_sha256.to_owned(),
                     },
                     BomProperty {
                         name: "forge:source-commit",
@@ -4034,6 +4937,136 @@ fn render_sbom(
         dependencies,
     };
     to_pretty_json(&bom, "CycloneDX SBOM")
+}
+
+fn render_sbom(
+    target: &ReleaseTarget,
+    metadata_bytes: &[u8],
+    tree_bytes: &[u8],
+    cargo_lock: &[u8],
+    source_commit: &str,
+    binary: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let projection = cargo_release_sbom_projection(target, metadata_bytes, tree_bytes, cargo_lock)?;
+    render_release_sbom_projection(
+        target,
+        &projection,
+        &sha256_hex(cargo_lock),
+        source_commit,
+        binary,
+    )
+}
+
+fn accepted_release_build_license(
+    value: ReleaseBuildSbomLicenseExpressionData,
+) -> Result<ReleaseBuildSbomLicenseExpressionData, ReleaseError> {
+    if matches!(value, ReleaseBuildSbomLicenseExpressionData::Unknown) {
+        Err(ReleaseError::internal(
+            "accepted release-build license escaped its closed projection",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn release_build_license_data(
+    expression: &str,
+) -> Result<ReleaseBuildSbomLicenseExpressionData, ReleaseError> {
+    let value =
+        serde_json::from_value(serde_json::Value::String(expression.to_owned())).map_err(|_| {
+            ReleaseError::internal("reviewed release license could not enter its schema projection")
+        })?;
+    if matches!(value, ReleaseBuildSbomLicenseExpressionData::Unknown) {
+        Err(ReleaseError::internal(
+            "reviewed release license escaped its closed projection",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn accepted_release_build_source_commit(plan: &ReleaseBuildPlanData) -> Result<&str, ReleaseError> {
+    match &plan.source_commit {
+        GitObjectIdV2Data::Sha1 { oid } => Ok(oid.as_str()),
+        GitObjectIdV2Data::Sha256 { oid } => Ok(oid.as_str()),
+        _ => Err(ReleaseError::internal(
+            "accepted release-build plan lost its source object identity",
+        )),
+    }
+}
+
+fn render_release_build_apply_sbom(
+    apply: &strict_release_protocol::AcceptedReleaseBuildApply<'_>,
+) -> Result<Vec<u8>, ReleaseError> {
+    render_release_sbom_projection(
+        apply.target(),
+        &apply.descriptor().sbom_graph,
+        apply.plan().cargo_lock_sha256.as_str(),
+        accepted_release_build_source_commit(apply.plan())?,
+        apply.binary(),
+    )
+}
+
+/// Fully accepted, path-free candidate output for one release-build apply invocation.
+#[derive(Debug)]
+pub(crate) struct ReleaseBuildApplyAssembly {
+    pub(crate) target: &'static str,
+    pub(crate) binary_name: String,
+    pub(crate) sbom_name: String,
+    pub(crate) binary: Vec<u8>,
+    pub(crate) sbom: Vec<u8>,
+}
+
+impl ReleaseBuildApplyAssembly {
+    #[must_use]
+    pub(crate) fn target(&self) -> &'static str {
+        self.target
+    }
+
+    #[must_use]
+    pub(crate) fn binary_name(&self) -> &str {
+        &self.binary_name
+    }
+
+    #[must_use]
+    pub(crate) fn sbom_name(&self) -> &str {
+        &self.sbom_name
+    }
+
+    #[must_use]
+    pub(crate) fn binary(&self) -> &[u8] {
+        &self.binary
+    }
+
+    #[must_use]
+    pub(crate) fn sbom(&self) -> &[u8] {
+        &self.sbom
+    }
+}
+
+pub(crate) fn assemble_release_build_apply(
+    plan_bytes: &[u8],
+    descriptor_bytes: &[u8],
+    binary: Vec<u8>,
+) -> Result<ReleaseBuildApplyAssembly, ReleaseError> {
+    let plan = strict_release_protocol::accept_release_build_plan(plan_bytes)?;
+    let descriptor =
+        strict_release_protocol::accept_release_build_apply_descriptor(&plan, descriptor_bytes)?;
+    let apply = strict_release_protocol::accept_release_build_apply(&plan, &descriptor, &binary)?;
+    let sbom = render_release_build_apply_sbom(&apply)?;
+    if sbom.len() > MAX_RELEASE_BUILD_APPLY_SBOM_BYTES {
+        return Err(ReleaseError::internal(format!(
+            "accepted release-build SBOM exceeds its {}-byte output limit",
+            MAX_RELEASE_BUILD_APPLY_SBOM_BYTES
+        )));
+    }
+    Ok(ReleaseBuildApplyAssembly {
+        target: apply.target().triple,
+        binary_name: apply.plan().outputs.binary.as_str().to_owned(),
+        sbom_name: apply.plan().outputs.sbom.as_str().to_owned(),
+        binary,
+        sbom,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -5596,7 +6629,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::Write as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
 
@@ -5604,16 +6637,41 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use forge_core::ports::EnvPolicy;
     use forge_core::{Mutability, NetworkIntent};
+    use forge_schema::{
+        GitObjectIdV2Data, GitSha1ObjectIdV2Data, GitSha256ObjectIdV2Data,
+        ReleaseBuildApplyDescriptorData, ReleaseBuildApplyDescriptorPurposeData,
+        ReleaseBuildBinaryData, ReleaseBuildBinaryLengthData, ReleaseBuildBoundBinaryData,
+        ReleaseBuildDependencyKeysData, ReleaseBuildDependencyResolutionData,
+        ReleaseBuildNetworkData, ReleaseBuildOutputNameData, ReleaseBuildPackageKeyData,
+        ReleaseBuildPackageNameData, ReleaseBuildPackageSourceData, ReleaseBuildPackageVersionData,
+        ReleaseBuildPlanData, ReleaseBuildPlanOutputsData, ReleaseBuildPlanPackageData,
+        ReleaseBuildPlanPurposeData, ReleaseBuildProfileData, ReleaseBuildSbomDependenciesData,
+        ReleaseBuildSbomDependencyData, ReleaseBuildSbomGraphData,
+        ReleaseBuildSbomLicenseExpressionData, ReleaseBuildSbomPackageData,
+        ReleaseBuildSbomPackagesData, ReleaseBuildTargetData, ReleaseSha256Data, SchemaKind,
+    };
+    use serde::Serialize;
+    use serde_json::Value;
     use tempfile::{TempDir, tempdir};
 
+    use super::strict_release_protocol::{
+        AcceptedReleaseBuildPlan, accept_release_build_apply,
+        accept_release_build_apply_descriptor, accept_release_build_plan, accepted_plan_target,
+    };
     use super::{
         BUILD_INPUT_OBSERVATION_PREFIX, BuildInputObservationOutput, CHECKSUMS_FILE,
-        LICENSE_NOTICES_FILE, MANIFEST_FILE, PreparedCargoInvocation, RELEASE_TARGETS,
-        ReleaseError, ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, binary_asset_name,
-        build_input_observation, check, encode_windows_utf16_input, finalize,
-        finalized_asset_names, known_stage_names, parse_build_request, render_sbom,
-        require_disjoint_output_roots, sha256_hex, stage_built, validate_binary_format,
-        write_build_input_observation,
+        CRATES_IO_SOURCE_ID, LICENSE_NOTICES_FILE, MANIFEST_FILE,
+        MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES, MAX_RELEASE_BUILD_PLAN_BYTES, PLAN_HELP,
+        PreparedCargoInvocation, RELEASE_BUILD_PLAN_FILE, RELEASE_TARGETS, ReleaseError,
+        ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, accepted_release_build_license,
+        assemble_release_build_apply, binary_asset_name, build_input_observation, check,
+        encode_windows_utf16_input, finalize, finalized_asset_names, known_stage_names,
+        local_release_build_arguments, parse_build_request, parse_plan_request,
+        release_build_completed_message, release_build_license_data,
+        release_build_plan_completed_message, render_release_build_apply_sbom,
+        render_release_build_plan, render_sbom, require_disjoint_output_roots, sbom_asset_name,
+        sha256_hex, stage_built, to_pretty_json, validate_binary_format,
+        write_build_input_observation, write_release_build_plan,
     };
 
     const METADATA: &str = r#"{
@@ -5650,6 +6708,1289 @@ mod tests {
         "{\"reason\":\"compiler-artifact\",\"package_id\":\"path+file:///repo/crates/forge-cli#0.1.0-rc.2\"}\n",
         "{\"reason\":\"build-finished\",\"success\":true}\n",
     );
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn protocol_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ReleaseError> {
+        to_pretty_json(value, "test release protocol document")
+    }
+
+    fn protocol_plan(target: ReleaseBuildTargetData) -> Result<ReleaseBuildPlanData, ReleaseError> {
+        let target_spec = accepted_plan_target(target)?;
+        Ok(ReleaseBuildPlanData {
+            schema: SchemaKind::ReleaseBuildPlan.id(),
+            purpose: ReleaseBuildPlanPurposeData::AuthorityExecutionRequestNotReleaseEvidence,
+            source_commit: GitObjectIdV2Data::Sha1 {
+                oid: GitSha1ObjectIdV2Data::new("a".repeat(40)).map_err(|_| {
+                    ReleaseError::internal("test release-build plan SHA-1 was malformed")
+                })?,
+            },
+            cargo_lock_sha256: ReleaseSha256Data::new("b".repeat(64)).map_err(|_| {
+                ReleaseError::internal("test release-build plan lock digest was malformed")
+            })?,
+            target,
+            package: ReleaseBuildPlanPackageData {
+                name: ReleaseBuildPackageNameData::new("forge-cli").map_err(|_| {
+                    ReleaseError::internal("test release-build package name was malformed")
+                })?,
+                version: ReleaseBuildPackageVersionData::new(super::RELEASE_VERSION).map_err(
+                    |_| ReleaseError::internal("test release-build version was malformed"),
+                )?,
+            },
+            binary: ReleaseBuildBinaryData::Forge,
+            profile: ReleaseBuildProfileData::Release,
+            dependency_resolution: ReleaseBuildDependencyResolutionData::Locked,
+            network: ReleaseBuildNetworkData::Offline,
+            outputs: ReleaseBuildPlanOutputsData {
+                binary: ReleaseBuildOutputNameData::new(binary_asset_name(target_spec)).map_err(
+                    |_| ReleaseError::internal("test release-build binary name was malformed"),
+                )?,
+                sbom: ReleaseBuildOutputNameData::new(sbom_asset_name(target_spec)).map_err(
+                    |_| ReleaseError::internal("test release-build SBOM name was malformed"),
+                )?,
+            },
+        })
+    }
+
+    fn protocol_package(
+        key: &str,
+        name: &str,
+        version: &str,
+        license: ReleaseBuildSbomLicenseExpressionData,
+        source: ReleaseBuildPackageSourceData,
+    ) -> Result<ReleaseBuildSbomPackageData, ReleaseError> {
+        Ok(ReleaseBuildSbomPackageData {
+            key: ReleaseBuildPackageKeyData::new(key).map_err(|_| {
+                ReleaseError::internal("test release-build package key was malformed")
+            })?,
+            name: ReleaseBuildPackageNameData::new(name).map_err(|_| {
+                ReleaseError::internal("test release-build package name was malformed")
+            })?,
+            version: ReleaseBuildPackageVersionData::new(version).map_err(|_| {
+                ReleaseError::internal("test release-build package version was malformed")
+            })?,
+            sbom_license_expression: license,
+            source,
+        })
+    }
+
+    fn protocol_dependency(
+        package: &str,
+        depends_on: &[&str],
+    ) -> Result<ReleaseBuildSbomDependencyData, ReleaseError> {
+        let depends_on = depends_on
+            .iter()
+            .map(|key| {
+                ReleaseBuildPackageKeyData::new(*key).map_err(|_| {
+                    ReleaseError::internal("test release-build dependency key was malformed")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ReleaseBuildSbomDependencyData {
+            package: ReleaseBuildPackageKeyData::new(package).map_err(|_| {
+                ReleaseError::internal("test release-build dependency row key was malformed")
+            })?,
+            depends_on: ReleaseBuildDependencyKeysData::new(depends_on).map_err(|_| {
+                ReleaseError::internal("test release-build dependency list was malformed")
+            })?,
+        })
+    }
+
+    fn protocol_descriptor(
+        plan: &AcceptedReleaseBuildPlan,
+    ) -> Result<ReleaseBuildApplyDescriptorData, ReleaseError> {
+        const BUILD_HELPER: &str = "crates-io:build-helper@1.2.3";
+        const SERDE: &str = "crates-io:serde@1.0.229";
+        let root = format!("workspace:forge-cli@{}", super::RELEASE_VERSION);
+        Ok(ReleaseBuildApplyDescriptorData {
+            schema: SchemaKind::ReleaseBuildApplyDescriptor.id(),
+            purpose:
+                ReleaseBuildApplyDescriptorPurposeData::CandidateApplyInputNotAuthorityEvidence,
+            plan_sha256: plan.sha256().clone(),
+            binary: ReleaseBuildBoundBinaryData {
+                length: ReleaseBuildBinaryLengthData::new(120).map_err(|_| {
+                    ReleaseError::internal("test release-build binary length was malformed")
+                })?,
+                sha256: ReleaseSha256Data::new("c".repeat(64)).map_err(|_| {
+                    ReleaseError::internal("test release-build binary digest was malformed")
+                })?,
+            },
+            sbom_graph: ReleaseBuildSbomGraphData {
+                root: ReleaseBuildPackageKeyData::new(&root).map_err(|_| {
+                    ReleaseError::internal("test release-build root key was malformed")
+                })?,
+                packages: ReleaseBuildSbomPackagesData::new(vec![
+                    protocol_package(
+                        BUILD_HELPER,
+                        "build-helper",
+                        "1.2.3",
+                        ReleaseBuildSbomLicenseExpressionData::Apache20OrMit,
+                        ReleaseBuildPackageSourceData::CratesIo {
+                            crate_archive_sha256: ReleaseSha256Data::new("d".repeat(64)).map_err(
+                                |_| {
+                                    ReleaseError::internal(
+                                        "test release-build crate digest was malformed",
+                                    )
+                                },
+                            )?,
+                        },
+                    )?,
+                    protocol_package(
+                        SERDE,
+                        "serde",
+                        "1.0.229",
+                        ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+                        ReleaseBuildPackageSourceData::CratesIo {
+                            crate_archive_sha256: ReleaseSha256Data::new("e".repeat(64)).map_err(
+                                |_| {
+                                    ReleaseError::internal(
+                                        "test release-build crate digest was malformed",
+                                    )
+                                },
+                            )?,
+                        },
+                    )?,
+                    protocol_package(
+                        &root,
+                        "forge-cli",
+                        super::RELEASE_VERSION,
+                        ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+                        ReleaseBuildPackageSourceData::Workspace,
+                    )?,
+                ])
+                .map_err(|_| {
+                    ReleaseError::internal("test release-build package list was malformed")
+                })?,
+                dependencies: ReleaseBuildSbomDependenciesData::new(vec![
+                    protocol_dependency(BUILD_HELPER, &[])?,
+                    protocol_dependency(SERDE, &[])?,
+                    protocol_dependency(&root, &[BUILD_HELPER, SERDE])?,
+                ])
+                .map_err(|_| {
+                    ReleaseError::internal("test release-build dependency rows were malformed")
+                })?,
+            },
+        })
+    }
+
+    fn mutated_descriptor<F>(
+        descriptor: &ReleaseBuildApplyDescriptorData,
+        mutate: F,
+    ) -> Result<ReleaseBuildApplyDescriptorData, Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&mut Value) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        let mut value = serde_json::to_value(descriptor)?;
+        mutate(&mut value)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    fn fixture_protocol_plan() -> Result<ReleaseBuildPlanData, Box<dyn std::error::Error>> {
+        let mut plan = protocol_plan(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?;
+        plan.cargo_lock_sha256 = ReleaseSha256Data::new(sha256_hex(CARGO_LOCK.as_bytes()))?;
+        Ok(plan)
+    }
+
+    fn fixture_protocol_descriptor(
+        plan: &AcceptedReleaseBuildPlan,
+        binary: &[u8],
+    ) -> Result<ReleaseBuildApplyDescriptorData, Box<dyn std::error::Error>> {
+        let descriptor = protocol_descriptor(plan)?;
+        mutated_descriptor(&descriptor, |value| {
+            value["binary"]["length"] = serde_json::json!(binary.len());
+            value["binary"]["sha256"] = serde_json::json!(sha256_hex(binary));
+            value["sbom_graph"]["packages"][0]["source"]["crate_archive_sha256"] =
+                serde_json::json!("b".repeat(64));
+            value["sbom_graph"]["packages"][1]["source"]["crate_archive_sha256"] = serde_json::json!(
+                "dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c"
+            );
+            Ok(())
+        })
+    }
+
+    fn json_array_mut<'a>(
+        value: &'a mut Value,
+        pointer: &str,
+    ) -> Result<&'a mut Vec<Value>, Box<dyn std::error::Error>> {
+        value
+            .pointer_mut(pointer)
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| format!("test JSON pointer is not an array: {pointer}").into())
+    }
+
+    fn insert_before_suffix(
+        bytes: &[u8],
+        suffix: &[u8],
+        insertion: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let prefix = bytes
+            .strip_suffix(suffix)
+            .ok_or("test protocol bytes did not have the expected suffix")?;
+        let mut result = Vec::with_capacity(bytes.len() + insertion.len());
+        result.extend_from_slice(prefix);
+        result.extend_from_slice(insertion);
+        result.extend_from_slice(suffix);
+        Ok(result)
+    }
+
+    fn assert_plan_rejected(plan: &ReleaseBuildPlanData) -> TestResult {
+        let bytes = protocol_bytes(plan)?;
+        let Err(error) = accept_release_build_plan(&bytes) else {
+            return Err("invalid release-build plan was accepted".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+        Ok(())
+    }
+
+    fn assert_descriptor_rejected(
+        plan: &AcceptedReleaseBuildPlan,
+        descriptor: &ReleaseBuildApplyDescriptorData,
+    ) -> TestResult {
+        let bytes = protocol_bytes(descriptor)?;
+        let Err(error) = accept_release_build_apply_descriptor(plan, &bytes) else {
+            return Err("invalid release-build apply descriptor was accepted".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+        Ok(())
+    }
+
+    fn assert_descriptor_rejected_with(
+        plan: &AcceptedReleaseBuildPlan,
+        descriptor: &ReleaseBuildApplyDescriptorData,
+        expected_message: &str,
+    ) -> TestResult {
+        let bytes = protocol_bytes(descriptor)?;
+        let Err(error) = accept_release_build_apply_descriptor(plan, &bytes) else {
+            return Err("invalid release-build apply descriptor was accepted".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+        assert_eq!(error.to_string(), expected_message);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_release_build_plans_are_canonical_and_bind_only_fixed_semantics() -> TestResult {
+        let source_commit = "a".repeat(40);
+        let cargo_lock = b"exact Cargo.lock bytes\n";
+        assert_eq!(
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, cargo_lock)?,
+            include_bytes!("../tests/golden/release-build-plan.json")
+        );
+        let mut rendered_targets = Vec::new();
+        for target in &RELEASE_TARGETS {
+            let bytes = render_release_build_plan(target, &source_commit, cargo_lock)?;
+            assert!(bytes.len() <= MAX_RELEASE_BUILD_PLAN_BYTES);
+            assert!(bytes.ends_with(b"}\n"));
+            assert!(!bytes.ends_with(b"\n\n"));
+            let accepted = accept_release_build_plan(&bytes)?;
+            let document = accepted.document();
+            assert_eq!(document.target, target.plan_target);
+            assert_eq!(document.cargo_lock_sha256.as_str(), sha256_hex(cargo_lock));
+            assert_eq!(document.package.name.as_str(), "forge-cli");
+            assert_eq!(document.package.version.as_str(), super::RELEASE_VERSION);
+            assert!(matches!(document.binary, ReleaseBuildBinaryData::Forge));
+            assert!(matches!(document.profile, ReleaseBuildProfileData::Release));
+            assert!(matches!(
+                document.dependency_resolution,
+                ReleaseBuildDependencyResolutionData::Locked
+            ));
+            assert!(matches!(document.network, ReleaseBuildNetworkData::Offline));
+            assert_eq!(document.outputs.binary.as_str(), binary_asset_name(target));
+            assert_eq!(document.outputs.sbom.as_str(), sbom_asset_name(target));
+            let GitObjectIdV2Data::Sha1 { oid } = &document.source_commit else {
+                return Err("generated SHA-1 plan used another object format".into());
+            };
+            assert_eq!(oid.as_str(), source_commit);
+
+            let text = std::str::from_utf8(&bytes)?;
+            for forbidden in [
+                "\"program\"",
+                "\"arguments\"",
+                "\"environment\"",
+                "\"working_directory\"",
+                "\"target_dir\"",
+                "\"authority\"",
+                "\"binary_sha256\"",
+                "\"sbom_graph\"",
+            ] {
+                assert!(!text.contains(forbidden), "plan leaked field {forbidden}");
+            }
+            rendered_targets.push(bytes);
+        }
+        for pair in rendered_targets.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+
+        let sha256_source = "f".repeat(64);
+        let sha256_plan =
+            render_release_build_plan(&RELEASE_TARGETS[0], &sha256_source, cargo_lock)?;
+        let sha256_plan = accept_release_build_plan(&sha256_plan)?;
+        let GitObjectIdV2Data::Sha256 { oid } = &sha256_plan.document().source_commit else {
+            return Err("generated SHA-256 plan used another object format".into());
+        };
+        assert_eq!(oid.as_str(), sha256_source);
+
+        assert_ne!(
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, cargo_lock)?,
+            render_release_build_plan(&RELEASE_TARGETS[0], &"b".repeat(40), cargo_lock)?
+        );
+        assert_ne!(
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, cargo_lock)?,
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, b"changed lock\n")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_plan_human_contract_is_frozen() {
+        assert_eq!(
+            PLAN_HELP,
+            "usage: xtask release-build-plan --target <TRIPLE> --output-dir <DIR>\n\nWrites exactly release-build-plan.json into an existing fresh empty directory outside the source repository. The canonical document binds the clean Git commit, Cargo.lock digest, target, and fixed release semantics without requesting Cargo or creating a binary, SBOM, or Cargo target directory. It is an untrusted candidate request, never builder evidence, qualification, approval, or release authority. This command does not establish a process sandbox or trust the Git found on PATH: formal qualification must invoke an already-built xtask directly while the external Authority pins the real Git executable and enforces its child-process allowlist; do not enter this phase through cargo run."
+        );
+        assert_eq!(
+            release_build_plan_completed_message(&RELEASE_TARGETS[0]),
+            "wrote canonical release-build-plan.json for x86_64-unknown-linux-musl; candidate request only, not builder evidence, qualification, approval, or release authority"
+        );
+    }
+
+    #[test]
+    fn release_build_plan_request_has_no_semantic_override_channel() -> Result<(), ReleaseError> {
+        let request = parse_plan_request(&[
+            String::from("--output-dir"),
+            String::from("/candidate-plan"),
+            String::from("--target"),
+            String::from("x86_64-pc-windows-msvc"),
+        ])?;
+        assert_eq!(request.target, &RELEASE_TARGETS[4]);
+        assert_eq!(request.output_directory, PathBuf::from("/candidate-plan"));
+
+        for forbidden in ["--program", "--package", "--binary", "--profile", "--env"] {
+            let result = parse_plan_request(&[
+                String::from("--target"),
+                String::from("x86_64-unknown-linux-musl"),
+                String::from("--output-dir"),
+                String::from("/candidate-plan"),
+                forbidden.to_owned(),
+                String::from("candidate-value"),
+            ]);
+            let Err(error) = result else {
+                return Err(ReleaseError::internal(
+                    "release-build plan accepted a semantic override",
+                ));
+            };
+            assert_eq!(error.kind(), ReleaseErrorKind::Usage);
+            assert_eq!(
+                error.to_string(),
+                format!("unknown release option `{forbidden}`")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_plan_output_is_fresh_create_only_and_exact() -> TestResult {
+        let (_temporary, repository) = minimal_release_repository()?;
+        let output_parent = tempdir()?;
+        let output = output_parent.path().join("plan");
+        fs::create_dir(&output)?;
+        let writer = super::open_labeled_command_output_directory(
+            &repository,
+            &output,
+            "release-build plan output",
+        )?;
+
+        write_release_build_plan(&repository, &RELEASE_TARGETS[0], &writer)?;
+        let plan_path = output.join(RELEASE_BUILD_PLAN_FILE);
+        let first = fs::read(&plan_path)?;
+        let accepted = accept_release_build_plan(&first)?;
+        assert_eq!(accepted.document().target, RELEASE_TARGETS[0].plan_target);
+        assert_eq!(
+            fs::read_dir(&output)?.collect::<Result<Vec<_>, _>>()?.len(),
+            1
+        );
+
+        let result = write_release_build_plan(&repository, &RELEASE_TARGETS[0], &writer);
+        let Err(error) = result else {
+            return Err("release-build plan reused a non-fresh namespace".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Environment);
+        assert_eq!(fs::read(&plan_path)?, first);
+
+        let occupied = output_parent.path().join("occupied");
+        fs::create_dir(&occupied)?;
+        fs::write(occupied.join("unrelated.txt"), b"sentinel")?;
+        let occupied_writer = super::open_labeled_command_output_directory(
+            &repository,
+            &occupied,
+            "release-build plan output",
+        )?;
+        let result = write_release_build_plan(&repository, &RELEASE_TARGETS[1], &occupied_writer);
+        let Err(error) = result else {
+            return Err("release-build plan accepted a nonempty namespace".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Environment);
+        assert_eq!(fs::read(occupied.join("unrelated.txt"))?, b"sentinel");
+        assert!(!occupied.join(RELEASE_BUILD_PLAN_FILE).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_plan_nominal_graph_is_mechanically_separate_from_cargo_and_staging()
+    -> TestResult {
+        // This is a candidate-side structural regression, not process-sandbox evidence. ADR-0044
+        // requires the external Authority to pin the real Git executable and enforce the complete
+        // child-process allowlist around this untrusted command.
+        let release_source = include_str!("release.rs");
+        let plan_seam = release_source
+            .split("fn render_release_build_plan")
+            .nth(1)
+            .and_then(|tail| tail.split("fn repository_root").next())
+            .ok_or("could not isolate release-build plan implementation")?;
+        assert!(plan_seam.contains("WorktreeGuard::capture"));
+        assert!(plan_seam.contains("write_fresh_protocol_file"));
+        for forbidden in [
+            "ReleaseSource::prepare",
+            "cargo_build(",
+            "cargo_program(",
+            "capture_cargo_metadata",
+            "capture_cargo_trees",
+            "PreparedCargoInvocation",
+            "render_sbom(",
+            "stage_built(",
+            "tempdir(",
+        ] {
+            assert!(
+                !plan_seam.contains(forbidden),
+                "release-build plan reached forbidden path {forbidden}"
+            );
+        }
+        let create_only_seam = release_source
+            .split("fn write_fresh_protocol_file")
+            .nth(1)
+            .and_then(|tail| tail.split("fn binary_asset_name").next())
+            .ok_or("could not isolate release-build protocol output helper")?;
+        assert!(create_only_seam.contains("write_atomic_new"));
+        assert!(!create_only_seam.contains("write_once_or_same"));
+        let raw_index_seam = release_source
+            .split("fn git_raw_index_snapshot")
+            .nth(1)
+            .and_then(|tail| tail.split("fn git_index_snapshot").next())
+            .ok_or("could not isolate raw Git index snapshot implementation")?;
+        assert!(raw_index_seam.contains("with_isolated_global_config"));
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains("command == \"release-build-plan\""));
+        assert!(main_source.contains("run_release_command(release::run_plan(rest))"));
+        assert!(PLAN_HELP.contains("does not establish a process sandbox"));
+        assert!(PLAN_HELP.contains("pins the real Git executable"));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_plan_accepts_current_canonical_targets() -> TestResult {
+        let targets = [
+            (
+                ReleaseBuildTargetData::X8664UnknownLinuxMusl,
+                "x86_64-unknown-linux-musl",
+                "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+                "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json",
+            ),
+            (
+                ReleaseBuildTargetData::Aarch64UnknownLinuxMusl,
+                "aarch64-unknown-linux-musl",
+                "forge-0.1.0-rc.2-aarch64-unknown-linux-musl",
+                "forge-0.1.0-rc.2-aarch64-unknown-linux-musl.cdx.json",
+            ),
+            (
+                ReleaseBuildTargetData::X8664AppleDarwin,
+                "x86_64-apple-darwin",
+                "forge-0.1.0-rc.2-x86_64-apple-darwin",
+                "forge-0.1.0-rc.2-x86_64-apple-darwin.cdx.json",
+            ),
+            (
+                ReleaseBuildTargetData::Aarch64AppleDarwin,
+                "aarch64-apple-darwin",
+                "forge-0.1.0-rc.2-aarch64-apple-darwin",
+                "forge-0.1.0-rc.2-aarch64-apple-darwin.cdx.json",
+            ),
+            (
+                ReleaseBuildTargetData::X8664PcWindowsMsvc,
+                "x86_64-pc-windows-msvc",
+                "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe",
+                "forge-0.1.0-rc.2-x86_64-pc-windows-msvc.exe.cdx.json",
+            ),
+        ];
+        for (index, (target, triple, binary, sbom)) in targets.into_iter().enumerate() {
+            let mut plan = protocol_plan(target)?;
+            if index == 1 {
+                plan.source_commit = GitObjectIdV2Data::Sha256 {
+                    oid: GitSha256ObjectIdV2Data::new("f".repeat(64))?,
+                };
+            }
+            let bytes = protocol_bytes(&plan)?;
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            let accepted = accept_release_build_plan(&bytes)?;
+            assert_eq!(accepted.document(), &plan);
+            assert_eq!(accepted.target(), accepted_plan_target(target)?);
+            assert_eq!(
+                accepted.sha256(),
+                &ReleaseSha256Data::new(sha256_hex(&bytes))?
+            );
+            assert_eq!(accepted.target().triple, triple);
+            assert_eq!(accepted.document().outputs.binary.as_str(), binary);
+            assert_eq!(accepted.document().outputs.sbom.as_str(), sbom);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_plan_rejects_noncurrent_semantics_and_noncanonical_bytes() -> TestResult {
+        let plan = protocol_plan(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?;
+        let mut invalid = Vec::new();
+
+        let mut value = plan.clone();
+        value.schema = String::from("forge.release-build-plan/v2");
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.purpose = ReleaseBuildPlanPurposeData::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.source_commit = GitObjectIdV2Data::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.target = ReleaseBuildTargetData::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.package.name = ReleaseBuildPackageNameData::new("other")?;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.package.version = ReleaseBuildPackageVersionData::new("9.9.9")?;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.binary = ReleaseBuildBinaryData::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.profile = ReleaseBuildProfileData::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.dependency_resolution = ReleaseBuildDependencyResolutionData::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.network = ReleaseBuildNetworkData::Unknown;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.outputs.binary = ReleaseBuildOutputNameData::new("forge-safe-but-wrong")?;
+        invalid.push(value);
+        let mut value = plan.clone();
+        value.outputs.sbom = ReleaseBuildOutputNameData::new("forge-safe-but-wrong.cdx.json")?;
+        invalid.push(value);
+
+        for value in &invalid {
+            assert_plan_rejected(value)?;
+        }
+
+        let canonical = protocol_bytes(&plan)?;
+        let compact = serde_json::to_vec(&plan)?;
+        let mut without_lf = canonical.clone();
+        let _ = without_lf.pop();
+        let mut double_lf = canonical.clone();
+        double_lf.push(b'\n');
+        let mut crlf = canonical.clone();
+        let _ = crlf.pop();
+        crlf.extend_from_slice(b"\r\n");
+        let oversized = vec![b' '; MAX_RELEASE_BUILD_PLAN_BYTES + 1];
+        let mut duplicate_schema = b"{\n  \"schema\": \"forge.release-build-plan/v1\",\n".to_vec();
+        duplicate_schema.extend_from_slice(&canonical[2..]);
+
+        for bytes in [
+            compact,
+            without_lf,
+            double_lf,
+            crlf,
+            oversized,
+            duplicate_schema,
+        ] {
+            let Err(error) = accept_release_build_plan(&bytes) else {
+                return Err("non-canonical release-build plan was accepted".into());
+            };
+            assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+        }
+
+        let private_bytes = insert_before_suffix(
+            &canonical,
+            b"\n}\n",
+            b",\n  \"future_private_field\": \"/home/private/token\"",
+        )?;
+        let Err(error) = accept_release_build_plan(&private_bytes) else {
+            return Err("release-build plan with an unknown field was accepted".into());
+        };
+        assert!(!error.to_string().contains("/home/private/token"));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_descriptor_accepts_one_canonical_rooted_dag() -> TestResult {
+        let plan_bytes = protocol_bytes(&protocol_plan(
+            ReleaseBuildTargetData::X8664UnknownLinuxMusl,
+        )?)?;
+        let plan = accept_release_build_plan(&plan_bytes)?;
+        let descriptor = protocol_descriptor(&plan)?;
+        let bytes = protocol_bytes(&descriptor)?;
+        let _accepted = accept_release_build_apply_descriptor(&plan, &bytes)?;
+
+        assert_eq!(descriptor.binary.length.get(), 120);
+        assert_eq!(
+            descriptor.sbom_graph.root.as_str(),
+            "workspace:forge-cli@0.1.0-rc.2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_bound_binary_requires_one_plan_descriptor_and_byte_identity() -> TestResult {
+        let plan_document = protocol_plan(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?;
+        let plan_bytes = protocol_bytes(&plan_document)?;
+        let plan = accept_release_build_plan(&plan_bytes)?;
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        let mut descriptor_document = protocol_descriptor(&plan)?;
+        descriptor_document.binary.length = ReleaseBuildBinaryLengthData::new(binary.len() as u64)?;
+        descriptor_document.binary.sha256 = ReleaseSha256Data::new(sha256_hex(&binary))?;
+        let descriptor_bytes = protocol_bytes(&descriptor_document)?;
+        let descriptor = accept_release_build_apply_descriptor(&plan, &descriptor_bytes)?;
+
+        let accepted = accept_release_build_apply(&plan, &descriptor, &binary)?;
+        assert_eq!(accepted.plan(), &plan_document);
+        assert_eq!(accepted.target().triple, "x86_64-unknown-linux-musl");
+        assert_eq!(accepted.descriptor(), &descriptor_document);
+        assert_eq!(accepted.binary(), binary);
+
+        let short_binary = &binary[..binary.len() - 1];
+        let Err(error) = accept_release_build_apply(&plan, &descriptor, short_binary) else {
+            return Err("release-build binary with the wrong length was accepted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build bound binary length does not match its descriptor"
+        );
+
+        let mut changed_binary = binary.clone();
+        *changed_binary.last_mut().ok_or("test binary was empty")? ^= 1;
+        let Err(error) = accept_release_build_apply(&plan, &descriptor, &changed_binary) else {
+            return Err("release-build binary with the wrong digest was accepted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build bound binary SHA-256 does not match its descriptor"
+        );
+
+        let wrong_format = vec![0_u8; binary.len()];
+        let mut wrong_format_descriptor = descriptor_document.clone();
+        wrong_format_descriptor.binary.sha256 = ReleaseSha256Data::new(sha256_hex(&wrong_format))?;
+        let wrong_format_bytes = protocol_bytes(&wrong_format_descriptor)?;
+        let wrong_format_descriptor =
+            accept_release_build_apply_descriptor(&plan, &wrong_format_bytes)?;
+        let Err(error) = accept_release_build_apply(&plan, &wrong_format_descriptor, &wrong_format)
+        else {
+            return Err("release-build binary with the wrong format was accepted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build bound binary format does not match the accepted target"
+        );
+
+        let mut other_plan_document = plan_document;
+        other_plan_document.source_commit = GitObjectIdV2Data::Sha1 {
+            oid: GitSha1ObjectIdV2Data::new("1".repeat(40))?,
+        };
+        let other_plan = accept_release_build_plan(&protocol_bytes(&other_plan_document)?)?;
+        let Err(error) = accept_release_build_apply(&other_plan, &descriptor, &binary) else {
+            return Err("release-build descriptor was paired with another plan".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build apply inputs do not share one accepted plan binding"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_apply_assembly_is_exact_for_every_supported_target() -> TestResult {
+        for target in &RELEASE_TARGETS {
+            let plan_bytes = protocol_bytes(&protocol_plan(target.plan_target)?)?;
+            let accepted_plan = accept_release_build_plan(&plan_bytes)?;
+            let binary = fake_binary(target.triple);
+            let mut descriptor_document = protocol_descriptor(&accepted_plan)?;
+            descriptor_document.binary.length =
+                ReleaseBuildBinaryLengthData::new(binary.len() as u64)?;
+            descriptor_document.binary.sha256 = ReleaseSha256Data::new(sha256_hex(&binary))?;
+            let descriptor_bytes = protocol_bytes(&descriptor_document)?;
+
+            let accepted_descriptor =
+                accept_release_build_apply_descriptor(&accepted_plan, &descriptor_bytes)?;
+            let accepted =
+                accept_release_build_apply(&accepted_plan, &accepted_descriptor, &binary)?;
+            let expected_sbom = render_release_build_apply_sbom(&accepted)?;
+            let assembly =
+                assemble_release_build_apply(&plan_bytes, &descriptor_bytes, binary.clone())?;
+
+            assert_eq!(assembly.target(), target.triple);
+            assert_eq!(assembly.binary_name(), binary_asset_name(target));
+            assert_eq!(assembly.sbom_name(), sbom_asset_name(target));
+            assert_eq!(assembly.binary(), binary);
+            assert_eq!(assembly.sbom(), expected_sbom);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_license_projection_is_exact_and_bijective() -> TestResult {
+        let cases = [
+            (
+                ReleaseBuildSbomLicenseExpressionData::MitOrApache20AndUnicode30,
+                "(MIT OR Apache-2.0) AND Unicode-3.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20,
+                "Apache-2.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20OrBsl10,
+                "Apache-2.0 OR BSL-1.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20OrMit,
+                "Apache-2.0 OR MIT",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20WithLlvmExceptionOrApache20OrMit,
+                "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Bsd2Clause,
+                "BSD-2-Clause",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Bsd2ClauseOrApache20OrMit,
+                "BSD-2-Clause OR Apache-2.0 OR MIT",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Cc010OrApache20OrApache20WithLlvmException,
+                "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Cc010OrMit0OrApache20,
+                "CC0-1.0 OR MIT-0 OR Apache-2.0",
+            ),
+            (ReleaseBuildSbomLicenseExpressionData::Mit, "MIT"),
+            (
+                ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+                "MIT OR Apache-2.0",
+            ),
+            (ReleaseBuildSbomLicenseExpressionData::Mit0, "MIT-0"),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Unicode30,
+                "Unicode-3.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::UnlicenseOrMit,
+                "Unlicense OR MIT",
+            ),
+            (ReleaseBuildSbomLicenseExpressionData::Zlib, "Zlib"),
+        ];
+        for (value, expression) in cases {
+            assert_eq!(accepted_release_build_license(value)?, value);
+            assert_eq!(release_build_license_data(expression)?, value);
+            assert_eq!(serde_json::to_value(value)?, serde_json::json!(expression));
+            assert_eq!(
+                serde_json::from_value::<ReleaseBuildSbomLicenseExpressionData>(
+                    serde_json::json!(expression)
+                )?,
+                value
+            );
+        }
+        assert!(
+            accepted_release_build_license(ReleaseBuildSbomLicenseExpressionData::Unknown).is_err()
+        );
+        assert!(release_build_license_data("LicenseRef-future").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_and_accepted_apply_share_exact_sbom_bytes() -> TestResult {
+        let plan_document = fixture_protocol_plan()?;
+        let plan = accept_release_build_plan(&protocol_bytes(&plan_document)?)?;
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        let descriptor_document = fixture_protocol_descriptor(&plan, &binary)?;
+        let descriptor =
+            accept_release_build_apply_descriptor(&plan, &protocol_bytes(&descriptor_document)?)?;
+        let apply = accept_release_build_apply(&plan, &descriptor, &binary)?;
+
+        let cargo_sbom = render_sbom(
+            accepted_plan_target(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?,
+            METADATA.as_bytes(),
+            TREE.as_bytes(),
+            CARGO_LOCK.as_bytes(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &binary,
+        )?;
+        let apply_sbom = render_release_build_apply_sbom(&apply)?;
+        assert_eq!(apply_sbom, cargo_sbom);
+        assert_eq!(apply_sbom.last(), Some(&b'\n'));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_sbom_projection_rejects_noncanonical_registry_without_replay() -> TestResult {
+        let private_source = "git+https://private.example.invalid/repository#secret";
+        let metadata = METADATA.replace(CRATES_IO_SOURCE_ID, private_source);
+        let matching_lock = CARGO_LOCK.replace(CRATES_IO_SOURCE_ID, private_source);
+        let missing_checksum_lock =
+            matching_lock.replace(&format!("checksum = \"{}\"\n", "b".repeat(64)), "");
+        let malformed_checksum_lock = matching_lock.replace(&"b".repeat(64), "not-a-digest");
+        let malformed_toml_lock = format!("version = 4\nsecret = [\"{private_source}\"\n");
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        for cargo_lock in [
+            CARGO_LOCK.to_owned(),
+            missing_checksum_lock,
+            malformed_checksum_lock,
+            malformed_toml_lock,
+        ] {
+            let Err(error) = render_sbom(
+                accepted_plan_target(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?,
+                metadata.as_bytes(),
+                TREE.as_bytes(),
+                cargo_lock.as_bytes(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &binary,
+            ) else {
+                return Err("non-crates.io registry entered the release SBOM projection".into());
+            };
+            assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+            assert_eq!(
+                error.to_string(),
+                "release SBOM projection supports only workspace and crates.io packages"
+            );
+            assert!(!error.to_string().contains(private_source));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_apply_sbom_omits_workspace_paths_and_sorts_by_rendered_identity() -> TestResult {
+        const LOCAL_KEY: &str = "workspace:aaa-helper@1.0.0";
+        let plan_document = fixture_protocol_plan()?;
+        let plan = accept_release_build_plan(&protocol_bytes(&plan_document)?)?;
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        let descriptor = fixture_protocol_descriptor(&plan, &binary)?;
+        let descriptor = mutated_descriptor(&descriptor, |value| {
+            json_array_mut(value, "/sbom_graph/packages")?.insert(
+                2,
+                serde_json::json!({
+                    "key": LOCAL_KEY,
+                    "name": "aaa-helper",
+                    "version": "1.0.0",
+                    "sbom_license_expression": "MIT",
+                    "source": {"kind": "workspace"}
+                }),
+            );
+            json_array_mut(value, "/sbom_graph/dependencies")?.insert(
+                2,
+                serde_json::json!({"package": LOCAL_KEY, "depends_on": []}),
+            );
+            json_array_mut(value, "/sbom_graph/dependencies/3/depends_on")?
+                .push(serde_json::json!(LOCAL_KEY));
+            Ok(())
+        })?;
+        let descriptor =
+            accept_release_build_apply_descriptor(&plan, &protocol_bytes(&descriptor)?)?;
+        let apply = accept_release_build_apply(&plan, &descriptor, &binary)?;
+        let sbom = render_release_build_apply_sbom(&apply)?;
+        let text = std::str::from_utf8(&sbom)?;
+        let document: Value = serde_json::from_slice(&sbom)?;
+
+        let expected_local_ref = format!(
+            "urn:forge:cargo:blake3:{}",
+            blake3::hash(concat!("aaa-helper", "\0", "1.0.0", "\0", "workspace").as_bytes())
+                .to_hex()
+        );
+        let components = document["components"]
+            .as_array()
+            .ok_or("SBOM components were not an array")?;
+        let component_names: Vec<_> = components
+            .iter()
+            .map(|component| component["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(component_names, ["aaa-helper", "build-helper", "serde"]);
+        let local = components
+            .iter()
+            .find(|component| component["name"] == "aaa-helper")
+            .ok_or("workspace component was absent")?;
+        assert_eq!(local["bom-ref"], expected_local_ref);
+        assert!(local.get("hashes").is_none());
+        assert!(local.get("properties").is_none());
+
+        let dependency_rows = document["dependencies"]
+            .as_array()
+            .ok_or("SBOM dependencies were not an array")?;
+        let references: Vec<_> = dependency_rows
+            .iter()
+            .filter_map(|row| row["ref"].as_str())
+            .collect();
+        let mut sorted_references = references.clone();
+        sorted_references.sort_unstable();
+        assert_eq!(references, sorted_references);
+        let root_dependencies = dependency_rows
+            .iter()
+            .find(|row| row["ref"] == "pkg:cargo/forge@0.1.0-rc.2")
+            .and_then(|row| row["dependsOn"].as_array())
+            .ok_or("SBOM root dependency row was absent")?;
+        let mut sorted_root_dependencies = root_dependencies.clone();
+        sorted_root_dependencies.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        assert_eq!(root_dependencies, &sorted_root_dependencies);
+        assert!(
+            root_dependencies
+                .iter()
+                .any(|dependency| dependency.as_str() == Some(expected_local_ref.as_str()))
+        );
+
+        assert!(!text.contains(LOCAL_KEY));
+        assert!(!text.contains("/repo"));
+        assert!(!text.contains("file://"));
+        assert_eq!(text.matches(CRATES_IO_SOURCE_ID).count(), 2);
+        assert_eq!(text.matches("https://").count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn strict_descriptor_rejects_wrong_identity_unknowns_and_noncanonical_bytes() -> TestResult {
+        let plan_bytes = protocol_bytes(&protocol_plan(
+            ReleaseBuildTargetData::X8664UnknownLinuxMusl,
+        )?)?;
+        let plan = accept_release_build_plan(&plan_bytes)?;
+        let descriptor = protocol_descriptor(&plan)?;
+
+        let mut wrong_digest = descriptor.clone();
+        wrong_digest.plan_sha256 = ReleaseSha256Data::new("9".repeat(64))?;
+        assert_descriptor_rejected_with(
+            &plan,
+            &wrong_digest,
+            "release-build apply descriptor does not bind the accepted plan",
+        )?;
+        let mut wrong_schema = descriptor.clone();
+        wrong_schema.schema = String::from("forge.release-build-apply-descriptor/v2");
+        assert_descriptor_rejected(&plan, &wrong_schema)?;
+        let mut unknown_purpose = descriptor.clone();
+        unknown_purpose.purpose = ReleaseBuildApplyDescriptorPurposeData::Unknown;
+        assert_descriptor_rejected(&plan, &unknown_purpose)?;
+
+        let unknown_source = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["packages"][0]["source"] = serde_json::json!({"kind": "unknown"});
+            Ok(())
+        })?;
+        assert_descriptor_rejected_with(
+            &plan,
+            &unknown_source,
+            "release-build apply descriptor has an unsupported package source",
+        )?;
+        let unknown_license = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["packages"][0]["sbom_license_expression"] =
+                serde_json::json!("unknown");
+            Ok(())
+        })?;
+        assert_descriptor_rejected_with(
+            &plan,
+            &unknown_license,
+            "release-build apply descriptor has an unsupported license expression",
+        )?;
+
+        let canonical = protocol_bytes(&descriptor)?;
+        let compact = serde_json::to_vec(&descriptor)?;
+        let Err(error) = accept_release_build_apply_descriptor(&plan, &compact) else {
+            return Err("compact release-build apply descriptor was accepted".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+
+        let canonical_prefix = concat!(
+            "{\n",
+            "  \"schema\": \"forge.release-build-apply-descriptor/v1\",\n",
+            "  \"purpose\": \"candidate-apply-input-not-authority-evidence\",\n",
+        )
+        .as_bytes();
+        let canonical_rest = canonical
+            .strip_prefix(canonical_prefix)
+            .ok_or("canonical descriptor field order drifted")?;
+        let mut reordered = concat!(
+            "{\n",
+            "  \"purpose\": \"candidate-apply-input-not-authority-evidence\",\n",
+            "  \"schema\": \"forge.release-build-apply-descriptor/v1\",\n",
+        )
+        .as_bytes()
+        .to_vec();
+        reordered.extend_from_slice(canonical_rest);
+        let Err(error) = accept_release_build_apply_descriptor(&plan, &reordered) else {
+            return Err("descriptor with reordered known fields was accepted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build apply descriptor is not canonical pretty JSON with one LF terminator"
+        );
+
+        let oversized = vec![b' '; MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES + 1];
+        let Err(error) = accept_release_build_apply_descriptor(&plan, &oversized) else {
+            return Err("oversized release-build apply descriptor was accepted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build apply descriptor exceeds its 1048576-byte limit"
+        );
+
+        let private_bytes = insert_before_suffix(
+            &canonical,
+            b"\n  }\n}\n",
+            b",\n    \"future_private_field\": \"C:\\\\private\\\\token\"",
+        )?;
+        let Err(error) = accept_release_build_apply_descriptor(&plan, &private_bytes) else {
+            return Err("descriptor with an unknown nested field was accepted".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "release-build apply descriptor is not canonical pretty JSON with one LF terminator"
+        );
+        assert!(!error.to_string().contains("C:\\private\\token"));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_descriptor_rejects_noncanonical_or_invalid_graphs() -> TestResult {
+        let plan_bytes = protocol_bytes(&protocol_plan(
+            ReleaseBuildTargetData::X8664UnknownLinuxMusl,
+        )?)?;
+        let plan = accept_release_build_plan(&plan_bytes)?;
+        let descriptor = protocol_descriptor(&plan)?;
+
+        let unsorted_packages = mutated_descriptor(&descriptor, |value| {
+            json_array_mut(value, "/sbom_graph/packages")?.swap(0, 1);
+            Ok(())
+        })?;
+        let wrong_key = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["packages"][0]["key"] = serde_json::json!("crates-io:wrong@1.2.3");
+            Ok(())
+        })?;
+        let duplicate_identity = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["packages"][0]["name"] = serde_json::json!("serde");
+            value["sbom_graph"]["packages"][0]["version"] = serde_json::json!("1.0.229");
+            value["sbom_graph"]["packages"][0]["key"] =
+                serde_json::json!("workspace:serde@1.0.229");
+            value["sbom_graph"]["packages"][0]["source"] = serde_json::json!({"kind": "workspace"});
+            let packages = json_array_mut(value, "/sbom_graph/packages")?;
+            let first_package = packages.remove(0);
+            packages.push(first_package);
+
+            value["sbom_graph"]["dependencies"][0]["package"] =
+                serde_json::json!("workspace:serde@1.0.229");
+            value["sbom_graph"]["dependencies"][2]["depends_on"] =
+                serde_json::json!(["crates-io:serde@1.0.229", "workspace:serde@1.0.229"]);
+            let rows = json_array_mut(value, "/sbom_graph/dependencies")?;
+            let first_row = rows.remove(0);
+            rows.push(first_row);
+            Ok(())
+        })?;
+        let wrong_root = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["root"] = serde_json::json!("crates-io:build-helper@1.2.3");
+            Ok(())
+        })?;
+        let missing_root_package = mutated_descriptor(&descriptor, |value| {
+            let _ = json_array_mut(value, "/sbom_graph/packages")?.remove(2);
+            Ok(())
+        })?;
+        let wrong_root_license = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["packages"][2]["sbom_license_expression"] =
+                serde_json::json!("MIT");
+            Ok(())
+        })?;
+        let missing_row = mutated_descriptor(&descriptor, |value| {
+            let _ = json_array_mut(value, "/sbom_graph/dependencies")?.remove(1);
+            Ok(())
+        })?;
+        let unsorted_rows = mutated_descriptor(&descriptor, |value| {
+            json_array_mut(value, "/sbom_graph/dependencies")?.swap(0, 1);
+            Ok(())
+        })?;
+        let unsorted_targets = mutated_descriptor(&descriptor, |value| {
+            json_array_mut(value, "/sbom_graph/dependencies/2/depends_on")?.swap(0, 1);
+            Ok(())
+        })?;
+        let duplicate_row = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][1] = value["sbom_graph"]["dependencies"][0].clone();
+            Ok(())
+        })?;
+        let duplicate_target = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][2]["depends_on"] = serde_json::json!([
+                "crates-io:build-helper@1.2.3",
+                "crates-io:build-helper@1.2.3",
+                "crates-io:serde@1.0.229"
+            ]);
+            Ok(())
+        })?;
+        let unknown_row = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][0]["package"] =
+                serde_json::json!("crates-io:aaa@1.0.0");
+            Ok(())
+        })?;
+        let dangling = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][2]["depends_on"][0] =
+                serde_json::json!("crates-io:missing@1.0.0");
+            Ok(())
+        })?;
+        let self_edge = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][0]["depends_on"] =
+                serde_json::json!(["crates-io:build-helper@1.2.3"]);
+            Ok(())
+        })?;
+        let root_incoming = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][0]["depends_on"] =
+                serde_json::json!(["workspace:forge-cli@0.1.0-rc.2"]);
+            Ok(())
+        })?;
+        let unreachable = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][2]["depends_on"] =
+                serde_json::json!(["crates-io:build-helper@1.2.3"]);
+            Ok(())
+        })?;
+        let cycle = mutated_descriptor(&descriptor, |value| {
+            value["sbom_graph"]["dependencies"][0]["depends_on"] =
+                serde_json::json!(["crates-io:serde@1.0.229"]);
+            value["sbom_graph"]["dependencies"][1]["depends_on"] =
+                serde_json::json!(["crates-io:build-helper@1.2.3"]);
+            Ok(())
+        })?;
+
+        for (invalid, expected_message) in [
+            (
+                unsorted_packages,
+                "release-build apply descriptor packages are not strictly key-sorted",
+            ),
+            (
+                wrong_key,
+                "release-build apply descriptor contains a non-canonical package key",
+            ),
+            (
+                duplicate_identity,
+                "release-build apply descriptor repeats a package name and version",
+            ),
+            (
+                wrong_root,
+                "release-build apply descriptor has an unsupported root key",
+            ),
+            (
+                missing_root_package,
+                "release-build apply descriptor root package is absent",
+            ),
+            (
+                wrong_root_license,
+                "release-build apply descriptor root package semantics are unsupported",
+            ),
+            (
+                missing_row,
+                "release-build apply descriptor must contain one dependency row per package",
+            ),
+            (
+                unsorted_rows,
+                "release-build apply descriptor dependency rows are not strictly key-sorted",
+            ),
+            (
+                unsorted_targets,
+                "release-build apply descriptor dependency targets are not strictly key-sorted",
+            ),
+            (
+                duplicate_row,
+                "release-build apply descriptor dependency rows are not strictly key-sorted",
+            ),
+            (
+                duplicate_target,
+                "release-build apply descriptor dependency targets are not strictly key-sorted",
+            ),
+            (
+                unknown_row,
+                "release-build apply descriptor has a dependency row for an unknown package",
+            ),
+            (
+                dangling,
+                "release-build apply descriptor contains a dangling dependency",
+            ),
+            (
+                self_edge,
+                "release-build apply descriptor contains a self dependency",
+            ),
+            (
+                root_incoming,
+                "release-build apply descriptor root has an incoming dependency",
+            ),
+            (
+                unreachable,
+                "release-build apply descriptor contains an unreachable package",
+            ),
+            (
+                cycle,
+                "release-build apply descriptor package graph contains a cycle",
+            ),
+        ] {
+            assert_descriptor_rejected_with(&plan, &invalid, expected_message)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_descriptor_rejects_graph_edge_amplification() -> TestResult {
+        let plan_bytes = protocol_bytes(&protocol_plan(
+            ReleaseBuildTargetData::X8664UnknownLinuxMusl,
+        )?)?;
+        let plan = accept_release_build_plan(&plan_bytes)?;
+        let mut descriptor = protocol_descriptor(&plan)?;
+        let archive_sha256 = ReleaseSha256Data::new("8".repeat(64))?;
+        let mut keys = Vec::new();
+        let mut packages = Vec::new();
+        for index in 0..91 {
+            let name = format!("p{index:03}");
+            let key = format!("crates-io:{name}@1.0.0");
+            packages.push(protocol_package(
+                &key,
+                &name,
+                "1.0.0",
+                ReleaseBuildSbomLicenseExpressionData::Mit,
+                ReleaseBuildPackageSourceData::CratesIo {
+                    crate_archive_sha256: archive_sha256.clone(),
+                },
+            )?);
+            keys.push(key);
+        }
+        let root = format!("workspace:forge-cli@{}", super::RELEASE_VERSION);
+        packages.push(protocol_package(
+            &root,
+            "forge-cli",
+            super::RELEASE_VERSION,
+            ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+            ReleaseBuildPackageSourceData::Workspace,
+        )?);
+
+        let mut rows = Vec::new();
+        for index in 0..keys.len() {
+            let dependencies: Vec<_> = keys[index + 1..].iter().map(String::as_str).collect();
+            rows.push(protocol_dependency(&keys[index], &dependencies)?);
+        }
+        let root_dependencies: Vec<_> = keys.iter().map(String::as_str).collect();
+        rows.push(protocol_dependency(&root, &root_dependencies)?);
+        descriptor.sbom_graph = ReleaseBuildSbomGraphData {
+            root: ReleaseBuildPackageKeyData::new(&root)?,
+            packages: ReleaseBuildSbomPackagesData::new(packages)?,
+            dependencies: ReleaseBuildSbomDependenciesData::new(rows)?,
+        };
+
+        assert_descriptor_rejected_with(
+            &plan,
+            &descriptor,
+            "release-build apply descriptor exceeds the graph edge limit",
+        )
+    }
 
     fn prepared_test_cargo_invocation(environment: EnvPolicy) -> PreparedCargoInvocation {
         PreparedCargoInvocation {
@@ -6639,6 +8980,34 @@ mod tests {
     }
 
     #[test]
+    fn local_release_build_invocation_and_completion_text_are_frozen() {
+        let target = &RELEASE_TARGETS[0];
+        assert_eq!(
+            local_release_build_arguments(target, Path::new("fresh-target")),
+            [
+                "build",
+                "--release",
+                "--locked",
+                "--offline",
+                "-p",
+                "forge-cli",
+                "--bin",
+                "forge",
+                "--message-format=json-render-diagnostics",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "--target-dir",
+                "fresh-target",
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            release_build_completed_message(target, Path::new("dist")),
+            "built and staged forge-0.1.0-rc.2-x86_64-unknown-linux-musl with its CycloneDX SBOM in dist; local candidate only, not signed or published"
+        );
+    }
+
+    #[test]
     fn scoped_cargo_tree_parser_is_strict_and_reconstructs_edges() -> Result<(), ReleaseError> {
         let metadata: super::CargoMetadata = serde_json::from_str(METADATA)
             .map_err(|error| ReleaseError::internal(error.to_string()))?;
@@ -6749,6 +9118,12 @@ mod tests {
             &binary,
         )?;
         assert_eq!(first, second);
+        assert_eq!(
+            first.as_slice(),
+            include_bytes!(
+                "../tests/golden/release-build/forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json"
+            )
+        );
         let text = String::from_utf8(first)
             .map_err(|error| ReleaseError::internal(format!("test SBOM was not UTF-8: {error}")))?;
         assert!(text.contains("\"specVersion\": \"1.6\""));
@@ -7318,14 +9693,56 @@ mod tests {
         let snapshot = snapshot();
 
         stage_built(&output_writer, target, &binary, &snapshot)?;
+        let binary_name = binary_asset_name(target);
+        let sbom_name = sbom_asset_name(target);
+        let mut names = fs::read_dir(&output)
+            .map_err(|error| ReleaseError::internal(error.to_string()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name())
+                    .map_err(|error| ReleaseError::internal(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        assert_eq!(
+            names,
+            [OsString::from(&binary_name), OsString::from(&sbom_name)]
+        );
+        let first_binary = fs::read(output.join(&binary_name))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        let first_sbom = fs::read(output.join(&sbom_name))
+            .map_err(|error| ReleaseError::internal(error.to_string()))?;
+        assert_eq!(first_binary, binary);
+        assert_eq!(
+            first_sbom.as_slice(),
+            include_bytes!(
+                "../tests/golden/release-build/forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json"
+            )
+        );
+
         stage_built(&output_writer, target, &binary, &snapshot)?;
+        assert_eq!(
+            fs::read(output.join(&binary_name))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first_binary
+        );
+        assert_eq!(
+            fs::read(output.join(&sbom_name))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first_sbom
+        );
         let mut different = binary.clone();
         different.push(1);
         assert!(stage_built(&output_writer, target, &different, &snapshot).is_err());
         assert_eq!(
-            fs::read(output.join(binary_asset_name(target)))
+            fs::read(output.join(&binary_name))
                 .map_err(|error| ReleaseError::internal(error.to_string()))?,
             binary
+        );
+        assert_eq!(
+            fs::read(output.join(&sbom_name))
+                .map_err(|error| ReleaseError::internal(error.to_string()))?,
+            first_sbom
         );
         Ok(())
     }

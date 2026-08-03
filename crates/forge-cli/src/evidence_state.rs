@@ -1,6 +1,5 @@
 //! Content-addressed encoding and schema-aware decoding for immutable Evidence state.
 
-mod canonical_json;
 mod contract_shape;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +20,7 @@ use forge_runtime::state::{
     ReceiptRetentionMetadata, ReceiptStateReference, ReferenceClosure, UtcTimestamp,
     parse_utc_rfc3339,
 };
+use forge_schema::exact_json::{ExactJson, parse_exact_json};
 use forge_schema::{
     BaseTaskDependencyV2Data, CommandDetailV2Data, CommandEnforcementData,
     ComparisonBaselineV2Data, ComparisonBasisV2Data, ComparisonProtocolV2Data,
@@ -34,7 +34,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use self::canonical_json::ParsedJson;
 use self::contract_shape::has_unknown_contract_content;
 
 const RECEIPT_IDENTITY_DOMAIN: &[u8] = b"forge.receipt-identity/v1";
@@ -618,8 +617,13 @@ fn decode_receipt(
         EvidenceStateVersion::V1 => SchemaKind::ReceiptV1,
         EvidenceStateVersion::V2 => SchemaKind::Receipt,
     };
-    let has_unknown_contract_content = has_unknown_contract_content(schema_kind, raw.semantic())
-        .map_err(|()| EvidenceStateDecodeError::Malformed)?;
+    let has_unknown_contract_content = raw.project_consistent(
+        |value| {
+            has_unknown_contract_content(schema_kind, value)
+                .map_err(|()| EvidenceStateDecodeError::Malformed)
+        },
+        || EvidenceStateDecodeError::Malformed,
+    )?;
     match version {
         EvidenceStateVersion::V1 => {
             // The v1 wire schema predates immutable storage, but this repository has never had a
@@ -692,8 +696,13 @@ fn decode_evidence(
         EvidenceStateVersion::V1 => SchemaKind::EvidenceV1,
         EvidenceStateVersion::V2 => SchemaKind::Evidence,
     };
-    let has_unknown_contract_content = has_unknown_contract_content(schema_kind, raw.semantic())
-        .map_err(|()| EvidenceStateDecodeError::Malformed)?;
+    let has_unknown_contract_content = raw.project_consistent(
+        |value| {
+            has_unknown_contract_content(schema_kind, value)
+                .map_err(|()| EvidenceStateDecodeError::Malformed)
+        },
+        || EvidenceStateDecodeError::Malformed,
+    )?;
     match version {
         EvidenceStateVersion::V1 => {
             // See the matching Receipt branch: v1 is historical/read-only, not an escape hatch
@@ -731,7 +740,9 @@ fn decode_evidence(
             })
         }
         EvidenceStateVersion::V2 => {
-            validate_raw_evidence_receipt_ids_in_document(raw.semantic())?;
+            raw.project_consistent(validate_raw_evidence_receipt_ids_in_document, || {
+                EvidenceStateDecodeError::Malformed
+            })?;
             let envelope = parse_evidence_v2_envelope(&raw, has_unknown_contract_content)?;
             let object_name =
                 validate_identity(&raw, envelope.data.id.as_str(), DocumentKind::Evidence)?;
@@ -764,13 +775,17 @@ fn decode_evidence(
 }
 
 fn parse_envelope<T: DeserializeOwned + PartialEq>(
-    raw: &ParsedJson,
+    raw: &ExactJson,
     domain: &str,
     version: EvidenceStateVersion,
 ) -> Result<Envelope<T>, EvidenceStateDecodeError> {
-    validate_schema(raw.semantic(), domain, version)?;
-    let envelope: Envelope<T> =
-        deserialize_consistent_semantic_projection(raw.semantic(), raw.alternate_semantic())?;
+    raw.project_consistent(
+        |value| validate_schema(value, domain, version),
+        || EvidenceStateDecodeError::Malformed,
+    )?;
+    let envelope: Envelope<T> = raw
+        .deserialize_consistent()
+        .map_err(|_| EvidenceStateDecodeError::Malformed)?;
     if !envelope.ok || envelope.truncated {
         return Err(EvidenceStateDecodeError::Malformed);
     }
@@ -778,19 +793,20 @@ fn parse_envelope<T: DeserializeOwned + PartialEq>(
 }
 
 fn parse_evidence_v2_envelope(
-    raw: &ParsedJson,
+    raw: &ExactJson,
     has_unknown_contract_content: bool,
 ) -> Result<Envelope<EvidenceV2Data>, EvidenceStateDecodeError> {
     match parse_envelope(raw, "evidence", EvidenceStateVersion::V2) {
         Ok(envelope) => Ok(envelope),
         Err(EvidenceStateDecodeError::Malformed) if has_unknown_contract_content => {
-            let projected = project_forward_compatible_stale_receipts(raw.semantic())?;
-            let alternate = raw
-                .alternate_semantic()
-                .map(project_forward_compatible_stale_receipts)
-                .transpose()?;
-            let envelope: Envelope<EvidenceV2Data> =
-                deserialize_consistent_semantic_projection(&projected, alternate.as_ref())?;
+            let envelope: Envelope<EvidenceV2Data> = raw.project_consistent(
+                |value| {
+                    let projected = project_forward_compatible_stale_receipts(value)?;
+                    serde_json::from_value(projected)
+                        .map_err(|_| EvidenceStateDecodeError::Malformed)
+                },
+                || EvidenceStateDecodeError::Malformed,
+            )?;
             if !envelope.ok || envelope.truncated {
                 return Err(EvidenceStateDecodeError::Malformed);
             }
@@ -798,22 +814,6 @@ fn parse_evidence_v2_envelope(
         }
         Err(error) => Err(error),
     }
-}
-
-fn deserialize_consistent_semantic_projection<T: DeserializeOwned + PartialEq>(
-    value: &Value,
-    alternate: Option<&Value>,
-) -> Result<T, EvidenceStateDecodeError> {
-    let parsed: T =
-        serde_json::from_value(value.clone()).map_err(|_| EvidenceStateDecodeError::Malformed)?;
-    if let Some(alternate) = alternate {
-        let alternate: T = serde_json::from_value(alternate.clone())
-            .map_err(|_| EvidenceStateDecodeError::Malformed)?;
-        if parsed != alternate {
-            return Err(EvidenceStateDecodeError::Malformed);
-        }
-    }
-    Ok(parsed)
 }
 
 /// Drops only stale summaries whose typed non-satisfying proof contains a future enum value.
@@ -970,7 +970,7 @@ fn validate_schema(
 }
 
 fn validate_identity(
-    raw: &ParsedJson,
+    raw: &ExactJson,
     declared: &str,
     kind: DocumentKind,
 ) -> Result<EvidenceStateObjectName, EvidenceStateDecodeError> {
@@ -992,12 +992,12 @@ fn calculate_identity(
 }
 
 fn calculate_parsed_identity(
-    raw: &ParsedJson,
+    raw: &ExactJson,
     kind: DocumentKind,
 ) -> Result<(String, EvidenceStateObjectName), EvidenceStateDecodeError> {
     let canonical = raw
         .canonical_without_data_id()
-        .map_err(|()| EvidenceStateDecodeError::Malformed)?;
+        .map_err(|_| EvidenceStateDecodeError::Malformed)?;
     let digest = Blake3Hasher::digest_chunks(&[kind.identity_domain(), &canonical]);
     let payload = digest
         .as_str()
@@ -1011,8 +1011,8 @@ fn calculate_parsed_identity(
 fn parse_identity_json(
     bytes: &[u8],
     kind: DocumentKind,
-) -> Result<ParsedJson, EvidenceStateDecodeError> {
-    canonical_json::parse(bytes, kind.max_bytes()).map_err(|()| EvidenceStateDecodeError::Malformed)
+) -> Result<ExactJson, EvidenceStateDecodeError> {
+    parse_exact_json(bytes, kind.max_bytes()).map_err(|_| EvidenceStateDecodeError::Malformed)
 }
 
 fn parse_public_id(

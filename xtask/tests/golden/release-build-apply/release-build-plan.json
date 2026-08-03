@@ -1,0 +1,22 @@
+{
+  "schema": "forge.release-build-plan/v1",
+  "purpose": "authority-execution-request-not-release-evidence",
+  "source_commit": {
+    "object_format": "sha1",
+    "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "cargo_lock_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "target": "x86_64-unknown-linux-musl",
+  "package": {
+    "name": "forge-cli",
+    "version": "0.1.0-rc.2"
+  },
+  "binary": "forge",
+  "profile": "release",
+  "dependency_resolution": "locked",
+  "network": "offline",
+  "outputs": {
+    "binary": "forge-0.1.0-rc.2-x86_64-unknown-linux-musl",
+    "sbom": "forge-0.1.0-rc.2-x86_64-unknown-linux-musl.cdx.json"
+  }
+}

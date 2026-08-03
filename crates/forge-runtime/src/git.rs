@@ -54,6 +54,7 @@ pub struct GitCli {
     status_entry_limit: usize,
     cancellation: Arc<AtomicBool>,
     operation_budget: OperationBudget,
+    isolated_global_config: Option<OsString>,
 }
 
 impl Default for GitCli {
@@ -66,6 +67,7 @@ impl Default for GitCli {
             status_entry_limit: DEFAULT_GIT_STATUS_ENTRY_LIMIT,
             cancellation: Arc::clone(&cancellation),
             operation_budget: OperationBudget::unlimited(cancellation),
+            isolated_global_config: None,
         }
     }
 }
@@ -173,6 +175,17 @@ impl GitCli {
         self
     }
 
+    /// Ignores ambient global, system, and command-parameter Git configuration.
+    ///
+    /// The supplied path should name an Authority-controlled empty configuration file (or the
+    /// platform null device). Repository-local configuration remains visible to the fixed Git
+    /// operation and must be validated separately by callers whose trust boundary requires it.
+    #[must_use]
+    pub fn with_isolated_global_config(mut self, path: impl AsRef<OsStr>) -> Self {
+        self.isolated_global_config = Some(path.as_ref().to_owned());
+        self
+    }
+
     /// Replaces the independent default cancellation flag with one shared by the caller.
     ///
     /// The flag is sticky: setting it to `true` interrupts all current and later Git operations
@@ -247,13 +260,17 @@ impl GitCli {
         // ecosystem offline flags were requested when Git has no such flag for these operations.
         spec.network = NetworkIntent::Unknown;
         spec.confidence = Confidence::High;
-        spec.env = hardened_git_environment(std::env::vars_os()).map_err(|error| {
+        let mut environment = hardened_git_environment(std::env::vars_os()).map_err(|error| {
             GitError::new(
                 GitErrorKind::UnsafeEnvironment,
                 operation.name(),
                 error.to_string(),
             )
         })?;
+        if let Some(global_config) = &self.isolated_global_config {
+            isolate_git_configuration(&mut environment, global_config);
+        }
+        spec.env = environment;
         Ok(spec)
     }
 
@@ -544,6 +561,35 @@ where
         environment.insert(OsString::from(key), OsString::from(value));
     }
     Ok(environment)
+}
+
+fn isolate_git_configuration(
+    environment: &mut BTreeMap<OsString, OsString>,
+    global_config: &OsStr,
+) {
+    environment.retain(|key, _| {
+        ![
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_ATTR_NOSYSTEM",
+        ]
+        .iter()
+        .any(|candidate| git_environment_key_eq(key, candidate))
+            && !indexed_git_config_key(key, "GIT_CONFIG_KEY_")
+            && !indexed_git_config_key(key, "GIT_CONFIG_VALUE_")
+    });
+    environment.extend([
+        (
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            global_config.to_owned(),
+        ),
+        (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_ATTR_NOSYSTEM"), OsString::from("1")),
+        (OsString::from("GIT_LFS_SKIP_SMUDGE"), OsString::from("1")),
+    ]);
 }
 
 #[cfg(windows)]
@@ -1436,8 +1482,9 @@ mod tests {
         GitCli, GitOperation, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS, INDEX_ENTRIES_ARGS,
         INDEX_PATH_ARGS, OBJECT_FORMAT_ARGS, STATUS_PORCELAIN_V2_ARGS, TRACKED_FILES_ARGS,
         UNTRACKED_FILES_ARGS, checked_stdout, classify_command_failure, hardened_git_environment,
-        indexed_git_config_key, modification_times_differ_or_are_unobservable,
-        parse_absolute_git_path, parse_blob_size, parse_exact_tree_blob, parse_object_format,
+        indexed_git_config_key, isolate_git_configuration,
+        modification_times_differ_or_are_unobservable, parse_absolute_git_path, parse_blob_size,
+        parse_exact_tree_blob, parse_object_format,
     };
     #[cfg(unix)]
     use super::{
@@ -1713,6 +1760,69 @@ mod tests {
             Some(&OsString::from("/workspace"))
         );
         assert!(!environment.contains_key(OsStr::new("FORGE_SECRET_TEST_VALUE")));
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_global_config_removes_every_ambient_config_injection() -> Result<(), io::Error> {
+        let mut environment = hardened_git_environment([
+            (
+                OsString::from("GIT_CEILING_DIRECTORIES"),
+                OsString::from("/workspace"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_GLOBAL"),
+                OsString::from("/ambient/global"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_SYSTEM"),
+                OsString::from("/ambient/system"),
+            ),
+            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+            (
+                OsString::from("GIT_CONFIG_KEY_0"),
+                OsString::from("core.fsmonitor"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_VALUE_0"),
+                OsString::from("/ambient/executable"),
+            ),
+            (
+                OsString::from("GIT_CONFIG_PARAMETERS"),
+                OsString::from("'include.path'='/ambient/include'"),
+            ),
+        ])?;
+        isolate_git_configuration(&mut environment, OsStr::new("/authority/empty-config"));
+
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&OsString::from("/authority/empty-config"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            Some(&OsString::from("1"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_ATTR_NOSYSTEM")),
+            Some(&OsString::from("1"))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_LFS_SKIP_SMUDGE")),
+            Some(&OsString::from("1"))
+        );
+        for removed in [
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            assert!(!environment.contains_key(OsStr::new(removed)));
+        }
+        assert_eq!(
+            environment.get(OsStr::new("GIT_CEILING_DIRECTORIES")),
+            Some(&OsString::from("/workspace"))
+        );
         Ok(())
     }
 

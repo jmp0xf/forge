@@ -1,4 +1,4 @@
-//! Bounded, exact JSON parsing for immutable Receipt and Evidence identities.
+//! Bounded, exact JSON parsing shared by content identities and strict protocol readers.
 //!
 //! `serde_json::Value` cannot represent every RFC 8259 number without routing some tokens through
 //! `f64`. That is unsafe for content identities because distinct large integers can round to the
@@ -8,41 +8,78 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Number, Value};
 
-pub(super) const MAX_JSON_NESTING_DEPTH: usize = 256;
+/// Maximum object/array nesting accepted by the exact parser.
+pub const MAX_JSON_NESTING_DEPTH: usize = 256;
 const MAX_PLAIN_INTEGER_DIGITS: usize = 20;
 
+/// A content-free failure classification for exact JSON input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ExactJsonError {
+    #[error("JSON input exceeds its configured byte limit")]
+    TooLarge,
+    #[error("JSON input is malformed or has inconsistent typed semantics")]
+    Malformed,
+}
+
+/// One duplicate-free, depth-bounded JSON document with exact numeric identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ParsedJson {
+pub struct ExactJson {
     identity: JsonValue,
     semantic: Value,
     alternate_semantic: Option<Value>,
 }
 
-impl ParsedJson {
-    pub(super) const fn semantic(&self) -> &Value {
-        &self.semantic
+impl ExactJson {
+    /// Applies one semantic projection to every numeric interpretation and requires one result.
+    ///
+    /// The callback cannot accidentally authorize only the primary projection: when an RFC 8259
+    /// number is not exactly representable by `serde_json`, the callback runs against both
+    /// sentinel projections and the results must agree.
+    pub fn project_consistent<T, E, F, G>(&self, mut project: F, inconsistent: G) -> Result<T, E>
+    where
+        T: PartialEq,
+        F: FnMut(&Value) -> Result<T, E>,
+        G: FnOnce() -> E,
+    {
+        let projected = project(&self.semantic)?;
+        if let Some(alternate) = &self.alternate_semantic {
+            let alternate = project(alternate)?;
+            if projected != alternate {
+                return Err(inconsistent());
+            }
+        }
+        Ok(projected)
     }
 
-    pub(super) const fn alternate_semantic(&self) -> Option<&Value> {
-        self.alternate_semantic.as_ref()
+    /// Deserializes both semantic projections and rejects numeric ambiguity.
+    pub fn deserialize_consistent<T>(&self) -> Result<T, ExactJsonError>
+    where
+        T: DeserializeOwned + PartialEq,
+    {
+        self.project_consistent(
+            |value| serde_json::from_value(value.clone()).map_err(|_| ExactJsonError::Malformed),
+            || ExactJsonError::Malformed,
+        )
     }
 
     /// Serializes the complete root object except for exactly `root.data.id`.
-    pub(super) fn canonical_without_data_id(&self) -> Result<Vec<u8>, ()> {
+    pub fn canonical_without_data_id(&self) -> Result<Vec<u8>, ExactJsonError> {
         let JsonValue::Object(root) = &self.identity else {
-            return Err(());
+            return Err(ExactJsonError::Malformed);
         };
         let Some(JsonValue::Object(data)) = root.get("data") else {
-            return Err(());
+            return Err(ExactJsonError::Malformed);
         };
         if !matches!(data.get("id"), Some(JsonValue::String(_))) {
-            return Err(());
+            return Err(ExactJsonError::Malformed);
         }
 
         let mut output = Vec::new();
-        write_object(root, RootMember::Data, &mut output)?;
+        write_object(root, RootMember::Data, &mut output)
+            .map_err(|()| ExactJsonError::Malformed)?;
         Ok(output)
     }
 }
@@ -334,21 +371,24 @@ fn subtract_decimal_magnitudes(left: &[u8], right: &[u8]) -> Result<Vec<u8>, ()>
     Ok(output)
 }
 
-pub(super) fn parse(bytes: &[u8], max_bytes: usize) -> Result<ParsedJson, ()> {
+/// Parses one exact JSON document without accepting duplicate decoded keys or ambiguous numbers.
+pub fn parse_exact_json(bytes: &[u8], max_bytes: usize) -> Result<ExactJson, ExactJsonError> {
     if bytes.len() > max_bytes {
-        return Err(());
+        return Err(ExactJsonError::TooLarge);
     }
     let mut parser = Parser { bytes, offset: 0 };
     parser.skip_whitespace();
-    let identity = parser.parse_value(0)?;
+    let identity = parser
+        .parse_value(0)
+        .map_err(|()| ExactJsonError::Malformed)?;
     parser.skip_whitespace();
     if parser.offset != bytes.len() {
-        return Err(());
+        return Err(ExactJsonError::Malformed);
     }
     let has_unrepresentable_number = identity.has_unrepresentable_number();
     let semantic = identity.semantic_projection(0);
     let alternate_semantic = has_unrepresentable_number.then(|| identity.semantic_projection(1));
-    Ok(ParsedJson {
+    Ok(ExactJson {
         identity,
         semantic,
         alternate_semantic,
@@ -650,17 +690,17 @@ fn write_string(value: &str, output: &mut Vec<u8>) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_JSON_NESTING_DEPTH, parse};
+    use super::{ExactJsonError, MAX_JSON_NESTING_DEPTH, parse_exact_json};
 
     const MAX_TEST_BYTES: usize = 1024 * 1024;
 
-    fn canonical_number(token: &str) -> Result<Vec<u8>, ()> {
+    fn canonical_number(token: &str) -> Result<Vec<u8>, ExactJsonError> {
         let bytes = format!("{{\"data\":{{\"id\":\"ignored\"}},\"value\":{token}}}");
-        parse(bytes.as_bytes(), MAX_TEST_BYTES)?.canonical_without_data_id()
+        parse_exact_json(bytes.as_bytes(), MAX_TEST_BYTES)?.canonical_without_data_id()
     }
 
     #[test]
-    fn equivalent_numbers_have_one_exact_canonical_form() -> Result<(), ()> {
+    fn equivalent_numbers_have_one_exact_canonical_form() -> Result<(), ExactJsonError> {
         let one = canonical_number("1")?;
         assert_eq!(one, br#"{"data":{},"value":1}"#);
         for equivalent in ["1.0", "1e0", "10e-1", "1000.000e-3"] {
@@ -675,7 +715,8 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_precision_numbers_are_distinct_or_equivalent_by_value() -> Result<(), ()> {
+    fn arbitrary_precision_numbers_are_distinct_or_equivalent_by_value()
+    -> Result<(), ExactJsonError> {
         assert_ne!(
             canonical_number("184467440737095516160000000000000000001")?,
             canonical_number("184467440737095516160000000000000000002")?
@@ -692,11 +733,11 @@ mod tests {
     }
 
     #[test]
-    fn decoded_keys_are_unique_and_sorted_by_utf8_bytes() -> Result<(), ()> {
+    fn decoded_keys_are_unique_and_sorted_by_utf8_bytes() -> Result<(), ExactJsonError> {
         let duplicate = br#"{"data":{"id":"ignored"},"a":1,"\u0061":2}"#;
-        assert!(parse(duplicate, MAX_TEST_BYTES).is_err());
+        assert!(parse_exact_json(duplicate, MAX_TEST_BYTES).is_err());
 
-        let parsed = parse(
+        let parsed = parse_exact_json(
             r#"{"z":0,"data":{"nested":{"id":"kept"},"id":"removed"},"é":2,"a":1}"#.as_bytes(),
             MAX_TEST_BYTES,
         )?;
@@ -714,10 +755,10 @@ mod tests {
             "[".repeat(MAX_JSON_NESTING_DEPTH),
             "]".repeat(MAX_JSON_NESTING_DEPTH)
         );
-        assert!(parse(accepted.as_bytes(), accepted.len()).is_ok());
+        assert!(parse_exact_json(accepted.as_bytes(), accepted.len()).is_ok());
         let rejected = format!("[{accepted}]");
-        assert!(parse(rejected.as_bytes(), rejected.len()).is_err());
-        assert!(parse(b"null", 3).is_err());
+        assert!(parse_exact_json(rejected.as_bytes(), rejected.len()).is_err());
+        assert_eq!(parse_exact_json(b"null", 3), Err(ExactJsonError::TooLarge));
     }
 
     #[test]
@@ -725,24 +766,28 @@ mod tests {
         for token in ["-", "01", "1.", "1e", "1e+", "+1", ".1", "--1"] {
             let document = format!("{{\"data\":{{\"id\":\"ignored\"}},\"value\":{token}}}");
             assert!(
-                parse(document.as_bytes(), MAX_TEST_BYTES).is_err(),
+                parse_exact_json(document.as_bytes(), MAX_TEST_BYTES).is_err(),
                 "{token}"
             );
         }
     }
 
     #[test]
-    fn dual_semantic_projection_exposes_known_unrepresentable_numbers() -> Result<(), ()> {
-        let parsed = parse(
+    fn dual_semantic_projection_exposes_known_unrepresentable_numbers() -> Result<(), ExactJsonError>
+    {
+        let parsed = parse_exact_json(
             br#"{"data":{"id":"ignored"},"wide":18446744073709551616,"fraction":1.5,"integer":1e1}"#,
             MAX_TEST_BYTES,
         )?;
-        let alternate = parsed.alternate_semantic().ok_or(())?;
-        assert_eq!(parsed.semantic()["wide"], 0);
+        let alternate = parsed
+            .alternate_semantic
+            .as_ref()
+            .ok_or(ExactJsonError::Malformed)?;
+        assert_eq!(parsed.semantic["wide"], 0);
         assert_eq!(alternate["wide"], 1);
-        assert_eq!(parsed.semantic()["fraction"], 0);
+        assert_eq!(parsed.semantic["fraction"], 0);
         assert_eq!(alternate["fraction"], 1);
-        assert_eq!(parsed.semantic()["integer"], 10);
+        assert_eq!(parsed.semantic["integer"], 10);
         assert_eq!(alternate["integer"], 10);
         Ok(())
     }
