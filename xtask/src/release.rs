@@ -25,15 +25,17 @@ use forge_schema::exact_json::{ExactJsonError, parse_exact_json};
 use forge_schema::{
     GitObjectIdV2Data, GitSha1ObjectIdV2Data, GitSha256ObjectIdV2Data, ReleaseArtifactKindV2Data,
     ReleaseArtifactV2Data, ReleaseAuthorityStatusData, ReleaseBuildApplyDescriptorData,
-    ReleaseBuildApplyDescriptorPurposeData, ReleaseBuildBinaryData,
+    ReleaseBuildApplyDescriptorPurposeData, ReleaseBuildBinaryData, ReleaseBuildDependencyKeysData,
     ReleaseBuildDependencyResolutionData, ReleaseBuildInputCargoCommandData,
     ReleaseBuildInputNativeStringData, ReleaseBuildInputObservationData,
     ReleaseBuildInputObservationPhaseData, ReleaseBuildInputObservationPurposeData,
     ReleaseBuildInputTargetData, ReleaseBuildInputValueData,
     ReleaseBuildInputWindowsMsvcEnvironmentData, ReleaseBuildNetworkData,
-    ReleaseBuildPackageSourceData, ReleaseBuildPlanData, ReleaseBuildPlanPurposeData,
-    ReleaseBuildProfileData, ReleaseBuildSbomGraphData, ReleaseBuildSbomLicenseExpressionData,
-    ReleaseBuildSbomPackageData, ReleaseBuildTargetData, ReleaseCandidateStatusData,
+    ReleaseBuildPackageKeyData, ReleaseBuildPackageNameData, ReleaseBuildPackageSourceData,
+    ReleaseBuildPackageVersionData, ReleaseBuildPlanData, ReleaseBuildPlanPurposeData,
+    ReleaseBuildProfileData, ReleaseBuildSbomDependenciesData, ReleaseBuildSbomDependencyData,
+    ReleaseBuildSbomGraphData, ReleaseBuildSbomLicenseExpressionData, ReleaseBuildSbomPackageData,
+    ReleaseBuildSbomPackagesData, ReleaseBuildTargetData, ReleaseCandidateStatusData,
     ReleaseChannelData, ReleaseDescriptorData, ReleaseDistributionData, ReleaseManifestV2Data,
     ReleasePredicateTypeData, ReleaseProvenanceStatusData, ReleaseProvenanceV2Data,
     ReleaseRollbackData, ReleaseRollbackStatusData, ReleaseSha256Data, ReleaseSigningData,
@@ -82,6 +84,8 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUILD_INPUT_OBSERVATION_BYTES: usize = 512 * 1024;
 const BUILD_INPUT_OBSERVATION_PREFIX: &str = "release-build-input-observation-";
+const CRATES_IO_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const MAX_RELEASE_BUILD_GRAPH_EDGES: usize = 4096;
 const FINALIZED_ASSET_COUNT: u16 = 13;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const CARGO_METADATA_TIMEOUT: Duration = Duration::from_secs(300);
@@ -492,7 +496,6 @@ mod strict_release_protocol {
     // These bounds are shared by the parser and the no-follow file seam that lands next.
     pub(super) const MAX_RELEASE_BUILD_PLAN_BYTES: usize = 16 * 1024;
     pub(super) const MAX_RELEASE_BUILD_APPLY_DESCRIPTOR_BYTES: usize = 1024 * 1024;
-    const MAX_RELEASE_BUILD_GRAPH_EDGES: usize = 4096;
 
     #[derive(Debug)]
     pub(super) struct AcceptedReleaseBuildPlan {
@@ -527,7 +530,6 @@ mod strict_release_protocol {
         binary: &'a [u8],
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "awaits the apply consumer"))]
     impl<'a> AcceptedReleaseBuildApply<'a> {
         pub(super) fn plan(&self) -> &ReleaseBuildPlanData {
             &self.plan.document
@@ -4085,7 +4087,7 @@ struct BomComponent {
 
 #[derive(Debug, Serialize)]
 struct BomLicenseChoice {
-    expression: String,
+    expression: ReleaseBuildSbomLicenseExpressionData,
 }
 
 #[derive(Debug, Serialize)]
@@ -4344,22 +4346,18 @@ fn parse_scoped_cargo_tree_graph(
     })
 }
 
-fn render_sbom(
+fn cargo_release_sbom_projection(
     target: &ReleaseTarget,
     metadata_bytes: &[u8],
     tree_bytes: &[u8],
     cargo_lock: &[u8],
-    source_commit: &str,
-    binary: &[u8],
-) -> Result<Vec<u8>, ReleaseError> {
+) -> Result<ReleaseBuildSbomGraphData, ReleaseError> {
     let metadata: CargoMetadata = serde_json::from_slice(metadata_bytes).map_err(|error| {
         ReleaseError::environment(format!(
             "Cargo metadata for {} is not valid JSON: {error}",
             target.triple
         ))
     })?;
-    let lock = parse_cargo_lock(cargo_lock)?;
-    let lock_packages = cargo_lock_packages(&lock)?;
     let packages: BTreeMap<_, _> = metadata
         .packages
         .iter()
@@ -4371,33 +4369,6 @@ fn render_sbom(
         .copied()
         .ok_or_else(|| ReleaseError::internal("selected Cargo root disappeared"))?;
     let selected = &selection.package_ids;
-
-    let root_ref = format!("pkg:cargo/forge@{RELEASE_VERSION}");
-    let mut references = BTreeMap::new();
-    for id in selected {
-        let package = packages.get(id.as_str()).ok_or_else(|| {
-            ReleaseError::environment(format!("Cargo metadata has no package for `{id}`"))
-        })?;
-        let reference = if package.id == root.id {
-            root_ref.clone()
-        } else {
-            format!(
-                "urn:forge:cargo:blake3:{}",
-                blake3::hash(
-                    format!(
-                        "{}\0{}\0{}",
-                        package.name,
-                        package.version,
-                        package.source.as_deref().unwrap_or("workspace")
-                    )
-                    .as_bytes()
-                )
-                .to_hex()
-            )
-        };
-        references.insert(id.clone(), reference);
-    }
-
     let mut component_ids: Vec<_> = selected
         .iter()
         .filter(|id| id.as_str() != root.id)
@@ -4409,63 +4380,280 @@ fn render_sbom(
         left.map(|package| (&package.name, &package.version, &package.source))
             .cmp(&right.map(|package| (&package.name, &package.version, &package.source)))
     });
-    let mut components = Vec::with_capacity(component_ids.len());
+    component_ids.push(root.id.clone());
+
     for id in &component_ids {
+        let package = packages.get(id.as_str()).ok_or_else(|| {
+            ReleaseError::internal("selected Cargo package disappeared during source preflight")
+        })?;
+        match package.source.as_deref() {
+            None | Some(CRATES_IO_SOURCE_ID) => {}
+            Some(_) => {
+                return Err(ReleaseError::negative(
+                    "release SBOM projection supports only workspace and crates.io packages",
+                ));
+            }
+        }
+    }
+    let lock = parse_cargo_lock(cargo_lock)?;
+    let lock_packages = cargo_lock_packages(&lock)?;
+
+    let mut keys_by_id = BTreeMap::new();
+    let mut projected_packages = Vec::with_capacity(component_ids.len());
+    for id in component_ids {
         let package = packages.get(id.as_str()).ok_or_else(|| {
             ReleaseError::internal(format!("selected Cargo package disappeared: `{id}`"))
         })?;
-        let lock_checksum = release_package_lock_checksum(package, &lock_packages)?;
-        let hashes = match lock_checksum {
-            Some(checksum) => vec![BomHash {
-                alg: "SHA-256",
-                content: checksum,
-            }],
-            None => Vec::new(),
+        let lock_checksum = if package.id == root.id {
+            None
+        } else {
+            release_package_lock_checksum(package, &lock_packages)?
         };
-        let properties = package
-            .source
-            .as_ref()
-            .map(|source| {
+        let (key_prefix, source) = match package.source.as_deref() {
+            None => ("workspace", ReleaseBuildPackageSourceData::Workspace),
+            Some(CRATES_IO_SOURCE_ID) => {
+                let checksum = lock_checksum.ok_or_else(|| {
+                    ReleaseError::internal(
+                        "validated crates.io release package lost its lock checksum",
+                    )
+                })?;
+                let crate_archive_sha256 = ReleaseSha256Data::new(checksum).map_err(|_| {
+                    ReleaseError::internal(
+                        "validated crates.io release package checksum became malformed",
+                    )
+                })?;
+                (
+                    "crates-io",
+                    ReleaseBuildPackageSourceData::CratesIo {
+                        crate_archive_sha256,
+                    },
+                )
+            }
+            Some(_) => {
+                return Err(ReleaseError::internal(
+                    "validated Cargo package escaped its closed source projection",
+                ));
+            }
+        };
+        let key = ReleaseBuildPackageKeyData::new(format!(
+            "{key_prefix}:{}@{}",
+            package.name, package.version
+        ))
+        .map_err(|_| {
+            ReleaseError::negative(
+                "selected Cargo package identity is outside the release SBOM protocol",
+            )
+        })?;
+        let projected = ReleaseBuildSbomPackageData {
+            key: key.clone(),
+            name: ReleaseBuildPackageNameData::new(package.name.clone()).map_err(|_| {
+                ReleaseError::negative(
+                    "selected Cargo package name is outside the release SBOM protocol",
+                )
+            })?,
+            version: ReleaseBuildPackageVersionData::new(package.version.clone()).map_err(
+                |_| {
+                    ReleaseError::negative(
+                        "selected Cargo package version is outside the release SBOM protocol",
+                    )
+                },
+            )?,
+            sbom_license_expression: release_build_license_data(&package_license_expression(
+                package,
+            )?)?,
+            source,
+        };
+        if keys_by_id.insert(id, key).is_some() {
+            return Err(ReleaseError::internal(
+                "scoped Cargo tree projection repeated a package ID",
+            ));
+        }
+        projected_packages.push(projected);
+    }
+    projected_packages.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let root_key = keys_by_id
+        .get(&selection.root_id)
+        .cloned()
+        .ok_or_else(|| ReleaseError::internal("release SBOM projection lost its root key"))?;
+    let mut projected_dependencies = Vec::with_capacity(selection.edges.len());
+    let mut edge_count = 0_usize;
+    for (id, dependencies) in selection.edges {
+        let package = keys_by_id.get(&id).cloned().ok_or_else(|| {
+            ReleaseError::internal("release SBOM projection lost a dependency-row package")
+        })?;
+        let mut depends_on = Vec::with_capacity(dependencies.len());
+        for dependency in dependencies {
+            edge_count = edge_count
+                .checked_add(1)
+                .filter(|count| *count <= MAX_RELEASE_BUILD_GRAPH_EDGES)
+                .ok_or_else(|| {
+                    ReleaseError::negative(
+                        "local release SBOM projection exceeds the graph edge limit",
+                    )
+                })?;
+            depends_on.push(keys_by_id.get(&dependency).cloned().ok_or_else(|| {
+                ReleaseError::internal("release SBOM projection lost a dependency target")
+            })?);
+        }
+        depends_on.sort();
+        projected_dependencies.push(ReleaseBuildSbomDependencyData {
+            package,
+            depends_on: ReleaseBuildDependencyKeysData::new(depends_on).map_err(|_| {
+                ReleaseError::negative(
+                    "local release SBOM projection exceeds the per-package dependency limit",
+                )
+            })?,
+        });
+    }
+    projected_dependencies.sort_by(|left, right| left.package.cmp(&right.package));
+
+    Ok(ReleaseBuildSbomGraphData {
+        root: root_key,
+        packages: ReleaseBuildSbomPackagesData::new(projected_packages).map_err(|_| {
+            ReleaseError::negative("local release SBOM projection exceeds the package limit")
+        })?,
+        dependencies: ReleaseBuildSbomDependenciesData::new(projected_dependencies).map_err(
+            |_| {
+                ReleaseError::negative(
+                    "local release SBOM projection exceeds the dependency-row limit",
+                )
+            },
+        )?,
+    })
+}
+
+fn release_build_source_identity(
+    source: &ReleaseBuildPackageSourceData,
+) -> Result<Option<&'static str>, ReleaseError> {
+    match source {
+        ReleaseBuildPackageSourceData::Workspace => Ok(None),
+        ReleaseBuildPackageSourceData::CratesIo { .. } => Ok(Some(CRATES_IO_SOURCE_ID)),
+        _ => Err(ReleaseError::internal(
+            "release SBOM renderer received an unaccepted package source",
+        )),
+    }
+}
+
+fn release_sbom_reference(package: &ReleaseBuildSbomPackageData) -> Result<String, ReleaseError> {
+    Ok(format!(
+        "urn:forge:cargo:blake3:{}",
+        blake3::hash(
+            format!(
+                "{}\0{}\0{}",
+                package.name.as_str(),
+                package.version.as_str(),
+                release_build_source_identity(&package.source)?.unwrap_or("workspace")
+            )
+            .as_bytes()
+        )
+        .to_hex()
+    ))
+}
+
+fn render_release_sbom_projection(
+    target: &ReleaseTarget,
+    projection: &ReleaseBuildSbomGraphData,
+    cargo_lock_sha256: &str,
+    source_commit: &str,
+    binary: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let packages: BTreeMap<_, _> = projection
+        .packages
+        .as_slice()
+        .iter()
+        .map(|package| (package.key.as_str(), package))
+        .collect();
+    let root = packages
+        .get(projection.root.as_str())
+        .copied()
+        .ok_or_else(|| ReleaseError::internal("release SBOM projection omitted its root"))?;
+    let root_ref = format!("pkg:cargo/forge@{RELEASE_VERSION}");
+    let mut references = BTreeMap::new();
+    for (key, package) in &packages {
+        let reference = if *key == projection.root.as_str() {
+            root_ref.clone()
+        } else {
+            release_sbom_reference(package)?
+        };
+        references.insert(*key, reference);
+    }
+
+    let mut component_keys = packages
+        .iter()
+        .filter(|(key, _)| **key != projection.root.as_str())
+        .map(|(key, package)| {
+            Ok((
+                *key,
+                package.name.as_str(),
+                package.version.as_str(),
+                release_build_source_identity(&package.source)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ReleaseError>>()?;
+    component_keys
+        .sort_by(|left, right| (left.1, left.2, left.3).cmp(&(right.1, right.2, right.3)));
+    let mut components = Vec::with_capacity(component_keys.len());
+    for (key, _, _, _) in component_keys {
+        let package = packages
+            .get(key)
+            .copied()
+            .ok_or_else(|| ReleaseError::internal("release SBOM component disappeared"))?;
+        let (hashes, properties) = match &package.source {
+            ReleaseBuildPackageSourceData::Workspace => (Vec::new(), Vec::new()),
+            ReleaseBuildPackageSourceData::CratesIo {
+                crate_archive_sha256,
+            } => (
+                vec![BomHash {
+                    alg: "SHA-256",
+                    content: crate_archive_sha256.as_str().to_owned(),
+                }],
                 vec![BomProperty {
                     name: "forge:cargo-source",
-                    value: source.clone(),
-                }]
-            })
-            .unwrap_or_default();
+                    value: CRATES_IO_SOURCE_ID.to_owned(),
+                }],
+            ),
+            _ => {
+                return Err(ReleaseError::internal(
+                    "release SBOM renderer received an unaccepted package source",
+                ));
+            }
+        };
         components.push(BomComponent {
             component_type: "library",
-            bom_ref: references.get(id).cloned().ok_or_else(|| {
-                ReleaseError::internal(format!("selected Cargo package has no reference: `{id}`"))
-            })?,
-            name: package.name.clone(),
-            version: package.version.clone(),
+            bom_ref: references
+                .get(key)
+                .cloned()
+                .ok_or_else(|| ReleaseError::internal("release SBOM component has no reference"))?,
+            name: package.name.as_str().to_owned(),
+            version: package.version.as_str().to_owned(),
             licenses: vec![BomLicenseChoice {
-                expression: package_license_expression(package)?,
+                expression: accepted_release_build_license(package.sbom_license_expression)?,
             }],
             hashes,
             properties,
         });
     }
 
-    let mut dependencies = Vec::with_capacity(selected.len());
-    for id in selected {
-        let mut depends_on: Vec<_> = selection
-            .edges
-            .get(id)
-            .ok_or_else(|| ReleaseError::internal("selected scoped Cargo tree node disappeared"))?
+    let mut dependencies = Vec::with_capacity(projection.dependencies.as_slice().len());
+    for row in projection.dependencies.as_slice() {
+        let mut depends_on: Vec<_> = row
+            .depends_on
+            .as_slice()
             .iter()
             .map(|dependency| {
-                references.get(dependency).cloned().ok_or_else(|| {
-                    ReleaseError::internal("scoped Cargo tree edge target has no SBOM reference")
+                references.get(dependency.as_str()).cloned().ok_or_else(|| {
+                    ReleaseError::internal("release SBOM dependency target has no reference")
                 })
             })
             .collect::<Result<Vec<_>, ReleaseError>>()?;
         depends_on.sort();
         depends_on.dedup();
         dependencies.push(BomDependency {
-            reference: references.get(id).cloned().ok_or_else(|| {
-                ReleaseError::internal(format!("selected Cargo node has no reference: `{id}`"))
-            })?,
+            reference: references
+                .get(row.package.as_str())
+                .cloned()
+                .ok_or_else(|| ReleaseError::internal("release SBOM row has no reference"))?,
             depends_on,
         });
     }
@@ -4483,7 +4671,7 @@ fn render_sbom(
                 name: "forge".to_owned(),
                 version: RELEASE_VERSION.to_owned(),
                 licenses: vec![BomLicenseChoice {
-                    expression: package_license_expression(root)?,
+                    expression: accepted_release_build_license(root.sbom_license_expression)?,
                 }],
                 hashes: vec![BomHash {
                     alg: "SHA-256",
@@ -4496,7 +4684,7 @@ fn render_sbom(
                     },
                     BomProperty {
                         name: "forge:cargo-lock-sha256",
-                        value: sha256_hex(cargo_lock),
+                        value: cargo_lock_sha256.to_owned(),
                     },
                     BomProperty {
                         name: "forge:source-commit",
@@ -4517,6 +4705,75 @@ fn render_sbom(
         dependencies,
     };
     to_pretty_json(&bom, "CycloneDX SBOM")
+}
+
+fn render_sbom(
+    target: &ReleaseTarget,
+    metadata_bytes: &[u8],
+    tree_bytes: &[u8],
+    cargo_lock: &[u8],
+    source_commit: &str,
+    binary: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let projection = cargo_release_sbom_projection(target, metadata_bytes, tree_bytes, cargo_lock)?;
+    render_release_sbom_projection(
+        target,
+        &projection,
+        &sha256_hex(cargo_lock),
+        source_commit,
+        binary,
+    )
+}
+
+fn accepted_release_build_license(
+    value: ReleaseBuildSbomLicenseExpressionData,
+) -> Result<ReleaseBuildSbomLicenseExpressionData, ReleaseError> {
+    if matches!(value, ReleaseBuildSbomLicenseExpressionData::Unknown) {
+        Err(ReleaseError::internal(
+            "accepted release-build license escaped its closed projection",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn release_build_license_data(
+    expression: &str,
+) -> Result<ReleaseBuildSbomLicenseExpressionData, ReleaseError> {
+    let value =
+        serde_json::from_value(serde_json::Value::String(expression.to_owned())).map_err(|_| {
+            ReleaseError::internal("reviewed release license could not enter its schema projection")
+        })?;
+    if matches!(value, ReleaseBuildSbomLicenseExpressionData::Unknown) {
+        Err(ReleaseError::internal(
+            "reviewed release license escaped its closed projection",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn accepted_release_build_source_commit(plan: &ReleaseBuildPlanData) -> Result<&str, ReleaseError> {
+    match &plan.source_commit {
+        GitObjectIdV2Data::Sha1 { oid } => Ok(oid.as_str()),
+        GitObjectIdV2Data::Sha256 { oid } => Ok(oid.as_str()),
+        _ => Err(ReleaseError::internal(
+            "accepted release-build plan lost its source object identity",
+        )),
+    }
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "awaits the apply output seam"))]
+fn render_release_build_apply_sbom(
+    apply: &strict_release_protocol::AcceptedReleaseBuildApply<'_>,
+) -> Result<Vec<u8>, ReleaseError> {
+    render_release_sbom_projection(
+        apply.target(),
+        &apply.descriptor().sbom_graph,
+        apply.plan().cargo_lock_sha256.as_str(),
+        accepted_release_build_source_commit(apply.plan())?,
+        apply.binary(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6111,11 +6368,12 @@ mod tests {
     };
     use super::{
         BUILD_INPUT_OBSERVATION_PREFIX, BuildInputObservationOutput, CHECKSUMS_FILE,
-        LICENSE_NOTICES_FILE, MANIFEST_FILE, PreparedCargoInvocation, RELEASE_TARGETS,
-        ReleaseError, ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, binary_asset_name,
-        build_input_observation, check, encode_windows_utf16_input, finalize,
-        finalized_asset_names, known_stage_names, local_release_build_arguments,
-        parse_build_request, release_build_completed_message, render_sbom,
+        CRATES_IO_SOURCE_ID, LICENSE_NOTICES_FILE, MANIFEST_FILE, PreparedCargoInvocation,
+        RELEASE_TARGETS, ReleaseError, ReleaseErrorKind, RepositorySnapshot, WorktreeGuard,
+        accepted_release_build_license, binary_asset_name, build_input_observation, check,
+        encode_windows_utf16_input, finalize, finalized_asset_names, known_stage_names,
+        local_release_build_arguments, parse_build_request, release_build_completed_message,
+        release_build_license_data, render_release_build_apply_sbom, render_sbom,
         require_disjoint_output_roots, sbom_asset_name, sha256_hex, stage_built, to_pretty_json,
         validate_binary_format, write_build_input_observation,
     };
@@ -6329,6 +6587,29 @@ mod tests {
         let mut value = serde_json::to_value(descriptor)?;
         mutate(&mut value)?;
         Ok(serde_json::from_value(value)?)
+    }
+
+    fn fixture_protocol_plan() -> Result<ReleaseBuildPlanData, Box<dyn std::error::Error>> {
+        let mut plan = protocol_plan(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?;
+        plan.cargo_lock_sha256 = ReleaseSha256Data::new(sha256_hex(CARGO_LOCK.as_bytes()))?;
+        Ok(plan)
+    }
+
+    fn fixture_protocol_descriptor(
+        plan: &AcceptedReleaseBuildPlan,
+        binary: &[u8],
+    ) -> Result<ReleaseBuildApplyDescriptorData, Box<dyn std::error::Error>> {
+        let descriptor = protocol_descriptor(plan)?;
+        mutated_descriptor(&descriptor, |value| {
+            value["binary"]["length"] = serde_json::json!(binary.len());
+            value["binary"]["sha256"] = serde_json::json!(sha256_hex(binary));
+            value["sbom_graph"]["packages"][0]["source"]["crate_archive_sha256"] =
+                serde_json::json!("b".repeat(64));
+            value["sbom_graph"]["packages"][1]["source"]["crate_archive_sha256"] = serde_json::json!(
+                "dafc30efc5f0fda1a660d7c0b0b3e2b8ddf0d7b3f05803e9f4b206f50807fd8c"
+            );
+            Ok(())
+        })
     }
 
     fn json_array_mut<'a>(
@@ -6615,6 +6896,225 @@ mod tests {
             error.to_string(),
             "release-build apply inputs do not share one accepted plan binding"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_license_projection_is_exact_and_bijective() -> TestResult {
+        let cases = [
+            (
+                ReleaseBuildSbomLicenseExpressionData::MitOrApache20AndUnicode30,
+                "(MIT OR Apache-2.0) AND Unicode-3.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20,
+                "Apache-2.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20OrBsl10,
+                "Apache-2.0 OR BSL-1.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20OrMit,
+                "Apache-2.0 OR MIT",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Apache20WithLlvmExceptionOrApache20OrMit,
+                "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Bsd2Clause,
+                "BSD-2-Clause",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Bsd2ClauseOrApache20OrMit,
+                "BSD-2-Clause OR Apache-2.0 OR MIT",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Cc010OrApache20OrApache20WithLlvmException,
+                "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Cc010OrMit0OrApache20,
+                "CC0-1.0 OR MIT-0 OR Apache-2.0",
+            ),
+            (ReleaseBuildSbomLicenseExpressionData::Mit, "MIT"),
+            (
+                ReleaseBuildSbomLicenseExpressionData::MitOrApache20,
+                "MIT OR Apache-2.0",
+            ),
+            (ReleaseBuildSbomLicenseExpressionData::Mit0, "MIT-0"),
+            (
+                ReleaseBuildSbomLicenseExpressionData::Unicode30,
+                "Unicode-3.0",
+            ),
+            (
+                ReleaseBuildSbomLicenseExpressionData::UnlicenseOrMit,
+                "Unlicense OR MIT",
+            ),
+            (ReleaseBuildSbomLicenseExpressionData::Zlib, "Zlib"),
+        ];
+        for (value, expression) in cases {
+            assert_eq!(accepted_release_build_license(value)?, value);
+            assert_eq!(release_build_license_data(expression)?, value);
+            assert_eq!(serde_json::to_value(value)?, serde_json::json!(expression));
+            assert_eq!(
+                serde_json::from_value::<ReleaseBuildSbomLicenseExpressionData>(
+                    serde_json::json!(expression)
+                )?,
+                value
+            );
+        }
+        assert!(
+            accepted_release_build_license(ReleaseBuildSbomLicenseExpressionData::Unknown).is_err()
+        );
+        assert!(release_build_license_data("LicenseRef-future").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_and_accepted_apply_share_exact_sbom_bytes() -> TestResult {
+        let plan_document = fixture_protocol_plan()?;
+        let plan = accept_release_build_plan(&protocol_bytes(&plan_document)?)?;
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        let descriptor_document = fixture_protocol_descriptor(&plan, &binary)?;
+        let descriptor =
+            accept_release_build_apply_descriptor(&plan, &protocol_bytes(&descriptor_document)?)?;
+        let apply = accept_release_build_apply(&plan, &descriptor, &binary)?;
+
+        let cargo_sbom = render_sbom(
+            accepted_plan_target(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?,
+            METADATA.as_bytes(),
+            TREE.as_bytes(),
+            CARGO_LOCK.as_bytes(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &binary,
+        )?;
+        let apply_sbom = render_release_build_apply_sbom(&apply)?;
+        assert_eq!(apply_sbom, cargo_sbom);
+        assert_eq!(apply_sbom.last(), Some(&b'\n'));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_sbom_projection_rejects_noncanonical_registry_without_replay() -> TestResult {
+        let private_source = "git+https://private.example.invalid/repository#secret";
+        let metadata = METADATA.replace(CRATES_IO_SOURCE_ID, private_source);
+        let matching_lock = CARGO_LOCK.replace(CRATES_IO_SOURCE_ID, private_source);
+        let missing_checksum_lock =
+            matching_lock.replace(&format!("checksum = \"{}\"\n", "b".repeat(64)), "");
+        let malformed_checksum_lock = matching_lock.replace(&"b".repeat(64), "not-a-digest");
+        let malformed_toml_lock = format!("version = 4\nsecret = [\"{private_source}\"\n");
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        for cargo_lock in [
+            CARGO_LOCK.to_owned(),
+            missing_checksum_lock,
+            malformed_checksum_lock,
+            malformed_toml_lock,
+        ] {
+            let Err(error) = render_sbom(
+                accepted_plan_target(ReleaseBuildTargetData::X8664UnknownLinuxMusl)?,
+                metadata.as_bytes(),
+                TREE.as_bytes(),
+                cargo_lock.as_bytes(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &binary,
+            ) else {
+                return Err("non-crates.io registry entered the release SBOM projection".into());
+            };
+            assert_eq!(error.kind(), ReleaseErrorKind::Negative);
+            assert_eq!(
+                error.to_string(),
+                "release SBOM projection supports only workspace and crates.io packages"
+            );
+            assert!(!error.to_string().contains(private_source));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_apply_sbom_omits_workspace_paths_and_sorts_by_rendered_identity() -> TestResult {
+        const LOCAL_KEY: &str = "workspace:aaa-helper@1.0.0";
+        let plan_document = fixture_protocol_plan()?;
+        let plan = accept_release_build_plan(&protocol_bytes(&plan_document)?)?;
+        let binary = fake_binary("x86_64-unknown-linux-musl");
+        let descriptor = fixture_protocol_descriptor(&plan, &binary)?;
+        let descriptor = mutated_descriptor(&descriptor, |value| {
+            json_array_mut(value, "/sbom_graph/packages")?.insert(
+                2,
+                serde_json::json!({
+                    "key": LOCAL_KEY,
+                    "name": "aaa-helper",
+                    "version": "1.0.0",
+                    "sbom_license_expression": "MIT",
+                    "source": {"kind": "workspace"}
+                }),
+            );
+            json_array_mut(value, "/sbom_graph/dependencies")?.insert(
+                2,
+                serde_json::json!({"package": LOCAL_KEY, "depends_on": []}),
+            );
+            json_array_mut(value, "/sbom_graph/dependencies/3/depends_on")?
+                .push(serde_json::json!(LOCAL_KEY));
+            Ok(())
+        })?;
+        let descriptor =
+            accept_release_build_apply_descriptor(&plan, &protocol_bytes(&descriptor)?)?;
+        let apply = accept_release_build_apply(&plan, &descriptor, &binary)?;
+        let sbom = render_release_build_apply_sbom(&apply)?;
+        let text = std::str::from_utf8(&sbom)?;
+        let document: Value = serde_json::from_slice(&sbom)?;
+
+        let expected_local_ref = format!(
+            "urn:forge:cargo:blake3:{}",
+            blake3::hash(concat!("aaa-helper", "\0", "1.0.0", "\0", "workspace").as_bytes())
+                .to_hex()
+        );
+        let components = document["components"]
+            .as_array()
+            .ok_or("SBOM components were not an array")?;
+        let component_names: Vec<_> = components
+            .iter()
+            .map(|component| component["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(component_names, ["aaa-helper", "build-helper", "serde"]);
+        let local = components
+            .iter()
+            .find(|component| component["name"] == "aaa-helper")
+            .ok_or("workspace component was absent")?;
+        assert_eq!(local["bom-ref"], expected_local_ref);
+        assert!(local.get("hashes").is_none());
+        assert!(local.get("properties").is_none());
+
+        let dependency_rows = document["dependencies"]
+            .as_array()
+            .ok_or("SBOM dependencies were not an array")?;
+        let references: Vec<_> = dependency_rows
+            .iter()
+            .filter_map(|row| row["ref"].as_str())
+            .collect();
+        let mut sorted_references = references.clone();
+        sorted_references.sort_unstable();
+        assert_eq!(references, sorted_references);
+        let root_dependencies = dependency_rows
+            .iter()
+            .find(|row| row["ref"] == "pkg:cargo/forge@0.1.0-rc.2")
+            .and_then(|row| row["dependsOn"].as_array())
+            .ok_or("SBOM root dependency row was absent")?;
+        let mut sorted_root_dependencies = root_dependencies.clone();
+        sorted_root_dependencies.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        assert_eq!(root_dependencies, &sorted_root_dependencies);
+        assert!(
+            root_dependencies
+                .iter()
+                .any(|dependency| dependency.as_str() == Some(expected_local_ref.as_str()))
+        );
+
+        assert!(!text.contains(LOCAL_KEY));
+        assert!(!text.contains("/repo"));
+        assert!(!text.contains("file://"));
+        assert_eq!(text.matches(CRATES_IO_SOURCE_ID).count(), 2);
+        assert_eq!(text.matches("https://").count(), 2);
         Ok(())
     }
 
