@@ -2059,6 +2059,64 @@ mod tests {
     const PROCESS_TREE_FIXTURE_OUTPUT_BYTES: &str = "FORGE_PROCESS_FIXTURE_OUTPUT_BYTES";
     const PROCESS_TREE_FIXTURE_TEST: &str = "process::tests::process_tree_fixture_helper";
 
+    #[cfg(target_vendor = "apple")]
+    #[allow(unsafe_code)]
+    fn wait_until_child_is_exited_but_unreaped(
+        child_pid: u32,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let wait_id = nix::libc::id_t::try_from(child_pid).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child process id is out of range",
+            )
+        })?;
+        let expected_pid = nix::libc::pid_t::try_from(child_pid).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child process id is out of range",
+            )
+        })?;
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let mut information = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+            // SAFETY: `information` points to writable storage of the exact type required by
+            // `waitid`. P_PID scopes the observation to this owned child, and WNOWAIT preserves
+            // the zombie so the process-tree cleanup path remains the only reaper.
+            let result = unsafe {
+                nix::libc::waitid(
+                    nix::libc::P_PID,
+                    wait_id,
+                    information.as_mut_ptr(),
+                    nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: the storage was zero-initialized before `waitid`; on a no-change
+                // WNOHANG return that leaves `si_pid` as zero, while an exited child reports its
+                // positive PID. Apple `siginfo_t::si_pid` reads that initialized field.
+                let observed_pid = unsafe { information.assume_init().si_pid() };
+                if observed_pid == expected_pid {
+                    return Ok(());
+                }
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child did not exit before the test synchronization deadline",
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn spec(program: impl AsRef<OsStr>, args: &[&str]) -> ExecSpec {
         ExecSpec::from_project_command(
             &CommandSpec::new(
@@ -2892,10 +2950,15 @@ mod tests {
         let prepared_tree = platform::PreparedTree::prepare(&mut command)?;
         let mut child = command.spawn()?;
 
-        // Force the same ordering as a heavily loaded caller: the direct child exits before the
-        // parent reaches EVFILT_PROC registration, but remains unreaped and therefore still owns
-        // its PID/PGID identity.
-        thread::sleep(Duration::from_millis(100));
+        // Establish the ordering through an independent kernel observation instead of assuming a
+        // fixed sleep was long enough on a loaded runner. WNOWAIT leaves the exited child unreaped,
+        // so it still owns its PID/PGID when attach reaches EVFILT_PROC registration.
+        if let Err(error) =
+            wait_until_child_is_exited_but_unreaped(child.id(), Duration::from_secs(2))
+        {
+            super::reap_direct_child(&mut child);
+            return Err(error.into());
+        }
         let mut tree = match prepared_tree.attach(&child) {
             Ok(tree) => tree,
             Err(error) => {
@@ -2904,7 +2967,7 @@ mod tests {
             }
         };
 
-        assert!(platform::wait_for_exit(&mut tree, Duration::ZERO)?);
+        assert!(platform::wait_for_exit(&mut tree, Duration::from_secs(2))?);
         assert!(super::kill_tree_and_reap(&mut child, &tree)?.success());
         Ok(())
     }
