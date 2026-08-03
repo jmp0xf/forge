@@ -3169,10 +3169,7 @@ mod platform {
     ) -> io::Result<ReadParentObservation> {
         validate_parent_path(relative)?;
         if relative.as_os_str().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Windows confined directory listing requires a named directory",
-            ));
+            return finish_read_parent_observation(root, Vec::new(), Vec::new(), true);
         }
         let mut chain = Vec::new();
         let mut identities = Vec::new();

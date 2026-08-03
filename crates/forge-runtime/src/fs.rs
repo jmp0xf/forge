@@ -396,6 +396,66 @@ impl RepositoryWriter {
         )
     }
 
+    /// Lists direct regular-file children through the pinned root directory handle.
+    ///
+    /// The result is bounded before allocation and the operation fails closed when any child is
+    /// a directory, symbolic link, reparse point, or another unsupported file type. This is the
+    /// directory analogue of the handle-relative read/write methods: replacing the visible root
+    /// cannot redirect the observation to a different directory.
+    pub fn list_root_regular_file_names(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<std::ffi::OsString>, FileSystemError> {
+        let listing = self
+            .write_root
+            .list_directory(Path::new(""), max_entries)
+            .map_err(|source| {
+                FileSystemError::io(
+                    "list regular files through repository root handle",
+                    &self.root,
+                    source,
+                )
+            })?
+            .ok_or_else(|| {
+                FileSystemError::io(
+                    "list regular files through repository root handle",
+                    &self.root,
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "pinned repository root directory disappeared",
+                    ),
+                )
+            })?;
+        let (_, entries) = listing.into_directory_and_entries().ok_or_else(|| {
+            FileSystemError::io(
+                "list regular files through repository root handle",
+                &self.root,
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "pinned repository root directory disappeared",
+                ),
+            )
+        })?;
+        entries
+            .into_iter()
+            .map(|entry| {
+                if entry.kind()
+                    != crate::repository_write::RepositoryDirectoryEntryKind::RegularFile
+                {
+                    return Err(FileSystemError::io(
+                        "list regular files through repository root handle",
+                        self.root.join(entry.name()),
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "repository root contains a non-regular entry",
+                        ),
+                    ));
+                }
+                Ok(entry.name().to_owned())
+            })
+            .collect()
+    }
+
     pub(crate) fn validate_open_regular_from(
         &self,
         relative_path: impl AsRef<Path>,
@@ -1038,6 +1098,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
 mod tests {
     use std::cell::Cell;
     use std::error::Error;
+    use std::ffi::OsString;
     use std::fs;
     use std::io;
     use std::path::Path;
@@ -1580,6 +1641,24 @@ mod tests {
         fs::create_dir(&repository)?;
 
         assert!(writer.validate_visible_root().is_err());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn root_file_listing_is_bounded_pinned_and_regular_only() -> Result<(), Box<dyn Error>> {
+        let repository = tempdir()?;
+        fs::write(repository.path().join("b.txt"), b"b")?;
+        fs::write(repository.path().join("a.txt"), b"a")?;
+        let writer = RepositoryWriter::new(repository.path())?;
+
+        let mut names = writer.list_root_regular_file_names(2)?;
+        names.sort();
+        assert_eq!(names, [OsString::from("a.txt"), OsString::from("b.txt")]);
+        assert!(writer.list_root_regular_file_names(1).is_err());
+
+        fs::create_dir(repository.path().join("nested"))?;
+        assert!(writer.list_root_regular_file_names(3).is_err());
         Ok(())
     }
 
