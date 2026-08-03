@@ -517,7 +517,8 @@ mod platform {
             max_entries: usize,
             hook: impl FnOnce() -> io::Result<()>,
         ) -> io::Result<Option<RepositoryDirectoryListing>> {
-            let observation = open_directory_for_listing(&self.directory, relative)?;
+            let observation =
+                open_directory_for_listing(&self.directory, &self.path, self.identity, relative)?;
             if !observation.complete {
                 validate_directory_observation(
                     &self.directory,
@@ -1307,6 +1308,8 @@ mod platform {
 
     fn open_directory_for_listing(
         root: &File,
+        _root_path: &Path,
+        _root_identity: (u64, u64),
         relative: &Path,
     ) -> io::Result<ReadParentObservation> {
         validate_parent_path(relative)?;
@@ -2319,6 +2322,16 @@ mod platform {
                 })
         }
 
+        #[cfg(test)]
+        pub(super) fn list_directory_with_hook(
+            &self,
+            relative: &Path,
+            max_entries: usize,
+            hook: impl FnOnce() -> io::Result<()>,
+        ) -> io::Result<Option<RepositoryDirectoryListing>> {
+            self.list_directory_inner(relative, None, max_entries, hook)
+        }
+
         fn list_directory_inner(
             &self,
             relative: &Path,
@@ -2326,7 +2339,8 @@ mod platform {
             max_entries: usize,
             hook: impl FnOnce() -> io::Result<()>,
         ) -> io::Result<Option<RepositoryDirectoryListing>> {
-            let observation = open_directory_for_listing(&self.directory, relative)?;
+            let observation =
+                open_directory_for_listing(&self.directory, &self.path, self.identity, relative)?;
             if !observation.complete {
                 validate_directory_observation(
                     &self.directory,
@@ -3165,11 +3179,18 @@ mod platform {
 
     fn open_directory_for_listing(
         root: &File,
+        root_path: &Path,
+        root_identity: (u64, [u8; 16]),
         relative: &Path,
     ) -> io::Result<ReadParentObservation> {
         validate_parent_path(relative)?;
         if relative.as_os_str().is_empty() {
-            return finish_read_parent_observation(root, Vec::new(), Vec::new(), true);
+            return Ok(ReadParentObservation {
+                directory: open_visible_listing_root(root_path, root_identity)?,
+                _ancestors: Vec::new(),
+                identities: Vec::new(),
+                complete: true,
+            });
         }
         let mut chain = Vec::new();
         let mut identities = Vec::new();
@@ -3766,9 +3787,46 @@ mod platform {
     fn reopen_listing_root(directory: &File) -> io::Result<File> {
         // A listing retains the already validated root only for identity and ACL checks. Cloning
         // duplicates that exact pinned handle with the same granted access and cannot trigger a
-        // second open-time access check or cross a visible-root replacement race. The root handle
-        // is never enumerated, so sharing its file-object cursor is immaterial.
+        // second open-time access check or cross a visible-root replacement race. The retained
+        // root handle is never enumerated, so sharing its file-object cursor is immaterial.
         directory.try_clone()
+    }
+
+    fn open_visible_listing_root(path: &Path, expected: (u64, [u8; 16])) -> io::Result<File> {
+        let wide = nul_terminated(path.as_os_str())?;
+        // Opening by the visible absolute path gives this listing its own file object and cursor.
+        // Identity is checked before use, and the caller checks it again after enumeration, so a
+        // visible-root replacement can only reject the observation, never redirect it.
+        // SAFETY: the path is NUL-terminated and the returned handle is checked before ownership
+        // is transferred to `File`.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is a newly returned owned Win32 handle.
+        let directory = unsafe { File::from_raw_handle(handle) };
+        validate_kind(&directory, true)?;
+        if directory_identity(&directory)? == expected {
+            Ok(directory)
+        } else {
+            Err(read_namespace_changed(
+                "visible repository root identity changed before directory listing",
+            ))
+        }
     }
 
     fn existing_target_permissions(
@@ -4455,6 +4513,31 @@ mod tests {
             .next()
             .ok_or_else(|| io::Error::other("missing listing did not retain its pinned root"))?;
         assert!(retained_root.metadata()?.is_dir());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn root_directory_listing_rejects_visible_root_replacement() -> Result<(), Box<dyn Error>> {
+        let container = tempdir()?;
+        let repository = container.path().join("repository");
+        let displaced = container.path().join("displaced-repository");
+        fs::create_dir(&repository)?;
+        fs::write(repository.join(ORIGINAL), CONTENT)?;
+        let root = RootHandle::open(&repository)?;
+
+        let result = root.list_directory_with_hook(Path::new(""), 8, || {
+            fs::rename(&repository, &displaced)?;
+            fs::create_dir(&repository)?;
+            fs::write(repository.join(ORIGINAL), b"replacement")
+        });
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(fs::read(displaced.join(ORIGINAL))?, CONTENT);
+        assert_eq!(fs::read(repository.join(ORIGINAL))?, b"replacement");
         Ok(())
     }
 
