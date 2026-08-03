@@ -12,11 +12,11 @@ use std::path::{Component as PathComponent, Path, PathBuf};
 use std::time::Duration;
 
 use forge_core::ports::{
-    EnvPolicy, ExecSpec, OutputPolicy, ProcessObservation, ProcessPort, StdinPolicy,
+    EnvPolicy, ExecSpec, GitPort, OutputPolicy, ProcessObservation, ProcessPort, StdinPolicy,
 };
 use forge_core::{
-    GitIndexEntry, GitIndexTag, GitObjectFormat, Mutability, NetworkIntent, RepoRelativePath,
-    parse_git_index_reader,
+    BranchOid, GitIndexEntry, GitIndexTag, GitObjectFormat, Mutability, NetworkIntent,
+    RepoRelativePath, parse_git_index_reader,
 };
 use forge_runtime::fs::RepositoryWriter;
 use forge_runtime::git::{GitCli, HARDENED_GIT_ENV, HARDENED_GIT_GLOBAL_ARGS};
@@ -31,8 +31,9 @@ use forge_schema::{
     ReleaseBuildInputObservationPhaseData, ReleaseBuildInputObservationPurposeData,
     ReleaseBuildInputTargetData, ReleaseBuildInputValueData,
     ReleaseBuildInputWindowsMsvcEnvironmentData, ReleaseBuildNetworkData,
-    ReleaseBuildPackageKeyData, ReleaseBuildPackageNameData, ReleaseBuildPackageSourceData,
-    ReleaseBuildPackageVersionData, ReleaseBuildPlanData, ReleaseBuildPlanPurposeData,
+    ReleaseBuildOutputNameData, ReleaseBuildPackageKeyData, ReleaseBuildPackageNameData,
+    ReleaseBuildPackageSourceData, ReleaseBuildPackageVersionData, ReleaseBuildPlanData,
+    ReleaseBuildPlanOutputsData, ReleaseBuildPlanPackageData, ReleaseBuildPlanPurposeData,
     ReleaseBuildProfileData, ReleaseBuildSbomDependenciesData, ReleaseBuildSbomDependencyData,
     ReleaseBuildSbomGraphData, ReleaseBuildSbomLicenseExpressionData, ReleaseBuildSbomPackageData,
     ReleaseBuildSbomPackagesData, ReleaseBuildTargetData, ReleaseCandidateStatusData,
@@ -84,6 +85,9 @@ const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const MAX_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUILD_INPUT_OBSERVATION_BYTES: usize = 512 * 1024;
 const BUILD_INPUT_OBSERVATION_PREFIX: &str = "release-build-input-observation-";
+const RELEASE_BUILD_PLAN_FILE: &str = "release-build-plan.json";
+const RELEASE_PACKAGE_NAME: &str = "forge-cli";
+const RELEASE_BINARY_NAME: &str = "forge";
 const CRATES_IO_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const MAX_RELEASE_BUILD_GRAPH_EDGES: usize = 4096;
 const FINALIZED_ASSET_COUNT: u16 = 13;
@@ -104,6 +108,7 @@ const REJECTED_RELEASE_GIT_ENV: &[&str] = &[
 ];
 
 pub(crate) const BUILD_HELP: &str = "usage: xtask release-build --target <TRIPLE> --output-dir <DIR> [--build-input-observation-dir <DIR>]\n\nBuilds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. The optional observation is a private, diagnostic-only pre-build record that can contain local toolchain paths; it is not a release asset or evidence and must not be uploaded raw. Run the compiled xtask directly when a nested `cargo run` is unsuitable.";
+pub(crate) const PLAN_HELP: &str = "usage: xtask release-build-plan --target <TRIPLE> --output-dir <DIR>\n\nWrites exactly release-build-plan.json into an existing fresh empty directory outside the source repository. The canonical document binds the clean Git commit, Cargo.lock digest, target, and fixed release semantics without requesting Cargo or creating a binary, SBOM, or Cargo target directory. It is an untrusted candidate request, never builder evidence, qualification, approval, or release authority. This command does not establish a process sandbox or trust the Git found on PATH: formal qualification must invoke an already-built xtask directly while the external Authority pins the real Git executable and enforces its child-process allowlist; do not enter this phase through cargo run.";
 pub(crate) const FINALIZE_HELP: &str = "usage: xtask release-finalize --output-dir <DIR>\n\nRequires all five target binaries and SBOMs, then copies the source-bound license notices and writes release-manifest.json and SHA256SUMS without overwriting different bytes.";
 pub(crate) const CHECK_HELP: &str = "usage: xtask release-check --output-dir <DIR>\n\nRecomputes the complete local asset set, binary formats, SBOMs, manifest, and SHA-256 checksums. Success is local consistency evidence, not provenance, signature, approval, upload, or publication.";
 pub(crate) const LICENSE_CHECK_HELP: &str = "usage: xtask release-license-check\n\nRecomputes the reviewed five-target scoped Cargo tree graph, legal-file inventory, policy, and deterministic THIRD-PARTY-LICENSES.txt fixed point. Fetched .crate archive bytes must match Cargo.lock SHA-256; legal text is separately read and hashed from current unpacked sources, without claiming the archive check proves those unpacked bytes. Each native release-build must independently prove compiler-artifact parity before staging.";
@@ -123,33 +128,39 @@ struct ReleaseTarget {
     triple: &'static str,
     executable_name: &'static str,
     format: BinaryFormat,
+    plan_target: ReleaseBuildTargetData,
 }
 
 const RELEASE_TARGETS: [ReleaseTarget; 5] = [
     ReleaseTarget {
         triple: "x86_64-unknown-linux-musl",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::ElfX86_64Static,
+        plan_target: ReleaseBuildTargetData::X8664UnknownLinuxMusl,
     },
     ReleaseTarget {
         triple: "aarch64-unknown-linux-musl",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::ElfAarch64Static,
+        plan_target: ReleaseBuildTargetData::Aarch64UnknownLinuxMusl,
     },
     ReleaseTarget {
         triple: "x86_64-apple-darwin",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::MachOX86_64,
+        plan_target: ReleaseBuildTargetData::X8664AppleDarwin,
     },
     ReleaseTarget {
         triple: "aarch64-apple-darwin",
-        executable_name: "forge",
+        executable_name: RELEASE_BINARY_NAME,
         format: BinaryFormat::MachOAarch64,
+        plan_target: ReleaseBuildTargetData::Aarch64AppleDarwin,
     },
     ReleaseTarget {
         triple: "x86_64-pc-windows-msvc",
         executable_name: "forge.exe",
         format: BinaryFormat::PeX86_64,
+        plan_target: ReleaseBuildTargetData::X8664PcWindowsMsvc,
     },
 ];
 
@@ -229,6 +240,12 @@ struct BuildRequest {
 }
 
 #[derive(Debug)]
+struct PlanRequest {
+    target: &'static ReleaseTarget,
+    output_directory: PathBuf,
+}
+
+#[derive(Debug)]
 struct BuildInputObservationOutput {
     writer: RepositoryWriter,
     file_name: String,
@@ -252,9 +269,9 @@ fn local_release_build_arguments(target: &ReleaseTarget, target_directory: &Path
         "--locked",
         "--offline",
         "-p",
-        "forge-cli",
+        RELEASE_PACKAGE_NAME,
         "--bin",
-        "forge",
+        RELEASE_BINARY_NAME,
         "--message-format=json-render-diagnostics",
         "--target",
         target.triple,
@@ -350,6 +367,38 @@ fn parse_build_request(arguments: &[String]) -> Result<BuildRequest, ReleaseErro
         build_input_observation_directory: options
             .get("--build-input-observation-dir")
             .map(PathBuf::from),
+    })
+}
+
+pub(crate) fn run_plan(arguments: &[String]) -> Result<ReleaseCommandOutput, ReleaseError> {
+    if is_help(arguments) {
+        return Ok(ReleaseCommandOutput::Help(PLAN_HELP));
+    }
+    let request = parse_plan_request(arguments)?;
+    let repository = repository_root()?;
+    let output = open_labeled_command_output_directory(
+        &repository,
+        &request.output_directory,
+        "release-build plan output",
+    )?;
+    write_release_build_plan(&repository, request.target, &output)?;
+    Ok(ReleaseCommandOutput::Completed(
+        release_build_plan_completed_message(request.target),
+    ))
+}
+
+fn release_build_plan_completed_message(target: &ReleaseTarget) -> String {
+    format!(
+        "wrote canonical {RELEASE_BUILD_PLAN_FILE} for {}; candidate request only, not builder evidence, qualification, approval, or release authority",
+        target.triple
+    )
+}
+
+fn parse_plan_request(arguments: &[String]) -> Result<PlanRequest, ReleaseError> {
+    let options = parse_options(arguments, &["--target", "--output-dir"])?;
+    Ok(PlanRequest {
+        target: parse_target(required_option(&options, "--target")?)?,
+        output_directory: PathBuf::from(required_option(&options, "--output-dir")?),
     })
 }
 
@@ -579,28 +628,12 @@ mod strict_release_protocol {
     pub(super) fn accepted_plan_target(
         target: ReleaseBuildTargetData,
     ) -> Result<&'static ReleaseTarget, ReleaseError> {
-        let triple = match target {
-            ReleaseBuildTargetData::X8664UnknownLinuxMusl => "x86_64-unknown-linux-musl",
-            ReleaseBuildTargetData::Aarch64UnknownLinuxMusl => "aarch64-unknown-linux-musl",
-            ReleaseBuildTargetData::X8664AppleDarwin => "x86_64-apple-darwin",
-            ReleaseBuildTargetData::Aarch64AppleDarwin => "aarch64-apple-darwin",
-            ReleaseBuildTargetData::X8664PcWindowsMsvc => "x86_64-pc-windows-msvc",
-            _ => {
-                return Err(ReleaseError::negative(
-                    "release-build plan has an unsupported target",
-                ));
-            }
-        };
         RELEASE_TARGETS
             .iter()
-            .find(|target| target.triple == triple)
-            .ok_or_else(|| ReleaseError::internal("release-build plan target table drifted"))
+            .find(|known| known.plan_target == target)
+            .ok_or_else(|| ReleaseError::negative("release-build plan has an unsupported target"))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "awaits the plan/apply commands")
-    )]
     pub(super) fn accept_release_build_plan(
         bytes: &[u8],
     ) -> Result<AcceptedReleaseBuildPlan, ReleaseError> {
@@ -628,7 +661,7 @@ mod strict_release_protocol {
             ));
         }
         let target = accepted_plan_target(document.target)?;
-        if document.package.name.as_str() != "forge-cli"
+        if document.package.name.as_str() != RELEASE_PACKAGE_NAME
             || document.package.version.as_str() != RELEASE_VERSION
         {
             return Err(ReleaseError::negative(
@@ -725,7 +758,7 @@ mod strict_release_protocol {
         }
 
         let expected_root_key = format!(
-            "workspace:forge-cli@{}",
+            "workspace:{RELEASE_PACKAGE_NAME}@{}",
             plan.document().package.version.as_str()
         );
         if graph.root.as_str() != expected_root_key {
@@ -736,7 +769,7 @@ mod strict_release_protocol {
         let root = packages_by_key.get(graph.root.as_str()).ok_or_else(|| {
             ReleaseError::negative("release-build apply descriptor root package is absent")
         })?;
-        if root.name.as_str() != "forge-cli"
+        if root.name.as_str() != RELEASE_PACKAGE_NAME
             || root.version.as_str() != plan.document().package.version.as_str()
             || !matches!(&root.source, ReleaseBuildPackageSourceData::Workspace)
             || !matches!(
@@ -950,6 +983,81 @@ mod strict_release_protocol {
     }
 }
 
+fn render_release_build_plan(
+    target: &ReleaseTarget,
+    source_commit: &str,
+    cargo_lock: &[u8],
+) -> Result<Vec<u8>, ReleaseError> {
+    let document = ReleaseBuildPlanData {
+        schema: SchemaKind::ReleaseBuildPlan.id(),
+        purpose: ReleaseBuildPlanPurposeData::AuthorityExecutionRequestNotReleaseEvidence,
+        source_commit: release_build_source_commit(source_commit)?,
+        cargo_lock_sha256: ReleaseSha256Data::new(sha256_hex(cargo_lock)).map_err(|_| {
+            ReleaseError::internal("release-build plan Cargo.lock SHA-256 was malformed")
+        })?,
+        target: target.plan_target,
+        package: ReleaseBuildPlanPackageData {
+            name: ReleaseBuildPackageNameData::new(RELEASE_PACKAGE_NAME).map_err(|_| {
+                ReleaseError::internal("release-build package name constant was malformed")
+            })?,
+            version: ReleaseBuildPackageVersionData::new(RELEASE_VERSION).map_err(|_| {
+                ReleaseError::internal("release-build package version constant was malformed")
+            })?,
+        },
+        binary: ReleaseBuildBinaryData::Forge,
+        profile: ReleaseBuildProfileData::Release,
+        dependency_resolution: ReleaseBuildDependencyResolutionData::Locked,
+        network: ReleaseBuildNetworkData::Offline,
+        outputs: ReleaseBuildPlanOutputsData {
+            binary: ReleaseBuildOutputNameData::new(binary_asset_name(target)).map_err(|_| {
+                ReleaseError::internal("release-build binary output name was malformed")
+            })?,
+            sbom: ReleaseBuildOutputNameData::new(sbom_asset_name(target)).map_err(|_| {
+                ReleaseError::internal("release-build SBOM output name was malformed")
+            })?,
+        },
+    };
+    let bytes = to_pretty_json(&document, "release-build plan")?;
+    strict_release_protocol::accept_release_build_plan(&bytes).map_err(|error| {
+        ReleaseError::internal(format!(
+            "generated release-build plan failed its strict self-check: {error}"
+        ))
+    })?;
+    Ok(bytes)
+}
+
+fn write_release_build_plan(
+    repository: &Path,
+    target: &ReleaseTarget,
+    output: &RepositoryWriter,
+) -> Result<(), ReleaseError> {
+    const LABEL: &str = "release-build plan output";
+    require_fresh_output_namespace(output, LABEL)?;
+    let source = WorktreeGuard::capture(repository)?;
+    let bytes = render_release_build_plan(target, &source.source_commit, &source.cargo_lock)?;
+    source.require_same(
+        &WorktreeGuard::capture(repository)?,
+        "release-build plan generation",
+    )?;
+    require_fresh_output_namespace(output, LABEL)?;
+    write_fresh_protocol_file(
+        output,
+        RELEASE_BUILD_PLAN_FILE,
+        &bytes,
+        strict_release_protocol::MAX_RELEASE_BUILD_PLAN_BYTES,
+        LABEL,
+    )?;
+    require_exact_output_namespace(
+        output,
+        &BTreeSet::from([RELEASE_BUILD_PLAN_FILE.to_owned()]),
+        LABEL,
+    )?;
+    source.require_same(
+        &WorktreeGuard::capture(repository)?,
+        "release-build plan output creation",
+    )
+}
+
 fn repository_root() -> Result<PathBuf, ReleaseError> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -979,18 +1087,21 @@ impl WorktreeGuard {
         let index = git_index_snapshot(repository, &source_commit)?;
         let status = git_status(repository)?;
         require_clean_status(&status)?;
-        let cargo_lock = read_bounded(
-            &repository.join("Cargo.lock"),
-            MAX_METADATA_BYTES as u64,
-            "Cargo.lock",
-        )?;
+        let committed_cargo_lock = read_committed_cargo_lock(repository, &source_commit)?;
+        let cargo_lock = read_pinned_cargo_lock(repository)?;
+        if cargo_lock != committed_cargo_lock {
+            return Err(ReleaseError::environment(
+                "pinned Cargo.lock bytes do not match the reported source commit",
+            ));
+        }
 
         require_expected_git_worktree(repository)?;
-        let later_lock = read_bounded(
-            &repository.join("Cargo.lock"),
-            MAX_METADATA_BYTES as u64,
-            "Cargo.lock",
-        )?;
+        let later_lock = read_pinned_cargo_lock(repository)?;
+        if later_lock != committed_cargo_lock {
+            return Err(ReleaseError::environment(
+                "pinned Cargo.lock bytes changed away from the reported source commit",
+            ));
+        }
         let later_status = git_status(repository)?;
         require_clean_status(&later_status)?;
         let later_commit = git_head(repository)?;
@@ -2154,14 +2265,70 @@ fn require_safe_local_git_config(repository: &Path) -> Result<(), ReleaseError> 
 }
 
 fn git_raw_index_snapshot(repository: &Path) -> Result<Vec<u8>, ReleaseError> {
-    GitCli::new()
-        .with_timeout(GIT_TIMEOUT)
+    release_git_cli()
         .index_snapshot_bytes(repository, MAX_METADATA_BYTES)
         .map_err(|error| {
             ReleaseError::environment(format!(
                 "failed to capture the bounded raw Git index without links, locks, or split-index omissions: {error}"
             ))
         })
+}
+
+fn release_git_cli() -> GitCli {
+    GitCli::new()
+        .with_timeout(GIT_TIMEOUT)
+        .with_isolated_global_config(empty_git_config_path())
+}
+
+fn read_pinned_cargo_lock(repository: &Path) -> Result<Vec<u8>, ReleaseError> {
+    RepositoryWriter::new(repository)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to pin the source repository for Cargo.lock: {error}"
+            ))
+        })?
+        .read_bounded("Cargo.lock", MAX_METADATA_BYTES)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to read Cargo.lock through the pinned source root: {error}"
+            ))
+        })
+}
+
+fn read_committed_cargo_lock(
+    repository: &Path,
+    source_commit: &str,
+) -> Result<Vec<u8>, ReleaseError> {
+    let git = release_git_cli();
+    let status = git.status(repository).map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to bind Cargo.lock to typed Git status: {error}"
+        ))
+    })?;
+    let Some(BranchOid::Commit(commit)) = status.branch.oid.as_ref() else {
+        return Err(ReleaseError::environment(
+            "typed Git status omitted the source commit needed to bind Cargo.lock",
+        ));
+    };
+    if commit.as_bytes() != source_commit.as_bytes() {
+        return Err(ReleaseError::environment(
+            "typed Git status and the release source commit disagree",
+        ));
+    }
+    let cargo_lock_path = RepoRelativePath::new("Cargo.lock")
+        .map_err(|_| ReleaseError::internal("Cargo.lock path constant was invalid"))?;
+    git.read_commit_file_bounded(
+        repository,
+        commit,
+        &cargo_lock_path,
+        MAX_METADATA_BYTES as u64,
+    )
+    .map_err(|error| {
+        ReleaseError::environment(format!(
+            "failed to read Cargo.lock from the reported source commit: {error}"
+        ))
+    })?
+    .ok_or_else(|| ReleaseError::environment("reported source commit does not contain Cargo.lock"))
 }
 
 fn git_index_snapshot(repository: &Path, source_commit: &str) -> Result<Vec<u8>, ReleaseError> {
@@ -3560,48 +3727,112 @@ fn visible_output_asset_names(
     output: &RepositoryWriter,
     max_entries: usize,
 ) -> Result<BTreeSet<String>, ReleaseError> {
-    validate_visible_root(output, "release output")?;
-    let entries = fs::read_dir(output.root()).map_err(|error| {
-        ReleaseError::environment(format!(
-            "failed to enumerate pinned release output {}: {error}",
-            output.root().display()
-        ))
-    })?;
+    visible_output_entry_names(output, max_entries, "release output")
+}
+
+fn visible_output_entry_names(
+    output: &RepositoryWriter,
+    max_entries: usize,
+    label: &str,
+) -> Result<BTreeSet<String>, ReleaseError> {
+    validate_visible_root(output, label)?;
+    let entries = output
+        .list_root_regular_file_names(max_entries)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to enumerate pinned {label} {}: {error}",
+                output.root().display()
+            ))
+        })?;
     let mut names = BTreeSet::new();
     for entry in entries {
-        let entry = entry.map_err(|error| {
-            ReleaseError::environment(format!(
-                "failed to enumerate a release output entry: {error}"
-            ))
-        })?;
-        if names.len() == max_entries {
-            return Err(ReleaseError::environment(format!(
-                "release output contains more than {max_entries} allowed entries"
-            )));
-        }
-        let file_type = entry.file_type().map_err(|error| {
-            ReleaseError::environment(format!(
-                "failed to inspect release output entry {}: {error}",
-                entry.path().display()
-            ))
-        })?;
-        if !file_type.is_file() || file_type.is_symlink() {
-            return Err(ReleaseError::environment(format!(
-                "release output entry is not a real regular file: {}",
-                entry.path().display()
-            )));
-        }
-        let name = entry.file_name().into_string().map_err(|_| {
-            ReleaseError::environment("release output contains a non-UTF-8 entry name")
+        let name = entry.into_string().map_err(|_| {
+            ReleaseError::environment(format!("{label} contains a non-UTF-8 entry name"))
         })?;
         if !names.insert(name.clone()) {
             return Err(ReleaseError::environment(format!(
-                "release output enumerated duplicate entry `{name}`"
+                "{label} enumerated duplicate entry `{name}`"
             )));
         }
     }
-    validate_visible_root(output, "release output")?;
+    validate_visible_root(output, label)?;
     Ok(names)
+}
+
+fn require_fresh_output_namespace(
+    output: &RepositoryWriter,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    if visible_output_entry_names(output, 1, label)?.is_empty() {
+        Ok(())
+    } else {
+        Err(ReleaseError::environment(format!(
+            "{label} must be a fresh empty directory"
+        )))
+    }
+}
+
+fn require_exact_output_namespace(
+    output: &RepositoryWriter,
+    expected: &BTreeSet<String>,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    let actual = visible_output_entry_names(output, expected.len(), label)?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+        let unexpected = actual.difference(expected).cloned().collect::<Vec<_>>();
+        Err(ReleaseError::environment(format!(
+            "{label} does not contain its exact file set; missing=[{}], unexpected=[{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        )))
+    }
+}
+
+fn write_fresh_protocol_file(
+    output: &RepositoryWriter,
+    name: &str,
+    bytes: &[u8],
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), ReleaseError> {
+    if bytes.len() > max_bytes {
+        return Err(ReleaseError::internal(format!(
+            "{label} document exceeds its {max_bytes}-byte limit"
+        )));
+    }
+    validate_visible_root(output, label)?;
+    match output.write_atomic_new(name, bytes) {
+        Ok(()) => {}
+        Err(error) if error.io_kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ReleaseError::environment(format!(
+                "{label} already contains `{name}`; use a fresh directory"
+            )));
+        }
+        Err(error) => {
+            return Err(ReleaseError::environment(format!(
+                "failed to atomically create {label} file `{name}`: {error}"
+            )));
+        }
+    }
+    validate_visible_root(output, label)?;
+    let actual = output
+        .read_optional_bounded(name, max_bytes)
+        .map_err(|error| {
+            ReleaseError::environment(format!(
+                "failed to verify pinned {label} file `{name}`: {error}"
+            ))
+        })?;
+    validate_visible_root(output, label)?;
+    if actual.as_deref() == Some(bytes) {
+        Ok(())
+    } else {
+        Err(ReleaseError::environment(format!(
+            "newly created {label} file does not match its canonical bytes: `{name}`"
+        )))
+    }
 }
 
 fn binary_asset_name(target: &ReleaseTarget) -> String {
@@ -3610,7 +3841,10 @@ fn binary_asset_name(target: &ReleaseTarget) -> String {
     } else {
         ""
     };
-    format!("forge-{RELEASE_VERSION}-{}{suffix}", target.triple)
+    format!(
+        "{RELEASE_BINARY_NAME}-{RELEASE_VERSION}-{}{suffix}",
+        target.triple
+    )
 }
 
 fn sbom_asset_name(target: &ReleaseTarget) -> String {
@@ -6368,14 +6602,16 @@ mod tests {
     };
     use super::{
         BUILD_INPUT_OBSERVATION_PREFIX, BuildInputObservationOutput, CHECKSUMS_FILE,
-        CRATES_IO_SOURCE_ID, LICENSE_NOTICES_FILE, MANIFEST_FILE, PreparedCargoInvocation,
-        RELEASE_TARGETS, ReleaseError, ReleaseErrorKind, RepositorySnapshot, WorktreeGuard,
-        accepted_release_build_license, binary_asset_name, build_input_observation, check,
-        encode_windows_utf16_input, finalize, finalized_asset_names, known_stage_names,
-        local_release_build_arguments, parse_build_request, release_build_completed_message,
-        release_build_license_data, render_release_build_apply_sbom, render_sbom,
+        CRATES_IO_SOURCE_ID, LICENSE_NOTICES_FILE, MANIFEST_FILE, PLAN_HELP,
+        PreparedCargoInvocation, RELEASE_BUILD_PLAN_FILE, RELEASE_TARGETS, ReleaseError,
+        ReleaseErrorKind, RepositorySnapshot, WorktreeGuard, accepted_release_build_license,
+        binary_asset_name, build_input_observation, check, encode_windows_utf16_input, finalize,
+        finalized_asset_names, known_stage_names, local_release_build_arguments,
+        parse_build_request, parse_plan_request, release_build_completed_message,
+        release_build_license_data, release_build_plan_completed_message,
+        render_release_build_apply_sbom, render_release_build_plan, render_sbom,
         require_disjoint_output_roots, sbom_asset_name, sha256_hex, stage_built, to_pretty_json,
-        validate_binary_format, write_build_input_observation,
+        validate_binary_format, write_build_input_observation, write_release_build_plan,
     };
 
     const METADATA: &str = r#"{
@@ -6669,6 +6905,223 @@ mod tests {
         };
         assert_eq!(error.kind(), ReleaseErrorKind::Negative);
         assert_eq!(error.to_string(), expected_message);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_release_build_plans_are_canonical_and_bind_only_fixed_semantics() -> TestResult {
+        let source_commit = "a".repeat(40);
+        let cargo_lock = b"exact Cargo.lock bytes\n";
+        assert_eq!(
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, cargo_lock)?,
+            include_bytes!("../tests/golden/release-build-plan.json")
+        );
+        let mut rendered_targets = Vec::new();
+        for target in &RELEASE_TARGETS {
+            let bytes = render_release_build_plan(target, &source_commit, cargo_lock)?;
+            assert!(bytes.len() <= MAX_RELEASE_BUILD_PLAN_BYTES);
+            assert!(bytes.ends_with(b"}\n"));
+            assert!(!bytes.ends_with(b"\n\n"));
+            let accepted = accept_release_build_plan(&bytes)?;
+            let document = accepted.document();
+            assert_eq!(document.target, target.plan_target);
+            assert_eq!(document.cargo_lock_sha256.as_str(), sha256_hex(cargo_lock));
+            assert_eq!(document.package.name.as_str(), "forge-cli");
+            assert_eq!(document.package.version.as_str(), super::RELEASE_VERSION);
+            assert!(matches!(document.binary, ReleaseBuildBinaryData::Forge));
+            assert!(matches!(document.profile, ReleaseBuildProfileData::Release));
+            assert!(matches!(
+                document.dependency_resolution,
+                ReleaseBuildDependencyResolutionData::Locked
+            ));
+            assert!(matches!(document.network, ReleaseBuildNetworkData::Offline));
+            assert_eq!(document.outputs.binary.as_str(), binary_asset_name(target));
+            assert_eq!(document.outputs.sbom.as_str(), sbom_asset_name(target));
+            let GitObjectIdV2Data::Sha1 { oid } = &document.source_commit else {
+                return Err("generated SHA-1 plan used another object format".into());
+            };
+            assert_eq!(oid.as_str(), source_commit);
+
+            let text = std::str::from_utf8(&bytes)?;
+            for forbidden in [
+                "\"program\"",
+                "\"arguments\"",
+                "\"environment\"",
+                "\"working_directory\"",
+                "\"target_dir\"",
+                "\"authority\"",
+                "\"binary_sha256\"",
+                "\"sbom_graph\"",
+            ] {
+                assert!(!text.contains(forbidden), "plan leaked field {forbidden}");
+            }
+            rendered_targets.push(bytes);
+        }
+        for pair in rendered_targets.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+
+        let sha256_source = "f".repeat(64);
+        let sha256_plan =
+            render_release_build_plan(&RELEASE_TARGETS[0], &sha256_source, cargo_lock)?;
+        let sha256_plan = accept_release_build_plan(&sha256_plan)?;
+        let GitObjectIdV2Data::Sha256 { oid } = &sha256_plan.document().source_commit else {
+            return Err("generated SHA-256 plan used another object format".into());
+        };
+        assert_eq!(oid.as_str(), sha256_source);
+
+        assert_ne!(
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, cargo_lock)?,
+            render_release_build_plan(&RELEASE_TARGETS[0], &"b".repeat(40), cargo_lock)?
+        );
+        assert_ne!(
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, cargo_lock)?,
+            render_release_build_plan(&RELEASE_TARGETS[0], &source_commit, b"changed lock\n")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_plan_human_contract_is_frozen() {
+        assert_eq!(
+            PLAN_HELP,
+            "usage: xtask release-build-plan --target <TRIPLE> --output-dir <DIR>\n\nWrites exactly release-build-plan.json into an existing fresh empty directory outside the source repository. The canonical document binds the clean Git commit, Cargo.lock digest, target, and fixed release semantics without requesting Cargo or creating a binary, SBOM, or Cargo target directory. It is an untrusted candidate request, never builder evidence, qualification, approval, or release authority. This command does not establish a process sandbox or trust the Git found on PATH: formal qualification must invoke an already-built xtask directly while the external Authority pins the real Git executable and enforces its child-process allowlist; do not enter this phase through cargo run."
+        );
+        assert_eq!(
+            release_build_plan_completed_message(&RELEASE_TARGETS[0]),
+            "wrote canonical release-build-plan.json for x86_64-unknown-linux-musl; candidate request only, not builder evidence, qualification, approval, or release authority"
+        );
+    }
+
+    #[test]
+    fn release_build_plan_request_has_no_semantic_override_channel() -> Result<(), ReleaseError> {
+        let request = parse_plan_request(&[
+            String::from("--output-dir"),
+            String::from("/candidate-plan"),
+            String::from("--target"),
+            String::from("x86_64-pc-windows-msvc"),
+        ])?;
+        assert_eq!(request.target, &RELEASE_TARGETS[4]);
+        assert_eq!(request.output_directory, PathBuf::from("/candidate-plan"));
+
+        for forbidden in ["--program", "--package", "--binary", "--profile", "--env"] {
+            let result = parse_plan_request(&[
+                String::from("--target"),
+                String::from("x86_64-unknown-linux-musl"),
+                String::from("--output-dir"),
+                String::from("/candidate-plan"),
+                forbidden.to_owned(),
+                String::from("candidate-value"),
+            ]);
+            let Err(error) = result else {
+                return Err(ReleaseError::internal(
+                    "release-build plan accepted a semantic override",
+                ));
+            };
+            assert_eq!(error.kind(), ReleaseErrorKind::Usage);
+            assert_eq!(
+                error.to_string(),
+                format!("unknown release option `{forbidden}`")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_plan_output_is_fresh_create_only_and_exact() -> TestResult {
+        let (_temporary, repository) = minimal_release_repository()?;
+        let output_parent = tempdir()?;
+        let output = output_parent.path().join("plan");
+        fs::create_dir(&output)?;
+        let writer = super::open_labeled_command_output_directory(
+            &repository,
+            &output,
+            "release-build plan output",
+        )?;
+
+        write_release_build_plan(&repository, &RELEASE_TARGETS[0], &writer)?;
+        let plan_path = output.join(RELEASE_BUILD_PLAN_FILE);
+        let first = fs::read(&plan_path)?;
+        let accepted = accept_release_build_plan(&first)?;
+        assert_eq!(accepted.document().target, RELEASE_TARGETS[0].plan_target);
+        assert_eq!(
+            fs::read_dir(&output)?.collect::<Result<Vec<_>, _>>()?.len(),
+            1
+        );
+
+        let result = write_release_build_plan(&repository, &RELEASE_TARGETS[0], &writer);
+        let Err(error) = result else {
+            return Err("release-build plan reused a non-fresh namespace".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Environment);
+        assert_eq!(fs::read(&plan_path)?, first);
+
+        let occupied = output_parent.path().join("occupied");
+        fs::create_dir(&occupied)?;
+        fs::write(occupied.join("unrelated.txt"), b"sentinel")?;
+        let occupied_writer = super::open_labeled_command_output_directory(
+            &repository,
+            &occupied,
+            "release-build plan output",
+        )?;
+        let result = write_release_build_plan(&repository, &RELEASE_TARGETS[1], &occupied_writer);
+        let Err(error) = result else {
+            return Err("release-build plan accepted a nonempty namespace".into());
+        };
+        assert_eq!(error.kind(), ReleaseErrorKind::Environment);
+        assert_eq!(fs::read(occupied.join("unrelated.txt"))?, b"sentinel");
+        assert!(!occupied.join(RELEASE_BUILD_PLAN_FILE).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn release_build_plan_nominal_graph_is_mechanically_separate_from_cargo_and_staging()
+    -> TestResult {
+        // This is a candidate-side structural regression, not process-sandbox evidence. ADR-0044
+        // requires the external Authority to pin the real Git executable and enforce the complete
+        // child-process allowlist around this untrusted command.
+        let release_source = include_str!("release.rs");
+        let plan_seam = release_source
+            .split("fn render_release_build_plan")
+            .nth(1)
+            .and_then(|tail| tail.split("fn repository_root").next())
+            .ok_or("could not isolate release-build plan implementation")?;
+        assert!(plan_seam.contains("WorktreeGuard::capture"));
+        assert!(plan_seam.contains("write_fresh_protocol_file"));
+        for forbidden in [
+            "ReleaseSource::prepare",
+            "cargo_build(",
+            "cargo_program(",
+            "capture_cargo_metadata",
+            "capture_cargo_trees",
+            "PreparedCargoInvocation",
+            "render_sbom(",
+            "stage_built(",
+            "tempdir(",
+        ] {
+            assert!(
+                !plan_seam.contains(forbidden),
+                "release-build plan reached forbidden path {forbidden}"
+            );
+        }
+        let create_only_seam = release_source
+            .split("fn write_fresh_protocol_file")
+            .nth(1)
+            .and_then(|tail| tail.split("fn binary_asset_name").next())
+            .ok_or("could not isolate release-build protocol output helper")?;
+        assert!(create_only_seam.contains("write_atomic_new"));
+        assert!(!create_only_seam.contains("write_once_or_same"));
+        let raw_index_seam = release_source
+            .split("fn git_raw_index_snapshot")
+            .nth(1)
+            .and_then(|tail| tail.split("fn git_index_snapshot").next())
+            .ok_or("could not isolate raw Git index snapshot implementation")?;
+        assert!(raw_index_seam.contains("with_isolated_global_config"));
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains("command == \"release-build-plan\""));
+        assert!(main_source.contains("run_release_command(release::run_plan(rest))"));
+        assert!(PLAN_HELP.contains("does not establish a process sandbox"));
+        assert!(PLAN_HELP.contains("pins the real Git executable"));
         Ok(())
     }
 

@@ -13,12 +13,18 @@ const RELEASE_BUILD_HELP: &str = concat!(
     "usage: xtask release-build --target <TRIPLE> --output-dir <DIR> [--build-input-observation-dir <DIR>]\n\n",
     "Builds one accepted target from a clean Git checkout in a fresh temporary Cargo target directory, then stages the binary and its source-bound CycloneDX 1.6 SBOM. The optional observation is a private, diagnostic-only pre-build record that can contain local toolchain paths; it is not a release asset or evidence and must not be uploaded raw. Run the compiled xtask directly when a nested `cargo run` is unsuitable.\n",
 );
+const RELEASE_BUILD_PLAN_HELP: &str = "usage: xtask release-build-plan --target <TRIPLE> --output-dir <DIR>\n\nWrites exactly release-build-plan.json into an existing fresh empty directory outside the source repository. The canonical document binds the clean Git commit, Cargo.lock digest, target, and fixed release semantics without requesting Cargo or creating a binary, SBOM, or Cargo target directory. It is an untrusted candidate request, never builder evidence, qualification, approval, or release authority. This command does not establish a process sandbox or trust the Git found on PATH: formal qualification must invoke an already-built xtask directly while the external Authority pins the real Git executable and enforces its child-process allowlist; do not enter this phase through cargo run.\n";
 const RELEASE_BUILD_USAGE_ERROR: &[u8] =
     b"error: release command options must be explicit `--name value` pairs\n";
 
 #[test]
 fn release_subcommands_publish_help_on_stdout() -> std::io::Result<()> {
-    for command in ["release-build", "release-finalize", "release-check"] {
+    for command in [
+        "release-build",
+        "release-build-plan",
+        "release-finalize",
+        "release-check",
+    ] {
         let output = run([command, "--help"])?;
         assert_eq!(output.status.code(), Some(0), "{command}");
         assert!(output.stderr.is_empty(), "{command}");
@@ -32,12 +38,21 @@ fn release_subcommands_publish_help_on_stdout() -> std::io::Result<()> {
     assert_eq!(build_help.status.code(), Some(0));
     assert_eq!(build_help.stdout, RELEASE_BUILD_HELP.as_bytes());
     assert!(build_help.stderr.is_empty());
+    let plan_help = run(["release-build-plan", "--help"])?;
+    assert_eq!(plan_help.status.code(), Some(0));
+    assert_eq!(plan_help.stdout, RELEASE_BUILD_PLAN_HELP.as_bytes());
+    assert!(plan_help.stderr.is_empty());
     Ok(())
 }
 
 #[test]
 fn release_subcommands_report_usage_on_stderr() -> std::io::Result<()> {
-    for command in ["release-build", "release-finalize", "release-check"] {
+    for command in [
+        "release-build",
+        "release-build-plan",
+        "release-finalize",
+        "release-check",
+    ] {
         let output = run([command])?;
         assert_eq!(output.status.code(), Some(EXIT_USAGE), "{command}");
         assert!(output.stdout.is_empty(), "{command}");
@@ -62,12 +77,43 @@ fn release_subcommands_classify_a_missing_output_directory_as_environment_unmet(
 
     let build =
         run_with_output_directory("release-build", Some("x86_64-unknown-linux-musl"), &missing)?;
-    assert_environment_failure("release-build", &build);
+    assert_environment_failure("release-build", "release output", &build);
+
+    let plan = run_with_output_directory(
+        "release-build-plan",
+        Some("x86_64-unknown-linux-musl"),
+        &missing,
+    )?;
+    assert_environment_failure("release-build-plan", "release-build plan output", &plan);
 
     for command in ["release-finalize", "release-check"] {
         let output = run_with_output_directory(command, None, &missing)?;
-        assert_environment_failure(command, &output);
+        assert_environment_failure(command, "release output", &output);
     }
+    Ok(())
+}
+
+#[test]
+fn release_build_plan_rejects_a_nonfresh_namespace_before_source_work() -> std::io::Result<()> {
+    let temporary = tempdir()?;
+    let output = temporary.path().join("plan");
+    std::fs::create_dir(&output)?;
+    let sentinel = output.join("sentinel.txt");
+    std::fs::write(&sentinel, b"existing bytes")?;
+
+    let result = run_with_output_directory(
+        "release-build-plan",
+        Some("x86_64-unknown-linux-musl"),
+        &output,
+    )?;
+    assert_eq!(result.status.code(), Some(EXIT_ENV_UNMET));
+    assert!(result.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("release-build plan output must be a fresh empty directory")
+    );
+    assert_eq!(std::fs::read(sentinel)?, b"existing bytes");
+    assert!(!output.join("release-build-plan.json").exists());
     Ok(())
 }
 
@@ -149,12 +195,14 @@ fn run_build_with_observation(output: &Path, observation: &Path) -> std::io::Res
         .output()
 }
 
-fn assert_environment_failure(command: &str, output: &Output) {
+fn assert_environment_failure(command: &str, label: &str, output: &Output) {
     assert_eq!(output.status.code(), Some(EXIT_ENV_UNMET), "{command}");
     assert!(output.stdout.is_empty(), "{command}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.starts_with("error: failed to pin the existing release output directory"),
+        stderr.starts_with(&format!(
+            "error: failed to pin the existing {label} directory"
+        )),
         "{command}: {stderr}"
     );
 }

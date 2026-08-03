@@ -45,6 +45,9 @@ fn main() -> ExitCode {
         [command, rest @ ..] if command == "release-build" => {
             run_release_command(release::run_build(rest))
         }
+        [command, rest @ ..] if command == "release-build-plan" => {
+            run_release_command(release::run_plan(rest))
+        }
         [command, rest @ ..] if command == "release-finalize" => {
             run_release_command(release::run_finalize(rest))
         }
@@ -423,6 +426,7 @@ fn print_help() {
          generate-fixtures build deterministic fixture repositories\n\
          diff-plans        compare N-1 and candidate public behavior; requires --baseline and --candidate\n\
          release-build     build and stage one accepted release target\n\
+         release-build-plan write one create-only candidate request without running Cargo\n\
          release-finalize  require all targets and write manifest/checksums\n\
          release-check     verify the complete local release asset set\n\
          release-license-check verify the checked-in dependency-license fixed point\n\
