@@ -1,0 +1,24 @@
+# Code ownership for acceptance assets and safety boundaries
+#
+# These paths require explicit owner review because changes can alter
+# acceptance criteria, test coverage, CI qualification, or baseline evidence.
+# Changes to these paths must be independently verified to prevent
+# test weakening, CI circumvention, or quality erosion.
+
+# Tests and test infrastructure
+/tests/ @jmp0xf
+/crates/*/tests/ @jmp0xf
+
+# Acceptance fixtures and baselines
+/fixtures/ @jmp0xf
+
+# CI workflows and qualification gates
+/.github/workflows/ @jmp0xf
+
+# Mutation testing and fuzz configuration
+/fuzz/ @jmp0xf
+/mutants.toml @jmp0xf
+/mutants.skip @jmp0xf
+
+# Release and verification tooling
+/xtask/ @jmp0xf

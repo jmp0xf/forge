@@ -26,8 +26,9 @@ commands and exit codes. Merge readiness still depends on independent CI and req
 Stop before weakening tests or assertions; changing CI, release, signing, ownership, or authority boundaries;
 changing a versioned machine contract without a migration; or contradicting an accepted ADR without a superseding ADR.
 
-<!-- forge:begin block=project-index schema=1 hash=blake3:e1acb2f9afc6fdca74da84ad334e3ff68eefe00c3a9904c724f369799f8bb35a -->
+<!-- forge:begin block=project-index schema=1 hash=blake3:b62ccb9eef2fd12d597c1abebcdf711e3361c6190427fe671df4259319538b65 -->
 ## Authoritative paths
+- `.github/CODEOWNERS`
 - `.github/workflows/verify.yml`
 - `CONTRIBUTING.md`
 - `Cargo.toml`
