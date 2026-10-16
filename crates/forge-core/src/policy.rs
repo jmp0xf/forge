@@ -256,7 +256,6 @@ impl EffectivePolicyContent {
         })
     }
 
-    #[must_use]
     pub fn rules(&self) -> impl ExactSizeIterator<Item = &RiskRule> {
         self.rules.values()
     }
